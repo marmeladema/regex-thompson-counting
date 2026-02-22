@@ -7,3 +7,6 @@ license = "MIT"
 [dev-dependencies]
 itertools = "0.10"
 regex = "1"
+
+[dependencies]
+regex-syntax = "0.8.9"
