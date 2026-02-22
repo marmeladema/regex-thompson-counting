@@ -76,7 +76,7 @@ enum RegexAst {
         min: Option<usize>,
         max: Option<usize>,
     },
-    Char(char),
+    Byte(u8),
     Wildcard,
     ZeroPlus(Box<RegexAst>),
     OnePlus(Box<RegexAst>),
@@ -125,7 +125,7 @@ impl fmt::Display for RegexAst {
                     (None, None) => write!(f, "{{0,}}"),
                 }
             }
-            Self::Char(c) => write!(f, "{}", c),
+            Self::Byte(b) => write!(f, "{}", *b as char),
             Self::Wildcard => write!(f, "."),
             Self::ZeroPlus(node) => {
                 if matches!(
@@ -168,8 +168,8 @@ impl fmt::Display for RegexAst {
 /// A single NFA state.
 ///
 /// Epsilon states (`Split`, `CounterInstance`, `CounterIncrement`)
-/// are followed during [`Matcher::addstate`].  Character-consuming states
-/// (`Char`, `Wildcard`) are stepped over in [`Matcher::step`].
+/// are followed during [`Matcher::addstate`].  Byte-consuming states
+/// (`Byte`, `Wildcard`) are stepped over in [`Matcher::step`].
 #[derive(Clone, Copy, Debug)]
 enum State {
     /// Epsilon fork: follow both `out` and `out1`.
@@ -194,10 +194,10 @@ enum State {
         max: usize,
     },
 
-    /// Match a literal character, then follow `out`.
-    Char { char: char, out: usize },
+    /// Match a literal byte, then follow `out`.
+    Byte { byte: u8, out: usize },
 
-    /// Match any character, then follow `out`.
+    /// Match any byte, then follow `out`.
     Wildcard { out: usize },
 
     /// Accepting state.
@@ -209,7 +209,7 @@ impl State {
     /// and [`RegexBuilder::append`] to thread fragment lists.
     fn next(self) -> usize {
         match self {
-            State::Char { out, .. }
+            State::Byte { out, .. }
             | State::Wildcard { out, .. }
             | State::CounterInstance { out, .. } => out,
             State::Split { out1, .. } | State::CounterIncrement { out1, .. } => out1,
@@ -220,7 +220,7 @@ impl State {
     /// Overwrite the "dangling out" pointer.
     fn append(&mut self, next: usize) {
         match self {
-            State::Char { out, .. }
+            State::Byte { out, .. }
             | State::Wildcard { out, .. }
             | State::CounterInstance { out, .. } => *out = next,
             State::Split { out1, .. } | State::CounterIncrement { out1, .. } => *out1 = next,
@@ -257,7 +257,7 @@ impl Fragment {
 enum RegexHirNode {
     Alternate,
     Catenate,
-    Char(char),
+    Byte(u8),
     RepeatZeroOne,
     RepeatZeroPlus,
     RepeatOnePlus,
@@ -353,9 +353,9 @@ impl Regex {
                 )
                 .unwrap();
             }
-            State::Char { char: c, out } => {
+            State::Byte { byte: b, out } => {
                 stack.push(out);
-                writeln!(buffer, "\t{} -> {} [label=\"{}\"];", idx, out, c).unwrap();
+                writeln!(buffer, "\t{} -> {} [label=\"{}\"];", idx, out, b as char).unwrap();
             }
             State::Wildcard { out } => {
                 stack.push(out);
@@ -540,8 +540,8 @@ impl RegexBuilder {
                     self.postfix.push(RegexHirNode::RepeatZeroOne);
                 }
             }
-            RegexAst::Char(c) => {
-                self.postfix.push(RegexHirNode::Char(*c));
+            RegexAst::Byte(b) => {
+                self.postfix.push(RegexHirNode::Byte(*b));
             }
             RegexAst::Wildcard => {
                 self.postfix.push(RegexHirNode::Wildcard);
@@ -563,7 +563,7 @@ impl RegexBuilder {
     fn patch(&mut self, mut list: usize, idx: usize) {
         while let Some(state) = self.states.get_mut(list) {
             list = match state {
-                State::Char { out, .. }
+                State::Byte { out, .. }
                 | State::Wildcard { out, .. }
                 | State::CounterInstance { out, .. } => {
                     let next = *out;
@@ -665,9 +665,9 @@ impl RegexBuilder {
                 let idx = self.state(State::Wildcard { out: DANGLING });
                 Fragment::new(idx, idx)
             }
-            RegexHirNode::Char(char) => {
-                let idx = self.state(State::Char {
-                    char,
+            RegexHirNode::Byte(byte) => {
+                let idx = self.state(State::Byte {
+                    byte,
                     out: DANGLING,
                 });
                 Fragment::new(idx, idx)
@@ -1024,7 +1024,7 @@ impl<'a> Matcher<'a> {
                 }
             }
 
-            // Char, Wildcard, Match, or CounterIncrement whose guard
+            // Byte, Wildcard, Match, or CounterIncrement whose guard
             // failed — just record the state for step() to inspect.
             _ => {}
         }
@@ -1032,12 +1032,12 @@ impl<'a> Matcher<'a> {
         self.nlist.push(idx);
     }
 
-    /// Advance the simulation by one input character.
+    /// Advance the simulation by one input byte.
     ///
-    /// For each state in `clist`, if the character matches (`Char` or
+    /// For each state in `clist`, if the byte matches (`Byte` or
     /// `Wildcard`), follow the `out` pointer through `addstate` to build
     /// the next `nlist`.
-    fn step(&mut self, c: char) {
+    fn step(&mut self, b: u8) {
         self.nlist.clear();
         let clist = std::mem::take(self.clist);
 
@@ -1050,7 +1050,7 @@ impl<'a> Matcher<'a> {
 
         for &idx in &clist {
             match self.states[idx] {
-                State::Char { char: c2, out } if c == c2 => self.addstate(out),
+                State::Byte { byte: b2, out } if b == b2 => self.addstate(out),
                 State::Wildcard { out } => self.addstate(out),
                 _ => {}
             }
@@ -1060,11 +1060,10 @@ impl<'a> Matcher<'a> {
         self.listid += 1;
     }
 
-    /// Feed an entire input string through the matcher, one character at
-    /// a time.
-    fn chunk(&mut self, input: &str) {
-        for c in input.chars() {
-            self.step(c);
+    /// Feed an entire byte slice through the matcher, one byte at a time.
+    fn chunk(&mut self, input: &[u8]) {
+        for &b in input {
+            self.step(b);
         }
     }
 
@@ -1107,7 +1106,7 @@ mod tests {
         let regex = builder.build(ast);
         let mut memory = MatcherMemory::default();
         let mut matcher = memory.matcher(&regex);
-        matcher.chunk(input);
+        matcher.chunk(input.as_bytes());
         let actual = matcher.ismatch();
 
         assert_eq!(
@@ -1121,8 +1120,8 @@ mod tests {
     fn range_regex() -> RegexAst {
         RegexAst::Repetition {
             node: Box::new(RegexAst::Alternate(vec![
-                RegexAst::Catenate(vec![RegexAst::Char('a')]),
-                RegexAst::Catenate(vec![RegexAst::Char('b'), RegexAst::Char('c')]),
+                RegexAst::Catenate(vec![RegexAst::Byte(b'a')]),
+                RegexAst::Catenate(vec![RegexAst::Byte(b'b'), RegexAst::Byte(b'c')]),
             ])),
             min: Some(1),
             max: Some(2),
@@ -1134,14 +1133,14 @@ mod tests {
     fn test_counting() {
         let ast = RegexAst::Catenate(vec![
             RegexAst::ZeroPlus(Box::new(RegexAst::Wildcard)),
-            RegexAst::Char('a'),
+            RegexAst::Byte(b'a'),
             RegexAst::Repetition {
                 node: Box::new(RegexAst::Wildcard),
                 min: Some(3),
                 max: Some(3),
             },
-            RegexAst::Char('b'),
-            RegexAst::Char('c'),
+            RegexAst::Byte(b'b'),
+            RegexAst::Byte(b'c'),
         ]);
 
         assert_matches_regex_crate(&ast, "aybzbc");
@@ -1225,8 +1224,8 @@ mod tests {
     fn test_aaaaa() {
         let ast = RegexAst::Repetition {
             node: Box::new(RegexAst::Alternate(vec![
-                RegexAst::Char('a'),
-                RegexAst::ZeroOne(Box::new(RegexAst::Char('a'))),
+                RegexAst::Byte(b'a'),
+                RegexAst::ZeroOne(Box::new(RegexAst::Byte(b'a'))),
             ])),
             min: Some(2),
             max: Some(3),
@@ -1242,7 +1241,7 @@ mod tests {
     /// `a+` — basic one-or-more repetition.
     #[test]
     fn test_one_plus_basic() {
-        let ast = RegexAst::OnePlus(Box::new(RegexAst::Char('a')));
+        let ast = RegexAst::OnePlus(Box::new(RegexAst::Byte(b'a')));
 
         assert_matches_regex_crate(&ast, "");
         assert_matches_regex_crate(&ast, "a");
@@ -1266,8 +1265,8 @@ mod tests {
     #[test]
     fn test_one_plus_catenation() {
         let ast = RegexAst::Catenate(vec![
-            RegexAst::OnePlus(Box::new(RegexAst::Char('a'))),
-            RegexAst::OnePlus(Box::new(RegexAst::Char('b'))),
+            RegexAst::OnePlus(Box::new(RegexAst::Byte(b'a'))),
+            RegexAst::OnePlus(Box::new(RegexAst::Byte(b'b'))),
         ]);
 
         assert_matches_regex_crate(&ast, "");
@@ -1280,12 +1279,12 @@ mod tests {
         assert_matches_regex_crate(&ast, "ba");
     }
 
-    /// `(ab)+` — one-or-more of a multi-char sequence.
+    /// `(ab)+` — one-or-more of a multi-byte sequence.
     #[test]
     fn test_one_plus_group() {
         let ast = RegexAst::OnePlus(Box::new(RegexAst::Catenate(vec![
-            RegexAst::Char('a'),
-            RegexAst::Char('b'),
+            RegexAst::Byte(b'a'),
+            RegexAst::Byte(b'b'),
         ])));
 
         assert_matches_regex_crate(&ast, "");
@@ -1300,8 +1299,8 @@ mod tests {
     #[test]
     fn test_one_plus_alternate() {
         let ast = RegexAst::OnePlus(Box::new(RegexAst::Alternate(vec![
-            RegexAst::Char('a'),
-            RegexAst::Char('b'),
+            RegexAst::Byte(b'a'),
+            RegexAst::Byte(b'b'),
         ])));
 
         assert_matches_regex_crate(&ast, "");
@@ -1318,14 +1317,14 @@ mod tests {
     fn test_one_plus_with_counting() {
         let ast = RegexAst::Catenate(vec![
             RegexAst::ZeroPlus(Box::new(RegexAst::Wildcard)),
-            RegexAst::Char('a'),
+            RegexAst::Byte(b'a'),
             RegexAst::Repetition {
                 node: Box::new(RegexAst::Wildcard),
                 min: Some(3),
                 max: Some(3),
             },
-            RegexAst::OnePlus(Box::new(RegexAst::Char('b'))),
-            RegexAst::Char('c'),
+            RegexAst::OnePlus(Box::new(RegexAst::Byte(b'b'))),
+            RegexAst::Byte(b'c'),
         ]);
 
         assert_matches_regex_crate(&ast, "a123bc");
@@ -1341,7 +1340,7 @@ mod tests {
     #[test]
     fn test_repetition_inside_one_plus() {
         let ast = RegexAst::OnePlus(Box::new(RegexAst::Repetition {
-            node: Box::new(RegexAst::Char('a')),
+            node: Box::new(RegexAst::Byte(b'a')),
             min: Some(2),
             max: Some(3),
         }));
@@ -1389,7 +1388,7 @@ mod tests {
     #[test]
     fn test_one_plus_inside_repetition() {
         let ast = RegexAst::Repetition {
-            node: Box::new(RegexAst::OnePlus(Box::new(RegexAst::Char('a')))),
+            node: Box::new(RegexAst::OnePlus(Box::new(RegexAst::Byte(b'a')))),
             min: Some(2),
             max: Some(3),
         };
@@ -1412,8 +1411,8 @@ mod tests {
 
         let ast = RegexAst::Repetition {
             node: Box::new(RegexAst::OnePlus(Box::new(RegexAst::Alternate(vec![
-                RegexAst::Char('a'),
-                RegexAst::Char('b'),
+                RegexAst::Byte(b'a'),
+                RegexAst::Byte(b'b'),
             ])))),
             min: Some(2),
             max: Some(4),
@@ -1441,9 +1440,9 @@ mod tests {
     #[test]
     fn test_mixed_plus_and_repetition_inside_one_plus() {
         let ast = RegexAst::OnePlus(Box::new(RegexAst::Catenate(vec![
-            RegexAst::OnePlus(Box::new(RegexAst::Char('a'))),
+            RegexAst::OnePlus(Box::new(RegexAst::Byte(b'a'))),
             RegexAst::Repetition {
-                node: Box::new(RegexAst::Char('b')),
+                node: Box::new(RegexAst::Byte(b'b')),
                 min: Some(2),
                 max: Some(3),
             },
@@ -1466,11 +1465,11 @@ mod tests {
 
     // -- min=0 repetition tests ---------------------------------------------
 
-    /// `a{0,2}` — zero to two occurrences of a single char.
+    /// `a{0,2}` — zero to two occurrences of a single byte.
     #[test]
     fn test_min_zero_basic() {
         let ast = RegexAst::Repetition {
-            node: Box::new(RegexAst::Char('a')),
+            node: Box::new(RegexAst::Byte(b'a')),
             min: Some(0),
             max: Some(2),
         };
@@ -1486,7 +1485,7 @@ mod tests {
     #[test]
     fn test_min_zero_max_one() {
         let ast = RegexAst::Repetition {
-            node: Box::new(RegexAst::Char('a')),
+            node: Box::new(RegexAst::Byte(b'a')),
             min: Some(0),
             max: Some(1),
         };
@@ -1504,8 +1503,8 @@ mod tests {
 
         let ast = RegexAst::Repetition {
             node: Box::new(RegexAst::Alternate(vec![
-                RegexAst::Catenate(vec![RegexAst::Char('a')]),
-                RegexAst::Catenate(vec![RegexAst::Char('b'), RegexAst::Char('c')]),
+                RegexAst::Catenate(vec![RegexAst::Byte(b'a')]),
+                RegexAst::Catenate(vec![RegexAst::Byte(b'b'), RegexAst::Byte(b'c')]),
             ])),
             min: Some(0),
             max: Some(3),
@@ -1532,7 +1531,7 @@ mod tests {
     #[test]
     fn test_min_zero_unbounded() {
         let ast = RegexAst::Repetition {
-            node: Box::new(RegexAst::Char('a')),
+            node: Box::new(RegexAst::Byte(b'a')),
             min: Some(0),
             max: None,
         };
@@ -1550,8 +1549,8 @@ mod tests {
     fn test_min_zero_unbounded_group() {
         let ast = RegexAst::Repetition {
             node: Box::new(RegexAst::Catenate(vec![
-                RegexAst::Char('a'),
-                RegexAst::Char('b'),
+                RegexAst::Byte(b'a'),
+                RegexAst::Byte(b'b'),
             ])),
             min: Some(0),
             max: None,
@@ -1569,13 +1568,13 @@ mod tests {
     #[test]
     fn test_min_zero_inside_one_plus() {
         let ast = RegexAst::Catenate(vec![
-            RegexAst::Char('x'),
+            RegexAst::Byte(b'x'),
             RegexAst::OnePlus(Box::new(RegexAst::Repetition {
-                node: Box::new(RegexAst::Char('a')),
+                node: Box::new(RegexAst::Byte(b'a')),
                 min: Some(0),
                 max: Some(2),
             })),
-            RegexAst::Char('y'),
+            RegexAst::Byte(b'y'),
         ]);
 
         assert_matches_regex_crate(&ast, "xy");
@@ -1593,7 +1592,7 @@ mod tests {
     fn test_min_zero_inside_repetition() {
         let ast = RegexAst::Repetition {
             node: Box::new(RegexAst::Repetition {
-                node: Box::new(RegexAst::Char('a')),
+                node: Box::new(RegexAst::Byte(b'a')),
                 min: Some(0),
                 max: Some(2),
             }),
@@ -1616,7 +1615,7 @@ mod tests {
     #[test]
     fn test_one_plus_inside_min_zero_repetition() {
         let ast = RegexAst::Repetition {
-            node: Box::new(RegexAst::OnePlus(Box::new(RegexAst::Char('a')))),
+            node: Box::new(RegexAst::OnePlus(Box::new(RegexAst::Byte(b'a')))),
             min: Some(0),
             max: Some(3),
         };
@@ -1651,7 +1650,7 @@ mod tests {
     #[test]
     fn test_none_min_repetition() {
         let ast = RegexAst::Repetition {
-            node: Box::new(RegexAst::Char('a')),
+            node: Box::new(RegexAst::Byte(b'a')),
             min: None,
             max: Some(3),
         };
