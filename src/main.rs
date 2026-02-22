@@ -95,8 +95,8 @@ impl std::error::Error for Error {}
 ///
 /// Epsilon states (`Split`, `CounterInstance`, `CounterIncrement`)
 /// are followed during [`Matcher::addstate`].  Byte-consuming states
-/// (`Byte`, `Wildcard`) are stepped over in [`Matcher::step`].
-#[derive(Clone, Copy, Debug)]
+/// (`Byte`, `ByteClass`) are stepped over in [`Matcher::step`].
+#[derive(Clone, Debug)]
 enum State {
     /// Epsilon fork: follow both `out` and `out1`.
     Split { out: usize, out1: usize },
@@ -123,8 +123,12 @@ enum State {
     /// Match a literal byte, then follow `out`.
     Byte { byte: u8, out: usize },
 
-    /// Match any byte, then follow `out`.
-    Wildcard { out: usize },
+    /// Match any byte in the class (lookup table), then follow `out`.
+    ///
+    /// The table has 256 entries — one per possible byte value.
+    /// A full-range table (`[true; 256]`) is equivalent to the old
+    /// `Wildcard` state.
+    ByteClass { table: Box<[bool; 256]>, out: usize },
 
     /// Accepting state.
     Match,
@@ -133,12 +137,12 @@ enum State {
 impl State {
     /// Return the "dangling out" pointer used by [`RegexBuilder::patch`]
     /// and [`RegexBuilder::append`] to thread fragment lists.
-    fn next(self) -> usize {
+    fn next(&self) -> usize {
         match self {
             State::Byte { out, .. }
-            | State::Wildcard { out, .. }
-            | State::CounterInstance { out, .. } => out,
-            State::Split { out1, .. } | State::CounterIncrement { out1, .. } => out1,
+            | State::ByteClass { out, .. }
+            | State::CounterInstance { out, .. } => *out,
+            State::Split { out1, .. } | State::CounterIncrement { out1, .. } => *out1,
             _ => unreachable!(),
         }
     }
@@ -147,7 +151,7 @@ impl State {
     fn append(&mut self, next: usize) {
         match self {
             State::Byte { out, .. }
-            | State::Wildcard { out, .. }
+            | State::ByteClass { out, .. }
             | State::CounterInstance { out, .. } => *out = next,
             State::Split { out1, .. } | State::CounterIncrement { out1, .. } => *out1 = next,
             _ => unreachable!(),
@@ -179,7 +183,7 @@ impl Fragment {
 
 /// A postfix HIR instruction consumed by [`RegexBuilder::next_fragment`]
 /// to emit NFA states.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 enum RegexHirNode {
     Alternate,
     Catenate,
@@ -187,7 +191,7 @@ enum RegexHirNode {
     RepeatZeroOne,
     RepeatZeroPlus,
     RepeatOnePlus,
-    Wildcard,
+    ByteClass(Box<[bool; 256]>),
     CounterInstance {
         counter: usize,
     },
@@ -283,9 +287,15 @@ impl Regex {
                 stack.push(out);
                 writeln!(buffer, "\t{} -> {} [label=\"{}\"];", idx, out, b as char).unwrap();
             }
-            State::Wildcard { out } => {
+            State::ByteClass { ref table, out } => {
                 stack.push(out);
-                writeln!(buffer, "\t{} -> {} [label=\".\"];", idx, out).unwrap();
+                // Summarise the class for the label.
+                let count = table.iter().filter(|&&b| b).count();
+                if count == 256 {
+                    writeln!(buffer, "\t{} -> {} [label=\".\"];", idx, out).unwrap();
+                } else {
+                    writeln!(buffer, "\t{} -> {} [label=\"[{}B]\"];", idx, out, count).unwrap();
+                }
             }
             State::Match => {
                 writeln!(buffer, "\t{} [peripheries=2];", idx).unwrap();
@@ -368,33 +378,20 @@ impl RegexBuilder {
                 Ok(())
             }
             HirKind::Class(hir::Class::Bytes(class)) => {
-                let ranges = class.ranges();
-                // A single range covering all bytes (0x00..=0xFF) is our
-                // Wildcard.
-                if ranges.len() == 1 && ranges[0].start() == 0x00 && ranges[0].end() == 0xFF {
-                    self.postfix.push(RegexHirNode::Wildcard);
-                    return Ok(());
-                }
-                // Lower an arbitrary byte class to alternations of Byte
-                // nodes.  Each contiguous range `[lo..=hi]` expands to
-                // individual bytes joined by Alternate.
-                let mut total = 0usize;
-                for range in ranges {
+                let mut table = Box::new([false; 256]);
+                for range in class.ranges() {
                     for b in range.start()..=range.end() {
-                        self.postfix.push(RegexHirNode::Byte(b));
-                        total += 1;
-                        if total > 1 {
-                            self.postfix.push(RegexHirNode::Alternate);
-                        }
+                        table[b as usize] = true;
                     }
                 }
+                self.postfix.push(RegexHirNode::ByteClass(table));
                 Ok(())
             }
             HirKind::Class(hir::Class::Unicode(class)) => {
                 // regex-syntax may produce Unicode classes for ASCII-only
                 // patterns like `(a|b)` → `[ab]`.  If all ranges fit in a
-                // single byte (0x00..=0xFF), lower them to byte
-                // alternations; otherwise reject.
+                // single byte (0x00..=0xFF), lower them to a ByteClass;
+                // otherwise reject.
                 let ranges = class.ranges();
                 let all_single_byte = ranges
                     .iter()
@@ -402,16 +399,13 @@ impl RegexBuilder {
                 if !all_single_byte {
                     return Err(Error::UnsupportedClass(hir::Class::Unicode(class.clone())));
                 }
-                let mut total = 0usize;
+                let mut table = Box::new([false; 256]);
                 for range in ranges {
                     for b in (range.start() as u8)..=(range.end() as u8) {
-                        self.postfix.push(RegexHirNode::Byte(b));
-                        total += 1;
-                        if total > 1 {
-                            self.postfix.push(RegexHirNode::Alternate);
-                        }
+                        table[b as usize] = true;
                     }
                 }
+                self.postfix.push(RegexHirNode::ByteClass(table));
                 Ok(())
             }
             HirKind::Look(look) => Err(Error::UnsupportedLook(*look)),
@@ -557,7 +551,7 @@ impl RegexBuilder {
         while let Some(state) = self.states.get_mut(list) {
             list = match state {
                 State::Byte { out, .. }
-                | State::Wildcard { out, .. }
+                | State::ByteClass { out, .. }
                 | State::CounterInstance { out, .. } => {
                     let next = *out;
                     *out = idx;
@@ -654,8 +648,11 @@ impl RegexBuilder {
                 self.patch(e.out, s);
                 Fragment::new(s, s)
             }
-            RegexHirNode::Wildcard => {
-                let idx = self.state(State::Wildcard { out: DANGLING });
+            RegexHirNode::ByteClass(table) => {
+                let idx = self.state(State::ByteClass {
+                    table,
+                    out: DANGLING,
+                });
                 Fragment::new(idx, idx)
             }
             RegexHirNode::Byte(byte) => {
@@ -929,9 +926,9 @@ impl<'a> Matcher<'a> {
     #[inline]
     fn addstate(&mut self, idx: usize) {
         if self.lastlist[idx] == self.listid {
-            let should_reenter = match self.states[idx] {
+            let should_reenter = match &self.states[idx] {
                 State::CounterIncrement { counter, .. } => {
-                    self.counter_is_processable(counter, idx)
+                    self.counter_is_processable(*counter, idx)
                 }
                 _ => false,
             };
@@ -947,13 +944,15 @@ impl<'a> Matcher<'a> {
         }
         self.lastlist[idx] = self.listid;
 
-        match self.states[idx] {
+        match &self.states[idx] {
             State::Split { out, out1 } => {
+                let (out, out1) = (*out, *out1);
                 self.addstate(out);
                 self.addstate(out1);
             }
 
             State::CounterInstance { out, counter } => {
+                let (out, counter) = (*out, *counter);
                 self.addcounter(counter);
                 self.addstate(out);
             }
@@ -964,7 +963,8 @@ impl<'a> Matcher<'a> {
                 counter,
                 min,
                 max,
-            } if self.counter_is_processable(counter, idx) => {
+            } if self.counter_is_processable(*counter, idx) => {
+                let (out, out1, counter, min, max) = (*out, *out1, *counter, *min, *max);
                 // Re-create the counter if it was exhausted (None).  This
                 // only happens when ci_gen advanced (i.e. a CounterInstance
                 // for an inner counter fired since our first visit).
@@ -1024,7 +1024,7 @@ impl<'a> Matcher<'a> {
                 }
             }
 
-            // Byte, Wildcard, Match, or CounterIncrement whose guard
+            // Byte, ByteClass, Match, or CounterIncrement whose guard
             // failed — just record the state for step() to inspect.
             _ => {}
         }
@@ -1035,7 +1035,7 @@ impl<'a> Matcher<'a> {
     /// Advance the simulation by one input byte.
     ///
     /// For each state in `clist`, if the byte matches (`Byte` or
-    /// `Wildcard`), follow the `out` pointer through `addstate` to build
+    /// `ByteClass`), follow the `out` pointer through `addstate` to build
     /// the next `nlist`.
     fn step(&mut self, b: u8) {
         self.nlist.clear();
@@ -1049,9 +1049,9 @@ impl<'a> Matcher<'a> {
         }
 
         for &idx in &clist {
-            match self.states[idx] {
-                State::Byte { byte: b2, out } if b == b2 => self.addstate(out),
-                State::Wildcard { out } => self.addstate(out),
+            match &self.states[idx] {
+                State::Byte { byte: b2, out } if b == *b2 => self.addstate(*out),
+                State::ByteClass { table, out } if table[b as usize] => self.addstate(*out),
                 _ => {}
             }
         }
