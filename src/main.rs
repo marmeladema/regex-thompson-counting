@@ -1114,7 +1114,7 @@ mod tests {
     /// The `regex` crate is used in byte mode (`regex::bytes::Regex`) so
     /// that `.` matches any byte, consistent with our engine.
     fn assert_matches_regex_crate(pattern: &str, input: &str) {
-        let anchored = format!("^(?s-u){}$", pattern);
+        let anchored = format!("^(?s-u)(?:{})$", pattern);
         let re = regex::bytes::Regex::new(&anchored).expect("regex crate should parse pattern");
         let expected = re.is_match(input.as_bytes());
 
@@ -1141,9 +1141,19 @@ mod tests {
         let p = ".*a.{3}bc";
         assert_matches_regex_crate(p, "aybzbc");
         assert_matches_regex_crate(p, "axaybzbc");
-        assert_matches_regex_crate(p, "abc");
-        assert_matches_regex_crate(p, "");
         assert_matches_regex_crate(p, "a123bc");
+        assert_matches_regex_crate(p, "za999bc");
+        // negatives: too few wildcard chars
+        assert_matches_regex_crate(p, "abc");
+        assert_matches_regex_crate(p, "a12bc");
+        // negatives: wrong trailing literal
+        assert_matches_regex_crate(p, "a123bd");
+        assert_matches_regex_crate(p, "a123xc");
+        // negatives: empty, no 'a' at all, missing suffix
+        assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "bc");
+        assert_matches_regex_crate(p, "a123b");
+        assert_matches_regex_crate(p, "a123");
     }
 
     /// `(a|bc){1,2}` — flat range repetition with all combos up to 3.
@@ -1153,9 +1163,16 @@ mod tests {
 
         let p = "(a|bc){1,2}";
 
-        assert_matches_regex_crate(p, "");
         assert_matches_regex_crate(p, "a");
         assert_matches_regex_crate(p, "bc");
+        // negatives: empty, wrong chars, partial match
+        assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "x");
+        assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "c");
+        assert_matches_regex_crate(p, "ab");
+        assert_matches_regex_crate(p, "ca");
+        assert_matches_regex_crate(p, "bca");
 
         // Two repetitions (all combos)
         for v in std::iter::repeat(["a", "bc"])
@@ -1185,9 +1202,14 @@ mod tests {
 
         let p = "((a|bc){1,2}){2,3}";
 
+        // negatives: below outer min, wrong chars
         assert_matches_regex_crate(p, "");
         assert_matches_regex_crate(p, "a");
         assert_matches_regex_crate(p, "bc");
+        assert_matches_regex_crate(p, "x");
+        assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "c");
+        assert_matches_regex_crate(p, "aax");
 
         for i in 2..=6 {
             for v in std::iter::repeat(["a", "bc"])
@@ -1216,22 +1238,34 @@ mod tests {
     fn test_aaaaa() {
         let p = "(a|a?){2,3}";
 
-        assert_matches_regex_crate(p, "aaaaa");
+        // positives (epsilon branches make all lengths 0..=3 matchable)
         assert_matches_regex_crate(p, "");
         assert_matches_regex_crate(p, "a");
         assert_matches_regex_crate(p, "aa");
         assert_matches_regex_crate(p, "aaa");
+        // negatives: too many a's
+        assert_matches_regex_crate(p, "aaaa");
+        assert_matches_regex_crate(p, "aaaaa");
+        // negatives: wrong characters
+        assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "ab");
+        assert_matches_regex_crate(p, "ba");
+        assert_matches_regex_crate(p, "aab");
     }
 
     /// `a+` — basic one-or-more repetition.
     #[test]
     fn test_one_plus_basic() {
         let p = "a+";
-        assert_matches_regex_crate(p, "");
         assert_matches_regex_crate(p, "a");
         assert_matches_regex_crate(p, "aa");
         assert_matches_regex_crate(p, "aaa");
+        // negatives
+        assert_matches_regex_crate(p, "");
         assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "ab");
+        assert_matches_regex_crate(p, "ba");
+        assert_matches_regex_crate(p, "aab");
     }
 
     /// `.+` — one-or-more wildcard.
@@ -1274,25 +1308,42 @@ mod tests {
     #[test]
     fn test_one_plus_alternate() {
         let p = "(a|b)+";
-        assert_matches_regex_crate(p, "");
         assert_matches_regex_crate(p, "a");
         assert_matches_regex_crate(p, "b");
         assert_matches_regex_crate(p, "ab");
         assert_matches_regex_crate(p, "ba");
         assert_matches_regex_crate(p, "aab");
+        assert_matches_regex_crate(p, "bba");
+        assert_matches_regex_crate(p, "abab");
+        // negatives
+        assert_matches_regex_crate(p, "");
         assert_matches_regex_crate(p, "c");
+        assert_matches_regex_crate(p, "ac");
+        assert_matches_regex_crate(p, "ca");
+        assert_matches_regex_crate(p, "abc");
     }
 
     /// `.*a.{3}b+c` — one-or-more mixed with counting constraints.
     #[test]
     fn test_one_plus_with_counting() {
         let p = ".*a.{3}b+c";
+        // positives
         assert_matches_regex_crate(p, "a123bc");
         assert_matches_regex_crate(p, "a123bbc");
         assert_matches_regex_crate(p, "a123bbbc");
-        assert_matches_regex_crate(p, "a123c");
         assert_matches_regex_crate(p, "xa123bc");
+        assert_matches_regex_crate(p, "xxxa999bc");
+        // negatives: missing b+ section
+        assert_matches_regex_crate(p, "a123c");
+        // negatives: too few wildcard chars
+        assert_matches_regex_crate(p, "a12bc");
+        // negatives: wrong trailing literal
+        assert_matches_regex_crate(p, "a123bd");
+        assert_matches_regex_crate(p, "a123bx");
+        // negatives: empty, no 'a', missing 'c'
         assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "x123bc");
+        assert_matches_regex_crate(p, "a123b");
     }
 
     /// `(a{2,3})+` — inner repetition, outer one-or-more.
@@ -1454,7 +1505,12 @@ mod tests {
         assert_matches_regex_crate(p, "aa");
         assert_matches_regex_crate(p, "aaa");
         assert_matches_regex_crate(p, "aaaa");
+        // negatives
         assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "ab");
+        assert_matches_regex_crate(p, "ba");
+        assert_matches_regex_crate(p, "aab");
+        assert_matches_regex_crate(p, "baa");
     }
 
     /// `(ab){0,}` — zero or more of a group, lowered to `(ab)*`.
@@ -1473,14 +1529,23 @@ mod tests {
     #[test]
     fn test_min_zero_inside_one_plus() {
         let p = "x(a{0,2})+y";
+        // positives
         assert_matches_regex_crate(p, "xy");
         assert_matches_regex_crate(p, "xay");
         assert_matches_regex_crate(p, "xaay");
         assert_matches_regex_crate(p, "xaaay");
         assert_matches_regex_crate(p, "xaaaay");
+        // negatives: missing suffix/prefix
         assert_matches_regex_crate(p, "x");
         assert_matches_regex_crate(p, "y");
         assert_matches_regex_crate(p, "");
+        // negatives: wrong characters in middle
+        assert_matches_regex_crate(p, "xby");
+        assert_matches_regex_crate(p, "xaby");
+        // negatives: wrong delimiters
+        assert_matches_regex_crate(p, "ay");
+        assert_matches_regex_crate(p, "xa");
+        assert_matches_regex_crate(p, "aay");
     }
 
     /// `(a{0,2}){2,3}` — min=0 inner, counted outer.
@@ -1531,7 +1596,248 @@ mod tests {
         assert_matches_regex_crate(p, "a");
         assert_matches_regex_crate(p, "aa");
         assert_matches_regex_crate(p, "aaa");
+        // negatives: above max
         assert_matches_regex_crate(p, "aaaa");
+        // negatives: wrong characters
+        assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "ab");
+        assert_matches_regex_crate(p, "aab");
+    }
+
+    // -- Standalone primitive tests ------------------------------------------
+
+    /// `a` — single literal byte.
+    #[test]
+    fn test_literal_single() {
+        let p = "a";
+        assert_matches_regex_crate(p, "a");
+        // negatives
+        assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "aa");
+        assert_matches_regex_crate(p, "ab");
+        assert_matches_regex_crate(p, "ba");
+    }
+
+    /// `abc` — multi-byte literal concatenation.
+    #[test]
+    fn test_literal_multi() {
+        let p = "abc";
+        assert_matches_regex_crate(p, "abc");
+        // negatives
+        assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "a");
+        assert_matches_regex_crate(p, "ab");
+        assert_matches_regex_crate(p, "abd");
+        assert_matches_regex_crate(p, "abcd");
+        assert_matches_regex_crate(p, "xabc");
+        assert_matches_regex_crate(p, "abcx");
+        assert_matches_regex_crate(p, "xabcx");
+        assert_matches_regex_crate(p, "cba");
+        assert_matches_regex_crate(p, "bac");
+    }
+
+    /// `.` — bare wildcard (matches exactly one byte).
+    #[test]
+    fn test_dot_single() {
+        let p = ".";
+        assert_matches_regex_crate(p, "a");
+        assert_matches_regex_crate(p, "z");
+        assert_matches_regex_crate(p, "0");
+        assert_matches_regex_crate(p, " ");
+        // negatives
+        assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "ab");
+        assert_matches_regex_crate(p, "abc");
+    }
+
+    /// `a|bc` — bare alternation (no repetition).
+    #[test]
+    fn test_alternation_bare() {
+        let p = "a|bc";
+        assert_matches_regex_crate(p, "a");
+        assert_matches_regex_crate(p, "bc");
+        // negatives
+        assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "c");
+        assert_matches_regex_crate(p, "ab");
+        assert_matches_regex_crate(p, "abc");
+        assert_matches_regex_crate(p, "x");
+        assert_matches_regex_crate(p, "bca");
+    }
+
+    /// `a|b|c` — three-way alternation.
+    #[test]
+    fn test_alternation_three_way() {
+        let p = "a|b|c";
+        assert_matches_regex_crate(p, "a");
+        assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "c");
+        // negatives
+        assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "d");
+        assert_matches_regex_crate(p, "ab");
+        assert_matches_regex_crate(p, "abc");
+    }
+
+    /// `a?` — standalone zero-or-one.
+    #[test]
+    fn test_question_mark_single() {
+        let p = "a?";
+        assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "a");
+        // negatives
+        assert_matches_regex_crate(p, "aa");
+        assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "ab");
+    }
+
+    /// `(ab)?` — zero-or-one of a group.
+    #[test]
+    fn test_question_mark_group() {
+        let p = "(ab)?";
+        assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "ab");
+        // negatives
+        assert_matches_regex_crate(p, "a");
+        assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "ba");
+        assert_matches_regex_crate(p, "abab");
+        assert_matches_regex_crate(p, "abc");
+    }
+
+    /// `a?b` — optional prefix followed by a literal.
+    #[test]
+    fn test_question_mark_prefix() {
+        let p = "a?b";
+        assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "ab");
+        // negatives
+        assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "a");
+        assert_matches_regex_crate(p, "aab");
+        assert_matches_regex_crate(p, "bb");
+        assert_matches_regex_crate(p, "cb");
+        assert_matches_regex_crate(p, "abc");
+    }
+
+    /// `a*` — standalone zero-or-more.
+    #[test]
+    fn test_star_single() {
+        let p = "a*";
+        assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "a");
+        assert_matches_regex_crate(p, "aa");
+        assert_matches_regex_crate(p, "aaa");
+        assert_matches_regex_crate(p, "aaaa");
+        // negatives
+        assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "ab");
+        assert_matches_regex_crate(p, "ba");
+        assert_matches_regex_crate(p, "aab");
+        assert_matches_regex_crate(p, "baa");
+    }
+
+    /// `(ab)*` — zero-or-more of a group.
+    #[test]
+    fn test_star_group() {
+        let p = "(ab)*";
+        assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "ab");
+        assert_matches_regex_crate(p, "abab");
+        assert_matches_regex_crate(p, "ababab");
+        // negatives
+        assert_matches_regex_crate(p, "a");
+        assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "ba");
+        assert_matches_regex_crate(p, "aba");
+        assert_matches_regex_crate(p, "abba");
+        assert_matches_regex_crate(p, "abc");
+    }
+
+    /// `a*b` — star followed by a literal.
+    #[test]
+    fn test_star_then_literal() {
+        let p = "a*b";
+        assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "ab");
+        assert_matches_regex_crate(p, "aab");
+        assert_matches_regex_crate(p, "aaab");
+        // negatives
+        assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "a");
+        assert_matches_regex_crate(p, "aa");
+        assert_matches_regex_crate(p, "bb");
+        assert_matches_regex_crate(p, "ba");
+        assert_matches_regex_crate(p, "abc");
+        assert_matches_regex_crate(p, "aabb");
+    }
+
+    /// `a{2,}` — unbounded min with n>0.
+    #[test]
+    fn test_min_n_unbounded() {
+        let p = "a{2,}";
+        assert_matches_regex_crate(p, "aa");
+        assert_matches_regex_crate(p, "aaa");
+        assert_matches_regex_crate(p, "aaaa");
+        assert_matches_regex_crate(p, "aaaaa");
+        // negatives
+        assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "a");
+        assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "ab");
+        assert_matches_regex_crate(p, "aab");
+        assert_matches_regex_crate(p, "baa");
+    }
+
+    /// `(ab){2,}` — unbounded min of a group.
+    #[test]
+    fn test_min_n_unbounded_group() {
+        let p = "(ab){2,}";
+        assert_matches_regex_crate(p, "abab");
+        assert_matches_regex_crate(p, "ababab");
+        assert_matches_regex_crate(p, "abababab");
+        // negatives
+        assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "ab");
+        assert_matches_regex_crate(p, "a");
+        assert_matches_regex_crate(p, "aba");
+        assert_matches_regex_crate(p, "abba");
+        assert_matches_regex_crate(p, "ababc");
+        assert_matches_regex_crate(p, "xabab");
+    }
+
+    /// `a{3,5}` — bounded min>0 range.
+    #[test]
+    fn test_bounded_range() {
+        let p = "a{3,5}";
+        assert_matches_regex_crate(p, "aaa");
+        assert_matches_regex_crate(p, "aaaa");
+        assert_matches_regex_crate(p, "aaaaa");
+        // negatives
+        assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "a");
+        assert_matches_regex_crate(p, "aa");
+        assert_matches_regex_crate(p, "aaaaaa");
+        assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "aaab");
+        assert_matches_regex_crate(p, "baaa");
+    }
+
+    /// `a{3,3}` — exact repetition.
+    #[test]
+    fn test_exact_repetition() {
+        let p = "a{3,3}";
+        assert_matches_regex_crate(p, "aaa");
+        // negatives
+        assert_matches_regex_crate(p, "");
+        assert_matches_regex_crate(p, "a");
+        assert_matches_regex_crate(p, "aa");
+        assert_matches_regex_crate(p, "aaaa");
+        assert_matches_regex_crate(p, "aaaaa");
+        assert_matches_regex_crate(p, "b");
+        assert_matches_regex_crate(p, "bbb");
     }
 
     // -- Byte class tests ---------------------------------------------------
