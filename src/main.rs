@@ -342,15 +342,17 @@ const DANGLING: usize = usize::MAX;
 ///    at a time, emitting NFA [`State`]s and wiring [`Fragment`]s together.
 /// 3. [`build`](Self::build) — drives the pipeline and patches the final
 ///    fragment to the `Match` state.
+use indexmap::IndexSet;
+
 #[derive(Debug, Default)]
 struct RegexBuilder {
     postfix: Vec<RegexHirNode>,
     states: Vec<State>,
     frags: Vec<Fragment>,
     counters: Vec<usize>,
-    /// Byte-class lookup tables; indices are stored in
+    /// Deduplicated byte-class lookup tables; indices are stored in
     /// [`RegexHirNode::ByteClass`] and [`State::ByteClass`].
-    classes: Vec<[bool; 256]>,
+    classes: IndexSet<[bool; 256]>,
 }
 
 impl RegexBuilder {
@@ -359,6 +361,15 @@ impl RegexBuilder {
         let counter = self.counters.len();
         self.counters.push(counter);
         counter
+    }
+
+    /// Return the index of `table` in `self.classes`, inserting it if it
+    /// is not already present.  Identical tables are deduplicated so that
+    /// patterns like `\d{3,5}` (which unroll to multiple ByteClass states)
+    /// share a single lookup table.
+    fn intern_class(&mut self, table: [bool; 256]) -> usize {
+        let (idx, _) = self.classes.insert_full(table);
+        idx
     }
 
     /// Recursively lower a `regex-syntax` HIR node into a postfix sequence
@@ -409,8 +420,7 @@ impl RegexBuilder {
                         table[b as usize] = true;
                     }
                 }
-                let idx = self.classes.len();
-                self.classes.push(table);
+                let idx = self.intern_class(table);
                 self.postfix.push(RegexHirNode::ByteClass(idx));
                 Ok(())
             }
@@ -432,8 +442,7 @@ impl RegexBuilder {
                         table[b as usize] = true;
                     }
                 }
-                let idx = self.classes.len();
-                self.classes.push(table);
+                let idx = self.intern_class(table);
                 self.postfix.push(RegexHirNode::ByteClass(idx));
                 Ok(())
             }
@@ -725,7 +734,12 @@ impl RegexBuilder {
             states: StateList(self.states.to_vec().into_boxed_slice()),
             start,
             counters: self.counters.to_vec().into_boxed_slice(),
-            classes: self.classes.to_vec().into_boxed_slice(),
+            classes: self
+                .classes
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         })
     }
 }
@@ -1187,7 +1201,7 @@ mod tests {
     #[test]
     fn test_counting() {
         let p = ".*a.{3}bc";
-        let re = build_regex(p, 1056);
+        let re = build_regex(p, 800);
         assert_matches_regex_crate(p, &re, "aybzbc");
         assert_matches_regex_crate(p, &re, "axaybzbc");
         assert_matches_regex_crate(p, &re, "a123bc");
@@ -1384,7 +1398,7 @@ mod tests {
     #[test]
     fn test_one_plus_with_counting() {
         let p = ".*a.{3}b+c";
-        let re = build_regex(p, 1104);
+        let re = build_regex(p, 848);
         // positives
         assert_matches_regex_crate(p, &re, "a123bc");
         assert_matches_regex_crate(p, &re, "a123bbc");
@@ -2255,5 +2269,144 @@ mod tests {
         assert_matches_regex_crate(p, &re, " hello");
         assert_matches_regex_crate(p, &re, "hello 42");
         assert_matches_regex_crate(p, &re, "42hello");
+    }
+
+    // -- Byte-class deduplication tests --------------------------------------
+
+    /// Build a compiled [`Regex`] from a pattern string *without*
+    /// asserting a specific memory size.  Used by dedup tests that
+    /// compare sizes relatively rather than absolutely.
+    fn build_regex_unchecked(pattern: &str) -> Regex {
+        let hir = parse_hir_bytes(pattern);
+        let mut builder = RegexBuilder::default();
+        builder
+            .build(&hir)
+            .expect("our builder should accept the HIR")
+    }
+
+    /// `\d\d` — two identical predefined classes share one lookup table.
+    ///
+    /// Without dedup this would allocate two 256-byte tables; with dedup
+    /// the memory is the same as `\d` plus one extra `ByteClass` state.
+    #[test]
+    fn test_dedup_same_class() {
+        let one = build_regex_unchecked(r"\d");
+        let two = build_regex_unchecked(r"\d\d");
+        // The second `\d` adds one ByteClass state but no extra class
+        // table — so the difference is exactly one state.
+        let state_size = std::mem::size_of::<State>();
+        assert_eq!(
+            two.memory_size() - one.memory_size(),
+            state_size,
+            "second \\d should add one state, no extra class table",
+        );
+        assert_eq!(one.classes.len(), 1);
+        assert_eq!(two.classes.len(), 1);
+    }
+
+    /// `[0-9]` and `\d` produce the same 256-byte lookup table.  When
+    /// concatenated as `[0-9]\d`, only one table should be stored.
+    #[test]
+    fn test_dedup_different_representation() {
+        let digit_only = build_regex_unchecked(r"\d\d");
+        let mixed = build_regex_unchecked(r"[0-9]\d");
+        assert_eq!(
+            digit_only.memory_size(),
+            mixed.memory_size(),
+            "[0-9]\\d should be the same size as \\d\\d (same table, deduped)",
+        );
+        assert_eq!(mixed.classes.len(), 1);
+        // Also verify correctness.
+        assert_matches_regex_crate(r"[0-9]\d", &mixed, "42");
+        assert_matches_regex_crate(r"[0-9]\d", &mixed, "00");
+        assert_matches_regex_crate(r"[0-9]\d", &mixed, "");
+        assert_matches_regex_crate(r"[0-9]\d", &mixed, "a1");
+        assert_matches_regex_crate(r"[0-9]\d", &mixed, "1a");
+        assert_matches_regex_crate(r"[0-9]\d", &mixed, "1");
+        assert_matches_regex_crate(r"[0-9]\d", &mixed, "123");
+    }
+
+    /// `\w` and `[0-9A-Za-z_]` should produce the same table and dedup.
+    #[test]
+    fn test_dedup_word_explicit_range() {
+        let shorthand = build_regex_unchecked(r"\w\w");
+        let explicit = build_regex_unchecked(r"[0-9A-Za-z_]\w");
+        assert_eq!(
+            shorthand.memory_size(),
+            explicit.memory_size(),
+            "[0-9A-Za-z_]\\w should dedup to same table as \\w\\w",
+        );
+        assert_eq!(explicit.classes.len(), 1);
+        assert_matches_regex_crate(r"[0-9A-Za-z_]\w", &explicit, "aZ");
+        assert_matches_regex_crate(r"[0-9A-Za-z_]\w", &explicit, "_0");
+        assert_matches_regex_crate(r"[0-9A-Za-z_]\w", &explicit, "!a");
+    }
+
+    /// `\s` and `[\t\n\x0B\x0C\r ]` should produce the same table.
+    #[test]
+    fn test_dedup_space_explicit_range() {
+        let shorthand = build_regex_unchecked(r"\s\s");
+        let explicit = build_regex_unchecked(r"[\t\n\x0B\x0C\r ]\s");
+        assert_eq!(
+            shorthand.memory_size(),
+            explicit.memory_size(),
+            "explicit whitespace class should dedup with \\s",
+        );
+        assert_eq!(explicit.classes.len(), 1);
+        assert_matches_regex_crate(r"[\t\n\x0B\x0C\r ]\s", &explicit, " \t");
+        assert_matches_regex_crate(r"[\t\n\x0B\x0C\r ]\s", &explicit, "a ");
+    }
+
+    /// `.*.*` — two wildcards produce the same `[true; 256]` table and
+    /// should be deduplicated to a single class.
+    #[test]
+    fn test_dedup_wildcard() {
+        let one_wild = build_regex_unchecked(".");
+        let two_wild = build_regex_unchecked("..");
+        let state_size = std::mem::size_of::<State>();
+        assert_eq!(
+            two_wild.memory_size() - one_wild.memory_size(),
+            state_size,
+            "second `.` should add one state, no extra class table",
+        );
+        assert_eq!(one_wild.classes.len(), 1);
+        assert_eq!(two_wild.classes.len(), 1);
+    }
+
+    /// `\d\D` — complementary classes are *not* the same table, so both
+    /// must be stored.  This is a negative dedup test.
+    #[test]
+    fn test_no_dedup_complementary() {
+        let same = build_regex_unchecked(r"\d\d");
+        let comp = build_regex_unchecked(r"\d\D");
+        // \d\D has two distinct tables; \d\d has one.
+        let class_size = std::mem::size_of::<[bool; 256]>();
+        assert_eq!(
+            comp.memory_size() - same.memory_size(),
+            class_size,
+            "\\d\\D should have one more class table than \\d\\d",
+        );
+        assert_eq!(same.classes.len(), 1);
+        assert_eq!(comp.classes.len(), 2);
+    }
+
+    /// `\d{3,5}` — counted repetition unrolls multiple ByteClass states
+    /// that all refer to the same class.  Only one table is stored.
+    #[test]
+    fn test_dedup_counted_repetition() {
+        let single = build_regex_unchecked(r"\d");
+        let counted = build_regex_unchecked(r"\d{3,5}");
+        // The counted version has more states (counter machinery) but
+        // should still have exactly one class table, same as the single.
+        assert_eq!(
+            single.classes.len(),
+            1,
+            "\\d should have exactly 1 class table",
+        );
+        assert_eq!(
+            counted.classes.len(),
+            1,
+            "\\d{{3,5}} should still have exactly 1 class table (deduped)",
+        );
     }
 }

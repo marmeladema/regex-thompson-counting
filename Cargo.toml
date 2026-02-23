@@ -9,4 +9,5 @@ itertools = "0.10"
 regex = "1"
 
 [dependencies]
+indexmap = "2"
 regex-syntax = "0.8.9"
