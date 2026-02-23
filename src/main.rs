@@ -96,7 +96,7 @@ impl std::error::Error for Error {}
 /// Epsilon states (`Split`, `CounterInstance`, `CounterIncrement`)
 /// are followed during [`Matcher::addstate`].  Byte-consuming states
 /// (`Byte`, `ByteClass`) are stepped over in [`Matcher::step`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 enum State {
     /// Epsilon fork: follow both `out` and `out1`.
     Split { out: usize, out1: usize },
@@ -125,10 +125,11 @@ enum State {
 
     /// Match any byte in the class (lookup table), then follow `out`.
     ///
-    /// The table has 256 entries — one per possible byte value.
+    /// `class` is an index into [`Regex::classes`], a side-table of
+    /// 256-entry boolean lookup tables — one per possible byte value.
     /// A full-range table (`[true; 256]`) is equivalent to the old
     /// `Wildcard` state.
-    ByteClass { table: Box<[bool; 256]>, out: usize },
+    ByteClass { class: usize, out: usize },
 
     /// Accepting state.
     Match,
@@ -183,7 +184,7 @@ impl Fragment {
 
 /// A postfix HIR instruction consumed by [`RegexBuilder::next_fragment`]
 /// to emit NFA states.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 enum RegexHirNode {
     Alternate,
     Catenate,
@@ -191,7 +192,8 @@ enum RegexHirNode {
     RepeatZeroOne,
     RepeatZeroPlus,
     RepeatOnePlus,
-    ByteClass(Box<[bool; 256]>),
+    /// Index into [`RegexBuilder::classes`].
+    ByteClass(usize),
     CounterInstance {
         counter: usize,
     },
@@ -230,16 +232,8 @@ struct Regex {
     start: usize,
     /// One slot per counter variable allocated during compilation.
     counters: Box<[usize]>,
-}
-
-impl State {
-    /// Return the heap-allocated memory (in bytes) owned by this state.
-    fn heap_size(&self) -> usize {
-        match self {
-            State::ByteClass { .. } => std::mem::size_of::<[bool; 256]>(),
-            _ => 0,
-        }
-    }
+    /// Byte-class lookup tables referenced by [`State::ByteClass::class`].
+    classes: Box<[[bool; 256]]>,
 }
 
 impl Regex {
@@ -249,16 +243,15 @@ impl Regex {
     /// This accounts for:
     /// - The `Regex` struct itself (inline fields).
     /// - The `states` boxed slice (header + per-state inline size).
-    /// - Heap allocations owned by individual states (e.g. `ByteClass`
-    ///   lookup tables).
+    /// - The `classes` boxed slice (byte-class lookup tables).
     /// - The `counters` boxed slice.
     #[allow(dead_code)]
     fn memory_size(&self) -> usize {
         let inline = std::mem::size_of::<Self>();
         let states_alloc = self.states.len() * std::mem::size_of::<State>();
-        let states_heap: usize = self.states.iter().map(|s| s.heap_size()).sum();
+        let classes_alloc = self.classes.len() * std::mem::size_of::<[bool; 256]>();
         let counters_alloc = self.counters.len() * std::mem::size_of::<usize>();
-        inline + states_alloc + states_heap + counters_alloc
+        inline + states_alloc + classes_alloc + counters_alloc
     }
 
     /// Emit a Graphviz DOT representation of the NFA.
@@ -315,9 +308,10 @@ impl Regex {
                 stack.push(out);
                 writeln!(buffer, "\t{} -> {} [label=\"{}\"];", idx, out, b as char).unwrap();
             }
-            State::ByteClass { ref table, out } => {
+            State::ByteClass { class, out } => {
                 stack.push(out);
                 // Summarise the class for the label.
+                let table = &self.classes[class];
                 let count = table.iter().filter(|&&b| b).count();
                 if count == 256 {
                     writeln!(buffer, "\t{} -> {} [label=\".\"];", idx, out).unwrap();
@@ -354,6 +348,9 @@ struct RegexBuilder {
     states: Vec<State>,
     frags: Vec<Fragment>,
     counters: Vec<usize>,
+    /// Byte-class lookup tables; indices are stored in
+    /// [`RegexHirNode::ByteClass`] and [`State::ByteClass`].
+    classes: Vec<[bool; 256]>,
 }
 
 impl RegexBuilder {
@@ -406,13 +403,15 @@ impl RegexBuilder {
                 Ok(())
             }
             HirKind::Class(hir::Class::Bytes(class)) => {
-                let mut table = Box::new([false; 256]);
+                let mut table = [false; 256];
                 for range in class.ranges() {
                     for b in range.start()..=range.end() {
                         table[b as usize] = true;
                     }
                 }
-                self.postfix.push(RegexHirNode::ByteClass(table));
+                let idx = self.classes.len();
+                self.classes.push(table);
+                self.postfix.push(RegexHirNode::ByteClass(idx));
                 Ok(())
             }
             HirKind::Class(hir::Class::Unicode(class)) => {
@@ -427,13 +426,15 @@ impl RegexBuilder {
                 if !all_single_byte {
                     return Err(Error::UnsupportedClass(hir::Class::Unicode(class.clone())));
                 }
-                let mut table = Box::new([false; 256]);
+                let mut table = [false; 256];
                 for range in ranges {
                     for b in (range.start() as u8)..=(range.end() as u8) {
                         table[b as usize] = true;
                     }
                 }
-                self.postfix.push(RegexHirNode::ByteClass(table));
+                let idx = self.classes.len();
+                self.classes.push(table);
+                self.postfix.push(RegexHirNode::ByteClass(idx));
                 Ok(())
             }
             HirKind::Look(look) => Err(Error::UnsupportedLook(*look)),
@@ -676,9 +677,9 @@ impl RegexBuilder {
                 self.patch(e.out, s);
                 Fragment::new(s, s)
             }
-            RegexHirNode::ByteClass(table) => {
+            RegexHirNode::ByteClass(class) => {
                 let idx = self.state(State::ByteClass {
-                    table,
+                    class,
                     out: DANGLING,
                 });
                 Fragment::new(idx, idx)
@@ -699,6 +700,7 @@ impl RegexBuilder {
         self.frags.clear();
         self.postfix.clear();
         self.counters.clear();
+        self.classes.clear();
         self.hir2postfix(hir)?;
 
         let mut postfix = std::mem::take(&mut self.postfix);
@@ -723,6 +725,7 @@ impl RegexBuilder {
             states: StateList(self.states.to_vec().into_boxed_slice()),
             start,
             counters: self.counters.to_vec().into_boxed_slice(),
+            classes: self.classes.to_vec().into_boxed_slice(),
         })
     }
 }
@@ -833,6 +836,7 @@ impl MatcherMemory {
         let mut m = Matcher {
             counters: &mut self.counters,
             states: &regex.states,
+            classes: &regex.classes,
             lastlist: &mut self.lastlist,
             listid: 0,
             clist: &mut self.clist,
@@ -851,6 +855,8 @@ impl MatcherMemory {
 struct Matcher<'a> {
     counters: &'a mut [Option<Counter>],
     states: &'a [State],
+    /// Byte-class lookup tables referenced by [`State::ByteClass::class`].
+    classes: &'a [[bool; 256]],
     /// Per-state deduplication stamp (compared against `listid`).
     lastlist: &'a mut [usize],
     /// Monotonically increasing step ID.
@@ -1077,9 +1083,11 @@ impl<'a> Matcher<'a> {
         }
 
         for &idx in &clist {
-            match &self.states[idx] {
-                State::Byte { byte: b2, out } if b == *b2 => self.addstate(*out),
-                State::ByteClass { table, out } if table[b as usize] => self.addstate(*out),
+            match self.states[idx] {
+                State::Byte { byte: b2, out } if b == b2 => self.addstate(out),
+                State::ByteClass { class, out } if self.classes[class][b as usize] => {
+                    self.addstate(out)
+                }
                 _ => {}
             }
         }
@@ -1179,7 +1187,7 @@ mod tests {
     #[test]
     fn test_counting() {
         let p = ".*a.{3}bc";
-        let re = build_regex(p, 1296);
+        let re = build_regex(p, 1056);
         assert_matches_regex_crate(p, &re, "aybzbc");
         assert_matches_regex_crate(p, &re, "axaybzbc");
         assert_matches_regex_crate(p, &re, "a123bc");
@@ -1203,7 +1211,7 @@ mod tests {
         use itertools::Itertools;
 
         let p = "(a|bc){1,2}";
-        let re = build_regex(p, 576);
+        let re = build_regex(p, 592);
 
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "bc");
@@ -1243,7 +1251,7 @@ mod tests {
         use itertools::Itertools;
 
         let p = "((a|bc){1,2}){2,3}";
-        let re = build_regex(p, 1168);
+        let re = build_regex(p, 1184);
 
         // negatives: below outer min, wrong chars
         assert_matches_regex_crate(p, &re, "");
@@ -1280,7 +1288,7 @@ mod tests {
     #[test]
     fn test_aaaaa() {
         let p = "(a|a?){2,3}";
-        let re = build_regex(p, 576);
+        let re = build_regex(p, 592);
 
         // positives (epsilon branches make all lengths 0..=3 matchable)
         assert_matches_regex_crate(p, &re, "");
@@ -1301,7 +1309,7 @@ mod tests {
     #[test]
     fn test_one_plus_basic() {
         let p = "a+";
-        let re = build_regex(p, 184);
+        let re = build_regex(p, 200);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "aaa");
@@ -1317,7 +1325,7 @@ mod tests {
     #[test]
     fn test_one_plus_wildcard() {
         let p = ".+";
-        let re = build_regex(p, 440);
+        let re = build_regex(p, 456);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -1328,7 +1336,7 @@ mod tests {
     #[test]
     fn test_one_plus_catenation() {
         let p = "a+b+";
-        let re = build_regex(p, 280);
+        let re = build_regex(p, 296);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "b");
@@ -1343,7 +1351,7 @@ mod tests {
     #[test]
     fn test_one_plus_group() {
         let p = "(ab)+";
-        let re = build_regex(p, 232);
+        let re = build_regex(p, 248);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -1356,7 +1364,7 @@ mod tests {
     #[test]
     fn test_one_plus_alternate() {
         let p = "(a|b)+";
-        let re = build_regex(p, 440);
+        let re = build_regex(p, 456);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
@@ -1376,7 +1384,7 @@ mod tests {
     #[test]
     fn test_one_plus_with_counting() {
         let p = ".*a.{3}b+c";
-        let re = build_regex(p, 1344);
+        let re = build_regex(p, 1104);
         // positives
         assert_matches_regex_crate(p, &re, "a123bc");
         assert_matches_regex_crate(p, &re, "a123bbc");
@@ -1401,7 +1409,7 @@ mod tests {
     #[test]
     fn test_repetition_inside_one_plus() {
         let p = "(a{2,3})+";
-        let re = build_regex(p, 336);
+        let re = build_regex(p, 352);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1421,7 +1429,7 @@ mod tests {
         use itertools::Itertools;
 
         let p = "((a|bc){1,2})+";
-        let re = build_regex(p, 624);
+        let re = build_regex(p, 640);
 
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
@@ -1446,7 +1454,7 @@ mod tests {
     #[test]
     fn test_one_plus_inside_repetition() {
         let p = "(a+){2,3}";
-        let re = build_regex(p, 384);
+        let re = build_regex(p, 400);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1464,7 +1472,7 @@ mod tests {
         use itertools::Itertools;
 
         let p = "((a|b)+){2,4}";
-        let re = build_regex(p, 896);
+        let re = build_regex(p, 656);
 
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
@@ -1488,7 +1496,7 @@ mod tests {
     #[test]
     fn test_mixed_plus_and_repetition_inside_one_plus() {
         let p = "(a+b{2,3})+";
-        let re = build_regex(p, 432);
+        let re = build_regex(p, 448);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -1510,7 +1518,7 @@ mod tests {
     #[test]
     fn test_min_zero_basic() {
         let p = "a{0,2}";
-        let re = build_regex(p, 336);
+        let re = build_regex(p, 352);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1522,7 +1530,7 @@ mod tests {
     #[test]
     fn test_min_zero_max_one() {
         let p = "a{0,1}";
-        let re = build_regex(p, 184);
+        let re = build_regex(p, 200);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1535,7 +1543,7 @@ mod tests {
         use itertools::Itertools;
 
         let p = "(a|bc){0,3}";
-        let re = build_regex(p, 624);
+        let re = build_regex(p, 640);
 
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
@@ -1558,7 +1566,7 @@ mod tests {
     #[test]
     fn test_min_zero_unbounded() {
         let p = "a{0,}";
-        let re = build_regex(p, 184);
+        let re = build_regex(p, 200);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1576,7 +1584,7 @@ mod tests {
     #[test]
     fn test_min_zero_unbounded_group() {
         let p = "(ab){0,}";
-        let re = build_regex(p, 232);
+        let re = build_regex(p, 248);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -1589,7 +1597,7 @@ mod tests {
     #[test]
     fn test_min_zero_inside_one_plus() {
         let p = "x(a{0,2})+y";
-        let re = build_regex(p, 480);
+        let re = build_regex(p, 496);
         // positives
         assert_matches_regex_crate(p, &re, "xy");
         assert_matches_regex_crate(p, &re, "xay");
@@ -1613,7 +1621,7 @@ mod tests {
     #[test]
     fn test_min_zero_inside_repetition() {
         let p = "(a{0,2}){2,3}";
-        let re = build_regex(p, 688);
+        let re = build_regex(p, 704);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1629,7 +1637,7 @@ mod tests {
     #[test]
     fn test_one_plus_inside_min_zero_repetition() {
         let p = "(a+){0,3}";
-        let re = build_regex(p, 432);
+        let re = build_regex(p, 448);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1644,7 +1652,7 @@ mod tests {
     #[test]
     fn test_min_zero_wildcard() {
         let p = ".{0,3}";
-        let re = build_regex(p, 848);
+        let re = build_regex(p, 608);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -1656,7 +1664,7 @@ mod tests {
     #[test]
     fn test_none_min_repetition() {
         let p = "a{0,3}";
-        let re = build_regex(p, 336);
+        let re = build_regex(p, 352);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1675,7 +1683,7 @@ mod tests {
     #[test]
     fn test_literal_single() {
         let p = "a";
-        let re = build_regex(p, 136);
+        let re = build_regex(p, 152);
         assert_matches_regex_crate(p, &re, "a");
         // negatives
         assert_matches_regex_crate(p, &re, "");
@@ -1689,7 +1697,7 @@ mod tests {
     #[test]
     fn test_literal_multi() {
         let p = "abc";
-        let re = build_regex(p, 232);
+        let re = build_regex(p, 248);
         assert_matches_regex_crate(p, &re, "abc");
         // negatives
         assert_matches_regex_crate(p, &re, "");
@@ -1708,7 +1716,7 @@ mod tests {
     #[test]
     fn test_dot_single() {
         let p = ".";
-        let re = build_regex(p, 392);
+        let re = build_regex(p, 408);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "z");
         assert_matches_regex_crate(p, &re, "0");
@@ -1723,7 +1731,7 @@ mod tests {
     #[test]
     fn test_alternation_bare() {
         let p = "a|bc";
-        let re = build_regex(p, 280);
+        let re = build_regex(p, 296);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "bc");
         // negatives
@@ -1740,7 +1748,7 @@ mod tests {
     #[test]
     fn test_alternation_three_way() {
         let p = "a|b|c";
-        let re = build_regex(p, 392);
+        let re = build_regex(p, 408);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "c");
@@ -1755,7 +1763,7 @@ mod tests {
     #[test]
     fn test_question_mark_single() {
         let p = "a?";
-        let re = build_regex(p, 184);
+        let re = build_regex(p, 200);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         // negatives
@@ -1768,7 +1776,7 @@ mod tests {
     #[test]
     fn test_question_mark_group() {
         let p = "(ab)?";
-        let re = build_regex(p, 232);
+        let re = build_regex(p, 248);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "ab");
         // negatives
@@ -1783,7 +1791,7 @@ mod tests {
     #[test]
     fn test_question_mark_prefix() {
         let p = "a?b";
-        let re = build_regex(p, 232);
+        let re = build_regex(p, 248);
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
         // negatives
@@ -1799,7 +1807,7 @@ mod tests {
     #[test]
     fn test_star_single() {
         let p = "a*";
-        let re = build_regex(p, 184);
+        let re = build_regex(p, 200);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1817,7 +1825,7 @@ mod tests {
     #[test]
     fn test_star_group() {
         let p = "(ab)*";
-        let re = build_regex(p, 232);
+        let re = build_regex(p, 248);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abab");
@@ -1835,7 +1843,7 @@ mod tests {
     #[test]
     fn test_star_then_literal() {
         let p = "a*b";
-        let re = build_regex(p, 232);
+        let re = build_regex(p, 248);
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "aab");
@@ -1854,7 +1862,7 @@ mod tests {
     #[test]
     fn test_min_n_unbounded() {
         let p = "a{2,}";
-        let re = build_regex(p, 288);
+        let re = build_regex(p, 304);
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "aaa");
         assert_matches_regex_crate(p, &re, "aaaa");
@@ -1872,7 +1880,7 @@ mod tests {
     #[test]
     fn test_min_n_unbounded_group() {
         let p = "(ab){2,}";
-        let re = build_regex(p, 384);
+        let re = build_regex(p, 400);
         assert_matches_regex_crate(p, &re, "abab");
         assert_matches_regex_crate(p, &re, "ababab");
         assert_matches_regex_crate(p, &re, "abababab");
@@ -1890,7 +1898,7 @@ mod tests {
     #[test]
     fn test_bounded_range() {
         let p = "a{3,5}";
-        let re = build_regex(p, 288);
+        let re = build_regex(p, 304);
         assert_matches_regex_crate(p, &re, "aaa");
         assert_matches_regex_crate(p, &re, "aaaa");
         assert_matches_regex_crate(p, &re, "aaaaa");
@@ -1908,7 +1916,7 @@ mod tests {
     #[test]
     fn test_exact_repetition() {
         let p = "a{3,3}";
-        let re = build_regex(p, 288);
+        let re = build_regex(p, 304);
         assert_matches_regex_crate(p, &re, "aaa");
         // negatives
         assert_matches_regex_crate(p, &re, "");
@@ -1926,7 +1934,7 @@ mod tests {
     #[test]
     fn test_byte_class_range() {
         let p = "[a-c]";
-        let re = build_regex(p, 392);
+        let re = build_regex(p, 408);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "b");
@@ -1939,7 +1947,7 @@ mod tests {
     #[test]
     fn test_byte_class_one_plus() {
         let p = "[a-c]+";
-        let re = build_regex(p, 440);
+        let re = build_regex(p, 456);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "abc");
@@ -1952,7 +1960,7 @@ mod tests {
     #[test]
     fn test_byte_class_counted() {
         let p = "[a-c]{2,3}";
-        let re = build_regex(p, 800);
+        let re = build_regex(p, 560);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -1966,7 +1974,7 @@ mod tests {
     #[test]
     fn test_byte_class_disjoint() {
         let p = "[ax]";
-        let re = build_regex(p, 392);
+        let re = build_regex(p, 408);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "x");
@@ -1978,7 +1986,7 @@ mod tests {
     #[test]
     fn test_byte_class_multi_range() {
         let p = "[a-cx-z]+";
-        let re = build_regex(p, 440);
+        let re = build_regex(p, 456);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "x");
@@ -1992,7 +2000,7 @@ mod tests {
     #[test]
     fn test_byte_class_with_wildcard() {
         let p = "[a-c].*[x-z]";
-        let re = build_regex(p, 1048);
+        let re = build_regex(p, 1064);
         assert_matches_regex_crate(p, &re, "ax");
         assert_matches_regex_crate(p, &re, "a123z");
         assert_matches_regex_crate(p, &re, "bx");
@@ -2007,7 +2015,7 @@ mod tests {
     #[test]
     fn test_digit() {
         let p = r"\d";
-        let re = build_regex(p, 392);
+        let re = build_regex(p, 408);
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "5");
         assert_matches_regex_crate(p, &re, "9");
@@ -2024,7 +2032,7 @@ mod tests {
     #[test]
     fn test_digit_plus() {
         let p = r"\d+";
-        let re = build_regex(p, 440);
+        let re = build_regex(p, 456);
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "42");
         assert_matches_regex_crate(p, &re, "999");
@@ -2041,7 +2049,7 @@ mod tests {
     #[test]
     fn test_digit_counted() {
         let p = r"\d{3,5}";
-        let re = build_regex(p, 800);
+        let re = build_regex(p, 560);
         assert_matches_regex_crate(p, &re, "123");
         assert_matches_regex_crate(p, &re, "1234");
         assert_matches_regex_crate(p, &re, "12345");
@@ -2058,7 +2066,7 @@ mod tests {
     #[test]
     fn test_non_digit() {
         let p = r"\D";
-        let re = build_regex(p, 392);
+        let re = build_regex(p, 408);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "z");
         assert_matches_regex_crate(p, &re, " ");
@@ -2075,7 +2083,7 @@ mod tests {
     #[test]
     fn test_non_digit_plus() {
         let p = r"\D+";
-        let re = build_regex(p, 440);
+        let re = build_regex(p, 456);
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "hello world");
         assert_matches_regex_crate(p, &re, "!@#");
@@ -2090,7 +2098,7 @@ mod tests {
     #[test]
     fn test_space() {
         let p = r"\s";
-        let re = build_regex(p, 392);
+        let re = build_regex(p, 408);
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "\t");
         assert_matches_regex_crate(p, &re, "\n");
@@ -2106,7 +2114,7 @@ mod tests {
     #[test]
     fn test_space_plus() {
         let p = r"\s+";
-        let re = build_regex(p, 440);
+        let re = build_regex(p, 456);
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "   ");
         assert_matches_regex_crate(p, &re, " \t\n\r");
@@ -2121,7 +2129,7 @@ mod tests {
     #[test]
     fn test_non_space() {
         let p = r"\S";
-        let re = build_regex(p, 392);
+        let re = build_regex(p, 408);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "!");
@@ -2137,7 +2145,7 @@ mod tests {
     #[test]
     fn test_non_space_plus() {
         let p = r"\S+";
-        let re = build_regex(p, 440);
+        let re = build_regex(p, 456);
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "123");
         assert_matches_regex_crate(p, &re, "a1!");
@@ -2152,7 +2160,7 @@ mod tests {
     #[test]
     fn test_word() {
         let p = r"\w";
-        let re = build_regex(p, 392);
+        let re = build_regex(p, 408);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "Z");
         assert_matches_regex_crate(p, &re, "0");
@@ -2170,7 +2178,7 @@ mod tests {
     #[test]
     fn test_word_plus() {
         let p = r"\w+";
-        let re = build_regex(p, 440);
+        let re = build_regex(p, 456);
         assert_matches_regex_crate(p, &re, "hello");
         assert_matches_regex_crate(p, &re, "foo_bar");
         assert_matches_regex_crate(p, &re, "x123");
@@ -2186,7 +2194,7 @@ mod tests {
     #[test]
     fn test_word_counted() {
         let p = r"\w{2,4}";
-        let re = build_regex(p, 800);
+        let re = build_regex(p, 560);
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "a1_Z");
@@ -2202,7 +2210,7 @@ mod tests {
     #[test]
     fn test_non_word() {
         let p = r"\W";
-        let re = build_regex(p, 392);
+        let re = build_regex(p, 408);
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "!");
         assert_matches_regex_crate(p, &re, "-");
@@ -2219,7 +2227,7 @@ mod tests {
     #[test]
     fn test_non_word_plus() {
         let p = r"\W+";
-        let re = build_regex(p, 440);
+        let re = build_regex(p, 456);
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "!@#");
         assert_matches_regex_crate(p, &re, " - ");
@@ -2235,7 +2243,7 @@ mod tests {
     #[test]
     fn test_predefined_mixed() {
         let p = r"\d+\s+\w+";
-        let re = build_regex(p, 1144);
+        let re = build_regex(p, 1160);
         assert_matches_regex_crate(p, &re, "42 hello");
         assert_matches_regex_crate(p, &re, "0\tfoo");
         assert_matches_regex_crate(p, &re, "123  x");
