@@ -57,7 +57,10 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::Write;
 
-use regex_syntax::hir::{self, Hir, HirKind};
+use regex_syntax::hir::{self, HirKind};
+
+/// Re-export so users do not need a direct `regex-syntax` dependency.
+pub use regex_syntax::hir::Hir;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -65,8 +68,9 @@ use regex_syntax::hir::{self, Hir, HirKind};
 
 /// An error returned when the HIR contains constructs we don't support.
 #[derive(Debug)]
-enum Error {
-    /// A character class (e.g. `\w`, `[a-z]`) was encountered.
+pub enum Error {
+    /// A Unicode character class that cannot be lowered to single bytes
+    /// (i.e. contains codepoints above U+00FF).
     UnsupportedClass(hir::Class),
     /// A look-around assertion (e.g. `^`, `$`, `\b`) was encountered.
     UnsupportedLook(hir::Look),
@@ -227,7 +231,7 @@ impl std::ops::Deref for StateList {
 
 /// A compiled NFA ready for matching.
 #[derive(Debug)]
-struct Regex {
+pub struct Regex {
     states: StateList,
     start: usize,
     /// One slot per counter variable allocated during compilation.
@@ -245,8 +249,7 @@ impl Regex {
     /// - The `states` boxed slice (header + per-state inline size).
     /// - The `classes` boxed slice (byte-class lookup tables).
     /// - The `counters` boxed slice.
-    #[allow(dead_code)]
-    fn memory_size(&self) -> usize {
+    pub fn memory_size(&self) -> usize {
         let inline = std::mem::size_of::<Self>();
         let states_alloc = self.states.len() * std::mem::size_of::<State>();
         let classes_alloc = self.classes.len() * std::mem::size_of::<[bool; 256]>();
@@ -255,8 +258,7 @@ impl Regex {
     }
 
     /// Emit a Graphviz DOT representation of the NFA.
-    #[allow(dead_code)]
-    fn to_dot(&self, mut buffer: impl Write) {
+    pub fn to_dot(&self, mut buffer: impl Write) {
         let mut visited = vec![false; self.states.len()];
         writeln!(buffer, "digraph graphname {{").unwrap();
         writeln!(buffer, "\trankdir=LR;").unwrap();
@@ -345,7 +347,7 @@ const DANGLING: usize = usize::MAX;
 use indexmap::IndexSet;
 
 #[derive(Debug, Default)]
-struct RegexBuilder {
+pub struct RegexBuilder {
     postfix: Vec<RegexHirNode>,
     states: Vec<State>,
     frags: Vec<Fragment>,
@@ -822,7 +824,7 @@ impl Counter {
 /// Reusable memory for [`Matcher`].  Create once, call
 /// [`matcher`](Self::matcher) for each regex to match.
 #[derive(Debug, Default)]
-struct MatcherMemory {
+pub struct MatcherMemory {
     /// Per-state: the `listid` when the state was last added.  Used for
     /// O(1) deduplication in `addstate`.
     lastlist: Vec<usize>,
@@ -837,7 +839,7 @@ struct MatcherMemory {
 }
 
 impl MatcherMemory {
-    fn matcher<'a>(&'a mut self, regex: &'a Regex) -> Matcher<'a> {
+    pub fn matcher<'a>(&'a mut self, regex: &'a Regex) -> Matcher<'a> {
         self.lastlist.clear();
         self.lastlist.resize(regex.states.len(), usize::MAX);
         self.counters.clear();
@@ -866,7 +868,7 @@ impl MatcherMemory {
 
 /// Runs a Thompson NFA simulation with counting-constraint support.
 #[derive(Debug)]
-struct Matcher<'a> {
+pub struct Matcher<'a> {
     counters: &'a mut [Option<Counter>],
     states: &'a [State],
     /// Byte-class lookup tables referenced by [`State::ByteClass::class`].
@@ -1085,7 +1087,7 @@ impl<'a> Matcher<'a> {
     /// For each state in `clist`, if the byte matches (`Byte` or
     /// `ByteClass`), follow the `out` pointer through `addstate` to build
     /// the next `nlist`.
-    fn step(&mut self, b: u8) {
+    pub fn step(&mut self, b: u8) {
         self.nlist.clear();
         let clist = std::mem::take(self.clist);
 
@@ -1111,7 +1113,7 @@ impl<'a> Matcher<'a> {
     }
 
     /// Feed an entire byte slice through the matcher, one byte at a time.
-    fn chunk(&mut self, input: &[u8]) {
+    pub fn chunk(&mut self, input: &[u8]) {
         for &b in input {
             self.step(b);
         }
@@ -1124,12 +1126,6 @@ impl<'a> Matcher<'a> {
             .any(|&idx| matches!(self.states[idx], State::Match))
     }
 }
-
-// ---------------------------------------------------------------------------
-// Entry point (unused — this crate is test-driven)
-// ---------------------------------------------------------------------------
-
-fn main() {}
 
 // ---------------------------------------------------------------------------
 // Tests
