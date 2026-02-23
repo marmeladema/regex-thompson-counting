@@ -216,9 +216,7 @@ struct StateList(Box<[State]>);
 
 impl fmt::Debug for StateList {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        fmt.debug_map()
-            .entries(self.0.iter().enumerate().map(|(idx, state)| (idx, state)))
-            .finish()
+        fmt.debug_map().entries(self.0.iter().enumerate()).finish()
     }
 }
 
@@ -767,23 +765,12 @@ impl RegexBuilder {
 /// - `incremented` — set by [`incr`](Self::incr), cleared at each
 ///   simulation step; used to prevent a `CounterIncrement` state from
 ///   being processed twice in the same epsilon closure.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct Counter {
     incremented: bool,
     value: usize,
     delta: usize,
     deltas: VecDeque<usize>,
-}
-
-impl Default for Counter {
-    fn default() -> Self {
-        Self {
-            incremented: false,
-            value: 0,
-            delta: 0,
-            deltas: VecDeque::default(),
-        }
-    }
 }
 
 impl Counter {
@@ -1235,8 +1222,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "bca");
 
         // Two repetitions (all combos)
-        for v in std::iter::repeat(["a", "bc"])
-            .take(2)
+        for v in std::iter::repeat_n(["a", "bc"], 2)
             .map(|a| a.into_iter())
             .multi_cartesian_product()
         {
@@ -1245,8 +1231,7 @@ mod tests {
         }
 
         // Three repetitions — should not match (max is 2)
-        for v in std::iter::repeat(["a", "bc"])
-            .take(3)
+        for v in std::iter::repeat_n(["a", "bc"], 3)
             .map(|a| a.into_iter())
             .multi_cartesian_product()
         {
@@ -1273,8 +1258,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aax");
 
         for i in 2..=6 {
-            for v in std::iter::repeat(["a", "bc"])
-                .take(i)
+            for v in std::iter::repeat_n(["a", "bc"], i)
                 .map(|a| a.into_iter())
                 .multi_cartesian_product()
             {
@@ -1283,8 +1267,7 @@ mod tests {
             }
         }
 
-        for v in std::iter::repeat(["a", "bc"])
-            .take(7)
+        for v in std::iter::repeat_n(["a", "bc"], 7)
             .map(|a| a.into_iter())
             .multi_cartesian_product()
         {
@@ -1449,8 +1432,7 @@ mod tests {
 
         // 2 through 6 atoms — exercises multiple iterations of the outer `+`
         for i in 2..=6 {
-            for v in std::iter::repeat(["a", "bc"])
-                .take(i)
+            for v in std::iter::repeat_n(["a", "bc"], i)
                 .map(|a| a.into_iter())
                 .multi_cartesian_product()
             {
@@ -1490,8 +1472,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "c");
 
         for i in 2..=8 {
-            for v in std::iter::repeat(["a", "b"])
-                .take(i)
+            for v in std::iter::repeat_n(["a", "b"], i)
                 .map(|a| a.into_iter())
                 .multi_cartesian_product()
             {
@@ -1561,8 +1542,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "b");
 
         for i in 2..=4 {
-            for v in std::iter::repeat(["a", "bc"])
-                .take(i)
+            for v in std::iter::repeat_n(["a", "bc"], i)
                 .map(|a| a.into_iter())
                 .multi_cartesian_product()
             {
