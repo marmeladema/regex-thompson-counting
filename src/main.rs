@@ -2000,4 +2000,252 @@ mod tests {
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
     }
+
+    // -- Predefined character class tests -----------------------------------
+
+    /// `\d` — matches a single ASCII digit.
+    #[test]
+    fn test_digit() {
+        let p = r"\d";
+        let re = build_regex(p, 392);
+        assert_matches_regex_crate(p, &re, "0");
+        assert_matches_regex_crate(p, &re, "5");
+        assert_matches_regex_crate(p, &re, "9");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "z");
+        assert_matches_regex_crate(p, &re, " ");
+        assert_matches_regex_crate(p, &re, "00");
+        assert_matches_regex_crate(p, &re, "12");
+    }
+
+    /// `\d+` — one-or-more digits.
+    #[test]
+    fn test_digit_plus() {
+        let p = r"\d+";
+        let re = build_regex(p, 440);
+        assert_matches_regex_crate(p, &re, "0");
+        assert_matches_regex_crate(p, &re, "42");
+        assert_matches_regex_crate(p, &re, "999");
+        assert_matches_regex_crate(p, &re, "0123456789");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "12a");
+        assert_matches_regex_crate(p, &re, "a12");
+        assert_matches_regex_crate(p, &re, "1 2");
+    }
+
+    /// `\d{3,5}` — counted digit repetition.
+    #[test]
+    fn test_digit_counted() {
+        let p = r"\d{3,5}";
+        let re = build_regex(p, 800);
+        assert_matches_regex_crate(p, &re, "123");
+        assert_matches_regex_crate(p, &re, "1234");
+        assert_matches_regex_crate(p, &re, "12345");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "1");
+        assert_matches_regex_crate(p, &re, "12");
+        assert_matches_regex_crate(p, &re, "123456");
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "12a");
+    }
+
+    /// `\D` — matches a single non-digit byte.
+    #[test]
+    fn test_non_digit() {
+        let p = r"\D";
+        let re = build_regex(p, 392);
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "z");
+        assert_matches_regex_crate(p, &re, " ");
+        assert_matches_regex_crate(p, &re, "!");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "0");
+        assert_matches_regex_crate(p, &re, "5");
+        assert_matches_regex_crate(p, &re, "9");
+        assert_matches_regex_crate(p, &re, "aa");
+    }
+
+    /// `\D+` — one-or-more non-digits.
+    #[test]
+    fn test_non_digit_plus() {
+        let p = r"\D+";
+        let re = build_regex(p, 440);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "hello world");
+        assert_matches_regex_crate(p, &re, "!@#");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "0");
+        assert_matches_regex_crate(p, &re, "abc1");
+        assert_matches_regex_crate(p, &re, "1abc");
+    }
+
+    /// `\s` — matches a single ASCII whitespace byte.
+    #[test]
+    fn test_space() {
+        let p = r"\s";
+        let re = build_regex(p, 392);
+        assert_matches_regex_crate(p, &re, " ");
+        assert_matches_regex_crate(p, &re, "\t");
+        assert_matches_regex_crate(p, &re, "\n");
+        assert_matches_regex_crate(p, &re, "\r");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "0");
+        assert_matches_regex_crate(p, &re, "  ");
+    }
+
+    /// `\s+` — one-or-more whitespace.
+    #[test]
+    fn test_space_plus() {
+        let p = r"\s+";
+        let re = build_regex(p, 440);
+        assert_matches_regex_crate(p, &re, " ");
+        assert_matches_regex_crate(p, &re, "   ");
+        assert_matches_regex_crate(p, &re, " \t\n\r");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, " a");
+        assert_matches_regex_crate(p, &re, "a ");
+    }
+
+    /// `\S` — matches a single non-whitespace byte.
+    #[test]
+    fn test_non_space() {
+        let p = r"\S";
+        let re = build_regex(p, 392);
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "0");
+        assert_matches_regex_crate(p, &re, "!");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, " ");
+        assert_matches_regex_crate(p, &re, "\t");
+        assert_matches_regex_crate(p, &re, "\n");
+        assert_matches_regex_crate(p, &re, "aa");
+    }
+
+    /// `\S+` — one-or-more non-whitespace.
+    #[test]
+    fn test_non_space_plus() {
+        let p = r"\S+";
+        let re = build_regex(p, 440);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "123");
+        assert_matches_regex_crate(p, &re, "a1!");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, " ");
+        assert_matches_regex_crate(p, &re, "a b");
+        assert_matches_regex_crate(p, &re, " abc");
+    }
+
+    /// `\w` — matches a single ASCII word byte (`[0-9A-Za-z_]`).
+    #[test]
+    fn test_word() {
+        let p = r"\w";
+        let re = build_regex(p, 392);
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "Z");
+        assert_matches_regex_crate(p, &re, "0");
+        assert_matches_regex_crate(p, &re, "9");
+        assert_matches_regex_crate(p, &re, "_");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, " ");
+        assert_matches_regex_crate(p, &re, "!");
+        assert_matches_regex_crate(p, &re, "-");
+        assert_matches_regex_crate(p, &re, "ab");
+    }
+
+    /// `\w+` — one-or-more word bytes.
+    #[test]
+    fn test_word_plus() {
+        let p = r"\w+";
+        let re = build_regex(p, 440);
+        assert_matches_regex_crate(p, &re, "hello");
+        assert_matches_regex_crate(p, &re, "foo_bar");
+        assert_matches_regex_crate(p, &re, "x123");
+        assert_matches_regex_crate(p, &re, "___");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, " ");
+        assert_matches_regex_crate(p, &re, "hello world");
+        assert_matches_regex_crate(p, &re, "foo-bar");
+    }
+
+    /// `\w{2,4}` — counted word repetition.
+    #[test]
+    fn test_word_counted() {
+        let p = r"\w{2,4}";
+        let re = build_regex(p, 800);
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "a1_Z");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "abcde");
+        assert_matches_regex_crate(p, &re, "!!");
+        assert_matches_regex_crate(p, &re, "a b");
+    }
+
+    /// `\W` — matches a single non-word byte.
+    #[test]
+    fn test_non_word() {
+        let p = r"\W";
+        let re = build_regex(p, 392);
+        assert_matches_regex_crate(p, &re, " ");
+        assert_matches_regex_crate(p, &re, "!");
+        assert_matches_regex_crate(p, &re, "-");
+        assert_matches_regex_crate(p, &re, ".");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "0");
+        assert_matches_regex_crate(p, &re, "_");
+        assert_matches_regex_crate(p, &re, "  ");
+    }
+
+    /// `\W+` — one-or-more non-word bytes.
+    #[test]
+    fn test_non_word_plus() {
+        let p = r"\W+";
+        let re = build_regex(p, 440);
+        assert_matches_regex_crate(p, &re, " ");
+        assert_matches_regex_crate(p, &re, "!@#");
+        assert_matches_regex_crate(p, &re, " - ");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "0");
+        assert_matches_regex_crate(p, &re, " a ");
+        assert_matches_regex_crate(p, &re, "!a!");
+    }
+
+    /// `\d+\s+\w+` — mixed predefined classes in concatenation.
+    #[test]
+    fn test_predefined_mixed() {
+        let p = r"\d+\s+\w+";
+        let re = build_regex(p, 1144);
+        assert_matches_regex_crate(p, &re, "42 hello");
+        assert_matches_regex_crate(p, &re, "0\tfoo");
+        assert_matches_regex_crate(p, &re, "123  x");
+        assert_matches_regex_crate(p, &re, "7 _");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "42");
+        assert_matches_regex_crate(p, &re, "42 ");
+        assert_matches_regex_crate(p, &re, " hello");
+        assert_matches_regex_crate(p, &re, "hello 42");
+        assert_matches_regex_crate(p, &re, "42hello");
+    }
 }
