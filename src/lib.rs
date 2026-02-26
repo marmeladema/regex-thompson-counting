@@ -17,25 +17,103 @@
 //!
 //! ## Counting constraints
 //!
-//! A repetition `body{min,max}` is lowered to:
+//! A repetition `body{min,max}` is lowered to a **two-copy** NFA:
 //!
 //! ```text
-//! body ── CounterInstance(c) ── body_copy ── CounterIncrement(c, min, max)
+//! body₁ ── CounterInstance(c) ── body₂ ── CounterIncrement(c, min, max)
 //!                                  ^                    │
 //!                                  └── continue ────────┘
 //!                                            break ──> (next)
 //! ```
 //!
-//! The first `body` is the mandatory initial match.  `CounterInstance`
-//! allocates a new counter instance (or creates the counter from scratch).
-//! The `body_copy` + `CounterIncrement` loop runs zero or more additional
-//! times.  `CounterIncrement` increments all active instances; when the
-//! oldest instance's value falls in `[min, max]`, the break path is
-//! followed.  When it reaches `max`, the oldest instance is de-allocated.
+//! `body₁` is the mandatory initial match.  `CounterInstance` allocates a
+//! new counter instance (or creates the counter from scratch).  The
+//! `body₂` + `CounterIncrement` loop runs zero or more additional times.
+//! `CounterIncrement` increments all active instances; when the oldest
+//! instance's value falls in `[min, max]`, the break path is followed.
+//! When it reaches `max`, the oldest instance is de-allocated.
 //!
 //! Counters use a **differential representation** (from the Becchi paper)
 //! so that increment and condition-evaluation require O(1) work regardless
 //! of how many instances are active.
+//!
+//! ### Why two copies are required
+//!
+//! It may seem wasteful to duplicate the body NFA (O(2·b) states per
+//! repetition, O(b·2^d) for d levels of nesting).  A tempting
+//! optimisation is to share a single body copy in a loop:
+//!
+//! ```text
+//! CounterInstance(c) ── body ── CounterIncrement(c, min, max)
+//!                         ^                │
+//!                         └── continue ────┘
+//!                                  break ──> (next)
+//! ```
+//!
+//! This **does not work** when multiple counter instances overlap — that
+//! is, when the NFA can enter the repetition from multiple match threads
+//! simultaneously (e.g. `^.*a.{3}bc$` on "axaybzbc", where `.*`
+//! produces two threads entering `.{3}` via different `a` positions).
+//!
+//! The root cause is the Thompson NFA's state deduplication.  During
+//! `step()`, each consuming state (Byte, ByteClass) appears at most once
+//! in the current state list (`clist`).  With a shared body, both the
+//! *loop re-entry* from `CounterIncrement` (for an existing counter
+//! instance) and the *initial entry* from `CounterInstance` (for a newly
+//! pushed instance) feed into the **same** body state.  NFA
+//! deduplication merges them into a single entry, so the body is only
+//! processed once per step.
+//!
+//! The problem manifests during a step where **both** `CounterInstance`
+//! (push) and `CounterIncrement` (increment) fire for the same counter:
+//!
+//!  1. Consuming state A matches byte `b`, triggering
+//!     `addstate(CounterInstance)` which **pushes** a new counter
+//!     instance (delta=0) and follows `out` to the shared `body`.
+//!     The body is a consuming state, so it is recorded in `nlist`.
+//!
+//!  2. Consuming state B (the shared body, from an older instance's loop)
+//!     also matches byte `b`, triggering `addstate(CounterIncrement)`
+//!     which **increments** all counter instances — including the one
+//!     just pushed in (1) that has not yet consumed a body byte.
+//!
+//! The new instance receives an "unearned" increment because the
+//! `CounterIncrement` from the *old* instance's body match blindly
+//! advances all instances.  This causes an **off-by-one** in the new
+//! instance's counter value: it reaches `max` one step too early,
+//! breaking the `break` condition and producing false negatives.
+//!
+//! Concrete example — `^.*a.{3}bc$` on "axaybzbc":
+//!
+//! - Position 0: `a` matches → `CounterInstance` pushes instance A,
+//!   body enters `nlist`.
+//! - Position 1: `x` consumed by body → `CounterIncrement` (A.value=1).
+//! - Position 2: `a` matches again → `CounterInstance` pushes instance B
+//!   (B.delta=0).  **In the same step**, the shared body (from A's loop)
+//!   matches `a` → `CounterIncrement` fires, incrementing **both** A
+//!   (value=2) and B (delta=0→1).  But B has not consumed a body byte
+//!   yet — this increment is wrong.
+//! - The off-by-one propagates: B reaches max=3 at position 4 instead
+//!   of position 5, causing the break to `Byte(b)` one position too
+//!   early.  The trailing `bc` then fails to match "zbc".
+//!
+//! With **two copies**, the problem disappears: `body₁` (state X) and
+//! `body₂` (state Y) are distinct NFA states, so they coexist in `clist`
+//! independently.  `body₁`'s match triggers `CounterInstance` (push) then
+//! `CounterIncrement` (increment), while `body₂`'s match triggers only
+//! `CounterIncrement` — but the `incremented` flag prevents double-
+//! processing in the same epsilon closure.  The push and increment are
+//! thus properly synchronized: each body match contributes exactly one
+//! increment to the instances it belongs to.
+//!
+//! Attempts to fix the shared-body approach (e.g. a `pushed_this_pass`
+//! flag to suppress the spurious delta increment) break the Becchi
+//! differential representation's invariant (`value == delta` when only
+//! one instance remains), causing assertion failures in `pop()`.
+//!
+//! The two-copy design is therefore **necessary for correctness** with
+//! the Becchi multi-instance counter representation, and is used for all
+//! bounded repetitions.
 //!
 //! ## Nested repetitions
 //!
@@ -533,7 +611,13 @@ impl RegexBuilder {
                 if min > 0 {
                     let counter = self.next_counter();
 
-                    // Emit the body once (mandatory initial match).
+                    // Two-copy lowering: body₁ · CounterInstance · body₂ · CounterIncrement
+                    //
+                    // The body is emitted twice (body₁ and body₂).  This is
+                    // necessary for correct multi-instance counter tracking;
+                    // sharing a single body copy causes an off-by-one when
+                    // overlapping instances exist.  See the module-level
+                    // "Why two copies are required" section for details.
                     let start = self.postfix.len();
                     self.hir2postfix(&rep.sub)?;
                     let end = self.postfix.len();
