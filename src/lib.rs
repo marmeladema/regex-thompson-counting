@@ -131,7 +131,6 @@
 //! a `CounterIncrement` with a `None` counter is allowed only if `ci_gen`
 //! has advanced since the state's first visit in the current step.
 
-use std::collections::VecDeque;
 use std::fmt;
 use std::io::Write;
 
@@ -881,30 +880,56 @@ impl RegexBuilder {
 /// tracked simultaneously.  All instances are incremented in parallel,
 /// and the oldest instance is always the one with the highest `value`.
 ///
+/// The *deltas* between consecutive instances are stored as a linked
+/// list in a shared [`DeltaPool`] (held in [`MatcherMemory`]).  The
+/// counter only stores `head`/`tail` indices into that pool, so it
+/// remains a small `Copy`-able struct with no per-counter heap
+/// allocation.  The pool retains its capacity across `matcher()` calls.
+///
 /// # Fields
 ///
 /// - `value` — the oldest (highest) instance's value.
 /// - `delta` — how much the newest instance has accumulated since the
 ///   last [`push`](Self::push).
-/// - `deltas` — FIFO of deltas for intermediate instances (oldest at
-///   front).
+/// - `head` / `tail` — indices into `DeltaPool` forming a singly-linked
+///   FIFO of deltas for intermediate instances.  Both are [`SENTINEL`]
+///   when the list is empty.
 /// - `incremented` — set by [`incr`](Self::incr), cleared at each
 ///   simulation step; used to prevent a `CounterIncrement` state from
 ///   being processed twice in the same epsilon closure.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct Counter {
     incremented: bool,
     value: usize,
     delta: usize,
-    deltas: VecDeque<usize>,
+    head: usize,
+    tail: usize,
+}
+
+impl Default for Counter {
+    fn default() -> Self {
+        Self {
+            incremented: false,
+            value: 0,
+            delta: 0,
+            head: SENTINEL,
+            tail: SENTINEL,
+        }
+    }
 }
 
 impl Counter {
-    /// Push (allocate) a new instance.  The current `delta` is saved and
-    /// reset to zero.
-    fn push(&mut self) {
+    /// Push (allocate) a new instance.  The current `delta` is saved
+    /// as a new node in `pool` and reset to zero.
+    fn push(&mut self, pool: &mut DeltaPool) {
         assert!(self.delta > 0);
-        self.deltas.push_back(self.delta);
+        let node = pool.alloc(self.delta);
+        if self.tail != SENTINEL {
+            pool.next[self.tail] = node;
+        } else {
+            self.head = node;
+        }
+        self.tail = node;
         self.delta = 0;
     }
 
@@ -917,9 +942,16 @@ impl Counter {
 
     /// De-allocate the oldest instance.  Returns `true` if the counter
     /// has no instances left (should be set to `None`).
-    fn pop(&mut self) -> bool {
+    fn pop(&mut self, pool: &mut DeltaPool) -> bool {
         assert!(self.value > 0);
-        if let Some(delta) = self.deltas.pop_front() {
+        if self.head != SENTINEL {
+            let old_head = self.head;
+            let delta = pool.values[old_head];
+            self.head = pool.next[old_head];
+            if self.head == SENTINEL {
+                self.tail = SENTINEL;
+            }
+            pool.free_node(old_head);
             assert!(delta < self.value);
             self.value -= delta;
             false
@@ -927,6 +959,82 @@ impl Counter {
             assert_eq!(self.value, self.delta);
             true
         }
+    }
+
+    /// Returns `true` when the delta linked list is empty (exactly one
+    /// active instance).
+    fn is_single(&self) -> bool {
+        self.head == SENTINEL
+    }
+
+    /// Check whether any active instance's value falls in `[min, max]`.
+    /// Walks from oldest (highest value) to newest.
+    fn any_instance_in_range(&self, pool: &DeltaPool, min: usize, max: usize) -> bool {
+        let mut val = self.value;
+        if val >= min && val <= max {
+            return true;
+        }
+        let mut node = self.head;
+        while node != SENTINEL {
+            val -= pool.values[node];
+            if val >= min && val <= max {
+                return true;
+            }
+            node = pool.next[node];
+        }
+        false
+    }
+}
+
+/// Sentinel value meaning "no node" (end of linked list / empty).
+const SENTINEL: usize = usize::MAX;
+
+/// Arena-backed pool of linked-list nodes for counter deltas.
+///
+/// All counters share a single `DeltaPool`.  Each counter owns a
+/// linked list (head/tail indices stored in [`Counter`]) whose nodes
+/// live in this pool.  Freed nodes are pushed onto a free-list stack
+/// and recycled by subsequent allocations.
+///
+/// Between matches, [`reset`](Self::reset) clears all three backing
+/// vecs (retaining heap capacity), so the pool's memory is reused
+/// across [`MatcherMemory::matcher`] calls without per-counter loops.
+#[derive(Clone, Debug, Default)]
+struct DeltaPool {
+    /// Node payload (delta value).
+    values: Vec<usize>,
+    /// `next[i]` = index of the successor node, or [`SENTINEL`].
+    next: Vec<usize>,
+    /// Stack of freed node indices available for reuse.
+    free: Vec<usize>,
+}
+
+impl DeltaPool {
+    /// Allocate a node with the given value.  Reuses a freed slot if
+    /// available, otherwise appends to the end of the arena.
+    fn alloc(&mut self, val: usize) -> usize {
+        if let Some(idx) = self.free.pop() {
+            self.values[idx] = val;
+            self.next[idx] = SENTINEL;
+            idx
+        } else {
+            let idx = self.values.len();
+            self.values.push(val);
+            self.next.push(SENTINEL);
+            idx
+        }
+    }
+
+    /// Return a node to the free list for reuse.
+    fn free_node(&mut self, idx: usize) {
+        self.free.push(idx);
+    }
+
+    /// Clear all nodes (retaining heap capacity).
+    fn reset(&mut self) {
+        self.values.clear();
+        self.next.clear();
+        self.free.clear();
     }
 }
 
@@ -943,6 +1051,9 @@ pub struct MatcherMemory {
     lastlist: Vec<usize>,
     /// One slot per counter variable.
     counters: Vec<Option<Counter>>,
+    /// Shared arena for counter delta linked lists.  Retains heap
+    /// capacity across `matcher()` calls.
+    delta_pool: DeltaPool,
     /// Current and next state lists (swapped each step).
     clist: Vec<usize>,
     nlist: Vec<usize>,
@@ -957,6 +1068,7 @@ impl MatcherMemory {
         self.lastlist.resize(regex.states.len(), usize::MAX);
         self.counters.clear();
         self.counters.resize(regex.counters.len(), None);
+        self.delta_pool.reset();
         self.clist.clear();
         self.nlist.clear();
         self.ci_gen_at_visit.clear();
@@ -964,6 +1076,7 @@ impl MatcherMemory {
 
         let mut m = Matcher {
             counters: &mut self.counters,
+            delta_pool: &mut self.delta_pool,
             states: &regex.states,
             classes: &regex.classes,
             lastlist: &mut self.lastlist,
@@ -990,6 +1103,8 @@ impl MatcherMemory {
 #[derive(Debug)]
 pub struct Matcher<'a> {
     counters: &'a mut [Option<Counter>],
+    /// Shared arena for counter delta linked lists.
+    delta_pool: &'a mut DeltaPool,
     states: &'a [State],
     /// Byte-class lookup tables referenced by [`State::ByteClass::class`].
     classes: &'a [[bool; 256]],
@@ -1043,7 +1158,7 @@ impl<'a> Matcher<'a> {
     /// checks can detect that a new instance was allocated.
     fn addcounter(&mut self, idx: usize) {
         if let Some(counter) = self.counters[idx].as_mut() {
-            counter.push();
+            counter.push(self.delta_pool);
         } else {
             self.counters[idx] = Some(Counter::default());
         }
@@ -1058,7 +1173,7 @@ impl<'a> Matcher<'a> {
     /// De-allocate the oldest instance of counter `idx`.  If no instances
     /// remain, the counter is set to `None`.
     fn delcounter(&mut self, idx: usize) {
-        if self.counters[idx].as_mut().unwrap().pop() {
+        if self.counters[idx].as_mut().unwrap().pop(self.delta_pool) {
             self.counters[idx] = None;
         }
     }
@@ -1172,7 +1287,7 @@ impl<'a> Matcher<'a> {
                 self.inccounter(counter);
                 let value = self.counters[counter].as_ref().unwrap().value;
                 debug_assert!(value > 0 && value <= max);
-                let is_single = self.counters[counter].as_ref().unwrap().deltas.is_empty();
+                let is_single = self.counters[counter].as_ref().unwrap().is_single();
 
                 // -- Continue path --
                 // Follow the body again unless the single remaining
@@ -1199,14 +1314,10 @@ impl<'a> Matcher<'a> {
                 let stop = if is_epsilon_body {
                     min <= max
                 } else {
-                    let cnt = self.counters[counter].as_ref().unwrap();
-                    let mut val = cnt.value;
-                    let mut ok = val >= min && val <= max;
-                    for delta in &cnt.deltas {
-                        val -= delta;
-                        ok = ok || (val >= min && val <= max);
-                    }
-                    ok
+                    self.counters[counter]
+                        .as_ref()
+                        .unwrap()
+                        .any_instance_in_range(self.delta_pool, min, max)
                 };
 
                 // De-allocate the oldest instance if it reached max.
@@ -1360,6 +1471,446 @@ impl<'a> Matcher<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // DeltaPool unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_delta_pool_alloc_sequential() {
+        let mut pool = DeltaPool::default();
+        let a = pool.alloc(10);
+        let b = pool.alloc(20);
+        let c = pool.alloc(30);
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
+        assert_eq!(c, 2);
+        assert_eq!(pool.values[a], 10);
+        assert_eq!(pool.values[b], 20);
+        assert_eq!(pool.values[c], 30);
+        assert_eq!(pool.next[a], SENTINEL);
+        assert_eq!(pool.next[b], SENTINEL);
+        assert_eq!(pool.next[c], SENTINEL);
+    }
+
+    #[test]
+    fn test_delta_pool_free_and_reuse() {
+        let mut pool = DeltaPool::default();
+        let a = pool.alloc(10);
+        let b = pool.alloc(20);
+        pool.free_node(a);
+        // Next alloc should reuse slot `a`.
+        let c = pool.alloc(99);
+        assert_eq!(c, a);
+        assert_eq!(pool.values[c], 99);
+        assert_eq!(pool.next[c], SENTINEL);
+        // `b` is unaffected.
+        assert_eq!(pool.values[b], 20);
+    }
+
+    #[test]
+    fn test_delta_pool_free_lifo_order() {
+        let mut pool = DeltaPool::default();
+        let a = pool.alloc(1);
+        let b = pool.alloc(2);
+        let c = pool.alloc(3);
+        pool.free_node(a);
+        pool.free_node(b);
+        pool.free_node(c);
+        // Free stack is LIFO: c, b, a.
+        assert_eq!(pool.alloc(10), c);
+        assert_eq!(pool.alloc(20), b);
+        assert_eq!(pool.alloc(30), a);
+    }
+
+    #[test]
+    fn test_delta_pool_reset_retains_capacity() {
+        let mut pool = DeltaPool::default();
+        for i in 0..100 {
+            pool.alloc(i);
+        }
+        let cap_values = pool.values.capacity();
+        let cap_next = pool.next.capacity();
+        pool.reset();
+        assert!(pool.values.is_empty());
+        assert!(pool.next.is_empty());
+        assert!(pool.free.is_empty());
+        assert_eq!(pool.values.capacity(), cap_values);
+        assert_eq!(pool.next.capacity(), cap_next);
+    }
+
+    #[test]
+    fn test_delta_pool_alloc_after_reset() {
+        let mut pool = DeltaPool::default();
+        pool.alloc(42);
+        pool.alloc(43);
+        pool.reset();
+        // After reset, free list is empty, vecs are empty — fresh allocs
+        // start from index 0 again.
+        let a = pool.alloc(99);
+        assert_eq!(a, 0);
+        assert_eq!(pool.values[a], 99);
+    }
+
+    #[test]
+    fn test_delta_pool_mixed_alloc_free_alloc() {
+        let mut pool = DeltaPool::default();
+        let a = pool.alloc(1);
+        let b = pool.alloc(2);
+        let c = pool.alloc(3);
+        // Free middle node.
+        pool.free_node(b);
+        // Alloc reuses `b`.
+        let d = pool.alloc(4);
+        assert_eq!(d, b);
+        assert_eq!(pool.values[d], 4);
+        // Alloc new — extends the arena.
+        let e = pool.alloc(5);
+        assert_eq!(e, 3);
+        // Original a, c untouched.
+        assert_eq!(pool.values[a], 1);
+        assert_eq!(pool.values[c], 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Counter + DeltaPool integration tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: collect all instance values from a counter (oldest to
+    /// newest) by walking the linked list.
+    fn collect_instance_values(c: &Counter, pool: &DeltaPool) -> Vec<usize> {
+        let mut vals = vec![c.value];
+        let mut val = c.value;
+        let mut node = c.head;
+        while node != SENTINEL {
+            val -= pool.values[node];
+            vals.push(val);
+            node = pool.next[node];
+        }
+        vals
+    }
+
+    #[test]
+    fn test_counter_default_is_single() {
+        let c = Counter::default();
+        assert!(c.is_single());
+        assert_eq!(c.value, 0);
+        assert_eq!(c.delta, 0);
+        assert!(!c.incremented);
+        assert_eq!(c.head, SENTINEL);
+        assert_eq!(c.tail, SENTINEL);
+    }
+
+    #[test]
+    fn test_counter_incr_single_instance() {
+        let mut c = Counter::default();
+        c.incr();
+        assert_eq!(c.value, 1);
+        assert_eq!(c.delta, 1);
+        assert!(c.incremented);
+        assert!(c.is_single());
+        c.incr();
+        assert_eq!(c.value, 2);
+        assert_eq!(c.delta, 2);
+    }
+
+    #[test]
+    fn test_counter_push_creates_linked_list() {
+        let mut pool = DeltaPool::default();
+        let mut c = Counter::default();
+        // Instance 1: increment 3 times.
+        c.incr();
+        c.incr();
+        c.incr();
+        assert_eq!(c.value, 3);
+        assert_eq!(c.delta, 3);
+        // Push: saves delta=3 to pool, resets delta to 0.
+        c.push(&mut pool);
+        assert_eq!(c.value, 3);
+        assert_eq!(c.delta, 0);
+        assert!(!c.is_single());
+        // Instance 2: increment 2 times.
+        c.incr();
+        c.incr();
+        assert_eq!(c.value, 5);
+        assert_eq!(c.delta, 2);
+        // Values: oldest=5 (value), newest=5-3=2.
+        assert_eq!(collect_instance_values(&c, &pool), vec![5, 2]);
+    }
+
+    #[test]
+    fn test_counter_push_multiple() {
+        let mut pool = DeltaPool::default();
+        let mut c = Counter::default();
+        // Instance 1: 3 increments.
+        for _ in 0..3 {
+            c.incr();
+        }
+        c.push(&mut pool);
+        // Instance 2: 2 increments.
+        for _ in 0..2 {
+            c.incr();
+        }
+        c.push(&mut pool);
+        // Instance 3: 1 increment.
+        c.incr();
+        assert_eq!(c.value, 6);
+        assert_eq!(c.delta, 1);
+        // Instances: 6, 6-3=3, 3-2=1
+        assert_eq!(collect_instance_values(&c, &pool), vec![6, 3, 1]);
+    }
+
+    #[test]
+    fn test_counter_pop_oldest() {
+        let mut pool = DeltaPool::default();
+        let mut c = Counter::default();
+        // Two instances: delta 3, then delta 2.
+        for _ in 0..3 {
+            c.incr();
+        }
+        c.push(&mut pool);
+        for _ in 0..2 {
+            c.incr();
+        }
+        assert_eq!(c.value, 5);
+        // Instances: 5, 2.
+        // Pop oldest (value=5), remaining value becomes 5-3=2.
+        let exhausted = c.pop(&mut pool);
+        assert!(!exhausted);
+        assert_eq!(c.value, 2);
+        assert!(c.is_single());
+        assert_eq!(collect_instance_values(&c, &pool), vec![2]);
+    }
+
+    #[test]
+    fn test_counter_pop_last_instance_returns_true() {
+        let mut pool = DeltaPool::default();
+        let mut c = Counter::default();
+        c.incr();
+        c.incr();
+        // Single instance, no deltas in list.
+        assert!(c.is_single());
+        let exhausted = c.pop(&mut pool);
+        assert!(exhausted);
+    }
+
+    #[test]
+    fn test_counter_push_pop_cycle() {
+        let mut pool = DeltaPool::default();
+        let mut c = Counter::default();
+        // Push 3 instances, then pop them all.
+        for _ in 0..2 {
+            c.incr();
+        }
+        c.push(&mut pool); // delta=2
+        for _ in 0..3 {
+            c.incr();
+        }
+        c.push(&mut pool); // delta=3
+        c.incr(); // delta=1
+                  // value=6, instances: 6, 6-2=4, 4-3=1
+        assert_eq!(collect_instance_values(&c, &pool), vec![6, 4, 1]);
+
+        // Pop oldest (6).
+        assert!(!c.pop(&mut pool));
+        assert_eq!(c.value, 4);
+        assert_eq!(collect_instance_values(&c, &pool), vec![4, 1]);
+
+        // Pop oldest (4).
+        assert!(!c.pop(&mut pool));
+        assert_eq!(c.value, 1);
+        assert!(c.is_single());
+
+        // Pop last.
+        assert!(c.pop(&mut pool));
+    }
+
+    #[test]
+    fn test_counter_pop_recycles_pool_nodes() {
+        let mut pool = DeltaPool::default();
+        let mut c = Counter::default();
+        // Create 2 instances, pop one, verify pool free list.
+        c.incr();
+        c.push(&mut pool);
+        c.incr();
+        assert_eq!(pool.free.len(), 0);
+        c.pop(&mut pool);
+        assert_eq!(pool.free.len(), 1);
+    }
+
+    #[test]
+    fn test_counter_any_instance_in_range_single() {
+        let pool = DeltaPool::default();
+        let mut c = Counter::default();
+        for _ in 0..5 {
+            c.incr();
+        }
+        assert!(c.any_instance_in_range(&pool, 3, 7));
+        assert!(c.any_instance_in_range(&pool, 5, 5));
+        assert!(!c.any_instance_in_range(&pool, 6, 10));
+        assert!(!c.any_instance_in_range(&pool, 1, 4));
+    }
+
+    #[test]
+    fn test_counter_any_instance_in_range_multiple() {
+        let mut pool = DeltaPool::default();
+        let mut c = Counter::default();
+        // Instance 1: 3 increments.
+        for _ in 0..3 {
+            c.incr();
+        }
+        c.push(&mut pool);
+        // Instance 2: 2 increments.
+        for _ in 0..2 {
+            c.incr();
+        }
+        // Instances: 5, 2.
+        // Check range that only matches oldest.
+        assert!(c.any_instance_in_range(&pool, 5, 5));
+        // Check range that only matches newest.
+        assert!(c.any_instance_in_range(&pool, 2, 2));
+        // Check range that matches both.
+        assert!(c.any_instance_in_range(&pool, 1, 10));
+        // Check range that matches neither.
+        assert!(!c.any_instance_in_range(&pool, 3, 4));
+    }
+
+    #[test]
+    fn test_counter_any_instance_in_range_three_instances() {
+        let mut pool = DeltaPool::default();
+        let mut c = Counter::default();
+        for _ in 0..4 {
+            c.incr();
+        }
+        c.push(&mut pool); // delta=4
+        for _ in 0..3 {
+            c.incr();
+        }
+        c.push(&mut pool); // delta=3
+        for _ in 0..2 {
+            c.incr();
+        }
+        // value=9, instances: 9, 5, 2
+        assert_eq!(collect_instance_values(&c, &pool), vec![9, 5, 2]);
+        assert!(c.any_instance_in_range(&pool, 9, 9));
+        assert!(c.any_instance_in_range(&pool, 5, 5));
+        assert!(c.any_instance_in_range(&pool, 2, 2));
+        assert!(!c.any_instance_in_range(&pool, 3, 4));
+        assert!(!c.any_instance_in_range(&pool, 6, 8));
+    }
+
+    #[test]
+    fn test_counter_is_single_transitions() {
+        let mut pool = DeltaPool::default();
+        let mut c = Counter::default();
+        assert!(c.is_single());
+        c.incr(); // value=1, delta=1
+        assert!(c.is_single());
+        c.push(&mut pool); // saves delta=1
+        assert!(!c.is_single());
+        c.incr(); // value=2, delta=1
+        c.push(&mut pool); // saves delta=1
+        assert!(!c.is_single());
+        c.incr(); // value=3, delta=1
+                  // Instances: 3, 2, 1.  Pop oldest (3) → value=2.
+        c.pop(&mut pool);
+        assert!(!c.is_single());
+        // Pop oldest (2) → value=1.
+        c.pop(&mut pool);
+        assert!(c.is_single());
+    }
+
+    #[test]
+    fn test_two_counters_share_pool() {
+        let mut pool = DeltaPool::default();
+        let mut c1 = Counter::default();
+        let mut c2 = Counter::default();
+        // Counter 1: push delta=2.
+        c1.incr();
+        c1.incr();
+        c1.push(&mut pool);
+        // Counter 2: push delta=5.
+        for _ in 0..5 {
+            c2.incr();
+        }
+        c2.push(&mut pool);
+        // Continue incrementing both.
+        c1.incr();
+        c2.incr();
+        // c1 instances: 3, 1.  c2 instances: 6, 1.
+        assert_eq!(collect_instance_values(&c1, &pool), vec![3, 1]);
+        assert_eq!(collect_instance_values(&c2, &pool), vec![6, 1]);
+        // Pop from c1 ��� should not affect c2.
+        c1.pop(&mut pool);
+        assert_eq!(collect_instance_values(&c1, &pool), vec![1]);
+        assert_eq!(collect_instance_values(&c2, &pool), vec![6, 1]);
+    }
+
+    #[test]
+    fn test_pool_node_reuse_across_counters() {
+        let mut pool = DeltaPool::default();
+        let mut c1 = Counter::default();
+        let mut c2 = Counter::default();
+        // c1 allocates and frees a node.
+        c1.incr();
+        c1.push(&mut pool);
+        c1.incr();
+        let node_used = c1.head;
+        c1.pop(&mut pool);
+        assert_eq!(pool.free.len(), 1);
+        assert_eq!(pool.free[0], node_used);
+        // c2 allocates — should reuse the freed node.
+        c2.incr();
+        c2.push(&mut pool);
+        assert_eq!(c2.head, node_used);
+        assert_eq!(pool.free.len(), 0);
+    }
+
+    #[test]
+    fn test_counter_push_pop_interleaved_with_incr() {
+        let mut pool = DeltaPool::default();
+        let mut c = Counter::default();
+        // Simulate a realistic pattern: push, incr everything, pop, push.
+        c.incr();
+        c.push(&mut pool);
+        c.incr();
+        // Instances: 2, 1.
+        assert_eq!(collect_instance_values(&c, &pool), vec![2, 1]);
+        c.push(&mut pool);
+        c.incr();
+        // Instances: 3, 2, 1.
+        assert_eq!(collect_instance_values(&c, &pool), vec![3, 2, 1]);
+        // Pop the oldest (3).
+        c.pop(&mut pool);
+        // Instances: 2, 1.
+        assert_eq!(collect_instance_values(&c, &pool), vec![2, 1]);
+        // Push again.
+        c.push(&mut pool);
+        c.incr();
+        // Instances: 3, 2, 1.
+        assert_eq!(collect_instance_values(&c, &pool), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn test_pool_reset_then_counter_from_scratch() {
+        let mut pool = DeltaPool::default();
+        let mut c = Counter::default();
+        c.incr();
+        c.push(&mut pool);
+        c.incr();
+        pool.reset();
+        // After reset, start fresh.
+        let mut c2 = Counter::default();
+        c2.incr();
+        c2.incr();
+        c2.push(&mut pool);
+        c2.incr();
+        assert_eq!(collect_instance_values(&c2, &pool), vec![3, 1]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regex matching tests
+    // -----------------------------------------------------------------------
 
     /// Parse a pattern in full byte mode (no UTF-8 validity requirement).
     /// Uses `ParserBuilder` with `utf8(false)` so that `.` in `(?s-u)`
