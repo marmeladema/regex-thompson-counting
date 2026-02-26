@@ -72,7 +72,8 @@ pub enum Error {
     /// A Unicode character class that cannot be lowered to single bytes
     /// (i.e. contains codepoints above U+00FF).
     UnsupportedClass(hir::Class),
-    /// A look-around assertion (e.g. `^`, `$`, `\b`) was encountered.
+    /// A look-around assertion other than `^` (Start) or `$` (End) was
+    /// encountered (e.g. `\b`, `\B`).
     UnsupportedLook(hir::Look),
 }
 
@@ -97,9 +98,10 @@ impl std::error::Error for Error {}
 
 /// A single NFA state.
 ///
-/// Epsilon states (`Split`, `CounterInstance`, `CounterIncrement`)
-/// are followed during [`Matcher::addstate`].  Byte-consuming states
-/// (`Byte`, `ByteClass`) are stepped over in [`Matcher::step`].
+/// Epsilon states (`Split`, `CounterInstance`, `CounterIncrement`,
+/// `AssertStart`, `AssertEnd`) are followed during
+/// [`Matcher::addstate`].  Byte-consuming states (`Byte`, `ByteClass`)
+/// are stepped over in [`Matcher::step`].
 #[derive(Clone, Copy, Debug)]
 enum State {
     /// Epsilon fork: follow both `out` and `out1`.
@@ -135,6 +137,14 @@ enum State {
     /// `Wildcard` state.
     ByteClass { class: usize, out: usize },
 
+    /// Zero-width assertion: matches only at the start of input.
+    /// Followed in `addstate` only when `at_start` is true.
+    AssertStart { out: usize },
+
+    /// Zero-width assertion: matches only at the end of input.
+    /// Followed in `addstate` only when `at_end` is true.
+    AssertEnd { out: usize },
+
     /// Accepting state.
     Match,
 }
@@ -146,7 +156,9 @@ impl State {
         match self {
             State::Byte { out, .. }
             | State::ByteClass { out, .. }
-            | State::CounterInstance { out, .. } => *out,
+            | State::CounterInstance { out, .. }
+            | State::AssertStart { out }
+            | State::AssertEnd { out } => *out,
             State::Split { out1, .. } | State::CounterIncrement { out1, .. } => *out1,
             _ => unreachable!(),
         }
@@ -157,7 +169,9 @@ impl State {
         match self {
             State::Byte { out, .. }
             | State::ByteClass { out, .. }
-            | State::CounterInstance { out, .. } => *out = next,
+            | State::CounterInstance { out, .. }
+            | State::AssertStart { out }
+            | State::AssertEnd { out } => *out = next,
             State::Split { out1, .. } | State::CounterIncrement { out1, .. } => *out1 = next,
             _ => unreachable!(),
         }
@@ -206,6 +220,8 @@ enum RegexHirNode {
         min: usize,
         max: usize,
     },
+    AssertStart,
+    AssertEnd,
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +334,14 @@ impl Regex {
                 } else {
                     writeln!(buffer, "\t{} -> {} [label=\"[{}B]\"];", idx, out, count).unwrap();
                 }
+            }
+            State::AssertStart { out } => {
+                stack.push(out);
+                writeln!(buffer, "\t{} -> {} [label=\"^\"];", idx, out).unwrap();
+            }
+            State::AssertEnd { out } => {
+                stack.push(out);
+                writeln!(buffer, "\t{} -> {} [label=\"$\"];", idx, out).unwrap();
             }
             State::Match => {
                 writeln!(buffer, "\t{} [peripheries=2];", idx).unwrap();
@@ -444,6 +468,14 @@ impl RegexBuilder {
                 }
                 let idx = self.intern_class(table);
                 self.postfix.push(RegexHirNode::ByteClass(idx));
+                Ok(())
+            }
+            HirKind::Look(hir::Look::Start) => {
+                self.postfix.push(RegexHirNode::AssertStart);
+                Ok(())
+            }
+            HirKind::Look(hir::Look::End) => {
+                self.postfix.push(RegexHirNode::AssertEnd);
                 Ok(())
             }
             HirKind::Look(look) => Err(Error::UnsupportedLook(*look)),
@@ -590,7 +622,9 @@ impl RegexBuilder {
             list = match state {
                 State::Byte { out, .. }
                 | State::ByteClass { out, .. }
-                | State::CounterInstance { out, .. } => {
+                | State::CounterInstance { out, .. }
+                | State::AssertStart { out }
+                | State::AssertEnd { out } => {
                     let next = *out;
                     *out = idx;
                     next
@@ -698,6 +732,14 @@ impl RegexBuilder {
                     byte,
                     out: DANGLING,
                 });
+                Fragment::new(idx, idx)
+            }
+            RegexHirNode::AssertStart => {
+                let idx = self.state(State::AssertStart { out: DANGLING });
+                Fragment::new(idx, idx)
+            }
+            RegexHirNode::AssertEnd => {
+                let idx = self.state(State::AssertEnd { out: DANGLING });
                 Fragment::new(idx, idx)
             }
         }
@@ -846,9 +888,16 @@ impl MatcherMemory {
             nlist: &mut self.nlist,
             ci_gen: 0,
             ci_gen_at_visit: &mut self.ci_gen_at_visit,
+            start: regex.start,
+            at_start: true,
+            at_end: false,
+            ever_matched: false,
         };
 
         m.startlist(regex.start);
+        // Check if the initial epsilon closure already reached Match
+        // (e.g. for patterns like `^$`, `^`, `a?`, etc.).
+        m.ever_matched = m.clist_has_match();
         m
     }
 }
@@ -876,6 +925,19 @@ pub struct Matcher<'a> {
     ci_gen: usize,
     /// Per-state snapshot of `ci_gen` recorded on first visit.
     ci_gen_at_visit: &'a mut [usize],
+
+    /// The NFA start state index, used for re-seeding at each step
+    /// (unanchored matching).
+    start: usize,
+    /// `true` until the first [`step`](Self::step) call.  Controls
+    /// whether `AssertStart` states are followed in `addstate`.
+    at_start: bool,
+    /// Set to `true` by [`finish`](Self::finish); controls whether
+    /// `AssertEnd` states are followed in `addstate`.
+    at_end: bool,
+    /// Tracks whether a `Match` state was ever reached in `clist`
+    /// during the simulation (before `finish`).
+    ever_matched: bool,
 }
 
 impl<'a> Matcher<'a> {
@@ -988,6 +1050,20 @@ impl<'a> Matcher<'a> {
                 self.addstate(out1);
             }
 
+            State::AssertStart { out } => {
+                if self.at_start {
+                    let out = *out;
+                    self.addstate(out);
+                }
+            }
+
+            State::AssertEnd { out } => {
+                if self.at_end {
+                    let out = *out;
+                    self.addstate(out);
+                }
+            }
+
             State::CounterInstance { out, counter } => {
                 let (out, counter) = (*out, *counter);
                 self.addcounter(counter);
@@ -1074,7 +1150,17 @@ impl<'a> Matcher<'a> {
     /// For each state in `clist`, if the byte matches (`Byte` or
     /// `ByteClass`), follow the `out` pointer through `addstate` to build
     /// the next `nlist`.
+    ///
+    /// After processing `clist`, the start state is re-seeded into `nlist`
+    /// to support unanchored matching (when there is no leading `^`, the
+    /// start state is a consuming state that will try matching from every
+    /// position; when `^` is present, the start state is `AssertStart`
+    /// and `at_start=false` prevents it from being followed).
     pub fn step(&mut self, b: u8) {
+        // `at_start` is cleared before processing so that `^` cannot
+        // match at any position other than the very beginning.
+        self.at_start = false;
+
         self.nlist.clear();
         let clist = std::mem::take(self.clist);
 
@@ -1095,8 +1181,19 @@ impl<'a> Matcher<'a> {
             }
         }
 
+        // Re-seed the start state so the pattern can match starting at
+        // the next position.  For `^`-anchored patterns this is harmless:
+        // the start state is `AssertStart`, and `at_start` is false, so
+        // `addstate` will record it but not follow `out`.
+        self.addstate(self.start);
+
         *self.clist = std::mem::replace(self.nlist, clist);
         self.listid += 1;
+
+        // Track whether we ever reach Match during stepping.
+        if !self.ever_matched {
+            self.ever_matched = self.clist_has_match();
+        }
     }
 
     /// Feed an entire byte slice through the matcher, one byte at a time.
@@ -1106,11 +1203,69 @@ impl<'a> Matcher<'a> {
         }
     }
 
-    /// Check whether the current state list contains a `Match` state.
-    pub fn ismatch(&self) -> bool {
+    /// Check whether `clist` currently contains a `Match` state.
+    fn clist_has_match(&self) -> bool {
         self.clist
             .iter()
             .any(|&idx| matches!(self.states[idx], State::Match))
+    }
+
+    /// Check whether the matcher has reached an accepting state so far.
+    ///
+    /// This returns `true` if a `Match` state is currently in `clist`
+    /// *or* was reached during any previous step.  It does **not**
+    /// signal end-of-input, so `$` assertions are not evaluated — use
+    /// [`finish`](Self::finish) for that.
+    pub fn ismatch(&self) -> bool {
+        self.ever_matched || self.clist_has_match()
+    }
+
+    /// Signal end-of-input and return the final match result.
+    ///
+    /// This allows `$` (AssertEnd) states to fire: `at_end` is set to
+    /// `true` and any `AssertEnd` states currently in `clist` have their
+    /// `out` pointers followed through `addstate`.
+    ///
+    /// Only `AssertEnd` states are re-expanded — other states (counters,
+    /// splits, consuming states) were already fully epsilon-expanded when
+    /// they entered `clist` and must not be re-processed.
+    ///
+    /// Consumes the matcher, since no further input can be fed after
+    /// end-of-input has been signalled.
+    pub fn finish(mut self) -> bool {
+        if self.ever_matched {
+            return true;
+        }
+
+        self.at_end = true;
+
+        // Walk clist by index to avoid holding a borrow across addstate().
+        // addstate() only writes to nlist, never clist, so this is safe.
+        let clist_len = self.clist.len();
+        if clist_len > 0 {
+            // Bump listid so addstate can visit new states.
+            self.listid += 1;
+
+            // Reset counter incremented flags for the new epsilon closure.
+            for counter in self.counters.iter_mut().filter_map(|c| c.as_mut()) {
+                counter.incremented = false;
+            }
+
+            // Follow the AssertEnd targets, building new states into nlist.
+            self.nlist.clear();
+            for i in 0..clist_len {
+                let idx = self.clist[i];
+                if let State::AssertEnd { out } = self.states[idx] {
+                    self.addstate(out);
+                }
+            }
+
+            // Append the newly discovered states to clist.
+            self.clist.append(self.nlist);
+        }
+
+        // ever_matched is known false here (early return above).
+        self.clist_has_match()
     }
 }
 
@@ -1159,27 +1314,32 @@ mod tests {
     }
 
     /// Assert that our NFA matcher and the `regex` crate agree on whether
-    /// `input` matches the given pattern (anchored at both ends).
+    /// `input` matches the given pattern.
     ///
-    /// The `regex` crate is used in byte mode (`regex::bytes::Regex`) so
-    /// that `.` matches any byte, consistent with our engine.
+    /// The pattern is expected to include its own `^` and `$` anchors
+    /// where needed.  The `regex` crate is used in byte mode
+    /// (`regex::bytes::Regex`) so that `.` matches any byte, consistent
+    /// with our engine.
     ///
     /// Two independent matcher runs are exercised using the same
     /// [`MatcherMemory`]:
     /// 1. **chunk** — feeds the entire input at once via [`Matcher::chunk`].
     /// 2. **step-by-step** — feeds bytes one at a time via [`Matcher::step`].
     ///
+    /// Both paths call [`Matcher::finish`] to signal end-of-input and
+    /// obtain the final match result (which also evaluates `$`).
+    ///
     /// Both results are compared against the `regex` crate oracle.
     fn assert_matches_regex_crate(pattern: &str, regex: &Regex, input: &str) {
-        let anchored = format!("^(?s-u)(?:{})$", pattern);
-        let re = regex::bytes::Regex::new(&anchored).expect("regex crate should parse pattern");
+        let full = format!("(?s-u){}", pattern);
+        let re = regex::bytes::Regex::new(&full).expect("regex crate should parse pattern");
         let expected = re.is_match(input.as_bytes());
 
         // Path 1: feed the whole input via chunk().
         let mut memory = MatcherMemory::default();
         let mut matcher = memory.matcher(regex);
         matcher.chunk(input.as_bytes());
-        let actual_chunk = matcher.ismatch();
+        let actual_chunk = matcher.finish();
 
         assert_eq!(
             actual_chunk, expected,
@@ -1189,12 +1349,11 @@ mod tests {
 
         // Path 2: feed bytes one at a time via step().
         // Re-use the same MatcherMemory — matcher() resets all state.
-        drop(matcher);
         let mut matcher = memory.matcher(regex);
         for &b in input.as_bytes() {
             matcher.step(b);
         }
-        let actual_step = matcher.ismatch();
+        let actual_step = matcher.finish();
 
         assert_eq!(
             actual_step, expected,
@@ -1206,8 +1365,8 @@ mod tests {
     /// `.*a.{3}bc` — counting constraint on a wildcard.
     #[test]
     fn test_counting() {
-        let p = ".*a.{3}bc";
-        let re = build_regex(p, 800);
+        let p = "^.*a.{3}bc$";
+        let re = build_regex(p, 896);
         assert_matches_regex_crate(p, &re, "aybzbc");
         assert_matches_regex_crate(p, &re, "axaybzbc");
         assert_matches_regex_crate(p, &re, "a123bc");
@@ -1230,8 +1389,8 @@ mod tests {
     fn test_range() {
         use itertools::Itertools;
 
-        let p = "(a|bc){1,2}";
-        let re = build_regex(p, 592);
+        let p = "^(a|bc){1,2}$";
+        let re = build_regex(p, 688);
 
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "bc");
@@ -1268,8 +1427,8 @@ mod tests {
     fn test_nested_counting() {
         use itertools::Itertools;
 
-        let p = "((a|bc){1,2}){2,3}";
-        let re = build_regex(p, 1184);
+        let p = "^((a|bc){1,2}){2,3}$";
+        let re = build_regex(p, 1280);
 
         // negatives: below outer min, wrong chars
         assert_matches_regex_crate(p, &re, "");
@@ -1303,8 +1462,8 @@ mod tests {
     /// empty).  Exercises the epsilon-body detection logic in `addstate`.
     #[test]
     fn test_aaaaa() {
-        let p = "(a|a?){2,3}";
-        let re = build_regex(p, 592);
+        let p = "^(a|a?){2,3}$";
+        let re = build_regex(p, 688);
 
         // positives (epsilon branches make all lengths 0..=3 matchable)
         assert_matches_regex_crate(p, &re, "");
@@ -1324,8 +1483,8 @@ mod tests {
     /// `a+` — basic one-or-more repetition.
     #[test]
     fn test_one_plus_basic() {
-        let p = "a+";
-        let re = build_regex(p, 200);
+        let p = "^a+$";
+        let re = build_regex(p, 296);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "aaa");
@@ -1340,8 +1499,8 @@ mod tests {
     /// `.+` — one-or-more wildcard.
     #[test]
     fn test_one_plus_wildcard() {
-        let p = ".+";
-        let re = build_regex(p, 456);
+        let p = "^.+$";
+        let re = build_regex(p, 552);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -1351,8 +1510,8 @@ mod tests {
     /// `a+b+` — consecutive one-or-more repetitions.
     #[test]
     fn test_one_plus_catenation() {
-        let p = "a+b+";
-        let re = build_regex(p, 296);
+        let p = "^a+b+$";
+        let re = build_regex(p, 392);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "b");
@@ -1366,8 +1525,8 @@ mod tests {
     /// `(ab)+` — one-or-more of a multi-byte sequence.
     #[test]
     fn test_one_plus_group() {
-        let p = "(ab)+";
-        let re = build_regex(p, 248);
+        let p = "^(ab)+$";
+        let re = build_regex(p, 344);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -1379,8 +1538,8 @@ mod tests {
     /// `(a|b)+` — one-or-more alternation.
     #[test]
     fn test_one_plus_alternate() {
-        let p = "(a|b)+";
-        let re = build_regex(p, 456);
+        let p = "^(a|b)+$";
+        let re = build_regex(p, 552);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
@@ -1399,8 +1558,8 @@ mod tests {
     /// `.*a.{3}b+c` — one-or-more mixed with counting constraints.
     #[test]
     fn test_one_plus_with_counting() {
-        let p = ".*a.{3}b+c";
-        let re = build_regex(p, 848);
+        let p = "^.*a.{3}b+c$";
+        let re = build_regex(p, 944);
         // positives
         assert_matches_regex_crate(p, &re, "a123bc");
         assert_matches_regex_crate(p, &re, "a123bbc");
@@ -1424,8 +1583,8 @@ mod tests {
     /// The body of `+` is itself a counted repetition.
     #[test]
     fn test_repetition_inside_one_plus() {
-        let p = "(a{2,3})+";
-        let re = build_regex(p, 352);
+        let p = "^(a{2,3})+$";
+        let re = build_regex(p, 448);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1444,8 +1603,8 @@ mod tests {
     fn test_range_alternation_inside_one_plus() {
         use itertools::Itertools;
 
-        let p = "((a|bc){1,2})+";
-        let re = build_regex(p, 640);
+        let p = "^((a|bc){1,2})+$";
+        let re = build_regex(p, 736);
 
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
@@ -1468,8 +1627,8 @@ mod tests {
     /// `(a+){2,3}` — inner one-or-more, outer counted repetition.
     #[test]
     fn test_one_plus_inside_repetition() {
-        let p = "(a+){2,3}";
-        let re = build_regex(p, 400);
+        let p = "^(a+){2,3}$";
+        let re = build_regex(p, 496);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1486,8 +1645,8 @@ mod tests {
     fn test_one_plus_alternation_inside_repetition() {
         use itertools::Itertools;
 
-        let p = "((a|b)+){2,4}";
-        let re = build_regex(p, 656);
+        let p = "^((a|b)+){2,4}$";
+        let re = build_regex(p, 752);
 
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
@@ -1509,8 +1668,8 @@ mod tests {
     /// wrapped in outer `+`.
     #[test]
     fn test_mixed_plus_and_repetition_inside_one_plus() {
-        let p = "(a+b{2,3})+";
-        let re = build_regex(p, 448);
+        let p = "^(a+b{2,3})+$";
+        let re = build_regex(p, 544);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -1531,8 +1690,8 @@ mod tests {
     /// `a{0,2}` — zero to two occurrences of a single byte.
     #[test]
     fn test_min_zero_basic() {
-        let p = "a{0,2}";
-        let re = build_regex(p, 352);
+        let p = "^a{0,2}$";
+        let re = build_regex(p, 448);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1543,8 +1702,8 @@ mod tests {
     /// `a{0,1}` — equivalent to `a?`.
     #[test]
     fn test_min_zero_max_one() {
-        let p = "a{0,1}";
-        let re = build_regex(p, 200);
+        let p = "^a{0,1}$";
+        let re = build_regex(p, 296);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1556,8 +1715,8 @@ mod tests {
     fn test_min_zero_alternation() {
         use itertools::Itertools;
 
-        let p = "(a|bc){0,3}";
-        let re = build_regex(p, 640);
+        let p = "^(a|bc){0,3}$";
+        let re = build_regex(p, 736);
 
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
@@ -1578,8 +1737,8 @@ mod tests {
     /// `a{0,}` — zero or more, lowered to `a*` (no counter overhead).
     #[test]
     fn test_min_zero_unbounded() {
-        let p = "a{0,}";
-        let re = build_regex(p, 200);
+        let p = "^a{0,}$";
+        let re = build_regex(p, 296);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1596,8 +1755,8 @@ mod tests {
     /// `(ab){0,}` — zero or more of a group, lowered to `(ab)*`.
     #[test]
     fn test_min_zero_unbounded_group() {
-        let p = "(ab){0,}";
-        let re = build_regex(p, 248);
+        let p = "^(ab){0,}$";
+        let re = build_regex(p, 344);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -1609,8 +1768,8 @@ mod tests {
     /// `x(a{0,2})+y` — min=0 repetition nested inside `+`.
     #[test]
     fn test_min_zero_inside_one_plus() {
-        let p = "x(a{0,2})+y";
-        let re = build_regex(p, 496);
+        let p = "^x(a{0,2})+y$";
+        let re = build_regex(p, 592);
         // positives
         assert_matches_regex_crate(p, &re, "xy");
         assert_matches_regex_crate(p, &re, "xay");
@@ -1633,8 +1792,8 @@ mod tests {
     /// `(a{0,2}){2,3}` — min=0 inner, counted outer.
     #[test]
     fn test_min_zero_inside_repetition() {
-        let p = "(a{0,2}){2,3}";
-        let re = build_regex(p, 704);
+        let p = "^(a{0,2}){2,3}$";
+        let re = build_regex(p, 800);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1649,8 +1808,8 @@ mod tests {
     /// `(a+){0,3}` — `+` inside a min=0 counted repetition.
     #[test]
     fn test_one_plus_inside_min_zero_repetition() {
-        let p = "(a+){0,3}";
-        let re = build_regex(p, 448);
+        let p = "^(a+){0,3}$";
+        let re = build_regex(p, 544);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1664,8 +1823,8 @@ mod tests {
     /// `.{0,3}` — min=0 repetition on wildcard.
     #[test]
     fn test_min_zero_wildcard() {
-        let p = ".{0,3}";
-        let re = build_regex(p, 608);
+        let p = "^.{0,3}$";
+        let re = build_regex(p, 704);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -1676,8 +1835,8 @@ mod tests {
     /// `a{0,3}` — same as `a{0,3}` (the old test used `min: None`).
     #[test]
     fn test_none_min_repetition() {
-        let p = "a{0,3}";
-        let re = build_regex(p, 352);
+        let p = "^a{0,3}$";
+        let re = build_regex(p, 448);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1695,8 +1854,8 @@ mod tests {
     /// `a` — single literal byte.
     #[test]
     fn test_literal_single() {
-        let p = "a";
-        let re = build_regex(p, 152);
+        let p = "^a$";
+        let re = build_regex(p, 248);
         assert_matches_regex_crate(p, &re, "a");
         // negatives
         assert_matches_regex_crate(p, &re, "");
@@ -1709,8 +1868,8 @@ mod tests {
     /// `abc` — multi-byte literal concatenation.
     #[test]
     fn test_literal_multi() {
-        let p = "abc";
-        let re = build_regex(p, 248);
+        let p = "^abc$";
+        let re = build_regex(p, 344);
         assert_matches_regex_crate(p, &re, "abc");
         // negatives
         assert_matches_regex_crate(p, &re, "");
@@ -1728,8 +1887,8 @@ mod tests {
     /// `.` — bare wildcard (matches exactly one byte).
     #[test]
     fn test_dot_single() {
-        let p = ".";
-        let re = build_regex(p, 408);
+        let p = "^.$";
+        let re = build_regex(p, 504);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "z");
         assert_matches_regex_crate(p, &re, "0");
@@ -1743,8 +1902,8 @@ mod tests {
     /// `a|bc` — bare alternation (no repetition).
     #[test]
     fn test_alternation_bare() {
-        let p = "a|bc";
-        let re = build_regex(p, 296);
+        let p = "^(a|bc)$";
+        let re = build_regex(p, 392);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "bc");
         // negatives
@@ -1760,8 +1919,8 @@ mod tests {
     /// `a|b|c` — three-way alternation.
     #[test]
     fn test_alternation_three_way() {
-        let p = "a|b|c";
-        let re = build_regex(p, 408);
+        let p = "^(a|b|c)$";
+        let re = build_regex(p, 504);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "c");
@@ -1775,8 +1934,8 @@ mod tests {
     /// `a?` — standalone zero-or-one.
     #[test]
     fn test_question_mark_single() {
-        let p = "a?";
-        let re = build_regex(p, 200);
+        let p = "^a?$";
+        let re = build_regex(p, 296);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         // negatives
@@ -1788,8 +1947,8 @@ mod tests {
     /// `(ab)?` — zero-or-one of a group.
     #[test]
     fn test_question_mark_group() {
-        let p = "(ab)?";
-        let re = build_regex(p, 248);
+        let p = "^(ab)?$";
+        let re = build_regex(p, 344);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "ab");
         // negatives
@@ -1803,8 +1962,8 @@ mod tests {
     /// `a?b` — optional prefix followed by a literal.
     #[test]
     fn test_question_mark_prefix() {
-        let p = "a?b";
-        let re = build_regex(p, 248);
+        let p = "^a?b$";
+        let re = build_regex(p, 344);
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
         // negatives
@@ -1819,8 +1978,8 @@ mod tests {
     /// `a*` — standalone zero-or-more.
     #[test]
     fn test_star_single() {
-        let p = "a*";
-        let re = build_regex(p, 200);
+        let p = "^a*$";
+        let re = build_regex(p, 296);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -1837,8 +1996,8 @@ mod tests {
     /// `(ab)*` — zero-or-more of a group.
     #[test]
     fn test_star_group() {
-        let p = "(ab)*";
-        let re = build_regex(p, 248);
+        let p = "^(ab)*$";
+        let re = build_regex(p, 344);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abab");
@@ -1855,8 +2014,8 @@ mod tests {
     /// `a*b` — star followed by a literal.
     #[test]
     fn test_star_then_literal() {
-        let p = "a*b";
-        let re = build_regex(p, 248);
+        let p = "^a*b$";
+        let re = build_regex(p, 344);
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "aab");
@@ -1874,8 +2033,8 @@ mod tests {
     /// `a{2,}` — unbounded min with n>0.
     #[test]
     fn test_min_n_unbounded() {
-        let p = "a{2,}";
-        let re = build_regex(p, 304);
+        let p = "^a{2,}$";
+        let re = build_regex(p, 400);
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "aaa");
         assert_matches_regex_crate(p, &re, "aaaa");
@@ -1892,8 +2051,8 @@ mod tests {
     /// `(ab){2,}` — unbounded min of a group.
     #[test]
     fn test_min_n_unbounded_group() {
-        let p = "(ab){2,}";
-        let re = build_regex(p, 400);
+        let p = "^(ab){2,}$";
+        let re = build_regex(p, 496);
         assert_matches_regex_crate(p, &re, "abab");
         assert_matches_regex_crate(p, &re, "ababab");
         assert_matches_regex_crate(p, &re, "abababab");
@@ -1910,8 +2069,8 @@ mod tests {
     /// `a{3,5}` — bounded min>0 range.
     #[test]
     fn test_bounded_range() {
-        let p = "a{3,5}";
-        let re = build_regex(p, 304);
+        let p = "^a{3,5}$";
+        let re = build_regex(p, 400);
         assert_matches_regex_crate(p, &re, "aaa");
         assert_matches_regex_crate(p, &re, "aaaa");
         assert_matches_regex_crate(p, &re, "aaaaa");
@@ -1928,8 +2087,8 @@ mod tests {
     /// `a{3,3}` — exact repetition.
     #[test]
     fn test_exact_repetition() {
-        let p = "a{3,3}";
-        let re = build_regex(p, 304);
+        let p = "^a{3,3}$";
+        let re = build_regex(p, 400);
         assert_matches_regex_crate(p, &re, "aaa");
         // negatives
         assert_matches_regex_crate(p, &re, "");
@@ -1946,8 +2105,8 @@ mod tests {
     /// `[a-c]` — a small contiguous byte range (Class::Bytes).
     #[test]
     fn test_byte_class_range() {
-        let p = "[a-c]";
-        let re = build_regex(p, 408);
+        let p = "^[a-c]$";
+        let re = build_regex(p, 504);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "b");
@@ -1959,8 +2118,8 @@ mod tests {
     /// `[a-c]+` — one-or-more of a byte class.
     #[test]
     fn test_byte_class_one_plus() {
-        let p = "[a-c]+";
-        let re = build_regex(p, 456);
+        let p = "^[a-c]+$";
+        let re = build_regex(p, 552);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "abc");
@@ -1972,8 +2131,8 @@ mod tests {
     /// `[a-c]{2,3}` — counted repetition of a byte class.
     #[test]
     fn test_byte_class_counted() {
-        let p = "[a-c]{2,3}";
-        let re = build_regex(p, 560);
+        let p = "^[a-c]{2,3}$";
+        let re = build_regex(p, 656);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -1986,8 +2145,8 @@ mod tests {
     /// `[ax]` — disjoint single bytes (multi-range Class::Bytes).
     #[test]
     fn test_byte_class_disjoint() {
-        let p = "[ax]";
-        let re = build_regex(p, 408);
+        let p = "^[ax]$";
+        let re = build_regex(p, 504);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "x");
@@ -1998,8 +2157,8 @@ mod tests {
     /// `[a-cx-z]+` — multiple disjoint ranges in a byte class.
     #[test]
     fn test_byte_class_multi_range() {
-        let p = "[a-cx-z]+";
-        let re = build_regex(p, 456);
+        let p = "^[a-cx-z]+$";
+        let re = build_regex(p, 552);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "x");
@@ -2012,8 +2171,8 @@ mod tests {
     /// `[a-c].*[x-z]` — byte classes mixed with wildcard.
     #[test]
     fn test_byte_class_with_wildcard() {
-        let p = "[a-c].*[x-z]";
-        let re = build_regex(p, 1064);
+        let p = "^[a-c].*[x-z]$";
+        let re = build_regex(p, 1160);
         assert_matches_regex_crate(p, &re, "ax");
         assert_matches_regex_crate(p, &re, "a123z");
         assert_matches_regex_crate(p, &re, "bx");
@@ -2027,8 +2186,8 @@ mod tests {
     /// `\d` — matches a single ASCII digit.
     #[test]
     fn test_digit() {
-        let p = r"\d";
-        let re = build_regex(p, 408);
+        let p = r"^\d$";
+        let re = build_regex(p, 504);
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "5");
         assert_matches_regex_crate(p, &re, "9");
@@ -2044,8 +2203,8 @@ mod tests {
     /// `\d+` — one-or-more digits.
     #[test]
     fn test_digit_plus() {
-        let p = r"\d+";
-        let re = build_regex(p, 456);
+        let p = r"^\d+$";
+        let re = build_regex(p, 552);
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "42");
         assert_matches_regex_crate(p, &re, "999");
@@ -2061,8 +2220,8 @@ mod tests {
     /// `\d{3,5}` — counted digit repetition.
     #[test]
     fn test_digit_counted() {
-        let p = r"\d{3,5}";
-        let re = build_regex(p, 560);
+        let p = r"^\d{3,5}$";
+        let re = build_regex(p, 656);
         assert_matches_regex_crate(p, &re, "123");
         assert_matches_regex_crate(p, &re, "1234");
         assert_matches_regex_crate(p, &re, "12345");
@@ -2078,8 +2237,8 @@ mod tests {
     /// `\D` — matches a single non-digit byte.
     #[test]
     fn test_non_digit() {
-        let p = r"\D";
-        let re = build_regex(p, 408);
+        let p = r"^\D$";
+        let re = build_regex(p, 504);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "z");
         assert_matches_regex_crate(p, &re, " ");
@@ -2095,8 +2254,8 @@ mod tests {
     /// `\D+` — one-or-more non-digits.
     #[test]
     fn test_non_digit_plus() {
-        let p = r"\D+";
-        let re = build_regex(p, 456);
+        let p = r"^\D+$";
+        let re = build_regex(p, 552);
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "hello world");
         assert_matches_regex_crate(p, &re, "!@#");
@@ -2110,8 +2269,8 @@ mod tests {
     /// `\s` — matches a single ASCII whitespace byte.
     #[test]
     fn test_space() {
-        let p = r"\s";
-        let re = build_regex(p, 408);
+        let p = r"^\s$";
+        let re = build_regex(p, 504);
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "\t");
         assert_matches_regex_crate(p, &re, "\n");
@@ -2126,8 +2285,8 @@ mod tests {
     /// `\s+` — one-or-more whitespace.
     #[test]
     fn test_space_plus() {
-        let p = r"\s+";
-        let re = build_regex(p, 456);
+        let p = r"^\s+$";
+        let re = build_regex(p, 552);
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "   ");
         assert_matches_regex_crate(p, &re, " \t\n\r");
@@ -2141,8 +2300,8 @@ mod tests {
     /// `\S` — matches a single non-whitespace byte.
     #[test]
     fn test_non_space() {
-        let p = r"\S";
-        let re = build_regex(p, 408);
+        let p = r"^\S$";
+        let re = build_regex(p, 504);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "!");
@@ -2157,8 +2316,8 @@ mod tests {
     /// `\S+` — one-or-more non-whitespace.
     #[test]
     fn test_non_space_plus() {
-        let p = r"\S+";
-        let re = build_regex(p, 456);
+        let p = r"^\S+$";
+        let re = build_regex(p, 552);
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "123");
         assert_matches_regex_crate(p, &re, "a1!");
@@ -2172,8 +2331,8 @@ mod tests {
     /// `\w` — matches a single ASCII word byte (`[0-9A-Za-z_]`).
     #[test]
     fn test_word() {
-        let p = r"\w";
-        let re = build_regex(p, 408);
+        let p = r"^\w$";
+        let re = build_regex(p, 504);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "Z");
         assert_matches_regex_crate(p, &re, "0");
@@ -2190,8 +2349,8 @@ mod tests {
     /// `\w+` — one-or-more word bytes.
     #[test]
     fn test_word_plus() {
-        let p = r"\w+";
-        let re = build_regex(p, 456);
+        let p = r"^\w+$";
+        let re = build_regex(p, 552);
         assert_matches_regex_crate(p, &re, "hello");
         assert_matches_regex_crate(p, &re, "foo_bar");
         assert_matches_regex_crate(p, &re, "x123");
@@ -2206,8 +2365,8 @@ mod tests {
     /// `\w{2,4}` — counted word repetition.
     #[test]
     fn test_word_counted() {
-        let p = r"\w{2,4}";
-        let re = build_regex(p, 560);
+        let p = r"^\w{2,4}$";
+        let re = build_regex(p, 656);
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "a1_Z");
@@ -2222,8 +2381,8 @@ mod tests {
     /// `\W` — matches a single non-word byte.
     #[test]
     fn test_non_word() {
-        let p = r"\W";
-        let re = build_regex(p, 408);
+        let p = r"^\W$";
+        let re = build_regex(p, 504);
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "!");
         assert_matches_regex_crate(p, &re, "-");
@@ -2239,8 +2398,8 @@ mod tests {
     /// `\W+` — one-or-more non-word bytes.
     #[test]
     fn test_non_word_plus() {
-        let p = r"\W+";
-        let re = build_regex(p, 456);
+        let p = r"^\W+$";
+        let re = build_regex(p, 552);
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "!@#");
         assert_matches_regex_crate(p, &re, " - ");
@@ -2255,8 +2414,8 @@ mod tests {
     /// `\d+\s+\w+` — mixed predefined classes in concatenation.
     #[test]
     fn test_predefined_mixed() {
-        let p = r"\d+\s+\w+";
-        let re = build_regex(p, 1160);
+        let p = r"^\d+\s+\w+$";
+        let re = build_regex(p, 1256);
         assert_matches_regex_crate(p, &re, "42 hello");
         assert_matches_regex_crate(p, &re, "0\tfoo");
         assert_matches_regex_crate(p, &re, "123  x");
@@ -2289,8 +2448,8 @@ mod tests {
     /// the memory is the same as `\d` plus one extra `ByteClass` state.
     #[test]
     fn test_dedup_same_class() {
-        let one = build_regex_unchecked(r"\d");
-        let two = build_regex_unchecked(r"\d\d");
+        let one = build_regex_unchecked(r"^\d$");
+        let two = build_regex_unchecked(r"^\d\d$");
         // The second `\d` adds one ByteClass state but no extra class
         // table — so the difference is exactly one state.
         let state_size = std::mem::size_of::<State>();
@@ -2307,8 +2466,8 @@ mod tests {
     /// concatenated as `[0-9]\d`, only one table should be stored.
     #[test]
     fn test_dedup_different_representation() {
-        let digit_only = build_regex_unchecked(r"\d\d");
-        let mixed = build_regex_unchecked(r"[0-9]\d");
+        let digit_only = build_regex_unchecked(r"^\d\d$");
+        let mixed = build_regex_unchecked(r"^[0-9]\d$");
         assert_eq!(
             digit_only.memory_size(),
             mixed.memory_size(),
@@ -2316,52 +2475,52 @@ mod tests {
         );
         assert_eq!(mixed.classes.len(), 1);
         // Also verify correctness.
-        assert_matches_regex_crate(r"[0-9]\d", &mixed, "42");
-        assert_matches_regex_crate(r"[0-9]\d", &mixed, "00");
-        assert_matches_regex_crate(r"[0-9]\d", &mixed, "");
-        assert_matches_regex_crate(r"[0-9]\d", &mixed, "a1");
-        assert_matches_regex_crate(r"[0-9]\d", &mixed, "1a");
-        assert_matches_regex_crate(r"[0-9]\d", &mixed, "1");
-        assert_matches_regex_crate(r"[0-9]\d", &mixed, "123");
+        assert_matches_regex_crate(r"^[0-9]\d$", &mixed, "42");
+        assert_matches_regex_crate(r"^[0-9]\d$", &mixed, "00");
+        assert_matches_regex_crate(r"^[0-9]\d$", &mixed, "");
+        assert_matches_regex_crate(r"^[0-9]\d$", &mixed, "a1");
+        assert_matches_regex_crate(r"^[0-9]\d$", &mixed, "1a");
+        assert_matches_regex_crate(r"^[0-9]\d$", &mixed, "1");
+        assert_matches_regex_crate(r"^[0-9]\d$", &mixed, "123");
     }
 
     /// `\w` and `[0-9A-Za-z_]` should produce the same table and dedup.
     #[test]
     fn test_dedup_word_explicit_range() {
-        let shorthand = build_regex_unchecked(r"\w\w");
-        let explicit = build_regex_unchecked(r"[0-9A-Za-z_]\w");
+        let shorthand = build_regex_unchecked(r"^\w\w$");
+        let explicit = build_regex_unchecked(r"^[0-9A-Za-z_]\w$");
         assert_eq!(
             shorthand.memory_size(),
             explicit.memory_size(),
             "[0-9A-Za-z_]\\w should dedup to same table as \\w\\w",
         );
         assert_eq!(explicit.classes.len(), 1);
-        assert_matches_regex_crate(r"[0-9A-Za-z_]\w", &explicit, "aZ");
-        assert_matches_regex_crate(r"[0-9A-Za-z_]\w", &explicit, "_0");
-        assert_matches_regex_crate(r"[0-9A-Za-z_]\w", &explicit, "!a");
+        assert_matches_regex_crate(r"^[0-9A-Za-z_]\w$", &explicit, "aZ");
+        assert_matches_regex_crate(r"^[0-9A-Za-z_]\w$", &explicit, "_0");
+        assert_matches_regex_crate(r"^[0-9A-Za-z_]\w$", &explicit, "!a");
     }
 
     /// `\s` and `[\t\n\x0B\x0C\r ]` should produce the same table.
     #[test]
     fn test_dedup_space_explicit_range() {
-        let shorthand = build_regex_unchecked(r"\s\s");
-        let explicit = build_regex_unchecked(r"[\t\n\x0B\x0C\r ]\s");
+        let shorthand = build_regex_unchecked(r"^\s\s$");
+        let explicit = build_regex_unchecked(r"^[\t\n\x0B\x0C\r ]\s$");
         assert_eq!(
             shorthand.memory_size(),
             explicit.memory_size(),
             "explicit whitespace class should dedup with \\s",
         );
         assert_eq!(explicit.classes.len(), 1);
-        assert_matches_regex_crate(r"[\t\n\x0B\x0C\r ]\s", &explicit, " \t");
-        assert_matches_regex_crate(r"[\t\n\x0B\x0C\r ]\s", &explicit, "a ");
+        assert_matches_regex_crate(r"^[\t\n\x0B\x0C\r ]\s$", &explicit, " \t");
+        assert_matches_regex_crate(r"^[\t\n\x0B\x0C\r ]\s$", &explicit, "a ");
     }
 
     /// `.*.*` — two wildcards produce the same `[true; 256]` table and
     /// should be deduplicated to a single class.
     #[test]
     fn test_dedup_wildcard() {
-        let one_wild = build_regex_unchecked(".");
-        let two_wild = build_regex_unchecked("..");
+        let one_wild = build_regex_unchecked("^.$");
+        let two_wild = build_regex_unchecked("^..$");
         let state_size = std::mem::size_of::<State>();
         assert_eq!(
             two_wild.memory_size() - one_wild.memory_size(),
@@ -2376,8 +2535,8 @@ mod tests {
     /// must be stored.  This is a negative dedup test.
     #[test]
     fn test_no_dedup_complementary() {
-        let same = build_regex_unchecked(r"\d\d");
-        let comp = build_regex_unchecked(r"\d\D");
+        let same = build_regex_unchecked(r"^\d\d$");
+        let comp = build_regex_unchecked(r"^\d\D$");
         // \d\D has two distinct tables; \d\d has one.
         let class_size = std::mem::size_of::<[bool; 256]>();
         assert_eq!(
@@ -2393,8 +2552,8 @@ mod tests {
     /// that all refer to the same class.  Only one table is stored.
     #[test]
     fn test_dedup_counted_repetition() {
-        let single = build_regex_unchecked(r"\d");
-        let counted = build_regex_unchecked(r"\d{3,5}");
+        let single = build_regex_unchecked(r"^\d$");
+        let counted = build_regex_unchecked(r"^\d{3,5}$");
         // The counted version has more states (counter machinery) but
         // should still have exactly one class table, same as the single.
         assert_eq!(
@@ -2407,5 +2566,276 @@ mod tests {
             1,
             "\\d{{3,5}} should still have exactly 1 class table (deduped)",
         );
+    }
+
+    // -- Partial anchor tests -----------------------------------------------
+
+    /// `^abc` — start-anchored only.  Matches strings that start with
+    /// "abc", regardless of what follows.
+    #[test]
+    fn test_anchor_start_only() {
+        let p = "^abc";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "abcdef");
+        assert_matches_regex_crate(p, &re, "abc123");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "xabc");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "abd");
+        assert_matches_regex_crate(p, &re, "zabc");
+    }
+
+    /// `abc$` — end-anchored only.  Matches strings that end with "abc",
+    /// regardless of what precedes.
+    #[test]
+    fn test_anchor_end_only() {
+        let p = "abc$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "xabc");
+        assert_matches_regex_crate(p, &re, "123abc");
+        assert_matches_regex_crate(p, &re, "xxabc");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "abcx");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "abcabd");
+    }
+
+    /// `abc` — fully unanchored.  Matches any string containing "abc".
+    #[test]
+    fn test_unanchored_literal() {
+        let p = "abc";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "xabc");
+        assert_matches_regex_crate(p, &re, "abcx");
+        assert_matches_regex_crate(p, &re, "xabcx");
+        assert_matches_regex_crate(p, &re, "xxabcxx");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "abd");
+        assert_matches_regex_crate(p, &re, "axbc");
+        assert_matches_regex_crate(p, &re, "bca");
+    }
+
+    /// `^a.b` — start-anchored with wildcard.
+    #[test]
+    fn test_anchor_start_wildcard() {
+        let p = "^a.b";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "axb");
+        assert_matches_regex_crate(p, &re, "axbyyy");
+        assert_matches_regex_crate(p, &re, "a1b");
+        // negatives
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "yaxb");
+        assert_matches_regex_crate(p, &re, "");
+    }
+
+    /// `a.b$` — end-anchored with wildcard.
+    #[test]
+    fn test_anchor_end_wildcard() {
+        let p = "a.b$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "axb");
+        assert_matches_regex_crate(p, &re, "yyyaxb");
+        assert_matches_regex_crate(p, &re, "a1b");
+        // negatives
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "axby");
+        assert_matches_regex_crate(p, &re, "");
+    }
+
+    /// `^a+b+$` — anchored with quantifiers (non-counter).
+    #[test]
+    fn test_both_anchors_quantifiers() {
+        let p = "^a+b+$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "aab");
+        assert_matches_regex_crate(p, &re, "abb");
+        assert_matches_regex_crate(p, &re, "aabb");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "ba");
+        assert_matches_regex_crate(p, &re, "xab");
+        assert_matches_regex_crate(p, &re, "abx");
+    }
+
+    /// `a+b+` — unanchored with quantifiers (non-counter).
+    #[test]
+    fn test_unanchored_quantifiers() {
+        let p = "a+b+";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "aab");
+        assert_matches_regex_crate(p, &re, "abb");
+        assert_matches_regex_crate(p, &re, "xab");
+        assert_matches_regex_crate(p, &re, "xaabb");
+        assert_matches_regex_crate(p, &re, "abx");
+        assert_matches_regex_crate(p, &re, "xabx");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "ba");
+        assert_matches_regex_crate(p, &re, "xyz");
+    }
+
+    /// `^a+` — start-anchored with one-or-more.
+    #[test]
+    fn test_anchor_start_one_plus() {
+        let p = "^a+";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "aab");
+        assert_matches_regex_crate(p, &re, "abc");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "ba");
+        assert_matches_regex_crate(p, &re, "baa");
+    }
+
+    /// `a+$` — end-anchored with one-or-more.
+    #[test]
+    fn test_anchor_end_one_plus() {
+        let p = "a+$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "ba");
+        assert_matches_regex_crate(p, &re, "baa");
+        assert_matches_regex_crate(p, &re, "xxa");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "aab");
+    }
+
+    /// `^$` — empty string, both anchors.
+    #[test]
+    fn test_anchors_empty() {
+        let p = "^$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "");
+        // negatives
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "ab");
+    }
+
+    /// `^` — start anchor only, matches any string.
+    #[test]
+    fn test_anchor_start_bare() {
+        let p = "^";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "abc");
+    }
+
+    /// `$` — end anchor only, matches any string.
+    #[test]
+    fn test_anchor_end_bare() {
+        let p = "$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "abc");
+    }
+
+    /// `(a|b)` — unanchored alternation, matches any string containing
+    /// 'a' or 'b'.
+    #[test]
+    fn test_unanchored_alternation() {
+        let p = "(a|b)";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "xa");
+        assert_matches_regex_crate(p, &re, "bx");
+        assert_matches_regex_crate(p, &re, "xax");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "c");
+        assert_matches_regex_crate(p, &re, "xyz");
+    }
+
+    /// `a*b` — unanchored star-then-literal.
+    #[test]
+    fn test_unanchored_star_literal() {
+        let p = "a*b";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "aab");
+        assert_matches_regex_crate(p, &re, "xb");
+        assert_matches_regex_crate(p, &re, "xab");
+        assert_matches_regex_crate(p, &re, "bx");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "xyz");
+    }
+
+    /// `a|^b` — anchor inside an alternation arm.  Matches any string
+    /// containing `a` (unanchored), OR any string starting with `b`.
+    #[test]
+    fn test_anchor_in_alternation_start() {
+        let p = "a|^b";
+        let re = build_regex_unchecked(p);
+        // positives via the `a` arm (unanchored)
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "xa");
+        assert_matches_regex_crate(p, &re, "ax");
+        assert_matches_regex_crate(p, &re, "xax");
+        // positives via the `^b` arm
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "bx");
+        assert_matches_regex_crate(p, &re, "bxx");
+        // positives via both arms
+        assert_matches_regex_crate(p, &re, "ba");
+        assert_matches_regex_crate(p, &re, "ab");
+        // negatives: no `a` and doesn't start with `b`
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "c");
+        assert_matches_regex_crate(p, &re, "xb");
+        assert_matches_regex_crate(p, &re, "xbx");
+        assert_matches_regex_crate(p, &re, "xyz");
+    }
+
+    /// `a$|b` — anchor inside an alternation arm.  Matches any string
+    /// ending with `a`, OR any string containing `b` (unanchored).
+    #[test]
+    fn test_anchor_in_alternation_end() {
+        let p = "a$|b";
+        let re = build_regex_unchecked(p);
+        // positives via the `a$` arm
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "xa");
+        assert_matches_regex_crate(p, &re, "xxa");
+        // positives via the `b` arm (unanchored)
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "xb");
+        assert_matches_regex_crate(p, &re, "bx");
+        assert_matches_regex_crate(p, &re, "xbx");
+        // positives via both arms
+        assert_matches_regex_crate(p, &re, "ba");
+        assert_matches_regex_crate(p, &re, "ab");
+        // negatives: doesn't end with `a` and no `b`
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "c");
+        assert_matches_regex_crate(p, &re, "ax");
+        assert_matches_regex_crate(p, &re, "xax");
+        assert_matches_regex_crate(p, &re, "xyz");
     }
 }
