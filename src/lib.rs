@@ -1163,20 +1163,43 @@ mod tests {
     ///
     /// The `regex` crate is used in byte mode (`regex::bytes::Regex`) so
     /// that `.` matches any byte, consistent with our engine.
+    ///
+    /// Two independent matcher runs are exercised using the same
+    /// [`MatcherMemory`]:
+    /// 1. **chunk** — feeds the entire input at once via [`Matcher::chunk`].
+    /// 2. **step-by-step** — feeds bytes one at a time via [`Matcher::step`].
+    ///
+    /// Both results are compared against the `regex` crate oracle.
     fn assert_matches_regex_crate(pattern: &str, regex: &Regex, input: &str) {
         let anchored = format!("^(?s-u)(?:{})$", pattern);
         let re = regex::bytes::Regex::new(&anchored).expect("regex crate should parse pattern");
         let expected = re.is_match(input.as_bytes());
 
+        // Path 1: feed the whole input via chunk().
         let mut memory = MatcherMemory::default();
         let mut matcher = memory.matcher(regex);
         matcher.chunk(input.as_bytes());
-        let actual = matcher.ismatch();
+        let actual_chunk = matcher.ismatch();
 
         assert_eq!(
-            actual, expected,
-            "mismatch for pattern `{}` on input {:?}: ours={}, regex crate={}",
-            pattern, input, actual, expected
+            actual_chunk, expected,
+            "chunk mismatch for pattern `{}` on input {:?}: ours={}, regex crate={}",
+            pattern, input, actual_chunk, expected
+        );
+
+        // Path 2: feed bytes one at a time via step().
+        // Re-use the same MatcherMemory — matcher() resets all state.
+        drop(matcher);
+        let mut matcher = memory.matcher(regex);
+        for &b in input.as_bytes() {
+            matcher.step(b);
+        }
+        let actual_step = matcher.ismatch();
+
+        assert_eq!(
+            actual_step, expected,
+            "step-by-step mismatch for pattern `{}` on input {:?}: ours={}, regex crate={}",
+            pattern, input, actual_step, expected
         );
     }
 
