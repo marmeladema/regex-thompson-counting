@@ -2130,46 +2130,36 @@ impl<'a> Matcher<'a> {
             counter.incremented = false;
         }
 
-        // --- Pre-mark pass: stamp body_alive_gen on counters whose
-        // loop body contains a consuming state that matches byte `b`.
-        // This tells `addcounter` which counters have a legitimate
-        // thread consuming the current byte vs. stale phantom instances.
-        for &idx in &clist {
-            let matches = match self.states[idx] {
-                State::Byte { byte: b2, .. } => b == b2,
-                State::ByteClass { class, .. } => self.classes[class][b],
-                State::ByteTable { table } => self.byte_tables[table][b] != StateIdx::NONE,
-                _ => false,
-            };
-            if matches {
-                for &ci in &self.body_counter_map[idx.raw()] {
-                    if let Some(counter) = self.counters[ci].as_mut() {
-                        counter.body_alive_gen = self.listid;
-                    }
-                }
-            }
-        }
+        // Single fused pass: iterate clist in reverse, stamping
+        // body_alive_gen on counters and pushing Visit ops.  Reverse
+        // iteration ensures that after LIFO drain the ops execute in
+        // original clist order.  The re-seed Visit(start) is pushed
+        // first so it runs last.
+        self.addstack.clear();
+        self.addstack.push(AddStateOp::Visit(self.start));
 
-        for &idx in &clist {
-            match self.states[idx] {
-                State::Byte { byte: b2, out } if b == b2 => self.addstate(out),
-                State::ByteClass { class, out } if self.classes[class][b] => self.addstate(out),
+        for &idx in clist.iter().rev() {
+            let target = match self.states[idx] {
+                State::Byte { byte: b2, out } if b == b2 => out,
+                State::ByteClass { class, out } if self.classes[class][b] => out,
                 State::ByteTable { table } => {
-                    let target = self.byte_tables[table][b];
-                    if target != StateIdx::NONE {
-                        self.addstate(target);
+                    let t = self.byte_tables[table][b];
+                    if t == StateIdx::NONE {
+                        continue;
                     }
+                    t
                 }
-                _ => {}
+                _ => continue,
+            };
+            for &ci in &self.body_counter_map[idx.raw()] {
+                if let Some(counter) = self.counters[ci].as_mut() {
+                    counter.body_alive_gen = self.listid;
+                }
             }
+            self.addstack.push(AddStateOp::Visit(target));
         }
 
-        // Re-seed the start state so the pattern can match starting at
-        // the next position.  For `^`-anchored patterns this is harmless:
-        // the start state is `AssertStart`, and `at_start` is false, so
-        // `addstate` will record it but not follow `out`.
-        let start = self.start;
-        self.addstate(start);
+        self.drain_addstack();
 
         *self.clist = std::mem::replace(self.nlist, clist);
         self.listid += 1;
