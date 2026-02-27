@@ -1283,8 +1283,49 @@ impl RegexBuilder {
     /// contain it.  This is the compile-time component of the stale
     /// Becchi-counter fix.
     ///
-    /// Algorithm: for each `CounterIncrement` state at index `ci`, BFS
-    /// forward from `ci.out` (the "continue" edge, i.e. the loop body
+    /// # The stale-instance problem
+    ///
+    /// The Becchi multi-instance counter model assumes all instances
+    /// belong to the same logical match attempt and count in lockstep.
+    /// This breaks when multiple independent threads enter the same
+    /// counted sub-expression from different input positions, because
+    /// `inccounter` increments ALL instances — including ones left
+    /// behind by threads that already died.
+    ///
+    /// This happens whenever the NFA can enter the counted pattern at
+    /// every position.  The most obvious case is unanchored matching
+    /// (re-seeding the start state at each step), but prepending `.*`
+    /// and anchoring would not help either: in a Thompson NFA, the
+    /// `.*` loop spawns a new thread into the counted pattern at every
+    /// position — it is functionally equivalent to re-seeding.
+    ///
+    /// Example: `\w{3,5}` on `"x y z"` (no 3+ consecutive word chars):
+    ///
+    /// - Position 0 (`x`): CounterInstance fires, instance pushed,
+    ///   value = 1.
+    /// - Position 1 (` `): no `\w` match — the thread that consumed
+    ///   `x` dies.  But the counter instance persists.
+    /// - Position 2 (`y`): re-seed enters CounterInstance again and
+    ///   pushes a new instance.  `inccounter` increments BOTH: the
+    ///   stale instance (from `x`) reaches 2, the new one reaches 1.
+    /// - Position 4 (`z`): same thing — stale instance reaches 3,
+    ///   hits `min=3`, spurious match.
+    ///
+    /// # The fix
+    ///
+    /// At compile time, this method records which counters' loop bodies
+    /// contain each consuming state.  At runtime, a pre-mark pass in
+    /// [`Matcher::step`] checks which consuming states in `clist`
+    /// actually match the current byte and stamps `body_alive_gen` on
+    /// their counters.  Then [`Matcher::addcounter`] uses this stamp
+    /// to distinguish legitimate new instances from stale ones: if no
+    /// consuming state in the counter's body matched, the existing
+    /// instances are from dead threads and get freed.
+    ///
+    /// # Algorithm
+    ///
+    /// For each `CounterIncrement` state at index `ci`, BFS forward
+    /// from `ci.out` (the "continue" edge, i.e. the loop body
     /// re-entry) collecting every consuming state (`Byte`, `ByteClass`,
     /// `ByteTable`) reachable before returning to `ci`.  Each such
     /// consuming state records the counter index associated with `ci`.
