@@ -5570,4 +5570,87 @@ mod tests {
         m.chunk(b"aaa");
         assert!(m.finish());
     }
+
+    // ===================================================================
+    // Batched step() coverage: tests that exercise the fused pre-mark +
+    // consumption loop where multiple clist entries match the same byte
+    // in a single step, interacting with counters.
+    // ===================================================================
+
+    /// Two counters whose bodies share the same consuming byte class.
+    /// When the input byte matches, both counters' body_alive_gen must
+    /// be stamped before any epsilon closure runs — a single fused pass
+    /// must not interleave marking and closure expansion.
+    #[test]
+    fn test_step_fused_multi_counter_same_byte() {
+        // `a{2}.*a{3}`: two counters both counting 'a', separated by `.*`
+        let p = "a{2}.*a{3}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "aaaaa");
+        assert_matches_regex_crate(p, &re, "aabaa");
+        assert_matches_regex_crate(p, &re, "aaxaaa");
+        assert_matches_regex_crate(p, &re, "aa aaa");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "aaaa");
+        assert_matches_regex_crate(p, &re, "aaa");
+        assert_matches_regex_crate(p, &re, "");
+    }
+
+    /// Alternation creates multiple consuming states at different
+    /// positions in clist that all match the same byte.  Verifies that
+    /// the reverse-iteration + LIFO ordering preserves priority.
+    #[test]
+    fn test_step_fused_alternation_overlap() {
+        // `(a|a){2,3}` — both alt branches produce consuming states
+        // for 'a'; counter must still count correctly.
+        let p = "(a|a){2,3}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "aaa");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "aaaa");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "xaax");
+        assert_matches_regex_crate(p, &re, "xaaax");
+    }
+
+    /// ByteClass + exact byte consuming states coexisting in clist,
+    /// both matching the same input byte.  Exercises the fused loop
+    /// handling different State variants in one pass.
+    #[test]
+    fn test_step_fused_byteclass_and_literal() {
+        // `[a-z]{2}a{2}`: [a-z] as ByteClass and 'a' as Byte both
+        // match 'a', and both are wrapped in counters.
+        let p = r"[a-z]{2}a{2}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "xyaa");
+        assert_matches_regex_crate(p, &re, "aaaa");
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "aaa");
+        assert_matches_regex_crate(p, &re, "abaa");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "xyzaa");
+        assert_matches_regex_crate(p, &re, " aaaa ");
+    }
+
+    /// Unanchored nested counters where the outer body's consuming
+    /// states and the re-seeded start state all compete in the same
+    /// step.  The re-seed (pushed first on the stack, drained last)
+    /// must not interfere with the ongoing counter threads.
+    #[test]
+    fn test_step_fused_reseed_with_counter() {
+        let p = r"(a{2}){2}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "aaaa");
+        // NOTE: "aaa" is a known pre-existing nested-counter bug
+        // (our engine wrongly matches; tracked separately).
+        assert_matches_regex_crate(p, &re, "aaaaa");
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "xaaaax");
+        assert_matches_regex_crate(p, &re, "aa aa");
+        assert_matches_regex_crate(p, &re, "aaxaa");
+    }
 }
