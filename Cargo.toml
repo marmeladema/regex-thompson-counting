@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[[bin]]
+name = "rethoc"
+path = "src/main.rs"
+
 [dev-dependencies]
 itertools = "0.10"
 regex = "1"
