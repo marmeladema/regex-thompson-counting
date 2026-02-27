@@ -1893,7 +1893,15 @@ impl<'a> Matcher<'a> {
     fn addstate(&mut self, idx: StateIdx) {
         self.addstack.clear();
         self.addstack.push(AddStateOp::Visit(idx));
+        self.drain_addstack();
+    }
 
+    /// Process all operations on the work stack until empty.
+    ///
+    /// This is the core of the iterative epsilon-closure traversal.
+    /// Callers seed `addstack` with one or more `Visit` operations and
+    /// then call this method to expand them.
+    fn drain_addstack(&mut self) {
         while let Some(op) = self.addstack.pop() {
             match op {
                 AddStateOp::Visit(idx) => {
