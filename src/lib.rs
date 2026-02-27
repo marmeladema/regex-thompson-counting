@@ -317,6 +317,17 @@ enum State {
     /// Followed in `addstate` only when `at_end` is true.
     AssertEnd { out: StateIdx },
 
+    /// Zero-width assertion: matches at start of any line (`(?m:^)`).
+    /// Fires when `at_start` is true OR `prev_byte == Some(b'\n')`.
+    /// Fully resolved in `addstate` (depends only on past context).
+    AssertStartLF { out: StateIdx },
+
+    /// Zero-width assertion: matches at end of any line (`(?m:$)`).
+    /// Fires when `at_end` is true OR the upcoming byte is `b'\n'`.
+    /// **Deferred** in `addstate` when `!at_end`: the state is parked
+    /// in the list and resolved by a pre-consumption pass in `step()`.
+    AssertEndLF { out: StateIdx },
+
     /// Accepting state.
     Match,
 }
@@ -330,7 +341,9 @@ impl State {
             | State::ByteClass { out, .. }
             | State::CounterInstance { out, .. }
             | State::AssertStart { out }
-            | State::AssertEnd { out } => *out,
+            | State::AssertEnd { out }
+            | State::AssertStartLF { out }
+            | State::AssertEndLF { out } => *out,
             State::Split { out1, .. } | State::CounterIncrement { out1, .. } => *out1,
             _ => unreachable!(),
         }
@@ -343,7 +356,9 @@ impl State {
             | State::ByteClass { out, .. }
             | State::CounterInstance { out, .. }
             | State::AssertStart { out }
-            | State::AssertEnd { out } => *out = next,
+            | State::AssertEnd { out }
+            | State::AssertStartLF { out }
+            | State::AssertEndLF { out } => *out = next,
             State::Split { out1, .. } | State::CounterIncrement { out1, .. } => *out1 = next,
             _ => unreachable!(),
         }
@@ -457,6 +472,8 @@ enum RegexHirNode {
     },
     AssertStart,
     AssertEnd,
+    AssertStartLF,
+    AssertEndLF,
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +600,14 @@ impl Regex {
             State::AssertEnd { out } => {
                 stack.push(out);
                 writeln!(buffer, "\t{} -> {} [label=\"$\"];", idx, out).unwrap();
+            }
+            State::AssertStartLF { out } => {
+                stack.push(out);
+                writeln!(buffer, "\t{} -> {} [label=\"^LF\"];", idx, out).unwrap();
+            }
+            State::AssertEndLF { out } => {
+                stack.push(out);
+                writeln!(buffer, "\t{} -> {} [label=\"$LF\"];", idx, out).unwrap();
             }
             State::ByteTable { table } => {
                 let t = &self.byte_tables[table];
@@ -731,6 +756,14 @@ impl RegexBuilder {
             }
             HirKind::Look(hir::Look::End) => {
                 self.postfix.push(RegexHirNode::AssertEnd);
+                Ok(())
+            }
+            HirKind::Look(hir::Look::StartLF) => {
+                self.postfix.push(RegexHirNode::AssertStartLF);
+                Ok(())
+            }
+            HirKind::Look(hir::Look::EndLF) => {
+                self.postfix.push(RegexHirNode::AssertEndLF);
                 Ok(())
             }
             HirKind::Look(look) => Err(Error::UnsupportedLook(*look)),
@@ -885,7 +918,9 @@ impl RegexBuilder {
                 | State::ByteClass { out, .. }
                 | State::CounterInstance { out, .. }
                 | State::AssertStart { out }
-                | State::AssertEnd { out } => {
+                | State::AssertEnd { out }
+                | State::AssertStartLF { out }
+                | State::AssertEndLF { out } => {
                     let next = *out;
                     *out = idx;
                     next
@@ -1003,6 +1038,18 @@ impl RegexBuilder {
             }
             RegexHirNode::AssertEnd => {
                 let idx = self.state(State::AssertEnd {
+                    out: StateIdx::NONE,
+                });
+                Fragment::new(idx, idx)
+            }
+            RegexHirNode::AssertStartLF => {
+                let idx = self.state(State::AssertStartLF {
+                    out: StateIdx::NONE,
+                });
+                Fragment::new(idx, idx)
+            }
+            RegexHirNode::AssertEndLF => {
+                let idx = self.state(State::AssertEndLF {
                     out: StateIdx::NONE,
                 });
                 Fragment::new(idx, idx)
@@ -1372,6 +1419,7 @@ impl MatcherMemory {
             start: regex.start,
             at_start: true,
             at_end: false,
+            prev_byte: None,
             ever_matched: false,
         };
 
@@ -1415,11 +1463,15 @@ pub struct Matcher<'a> {
     /// (unanchored matching).
     start: StateIdx,
     /// `true` until the first [`step`](Self::step) call.  Controls
-    /// whether `AssertStart` states are followed in `addstate`.
+    /// whether `AssertStart` / `AssertStartLF` states are followed
+    /// in `addstate`.
     at_start: bool,
     /// Set to `true` by [`finish`](Self::finish); controls whether
-    /// `AssertEnd` states are followed in `addstate`.
+    /// `AssertEnd` / `AssertEndLF` states are followed in `addstate`.
     at_end: bool,
+    /// The last byte consumed by [`step`](Self::step), or `None` before
+    /// the first step.  Used by `AssertStartLF` to detect line boundaries.
+    prev_byte: Option<u8>,
     /// Tracks whether a `Match` state was ever reached in `clist`
     /// during the simulation (before `finish`).
     ever_matched: bool,
@@ -1550,6 +1602,23 @@ impl<'a> Matcher<'a> {
                 }
             }
 
+            State::AssertStartLF { out } => {
+                if self.at_start || self.prev_byte == Some(b'\n') {
+                    let out = *out;
+                    self.addstate(out);
+                }
+            }
+
+            State::AssertEndLF { out } => {
+                if self.at_end {
+                    let out = *out;
+                    self.addstate(out);
+                }
+                // When !at_end: NOT followed here.  The state is still
+                // pushed to nlist (below) and will be resolved by the
+                // pre-consumption pass in step() when b == '\n'.
+            }
+
             State::CounterInstance { out, counter } => {
                 let (out, counter) = (*out, *counter);
                 self.addcounter(counter);
@@ -1639,9 +1708,44 @@ impl<'a> Matcher<'a> {
     /// position; when `^` is present, the start state is `AssertStart`
     /// and `at_start=false` prevents it from being followed).
     pub fn step(&mut self, b: u8) {
+        // --- Pre-consumption: resolve deferred EndLF assertions ---
+        // When the upcoming byte is '\n', any `AssertEndLF` state parked
+        // in clist should fire (the assertion "end of line" is satisfied
+        // before the newline).  We expand their successors into clist
+        // using the same nlist-as-scratch pattern that finish() uses.
+        if b == b'\n' {
+            self.listid += 1;
+            for counter in self.counters.iter_mut().filter_map(|c| c.as_mut()) {
+                counter.incremented = false;
+            }
+            self.nlist.clear();
+            let clist_len = self.clist.len();
+            for i in 0..clist_len {
+                let idx = self.clist[i];
+                if let State::AssertEndLF { out } = self.states[idx] {
+                    self.addstate(out);
+                }
+            }
+            self.clist.append(self.nlist);
+
+            // The expansion may have reached Match (e.g. `(?m)abc$`
+            // followed by `\n`).  Record it now before the consumption
+            // loop discards clist.
+            if !self.ever_matched {
+                self.ever_matched = self.clist_has_match();
+            }
+        }
+
         // `at_start` is cleared before processing so that `^` cannot
         // match at any position other than the very beginning.
         self.at_start = false;
+
+        // Update prev_byte AFTER the pre-consumption EndLF pass (which
+        // needs the old prev_byte for any StartLF it encounters at the
+        // current position) but BEFORE consumption + re-seed (which
+        // produce states at the next position, where StartLF needs to
+        // see the byte just consumed).
+        self.prev_byte = Some(b);
 
         self.nlist.clear();
         let clist = std::mem::take(self.clist);
@@ -1709,13 +1813,14 @@ impl<'a> Matcher<'a> {
 
     /// Signal end-of-input and return the final match result.
     ///
-    /// This allows `$` (AssertEnd) states to fire: `at_end` is set to
-    /// `true` and any `AssertEnd` states currently in `clist` have their
-    /// `out` pointers followed through `addstate`.
+    /// This allows `$` (`AssertEnd`) and `(?m:$)` (`AssertEndLF`) states
+    /// to fire: `at_end` is set to `true` and any such states currently
+    /// in `clist` have their `out` pointers followed through `addstate`.
     ///
-    /// Only `AssertEnd` states are re-expanded — other states (counters,
-    /// splits, consuming states) were already fully epsilon-expanded when
-    /// they entered `clist` and must not be re-processed.
+    /// Only end-of-line/input assertion states are re-expanded — other
+    /// states (counters, splits, consuming states) were already fully
+    /// epsilon-expanded when they entered `clist` and must not be
+    /// re-processed.
     ///
     /// Consumes the matcher, since no further input can be fed after
     /// end-of-input has been signalled.
@@ -1738,12 +1843,17 @@ impl<'a> Matcher<'a> {
                 counter.incremented = false;
             }
 
-            // Follow the AssertEnd targets, building new states into nlist.
+            // Follow the AssertEnd / AssertEndLF targets, building new
+            // states into nlist.  (End-of-input satisfies both `$` and
+            // `(?m:$)`.)
             self.nlist.clear();
             for i in 0..clist_len {
                 let idx = self.clist[i];
-                if let State::AssertEnd { out } = self.states[idx] {
-                    self.addstate(out);
+                match self.states[idx] {
+                    State::AssertEnd { out } | State::AssertEndLF { out } => {
+                        self.addstate(out);
+                    }
+                    _ => {}
                 }
             }
 
@@ -2000,7 +2110,7 @@ mod tests {
         }
         c.push(&mut pool); // delta=3
         c.incr(); // delta=1
-        // value=6, instances: 6, 6-2=4, 4-3=1
+                  // value=6, instances: 6, 6-2=4, 4-3=1
         assert_eq!(collect_instance_values(&c, &pool), vec![6, 4, 1]);
 
         // Pop oldest (6).
@@ -2104,7 +2214,7 @@ mod tests {
         c.push(&mut pool); // saves delta=1
         assert!(!c.is_single());
         c.incr(); // value=3, delta=1
-        // Instances: 3, 2, 1.  Pop oldest (3) → value=2.
+                  // Instances: 3, 2, 1.  Pop oldest (3) → value=2.
         c.pop(&mut pool);
         assert!(!c.is_single());
         // Pop oldest (2) → value=1.
@@ -4307,5 +4417,164 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ax");
         assert_matches_regex_crate(p, &re, "xax");
         assert_matches_regex_crate(p, &re, "xyz");
+    }
+
+    // -------------------------------------------------------------------
+    // Multiline assertions: (?m:^) = StartLF, (?m:$) = EndLF
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_multiline_start_basic() {
+        let p = "(?m)^abc";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "abc\ndef");
+        assert_matches_regex_crate(p, &re, "xxx\nabc");
+        assert_matches_regex_crate(p, &re, "xxx\nabc\nyyy");
+        assert_matches_regex_crate(p, &re, "\nabc");
+        assert_matches_regex_crate(p, &re, "xabc"); // no match: not at line start
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "\n");
+    }
+
+    #[test]
+    fn test_multiline_end_basic() {
+        let p = "(?m)abc$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "abc\ndef");
+        assert_matches_regex_crate(p, &re, "xxx\nabc");
+        assert_matches_regex_crate(p, &re, "xxxabc\nyyy");
+        assert_matches_regex_crate(p, &re, "abc\n");
+        assert_matches_regex_crate(p, &re, "abcx"); // no match: not at line end
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "\n");
+    }
+
+    #[test]
+    fn test_multiline_both_anchors() {
+        let p = "(?m)^abc$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "abc\ndef");
+        assert_matches_regex_crate(p, &re, "def\nabc");
+        assert_matches_regex_crate(p, &re, "xxx\nabc\nyyy");
+        assert_matches_regex_crate(p, &re, "\nabc\n");
+        assert_matches_regex_crate(p, &re, "abc\n");
+        assert_matches_regex_crate(p, &re, "\nabc");
+        assert_matches_regex_crate(p, &re, "xabc"); // no match
+        assert_matches_regex_crate(p, &re, "abcx"); // no match
+        assert_matches_regex_crate(p, &re, "xabcx"); // no match
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "\n");
+        assert_matches_regex_crate(p, &re, "\n\n");
+    }
+
+    #[test]
+    fn test_multiline_multi_lines() {
+        // Pattern that matches "abc" on its own line somewhere in the input.
+        let p = "(?m)^abc$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc\ndef\nghi");
+        assert_matches_regex_crate(p, &re, "def\nabc\nghi");
+        assert_matches_regex_crate(p, &re, "def\nghi\nabc");
+        assert_matches_regex_crate(p, &re, "def\nghi\njkl"); // no match
+    }
+
+    #[test]
+    fn test_multiline_catenation_across_newline() {
+        // Pattern: line ending with abc, newline, line starting with def
+        let p = r"(?m)abc$\n^def";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc\ndef");
+        assert_matches_regex_crate(p, &re, "xxx\nabc\ndef\nyyy");
+        assert_matches_regex_crate(p, &re, "abc\nxef"); // no match
+        assert_matches_regex_crate(p, &re, "abcdef"); // no match
+    }
+
+    #[test]
+    fn test_multiline_with_dot_plus() {
+        let p = "(?m)^.+$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "abc\ndef");
+        assert_matches_regex_crate(p, &re, "\nabc");
+        assert_matches_regex_crate(p, &re, "abc\n");
+        assert_matches_regex_crate(p, &re, ""); // no match: .+ needs >=1 char
+        assert_matches_regex_crate(p, &re, "\n"); // no match: each line is empty
+        assert_matches_regex_crate(p, &re, "\n\n");
+    }
+
+    #[test]
+    fn test_multiline_with_counting() {
+        let p = r"(?m)^\d{2,4}$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "12");
+        assert_matches_regex_crate(p, &re, "123");
+        assert_matches_regex_crate(p, &re, "1234");
+        assert_matches_regex_crate(p, &re, "1"); // too short
+        assert_matches_regex_crate(p, &re, "12345"); // too long
+        assert_matches_regex_crate(p, &re, "xx\n12\nyy");
+        assert_matches_regex_crate(p, &re, "xx\n12345\nyy"); // no match on that line
+        assert_matches_regex_crate(p, &re, "xx\n1\nyy"); // too short
+        assert_matches_regex_crate(p, &re, "12\n1234\n12345");
+    }
+
+    #[test]
+    fn test_multiline_edge_cases_empty() {
+        // (?m)^$ matches any empty line (including empty input).
+        let p = "(?m)^$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "\n");
+        assert_matches_regex_crate(p, &re, "\n\n");
+        assert_matches_regex_crate(p, &re, "abc"); // no empty line
+        assert_matches_regex_crate(p, &re, "abc\n"); // empty line after trailing \n
+        assert_matches_regex_crate(p, &re, "\nabc"); // empty line before \n
+        assert_matches_regex_crate(p, &re, "abc\n\ndef"); // empty line between
+    }
+
+    #[test]
+    fn test_multiline_start_only_empty_lines() {
+        let p = "(?m)^";
+        let re = build_regex_unchecked(p);
+        // ^ in multiline always matches (every input has at least position 0).
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "\n");
+    }
+
+    #[test]
+    fn test_multiline_end_only() {
+        let p = "(?m)$";
+        let re = build_regex_unchecked(p);
+        // $ in multiline always matches.
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "\n");
+    }
+
+    #[test]
+    fn test_multiline_alternation() {
+        let p = "(?m)^(abc|def)$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "def");
+        assert_matches_regex_crate(p, &re, "abc\ndef");
+        assert_matches_regex_crate(p, &re, "ghi\nabc\njkl");
+        assert_matches_regex_crate(p, &re, "ghi\njkl"); // no match
+        assert_matches_regex_crate(p, &re, "abcdef"); // no match
+    }
+
+    #[test]
+    fn test_multiline_mixed_with_nonmultiline() {
+        // Non-multiline ^ and multiline $ in the same pattern.
+        // regex-syntax: ^ without (?m) = Look::Start, $ with (?m) = Look::EndLF
+        let p = "^abc(?m:$)";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "abc\ndef");
+        assert_matches_regex_crate(p, &re, "xabc"); // no match: ^ is not multiline
+        assert_matches_regex_crate(p, &re, "\nabc"); // no match: ^ is not multiline
     }
 }
