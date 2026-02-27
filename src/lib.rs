@@ -376,11 +376,7 @@ impl AssertKind {
                     Some(b'\n') => {
                         // Before \n: line end unless \r precedes (\r\n is
                         // a single line terminator; the end was before \r).
-                        if prev == Some(b'\r') {
-                            Fail
-                        } else {
-                            Pass
-                        }
+                        if prev == Some(b'\r') { Fail } else { Pass }
                     }
                     Some(_) => Fail,
                     None => Defer,
@@ -1550,9 +1546,6 @@ impl MatcherMemory {
         };
 
         m.startlist(m.start);
-        // Check if the initial epsilon closure already reached Match
-        // (e.g. for patterns like `^$`, `^`, `a?`, etc.).
-        m.ever_matched = m.clist_has_match();
         m
     }
 }
@@ -1795,8 +1788,12 @@ impl<'a> Matcher<'a> {
                 }
             }
 
-            // Byte, ByteClass, Match, or CounterIncrement whose guard
-            // failed — just record the state for step() to inspect.
+            State::Match => {
+                self.ever_matched = true;
+            }
+
+            // Byte, ByteClass, or CounterIncrement whose guard failed —
+            // just record the state for step() to inspect.
             _ => {}
         }
 
@@ -1834,9 +1831,7 @@ impl<'a> Matcher<'a> {
                         // Lazy init: bump listid + reset counters
                         // only when we actually have work to do.
                         self.listid += 1;
-                        for counter in
-                            self.counters.iter_mut().filter_map(|c| c.as_mut())
-                        {
+                        for counter in self.counters.iter_mut().filter_map(|c| c.as_mut()) {
                             counter.incremented = false;
                         }
                         self.nlist.clear();
@@ -1847,13 +1842,6 @@ impl<'a> Matcher<'a> {
             }
             if any_expanded {
                 self.clist.append(self.nlist);
-
-                // The expansion may have reached Match (e.g. `(?m)abc$`
-                // followed by `\n`).  Record it now before the consumption
-                // loop discards clist.
-                if !self.ever_matched {
-                    self.ever_matched = self.clist_has_match();
-                }
             }
         }
 
@@ -1901,11 +1889,6 @@ impl<'a> Matcher<'a> {
 
         *self.clist = std::mem::replace(self.nlist, clist);
         self.listid += 1;
-
-        // Track whether we ever reach Match during stepping.
-        if !self.ever_matched {
-            self.ever_matched = self.clist_has_match();
-        }
     }
 
     /// Feed an entire byte slice through the matcher, one byte at a time.
@@ -1915,21 +1898,15 @@ impl<'a> Matcher<'a> {
         }
     }
 
-    /// Check whether `clist` currently contains a `Match` state.
-    fn clist_has_match(&self) -> bool {
-        self.clist
-            .iter()
-            .any(|&idx| matches!(self.states[idx], State::Match))
-    }
-
     /// Check whether the matcher has reached an accepting state so far.
     ///
-    /// This returns `true` if a `Match` state is currently in `clist`
-    /// *or* was reached during any previous step.  It does **not**
-    /// signal end-of-input, so `$` assertions are not evaluated — use
+    /// This returns `true` if a `Match` state was reached during
+    /// [`start`](MatcherMemory::matcher) or any previous
+    /// [`step`](Self::step).  It does **not** signal end-of-input, so
+    /// `$` assertions are not evaluated — use
     /// [`finish`](Self::finish) for that.
     pub fn ismatch(&self) -> bool {
-        self.ever_matched || self.clist_has_match()
+        self.ever_matched
     }
 
     /// Signal end-of-input and return the final match result.
@@ -1971,8 +1948,7 @@ impl<'a> Matcher<'a> {
             for i in 0..clist_len {
                 let idx = self.clist[i];
                 if let State::Assert { kind, out } = self.states[idx]
-                    && kind.eval(self.at_start, true, self.prev_byte, None)
-                        == AssertEval::Pass
+                    && kind.eval(self.at_start, true, self.prev_byte, None) == AssertEval::Pass
                 {
                     self.addstate(out);
                 }
@@ -1982,8 +1958,8 @@ impl<'a> Matcher<'a> {
             self.clist.append(self.nlist);
         }
 
-        // ever_matched is known false here (early return above).
-        self.clist_has_match()
+        // ever_matched was set by addstate if Match was reached.
+        self.ever_matched
     }
 }
 
@@ -2231,7 +2207,7 @@ mod tests {
         }
         c.push(&mut pool); // delta=3
         c.incr(); // delta=1
-                  // value=6, instances: 6, 6-2=4, 4-3=1
+        // value=6, instances: 6, 6-2=4, 4-3=1
         assert_eq!(collect_instance_values(&c, &pool), vec![6, 4, 1]);
 
         // Pop oldest (6).
@@ -2335,7 +2311,7 @@ mod tests {
         c.push(&mut pool); // saves delta=1
         assert!(!c.is_single());
         c.incr(); // value=3, delta=1
-                  // Instances: 3, 2, 1.  Pop oldest (3) → value=2.
+        // Instances: 3, 2, 1.  Pop oldest (3) → value=2.
         c.pop(&mut pool);
         assert!(!c.is_single());
         // Pop oldest (2) → value=1.
