@@ -133,6 +133,7 @@
 
 use std::fmt;
 use std::io::Write;
+use std::ops::{Index, IndexMut};
 
 use regex_syntax::hir::{self, HirKind};
 
@@ -169,6 +170,92 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// A 256-entry boolean lookup table indicating which byte values belong
+/// to a character class.  `class[b]` is `true` when byte `b` matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ByteClass([bool; 256]);
+
+impl ByteClass {
+    /// A class that matches every byte value (`[true; 256]` — equivalent to `.`).
+    #[allow(dead_code)]
+    const ALL: Self = Self([true; 256]);
+
+    /// A class that matches no byte value.
+    const NONE: Self = Self([false; 256]);
+}
+
+/// `class[byte]` — test whether a byte matches this class.
+impl Index<u8> for ByteClass {
+    type Output = bool;
+
+    #[inline]
+    fn index(&self, byte: u8) -> &bool {
+        &self.0[byte as usize]
+    }
+}
+
+/// Index into the byte-class lookup tables ([`Regex::classes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ClassIdx(usize);
+
+impl ClassIdx {
+    #[inline]
+    fn idx(self) -> usize {
+        self.0
+    }
+}
+
+/// `classes[class_idx]` — typed access to byte-class lookup tables.
+impl Index<ClassIdx> for [ByteClass] {
+    type Output = ByteClass;
+
+    #[inline]
+    fn index(&self, idx: ClassIdx) -> &ByteClass {
+        &self[idx.idx()]
+    }
+}
+
+/// Index into the byte-dispatch tables ([`Regex::byte_tables`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ByteTableIdx(usize);
+
+impl ByteTableIdx {
+    #[inline]
+    fn idx(self) -> usize {
+        self.0
+    }
+}
+
+/// A 256-entry dispatch table mapping each byte value to a target
+/// [`StateIdx`], or [`StateIdx::NONE`] for "no transition".
+#[derive(Clone, Copy, Debug)]
+struct ByteMap([StateIdx; 256]);
+
+impl ByteMap {
+    /// A table with no transitions (all entries are [`StateIdx::NONE`]).
+    const EMPTY: Self = Self([StateIdx::NONE; 256]);
+}
+
+/// `map[byte]` — look up the target state for a given byte value.
+impl Index<u8> for ByteMap {
+    type Output = StateIdx;
+
+    #[inline]
+    fn index(&self, byte: u8) -> &StateIdx {
+        &self.0[byte as usize]
+    }
+}
+
+/// `byte_tables[table_idx]` — typed access to byte-dispatch tables.
+impl Index<ByteTableIdx> for [ByteMap] {
+    type Output = ByteMap;
+
+    #[inline]
+    fn index(&self, idx: ByteTableIdx) -> &ByteMap {
+        &self[idx.idx()]
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NFA states
 // ---------------------------------------------------------------------------
@@ -182,11 +269,11 @@ impl std::error::Error for Error {}
 #[derive(Clone, Copy, Debug)]
 enum State {
     /// Epsilon fork: follow both `out` and `out1`.
-    Split { out: usize, out1: usize },
+    Split { out: StateIdx, out1: StateIdx },
 
     /// Allocate (or push) a new instance on counter `counter`, then
     /// follow `out`.
-    CounterInstance { counter: usize, out: usize },
+    CounterInstance { counter: CounterIdx, out: StateIdx },
 
     /// Increment counter `counter`.
     ///
@@ -196,39 +283,39 @@ enum State {
     /// - **Break** (`out1`): exit the repetition (taken when any instance
     ///   value falls in `[min, max]`).
     CounterIncrement {
-        counter: usize,
-        out: usize,
-        out1: usize,
+        counter: CounterIdx,
+        out: StateIdx,
+        out1: StateIdx,
         min: usize,
         max: usize,
     },
 
     /// Match a literal byte, then follow `out`.
-    Byte { byte: u8, out: usize },
+    Byte { byte: u8, out: StateIdx },
 
     /// Match any byte in the class (lookup table), then follow `out`.
     ///
     /// `class` is an index into [`Regex::classes`], a side-table of
-    /// 256-entry boolean lookup tables — one per possible byte value.
-    /// A full-range table (`[true; 256]`) is equivalent to the old
+    /// [`ByteClass`] lookup tables — one per possible byte value.
+    /// A full-range table ([`ByteClass::ALL`]) is equivalent to the old
     /// `Wildcard` state.
-    ByteClass { class: usize, out: usize },
+    ByteClass { class: ClassIdx, out: StateIdx },
 
     /// Byte dispatch table: for input byte `b`, follow
-    /// `byte_tables[table][b]` if it is not [`SENTINEL`].
+    /// `byte_tables[table][b]` if the target is not [`StateIdx::NONE`].
     ///
     /// Replaces a chain of `Split` + `Byte` states when an alternation's
     /// branches all start with distinct literal bytes.  `table` is an
     /// index into [`Regex::byte_tables`].
-    ByteTable { table: usize },
+    ByteTable { table: ByteTableIdx },
 
     /// Zero-width assertion: matches only at the start of input.
     /// Followed in `addstate` only when `at_start` is true.
-    AssertStart { out: usize },
+    AssertStart { out: StateIdx },
 
     /// Zero-width assertion: matches only at the end of input.
     /// Followed in `addstate` only when `at_end` is true.
-    AssertEnd { out: usize },
+    AssertEnd { out: StateIdx },
 
     /// Accepting state.
     Match,
@@ -237,7 +324,7 @@ enum State {
 impl State {
     /// Return the "dangling out" pointer used by [`RegexBuilder::patch`]
     /// and [`RegexBuilder::append`] to thread fragment lists.
-    fn next(&self) -> usize {
+    fn next(&self) -> StateIdx {
         match self {
             State::Byte { out, .. }
             | State::ByteClass { out, .. }
@@ -250,7 +337,7 @@ impl State {
     }
 
     /// Overwrite the "dangling out" pointer.
-    fn append(&mut self, next: usize) {
+    fn append(&mut self, next: StateIdx) {
         match self {
             State::Byte { out, .. }
             | State::ByteClass { out, .. }
@@ -263,6 +350,49 @@ impl State {
     }
 }
 
+/// Index into the NFA state array ([`Regex::states`]).
+///
+/// [`StateIdx::NONE`] is used both as a "dangling/unpatched" marker
+/// during construction and as "no transition" in byte-table entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct StateIdx(usize);
+
+impl StateIdx {
+    /// Sentinel value for unpatched `out` pointers during construction
+    /// and for "no transition" entries in byte-dispatch tables.
+    const NONE: Self = Self(usize::MAX);
+
+    /// Return the raw index.  Panics on `NONE` in debug builds.
+    #[inline]
+    fn idx(self) -> usize {
+        debug_assert!(self != Self::NONE, "StateIdx::NONE used as index");
+        self.0
+    }
+}
+
+impl fmt::Display for StateIdx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// `states[state_idx]` — typed access to the NFA state array.
+impl Index<StateIdx> for [State] {
+    type Output = State;
+
+    #[inline]
+    fn index(&self, idx: StateIdx) -> &State {
+        &self[idx.idx()]
+    }
+}
+
+impl IndexMut<StateIdx> for [State] {
+    #[inline]
+    fn index_mut(&mut self, idx: StateIdx) -> &mut State {
+        &mut self[idx.idx()]
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NFA fragment (used during construction)
 // ---------------------------------------------------------------------------
@@ -271,12 +401,12 @@ impl State {
 /// `out` pointer that will be patched to the next fragment's start.
 #[derive(Debug)]
 struct Fragment {
-    start: usize,
-    out: usize,
+    start: StateIdx,
+    out: StateIdx,
 }
 
 impl Fragment {
-    fn new(start: usize, out: usize) -> Self {
+    fn new(start: StateIdx, out: StateIdx) -> Self {
         Self { start, out }
     }
 }
@@ -296,12 +426,12 @@ enum RegexHirNode {
     RepeatZeroPlus,
     RepeatOnePlus,
     /// Index into [`RegexBuilder::classes`].
-    ByteClass(usize),
+    ByteClass(ClassIdx),
     CounterInstance {
-        counter: usize,
+        counter: CounterIdx,
     },
     CounterIncrement {
-        counter: usize,
+        counter: CounterIdx,
         min: usize,
         max: usize,
     },
@@ -332,15 +462,15 @@ impl std::ops::Deref for StateList {
 #[derive(Debug)]
 pub struct Regex {
     states: StateList,
-    start: usize,
+    start: StateIdx,
     /// One slot per counter variable allocated during compilation.
     counters: Box<[usize]>,
     /// Byte-class lookup tables referenced by [`State::ByteClass::class`].
-    classes: Box<[[bool; 256]]>,
+    classes: Box<[ByteClass]>,
     /// Byte dispatch tables referenced by [`State::ByteTable::table`].
     /// Each entry maps a byte value to a target state index, or
-    /// [`SENTINEL`] for "no transition".
-    byte_tables: Box<[[usize; 256]]>,
+    /// [`StateIdx::NONE`] for "no transition".
+    byte_tables: Box<[ByteMap]>,
 }
 
 impl Regex {
@@ -355,9 +485,9 @@ impl Regex {
     pub fn memory_size(&self) -> usize {
         let inline = std::mem::size_of::<Self>();
         let states_alloc = self.states.len() * std::mem::size_of::<State>();
-        let classes_alloc = self.classes.len() * std::mem::size_of::<[bool; 256]>();
+        let classes_alloc = self.classes.len() * std::mem::size_of::<ByteClass>();
         let counters_alloc = self.counters.len() * std::mem::size_of::<usize>();
-        let byte_tables_alloc = self.byte_tables.len() * std::mem::size_of::<[usize; 256]>();
+        let byte_tables_alloc = self.byte_tables.len() * std::mem::size_of::<ByteMap>();
         inline + states_alloc + classes_alloc + counters_alloc + byte_tables_alloc
     }
 
@@ -368,17 +498,18 @@ impl Regex {
         writeln!(buffer, "\trankdir=LR;").unwrap();
         writeln!(&mut buffer, "\t{} [shape=box];", self.start).unwrap();
         let mut stack = vec![self.start];
-        while let Some(idx) = stack.pop() {
-            if !visited[idx] {
-                writeln!(buffer, "\t// [{}] {:?}", idx, self.states[idx]).unwrap();
-                self.write_dot_state(idx, &mut buffer, &mut stack);
-                visited[idx] = true;
+        while let Some(s) = stack.pop() {
+            let i = s.idx();
+            if !visited[i] {
+                writeln!(buffer, "\t// [{}] {:?}", s, self.states[s]).unwrap();
+                self.write_dot_state(s, &mut buffer, &mut stack);
+                visited[i] = true;
             }
         }
         writeln!(buffer, "}}").unwrap();
     }
 
-    fn write_dot_state(&self, idx: usize, buffer: &mut impl Write, stack: &mut Vec<usize>) {
+    fn write_dot_state(&self, idx: StateIdx, buffer: &mut impl Write, stack: &mut Vec<StateIdx>) {
         match self.states[idx] {
             State::Split { out, out1 } => {
                 self.write_dot_state(out, buffer, stack);
@@ -418,7 +549,7 @@ impl Regex {
                 stack.push(out);
                 // Summarise the class for the label.
                 let table = &self.classes[class];
-                let count = table.iter().filter(|&&b| b).count();
+                let count = table.0.iter().filter(|&&b| b).count();
                 if count == 256 {
                     writeln!(buffer, "\t{} -> {} [label=\".\"];", idx, out).unwrap();
                 } else {
@@ -435,8 +566,8 @@ impl Regex {
             }
             State::ByteTable { table } => {
                 let t = &self.byte_tables[table];
-                for (b, &target) in t.iter().enumerate() {
-                    if target != SENTINEL {
+                for (b, &target) in t.0.iter().enumerate() {
+                    if target != StateIdx::NONE {
                         stack.push(target);
                         writeln!(
                             buffer,
@@ -458,9 +589,6 @@ impl Regex {
 // NFA builder (regex-syntax HIR -> postfix -> NFA)
 // ---------------------------------------------------------------------------
 
-/// Sentinel used for yet-unpatched `out` pointers in NFA states.
-const DANGLING: usize = usize::MAX;
-
 /// Builds a compiled [`Regex`] from a [`regex_syntax::hir::Hir`].
 ///
 /// The pipeline is:
@@ -480,27 +608,27 @@ pub struct RegexBuilder {
     counters: Vec<usize>,
     /// Deduplicated byte-class lookup tables; indices are stored in
     /// [`RegexHirNode::ByteClass`] and [`State::ByteClass`].
-    classes: IndexSet<[bool; 256]>,
+    classes: IndexSet<ByteClass>,
     /// Byte dispatch tables created by the post-construction
     /// [`optimize_byte_tables`](Self::optimize_byte_tables) pass.
-    byte_tables: Vec<[usize; 256]>,
+    byte_tables: Vec<ByteMap>,
 }
 
 impl RegexBuilder {
     /// Allocate a fresh counter index.
-    fn next_counter(&mut self) -> usize {
+    fn next_counter(&mut self) -> CounterIdx {
         let counter = self.counters.len();
         self.counters.push(counter);
-        counter
+        CounterIdx(counter)
     }
 
     /// Return the index of `table` in `self.classes`, inserting it if it
     /// is not already present.  Identical tables are deduplicated so that
     /// patterns like `\d{3,5}` (which unroll to multiple ByteClass states)
     /// share a single lookup table.
-    fn intern_class(&mut self, table: [bool; 256]) -> usize {
+    fn intern_class(&mut self, table: ByteClass) -> ClassIdx {
         let (idx, _) = self.classes.insert_full(table);
-        idx
+        ClassIdx(idx)
     }
 
     /// Recursively lower a `regex-syntax` HIR node into a postfix sequence
@@ -545,10 +673,10 @@ impl RegexBuilder {
                 Ok(())
             }
             HirKind::Class(hir::Class::Bytes(class)) => {
-                let mut table = [false; 256];
+                let mut table = ByteClass::NONE;
                 for range in class.ranges() {
                     for b in range.start()..=range.end() {
-                        table[b as usize] = true;
+                        table.0[b as usize] = true;
                     }
                 }
                 let idx = self.intern_class(table);
@@ -567,10 +695,10 @@ impl RegexBuilder {
                 if !all_single_byte {
                     return Err(Error::UnsupportedClass(hir::Class::Unicode(class.clone())));
                 }
-                let mut table = [false; 256];
+                let mut table = ByteClass::NONE;
                 for range in ranges {
                     for b in (range.start() as u8)..=(range.end() as u8) {
-                        table[b as usize] = true;
+                        table.0[b as usize] = true;
                     }
                 }
                 let idx = self.intern_class(table);
@@ -722,16 +850,16 @@ impl RegexBuilder {
     // -- Low-level NFA construction helpers ----------------------------------
 
     /// Push a new NFA state and return its index.
-    fn state(&mut self, state: State) -> usize {
-        let idx = self.states.len();
+    fn state(&mut self, state: State) -> StateIdx {
+        let idx = StateIdx(self.states.len());
         self.states.push(state);
         idx
     }
 
     /// Walk the linked list of dangling `out` pointers starting at `list`
     /// and patch each one to point to `idx`.
-    fn patch(&mut self, mut list: usize, idx: usize) {
-        while let Some(state) = self.states.get_mut(list) {
+    fn patch(&mut self, mut list: StateIdx, idx: StateIdx) {
+        while let Some(state) = self.states.get_mut(list.0) {
             list = match state {
                 State::Byte { out, .. }
                 | State::ByteClass { out, .. }
@@ -754,12 +882,12 @@ impl RegexBuilder {
 
     /// Append `list2` to the end of the dangling-pointer chain starting at
     /// `list1`.
-    fn append(&mut self, list1: usize, list2: usize) -> usize {
+    fn append(&mut self, list1: StateIdx, list2: StateIdx) -> StateIdx {
         let len = self.states.len();
-        let mut s = &mut self.states[list1];
+        let mut s = &mut self.states.as_mut_slice()[list1];
         let mut next = s.next();
-        while next < len {
-            s = &mut self.states[next];
+        while next.0 < len {
+            s = &mut self.states.as_mut_slice()[next];
             next = s.next();
         }
         s.append(list2);
@@ -790,7 +918,7 @@ impl RegexBuilder {
                 let e = self.frags.pop().unwrap();
                 let s = self.state(State::Split {
                     out: e.start,
-                    out1: DANGLING,
+                    out1: StateIdx::NONE,
                 });
                 Fragment::new(s, self.append(e.out, s))
             }
@@ -798,7 +926,7 @@ impl RegexBuilder {
                 let e = self.frags.pop().unwrap();
                 let s = self.state(State::Split {
                     out: e.start,
-                    out1: DANGLING,
+                    out1: StateIdx::NONE,
                 });
                 self.patch(e.out, s);
                 Fragment::new(s, s)
@@ -807,7 +935,7 @@ impl RegexBuilder {
                 let e = self.frags.pop().unwrap();
                 let s = self.state(State::Split {
                     out: e.start,
-                    out1: DANGLING,
+                    out1: StateIdx::NONE,
                 });
                 self.patch(e.out, s);
                 Fragment::new(e.start, s)
@@ -816,7 +944,7 @@ impl RegexBuilder {
                 let e = self.frags.pop().unwrap();
                 let s = self.state(State::CounterInstance {
                     counter,
-                    out: DANGLING,
+                    out: StateIdx::NONE,
                 });
                 self.patch(e.out, s);
                 Fragment::new(e.start, s)
@@ -825,7 +953,7 @@ impl RegexBuilder {
                 let e = self.frags.pop().unwrap();
                 let s = self.state(State::CounterIncrement {
                     out: e.start,
-                    out1: DANGLING,
+                    out1: StateIdx::NONE,
                     min,
                     max,
                     counter,
@@ -836,23 +964,27 @@ impl RegexBuilder {
             RegexHirNode::ByteClass(class) => {
                 let idx = self.state(State::ByteClass {
                     class,
-                    out: DANGLING,
+                    out: StateIdx::NONE,
                 });
                 Fragment::new(idx, idx)
             }
             RegexHirNode::Byte(byte) => {
                 let idx = self.state(State::Byte {
                     byte,
-                    out: DANGLING,
+                    out: StateIdx::NONE,
                 });
                 Fragment::new(idx, idx)
             }
             RegexHirNode::AssertStart => {
-                let idx = self.state(State::AssertStart { out: DANGLING });
+                let idx = self.state(State::AssertStart {
+                    out: StateIdx::NONE,
+                });
                 Fragment::new(idx, idx)
             }
             RegexHirNode::AssertEnd => {
-                let idx = self.state(State::AssertEnd { out: DANGLING });
+                let idx = self.state(State::AssertEnd {
+                    out: StateIdx::NONE,
+                });
                 Fragment::new(idx, idx)
             }
         }
@@ -911,8 +1043,8 @@ impl RegexBuilder {
     /// a pure `Split` chain.  Returns `None` if any leaf is not a `Byte`
     /// state (e.g. `ByteClass`, `CounterInstance`, etc.) or if two leaves
     /// share the same byte value.
-    fn collect_byte_leaves(&self, idx: usize, out: &mut Vec<(u8, usize)>) -> bool {
-        match self.states[idx] {
+    fn collect_byte_leaves(&self, idx: StateIdx, out: &mut Vec<(u8, StateIdx)>) -> bool {
+        match self.states.as_slice()[idx] {
             State::Byte { byte, out: target } => {
                 // Check for duplicate byte values.
                 if out.iter().any(|&(b, _)| b == byte) {
@@ -939,8 +1071,9 @@ impl RegexBuilder {
         // created later by the left-fold in hir2postfix) are processed
         // first, maximising the number of alternatives collapsed into a
         // single ByteTable.
-        for idx in (0..self.states.len()).rev() {
-            if !matches!(self.states[idx], State::Split { .. }) {
+        for raw in (0..self.states.len()).rev() {
+            let idx = StateIdx(raw);
+            if !matches!(self.states.as_slice()[idx], State::Split { .. }) {
                 continue;
             }
             leaves.clear();
@@ -954,13 +1087,13 @@ impl RegexBuilder {
                 continue;
             }
             // Build the dispatch table.
-            let mut table = [SENTINEL; 256];
+            let mut table = ByteMap::EMPTY;
             for &(byte, target) in &leaves {
-                table[byte as usize] = target;
+                table.0[byte as usize] = target;
             }
-            let table_idx = self.byte_tables.len();
+            let table_idx = ByteTableIdx(self.byte_tables.len());
             self.byte_tables.push(table);
-            self.states[idx] = State::ByteTable { table: table_idx };
+            self.states.as_mut_slice()[idx] = State::ByteTable { table: table_idx };
         }
     }
 }
@@ -1082,6 +1215,39 @@ impl Counter {
     }
 }
 
+/// Index into the counter variable array ([`Regex::counters`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct CounterIdx(usize);
+
+impl CounterIdx {
+    #[inline]
+    fn idx(self) -> usize {
+        self.0
+    }
+}
+
+impl fmt::Display for CounterIdx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// `counters[counter_idx]` — typed access to the counter variable array.
+impl Index<CounterIdx> for [Option<Counter>] {
+    type Output = Option<Counter>;
+    #[inline]
+    fn index(&self, idx: CounterIdx) -> &Option<Counter> {
+        &self[idx.idx()]
+    }
+}
+
+impl IndexMut<CounterIdx> for [Option<Counter>] {
+    #[inline]
+    fn index_mut(&mut self, idx: CounterIdx) -> &mut Option<Counter> {
+        &mut self[idx.idx()]
+    }
+}
+
 /// Sentinel value meaning "no node" (end of linked list / empty).
 const SENTINEL: usize = usize::MAX;
 
@@ -1151,8 +1317,8 @@ pub struct MatcherMemory {
     /// capacity across `matcher()` calls.
     delta_pool: DeltaPool,
     /// Current and next state lists (swapped each step).
-    clist: Vec<usize>,
-    nlist: Vec<usize>,
+    clist: Vec<StateIdx>,
+    nlist: Vec<StateIdx>,
     /// Per-state snapshot of `ci_gen` at first visit in the current step.
     /// See the module-level doc comment for the motivation.
     ci_gen_at_visit: Vec<usize>,
@@ -1188,7 +1354,7 @@ impl MatcherMemory {
             ever_matched: false,
         };
 
-        m.startlist(regex.start);
+        m.startlist(m.start);
         // Check if the initial epsilon closure already reached Match
         // (e.g. for patterns like `^$`, `^`, `a?`, etc.).
         m.ever_matched = m.clist_has_match();
@@ -1204,17 +1370,17 @@ pub struct Matcher<'a> {
     delta_pool: &'a mut DeltaPool,
     states: &'a [State],
     /// Byte-class lookup tables referenced by [`State::ByteClass::class`].
-    classes: &'a [[bool; 256]],
+    classes: &'a [ByteClass],
     /// Byte dispatch tables referenced by [`State::ByteTable::table`].
-    byte_tables: &'a [[usize; 256]],
+    byte_tables: &'a [ByteMap],
     /// Per-state deduplication stamp (compared against `listid`).
     lastlist: &'a mut [usize],
     /// Monotonically increasing step ID.
     listid: usize,
     /// Current active state list.
-    clist: &'a mut Vec<usize>,
+    clist: &'a mut Vec<StateIdx>,
     /// Next active state list (built during a step).
-    nlist: &'a mut Vec<usize>,
+    nlist: &'a mut Vec<StateIdx>,
     /// Monotonically increasing generation counter; incremented every
     /// time [`addcounter`](Self::addcounter) is called.  Used together
     /// with `ci_gen_at_visit` to detect whether a `CounterInstance`
@@ -1226,7 +1392,7 @@ pub struct Matcher<'a> {
 
     /// The NFA start state index, used for re-seeding at each step
     /// (unanchored matching).
-    start: usize,
+    start: StateIdx,
     /// `true` until the first [`step`](Self::step) call.  Controls
     /// whether `AssertStart` states are followed in `addstate`.
     at_start: bool,
@@ -1242,7 +1408,7 @@ impl<'a> Matcher<'a> {
     /// Compute the initial state list by following all epsilon transitions
     /// from `start`.
     #[inline]
-    fn startlist(&mut self, start: usize) {
+    fn startlist(&mut self, start: StateIdx) {
         self.addstate(start);
         std::mem::swap(self.clist, self.nlist);
         self.listid += 1;
@@ -1255,7 +1421,7 @@ impl<'a> Matcher<'a> {
     ///
     /// Increments `ci_gen` so that downstream `CounterIncrement` re-entry
     /// checks can detect that a new instance was allocated.
-    fn addcounter(&mut self, idx: usize) {
+    fn addcounter(&mut self, idx: CounterIdx) {
         if let Some(counter) = self.counters[idx].as_mut() {
             counter.push(self.delta_pool);
         } else {
@@ -1265,13 +1431,13 @@ impl<'a> Matcher<'a> {
     }
 
     /// Increment all instances of counter `idx`.
-    fn inccounter(&mut self, idx: usize) {
+    fn inccounter(&mut self, idx: CounterIdx) {
         self.counters[idx].as_mut().unwrap().incr();
     }
 
     /// De-allocate the oldest instance of counter `idx`.  If no instances
     /// remain, the counter is set to `None`.
-    fn delcounter(&mut self, idx: usize) {
+    fn delcounter(&mut self, idx: CounterIdx) {
         if self.counters[idx].as_mut().unwrap().pop(self.delta_pool) {
             self.counters[idx] = None;
         }
@@ -1285,10 +1451,10 @@ impl<'a> Matcher<'a> {
     ///   closure pass (`!incremented`), OR
     /// - It is `None` (exhausted) and a `CounterInstance` fired since
     ///   this state's first visit in the current step (`ci_gen` advanced).
-    fn counter_is_processable(&self, counter: usize, state_idx: usize) -> bool {
+    fn counter_is_processable(&self, counter: CounterIdx, state_idx: StateIdx) -> bool {
         self.counters[counter]
             .as_ref()
-            .map_or(self.ci_gen > self.ci_gen_at_visit[state_idx], |c| {
+            .map_or(self.ci_gen > self.ci_gen_at_visit[state_idx.idx()], |c| {
                 !c.incremented
             })
     }
@@ -1321,8 +1487,9 @@ impl<'a> Matcher<'a> {
     /// can advance the counter for free, any value in `[min, max]` is
     /// reachable and we always allow the break.
     #[inline]
-    fn addstate(&mut self, idx: usize) {
-        if self.lastlist[idx] == self.listid {
+    fn addstate(&mut self, idx: StateIdx) {
+        let i = idx.idx();
+        if self.lastlist[i] == self.listid {
             let should_reenter = match &self.states[idx] {
                 State::CounterIncrement { counter, .. } => {
                     self.counter_is_processable(*counter, idx)
@@ -1336,10 +1503,10 @@ impl<'a> Matcher<'a> {
 
         // Record ci_gen only on first visit so re-entry compares against
         // the original snapshot.
-        if self.lastlist[idx] != self.listid {
-            self.ci_gen_at_visit[idx] = self.ci_gen;
+        if self.lastlist[i] != self.listid {
+            self.ci_gen_at_visit[i] = self.ci_gen;
         }
-        self.lastlist[idx] = self.listid;
+        self.lastlist[i] = self.listid;
 
         match &self.states[idx] {
             State::Split { out, out1 } => {
@@ -1398,10 +1565,10 @@ impl<'a> Matcher<'a> {
                     // loops.  The `incremented` flag (set by inccounter)
                     // prevents the recursive call from re-processing this
                     // state — it just sets lastlist[idx] and falls through.
-                    self.lastlist[idx] = self.listid.wrapping_sub(1);
+                    self.lastlist[i] = self.listid.wrapping_sub(1);
                     self.addstate(out);
-                    is_epsilon_body = self.lastlist[idx] == self.listid;
-                    self.lastlist[idx] = self.listid;
+                    is_epsilon_body = self.lastlist[i] == self.listid;
+                    self.lastlist[i] = self.listid;
                 }
 
                 // -- Break condition --
@@ -1468,12 +1635,10 @@ impl<'a> Matcher<'a> {
         for &idx in &clist {
             match self.states[idx] {
                 State::Byte { byte: b2, out } if b == b2 => self.addstate(out),
-                State::ByteClass { class, out } if self.classes[class][b as usize] => {
-                    self.addstate(out)
-                }
+                State::ByteClass { class, out } if self.classes[class][b] => self.addstate(out),
                 State::ByteTable { table } => {
-                    let target = self.byte_tables[table][b as usize];
-                    if target != SENTINEL {
+                    let target = self.byte_tables[table][b];
+                    if target != StateIdx::NONE {
                         self.addstate(target);
                     }
                 }
@@ -1485,7 +1650,8 @@ impl<'a> Matcher<'a> {
         // the next position.  For `^`-anchored patterns this is harmless:
         // the start state is `AssertStart`, and `at_start` is false, so
         // `addstate` will record it but not follow `out`.
-        self.addstate(self.start);
+        let start = self.start;
+        self.addstate(start);
 
         *self.clist = std::mem::replace(self.nlist, clist);
         self.listid += 1;
@@ -3821,7 +3987,7 @@ mod tests {
         let same = build_regex_unchecked(r"^\d\d$");
         let comp = build_regex_unchecked(r"^\d\D$");
         // \d\D has two distinct tables; \d\d has one.
-        let class_size = std::mem::size_of::<[bool; 256]>();
+        let class_size = std::mem::size_of::<ByteClass>();
         assert_eq!(
             comp.memory_size() - same.memory_size(),
             class_size,
