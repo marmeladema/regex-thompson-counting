@@ -7,19 +7,19 @@ use std::io::{self, Write};
 use std::process;
 
 fn parse_pattern(pattern: &str) -> Regex {
-    // Wrap in (?s-u) for byte mode (dot matches any byte, no Unicode).
-    let full = format!("(?s-u){}", pattern);
     let ast = ParserBuilder::new()
         .build()
-        .parse(&full)
+        .parse(pattern)
         .unwrap_or_else(|e| {
             eprintln!("error: failed to parse pattern: {e}");
             process::exit(1);
         });
     let hir = TranslatorBuilder::new()
+        .unicode(false)
         .utf8(false)
+        .dot_matches_new_line(true)
         .build()
-        .translate(&full, &ast)
+        .translate(pattern, &ast)
         .unwrap_or_else(|e| {
             eprintln!("error: failed to translate pattern: {e}");
             process::exit(1);

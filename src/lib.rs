@@ -3180,21 +3180,23 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Parse a pattern in full byte mode (no UTF-8 validity requirement).
-    /// Uses `ParserBuilder` with `utf8(false)` so that `.` in `(?s-u)`
-    /// mode produces a `Class::Bytes` covering all 256 byte values.
+    /// Parses `pattern` into HIR in byte mode: Unicode disabled, dot
+    /// matches any byte (including newline).  Equivalent to prepending
+    /// `(?s-u)` but configured via the builder API instead.
     fn parse_hir_bytes(pattern: &str) -> Hir {
         use regex_syntax::ast::parse::ParserBuilder;
         use regex_syntax::hir::translate::TranslatorBuilder;
 
-        let full = format!("(?s-u){}", pattern);
         let ast = ParserBuilder::new()
             .build()
-            .parse(&full)
+            .parse(pattern)
             .expect("regex-syntax AST parse should succeed");
         TranslatorBuilder::new()
+            .unicode(false)
             .utf8(false)
+            .dot_matches_new_line(true)
             .build()
-            .translate(&full, &ast)
+            .translate(pattern, &ast)
             .expect("regex-syntax HIR translation should succeed")
     }
 
