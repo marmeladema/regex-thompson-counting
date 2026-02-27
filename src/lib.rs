@@ -1434,6 +1434,7 @@ impl RegexBuilder {
 struct Counter {
     incremented: bool,
     body_alive_gen: usize,
+    /// The oldest (highest) instance's count.
     value: usize,
     delta: usize,
     head: usize,
@@ -1503,21 +1504,19 @@ impl Counter {
     }
 
     /// Check whether any active instance's value falls in `[min, max]`.
-    /// Walks from oldest (highest value) to newest.
-    fn any_instance_in_range(&self, pool: &DeltaPool, min: usize, max: usize) -> bool {
-        let mut val = self.value;
-        if val >= min && val <= max {
-            return true;
-        }
-        let mut node = self.head;
-        while node != SENTINEL {
-            val -= pool.values[node];
-            if val >= min && val <= max {
-                return true;
-            }
-            node = pool.next[node];
-        }
-        false
+    ///
+    /// O(1): instance values are strictly decreasing from `value`
+    /// (oldest) downward, and the runtime guarantees `value <= max`
+    /// (instances are popped when they reach `max`).  Therefore the
+    /// only question is whether the oldest instance has reached `min`.
+    fn any_instance_in_range(&self, min: usize, max: usize) -> bool {
+        debug_assert!(
+            self.value <= max,
+            "oldest instance {} should not exceed max {}",
+            self.value,
+            max
+        );
+        self.value >= min
     }
 }
 
@@ -1971,7 +1970,7 @@ impl<'a> Matcher<'a> {
                     self.counters[counter]
                         .as_ref()
                         .unwrap()
-                        .any_instance_in_range(self.delta_pool, min, max)
+                        .any_instance_in_range(min, max)
                 };
 
                 // De-allocate the oldest instance if it reached max.
@@ -2465,15 +2464,15 @@ mod tests {
 
     #[test]
     fn test_counter_any_instance_in_range_single() {
-        let pool = DeltaPool::default();
         let mut c = Counter::default();
         for _ in 0..5 {
             c.incr();
         }
-        assert!(c.any_instance_in_range(&pool, 3, 7));
-        assert!(c.any_instance_in_range(&pool, 5, 5));
-        assert!(!c.any_instance_in_range(&pool, 6, 10));
-        assert!(!c.any_instance_in_range(&pool, 1, 4));
+        // value=5.  Runtime invariant: value <= max.
+        assert!(c.any_instance_in_range(3, 7)); // 5 >= 3
+        assert!(c.any_instance_in_range(5, 5)); // 5 >= 5
+        assert!(c.any_instance_in_range(1, 5)); // 5 >= 1
+        assert!(!c.any_instance_in_range(6, 10)); // 5 < 6
     }
 
     #[test]
@@ -2489,15 +2488,12 @@ mod tests {
         for _ in 0..2 {
             c.incr();
         }
-        // Instances: 5, 2.
-        // Check range that only matches oldest.
-        assert!(c.any_instance_in_range(&pool, 5, 5));
-        // Check range that only matches newest.
-        assert!(c.any_instance_in_range(&pool, 2, 2));
-        // Check range that matches both.
-        assert!(c.any_instance_in_range(&pool, 1, 10));
-        // Check range that matches neither.
-        assert!(!c.any_instance_in_range(&pool, 3, 4));
+        // Instances: 5, 2.  value=5.
+        // Runtime invariant: value <= max, so max >= 5.
+        assert!(c.any_instance_in_range(5, 5)); // 5 >= 5
+        assert!(c.any_instance_in_range(2, 5)); // 5 >= 2
+        assert!(c.any_instance_in_range(1, 10)); // 5 >= 1
+        assert!(!c.any_instance_in_range(6, 10)); // 5 < 6
     }
 
     #[test]
@@ -2515,13 +2511,13 @@ mod tests {
         for _ in 0..2 {
             c.incr();
         }
-        // value=9, instances: 9, 5, 2
+        // value=9, instances: 9, 5, 2.
         assert_eq!(collect_instance_values(&c, &pool), vec![9, 5, 2]);
-        assert!(c.any_instance_in_range(&pool, 9, 9));
-        assert!(c.any_instance_in_range(&pool, 5, 5));
-        assert!(c.any_instance_in_range(&pool, 2, 2));
-        assert!(!c.any_instance_in_range(&pool, 3, 4));
-        assert!(!c.any_instance_in_range(&pool, 6, 8));
+        // Runtime invariant: value <= max, so max >= 9.
+        assert!(c.any_instance_in_range(9, 9)); // 9 >= 9
+        assert!(c.any_instance_in_range(3, 9)); // 9 >= 3
+        assert!(c.any_instance_in_range(1, 10)); // 9 >= 1
+        assert!(!c.any_instance_in_range(10, 15)); // 9 < 10
     }
 
     #[test]
