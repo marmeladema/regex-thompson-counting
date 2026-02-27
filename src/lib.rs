@@ -1407,6 +1407,40 @@ impl IndexMut<CounterIdx> for [Option<Counter>] {
     }
 }
 
+/// Monotonically increasing generation stamp used to detect whether a
+/// [`CounterInstance`](State::CounterInstance) fired between two visits
+/// to the same [`CounterIncrement`](State::CounterIncrement) state.
+///
+/// See the module-level doc comment ("multi-instance counting") for
+/// the full motivation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct CounterGeneration(usize);
+
+impl CounterGeneration {
+    /// Advance the generation by one tick.
+    #[inline]
+    fn advance(&mut self) {
+        self.0 += 1;
+    }
+}
+
+/// `ci_gen_at_visit[state_idx]` — typed access to per-state generation snapshots.
+impl Index<StateIdx> for [CounterGeneration] {
+    type Output = CounterGeneration;
+
+    #[inline]
+    fn index(&self, idx: StateIdx) -> &CounterGeneration {
+        &self[idx.idx()]
+    }
+}
+
+impl IndexMut<StateIdx> for [CounterGeneration] {
+    #[inline]
+    fn index_mut(&mut self, idx: StateIdx) -> &mut CounterGeneration {
+        &mut self[idx.idx()]
+    }
+}
+
 /// Sentinel value meaning "no node" (end of linked list / empty).
 const SENTINEL: usize = usize::MAX;
 
@@ -1478,9 +1512,9 @@ pub struct MatcherMemory {
     /// Current and next state lists (swapped each step).
     clist: Vec<StateIdx>,
     nlist: Vec<StateIdx>,
-    /// Per-state snapshot of `ci_gen` at first visit in the current step.
-    /// See the module-level doc comment for the motivation.
-    ci_gen_at_visit: Vec<usize>,
+    /// Per-state snapshot of [`CounterGeneration`] at first visit in the
+    /// current step.  See the module-level doc comment for the motivation.
+    ci_gen_at_visit: Vec<CounterGeneration>,
 }
 
 impl MatcherMemory {
@@ -1493,7 +1527,8 @@ impl MatcherMemory {
         self.clist.clear();
         self.nlist.clear();
         self.ci_gen_at_visit.clear();
-        self.ci_gen_at_visit.resize(regex.states.len(), 0);
+        self.ci_gen_at_visit
+            .resize(regex.states.len(), CounterGeneration::default());
 
         let mut m = Matcher {
             counters: &mut self.counters,
@@ -1505,7 +1540,7 @@ impl MatcherMemory {
             listid: 0,
             clist: &mut self.clist,
             nlist: &mut self.nlist,
-            ci_gen: 0,
+            ci_gen: CounterGeneration::default(),
             ci_gen_at_visit: &mut self.ci_gen_at_visit,
             start: regex.start,
             at_start: true,
@@ -1546,9 +1581,9 @@ pub struct Matcher<'a> {
     /// with `ci_gen_at_visit` to detect whether a `CounterInstance`
     /// fired between the first visit and a re-entry at a
     /// `CounterIncrement` state.
-    ci_gen: usize,
-    /// Per-state snapshot of `ci_gen` recorded on first visit.
-    ci_gen_at_visit: &'a mut [usize],
+    ci_gen: CounterGeneration,
+    /// Per-state snapshot of [`CounterGeneration`] recorded on first visit.
+    ci_gen_at_visit: &'a mut [CounterGeneration],
 
     /// The NFA start state index, used for re-seeding at each step
     /// (unanchored matching).
@@ -1591,7 +1626,7 @@ impl<'a> Matcher<'a> {
         } else {
             self.counters[idx] = Some(Counter::default());
         }
-        self.ci_gen += 1;
+        self.ci_gen.advance();
     }
 
     /// Increment all instances of counter `idx`.
@@ -1618,7 +1653,7 @@ impl<'a> Matcher<'a> {
     fn counter_is_processable(&self, counter: CounterIdx, state_idx: StateIdx) -> bool {
         self.counters[counter]
             .as_ref()
-            .map_or(self.ci_gen > self.ci_gen_at_visit[state_idx.idx()], |c| {
+            .map_or(self.ci_gen > self.ci_gen_at_visit[state_idx], |c| {
                 !c.incremented
             })
     }
@@ -1668,7 +1703,7 @@ impl<'a> Matcher<'a> {
         // Record ci_gen only on first visit so re-entry compares against
         // the original snapshot.
         if self.lastlist[i] != self.listid {
-            self.ci_gen_at_visit[i] = self.ci_gen;
+            self.ci_gen_at_visit[idx] = self.ci_gen;
         }
         self.lastlist[i] = self.listid;
 
