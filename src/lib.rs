@@ -257,15 +257,161 @@ impl Index<ByteTableIdx> for [ByteMap] {
 }
 
 // ---------------------------------------------------------------------------
+// Zero-width assertions
+// ---------------------------------------------------------------------------
+
+/// The kind of zero-width assertion.
+///
+/// Each variant knows how to evaluate itself given the surrounding
+/// context (position flags and neighbouring bytes).  See [`eval`].
+///
+/// [`eval`]: AssertKind::eval
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssertKind {
+    /// `^`  — start of input only.
+    Start,
+    /// `$`  — end of input only.
+    End,
+    /// `(?m:^)` — start of any line (LF-terminated).
+    StartLF,
+    /// `(?m:$)` — end of any line (LF-terminated).
+    EndLF,
+    /// `(?Rm:^)` — start of any line (CRLF-aware).
+    ///
+    /// Matches at the start of input, or immediately after `\n`, or
+    /// immediately after `\r` **unless** a `\n` follows (i.e. not
+    /// between `\r` and `\n`).
+    StartCRLF,
+    /// `(?Rm:$)` — end of any line (CRLF-aware).
+    ///
+    /// Matches at the end of input, or immediately before `\r`, or
+    /// immediately before `\n` **unless** `\r` precedes (i.e. not
+    /// between `\r` and `\n`).
+    EndCRLF,
+}
+
+/// Result of evaluating an assertion at a given position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssertEval {
+    /// Assertion is satisfied — follow the `out` transition.
+    Pass,
+    /// Assertion is not satisfied — skip.
+    Fail,
+    /// Cannot determine yet (the upcoming byte is unknown).
+    /// The state is parked in the list for deferred resolution in
+    /// [`Matcher::step`] or [`Matcher::finish`].
+    Defer,
+}
+
+impl AssertKind {
+    /// Evaluate this assertion.
+    ///
+    /// * `at_start` — true when at position 0.
+    /// * `at_end`   — true when at end-of-input.
+    /// * `prev`     — the byte before the current position, or `None`
+    ///   at the very beginning.
+    /// * `next`     — the byte at the current position (the one about
+    ///   to be consumed), or `None` when unknown or at end-of-input.
+    #[inline]
+    fn eval(self, at_start: bool, at_end: bool, prev: Option<u8>, next: Option<u8>) -> AssertEval {
+        use AssertEval::*;
+        match self {
+            AssertKind::Start => {
+                if at_start {
+                    Pass
+                } else {
+                    Fail
+                }
+            }
+            AssertKind::End => {
+                if at_end {
+                    Pass
+                } else {
+                    Fail
+                }
+            }
+            AssertKind::StartLF => {
+                if at_start || prev == Some(b'\n') {
+                    Pass
+                } else {
+                    Fail
+                }
+            }
+            AssertKind::EndLF => {
+                if at_end {
+                    return Pass;
+                }
+                match next {
+                    Some(b'\n') => Pass,
+                    Some(_) => Fail,
+                    None => Defer,
+                }
+            }
+            AssertKind::StartCRLF => {
+                if at_start || prev == Some(b'\n') {
+                    return Pass;
+                }
+                match prev {
+                    Some(b'\r') => {
+                        // After \r: line start unless \n follows (\r\n is
+                        // a single line terminator).
+                        if at_end {
+                            return Pass;
+                        }
+                        match next {
+                            Some(b'\n') => Fail,
+                            Some(_) => Pass,
+                            None => Defer,
+                        }
+                    }
+                    _ => Fail,
+                }
+            }
+            AssertKind::EndCRLF => {
+                if at_end {
+                    return Pass;
+                }
+                match next {
+                    Some(b'\r') => Pass,
+                    Some(b'\n') => {
+                        // Before \n: line end unless \r precedes (\r\n is
+                        // a single line terminator; the end was before \r).
+                        if prev == Some(b'\r') {
+                            Fail
+                        } else {
+                            Pass
+                        }
+                    }
+                    Some(_) => Fail,
+                    None => Defer,
+                }
+            }
+        }
+    }
+
+    /// Dot-graph label for this assertion kind.
+    fn label(self) -> &'static str {
+        match self {
+            AssertKind::Start => "^",
+            AssertKind::End => "$",
+            AssertKind::StartLF => "^LF",
+            AssertKind::EndLF => "$LF",
+            AssertKind::StartCRLF => "^CRLF",
+            AssertKind::EndCRLF => "$CRLF",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NFA states
 // ---------------------------------------------------------------------------
 
 /// A single NFA state.
 ///
 /// Epsilon states (`Split`, `CounterInstance`, `CounterIncrement`,
-/// `AssertStart`, `AssertEnd`) are followed during
-/// [`Matcher::addstate`].  Byte-consuming states (`Byte`, `ByteClass`)
-/// are stepped over in [`Matcher::step`].
+/// `Assert`) are followed during [`Matcher::addstate`].
+/// Byte-consuming states (`Byte`, `ByteClass`) are stepped over in
+/// [`Matcher::step`].
 #[derive(Clone, Copy, Debug)]
 enum State {
     /// Epsilon fork: follow both `out` and `out1`.
@@ -309,24 +455,14 @@ enum State {
     /// index into [`Regex::byte_tables`].
     ByteTable { table: ByteTableIdx },
 
-    /// Zero-width assertion: matches only at the start of input.
-    /// Followed in `addstate` only when `at_start` is true.
-    AssertStart { out: StateIdx },
-
-    /// Zero-width assertion: matches only at the end of input.
-    /// Followed in `addstate` only when `at_end` is true.
-    AssertEnd { out: StateIdx },
-
-    /// Zero-width assertion: matches at start of any line (`(?m:^)`).
-    /// Fires when `at_start` is true OR `prev_byte == Some(b'\n')`.
-    /// Fully resolved in `addstate` (depends only on past context).
-    AssertStartLF { out: StateIdx },
-
-    /// Zero-width assertion: matches at end of any line (`(?m:$)`).
-    /// Fires when `at_end` is true OR the upcoming byte is `b'\n'`.
-    /// **Deferred** in `addstate` when `!at_end`: the state is parked
-    /// in the list and resolved by a pre-consumption pass in `step()`.
-    AssertEndLF { out: StateIdx },
+    /// Zero-width assertion (see [`AssertKind`] for the full catalogue).
+    ///
+    /// Evaluated in [`Matcher::addstate`] via [`AssertKind::eval`].
+    /// When the result is [`AssertEval::Pass`], the `out` transition
+    /// is followed.  When [`AssertEval::Defer`], the state is parked
+    /// in the list and resolved by a pre-consumption pass in
+    /// [`Matcher::step`] or by [`Matcher::finish`].
+    Assert { kind: AssertKind, out: StateIdx },
 
     /// Accepting state.
     Match,
@@ -340,10 +476,7 @@ impl State {
             State::Byte { out, .. }
             | State::ByteClass { out, .. }
             | State::CounterInstance { out, .. }
-            | State::AssertStart { out }
-            | State::AssertEnd { out }
-            | State::AssertStartLF { out }
-            | State::AssertEndLF { out } => *out,
+            | State::Assert { out, .. } => *out,
             State::Split { out1, .. } | State::CounterIncrement { out1, .. } => *out1,
             _ => unreachable!(),
         }
@@ -355,10 +488,7 @@ impl State {
             State::Byte { out, .. }
             | State::ByteClass { out, .. }
             | State::CounterInstance { out, .. }
-            | State::AssertStart { out }
-            | State::AssertEnd { out }
-            | State::AssertStartLF { out }
-            | State::AssertEndLF { out } => *out = next,
+            | State::Assert { out, .. } => *out = next,
             State::Split { out1, .. } | State::CounterIncrement { out1, .. } => *out1 = next,
             _ => unreachable!(),
         }
@@ -470,10 +600,7 @@ enum RegexHirNode {
         min: usize,
         max: usize,
     },
-    AssertStart,
-    AssertEnd,
-    AssertStartLF,
-    AssertEndLF,
+    Assert(AssertKind),
 }
 
 // ---------------------------------------------------------------------------
@@ -593,21 +720,9 @@ impl Regex {
                     writeln!(buffer, "\t{} -> {} [label=\"[{}B]\"];", idx, out, count).unwrap();
                 }
             }
-            State::AssertStart { out } => {
+            State::Assert { kind, out } => {
                 stack.push(out);
-                writeln!(buffer, "\t{} -> {} [label=\"^\"];", idx, out).unwrap();
-            }
-            State::AssertEnd { out } => {
-                stack.push(out);
-                writeln!(buffer, "\t{} -> {} [label=\"$\"];", idx, out).unwrap();
-            }
-            State::AssertStartLF { out } => {
-                stack.push(out);
-                writeln!(buffer, "\t{} -> {} [label=\"^LF\"];", idx, out).unwrap();
-            }
-            State::AssertEndLF { out } => {
-                stack.push(out);
-                writeln!(buffer, "\t{} -> {} [label=\"$LF\"];", idx, out).unwrap();
+                writeln!(buffer, "\t{} -> {} [label=\"{}\"];", idx, out, kind.label()).unwrap();
             }
             State::ByteTable { table } => {
                 let t = &self.byte_tables[table];
@@ -750,23 +865,19 @@ impl RegexBuilder {
                 self.postfix.push(RegexHirNode::ByteClass(idx));
                 Ok(())
             }
-            HirKind::Look(hir::Look::Start) => {
-                self.postfix.push(RegexHirNode::AssertStart);
+            HirKind::Look(look) => {
+                let kind = match look {
+                    hir::Look::Start => AssertKind::Start,
+                    hir::Look::End => AssertKind::End,
+                    hir::Look::StartLF => AssertKind::StartLF,
+                    hir::Look::EndLF => AssertKind::EndLF,
+                    hir::Look::StartCRLF => AssertKind::StartCRLF,
+                    hir::Look::EndCRLF => AssertKind::EndCRLF,
+                    _ => return Err(Error::UnsupportedLook(*look)),
+                };
+                self.postfix.push(RegexHirNode::Assert(kind));
                 Ok(())
             }
-            HirKind::Look(hir::Look::End) => {
-                self.postfix.push(RegexHirNode::AssertEnd);
-                Ok(())
-            }
-            HirKind::Look(hir::Look::StartLF) => {
-                self.postfix.push(RegexHirNode::AssertStartLF);
-                Ok(())
-            }
-            HirKind::Look(hir::Look::EndLF) => {
-                self.postfix.push(RegexHirNode::AssertEndLF);
-                Ok(())
-            }
-            HirKind::Look(look) => Err(Error::UnsupportedLook(*look)),
             HirKind::Capture(cap) => self.hir2postfix(&cap.sub),
             HirKind::Concat(children) => {
                 let mut count = 0;
@@ -917,10 +1028,7 @@ impl RegexBuilder {
                 State::Byte { out, .. }
                 | State::ByteClass { out, .. }
                 | State::CounterInstance { out, .. }
-                | State::AssertStart { out }
-                | State::AssertEnd { out }
-                | State::AssertStartLF { out }
-                | State::AssertEndLF { out } => {
+                | State::Assert { out, .. } => {
                     let next = *out;
                     *out = idx;
                     next
@@ -1030,26 +1138,9 @@ impl RegexBuilder {
                 });
                 Fragment::new(idx, idx)
             }
-            RegexHirNode::AssertStart => {
-                let idx = self.state(State::AssertStart {
-                    out: StateIdx::NONE,
-                });
-                Fragment::new(idx, idx)
-            }
-            RegexHirNode::AssertEnd => {
-                let idx = self.state(State::AssertEnd {
-                    out: StateIdx::NONE,
-                });
-                Fragment::new(idx, idx)
-            }
-            RegexHirNode::AssertStartLF => {
-                let idx = self.state(State::AssertStartLF {
-                    out: StateIdx::NONE,
-                });
-                Fragment::new(idx, idx)
-            }
-            RegexHirNode::AssertEndLF => {
-                let idx = self.state(State::AssertEndLF {
+            RegexHirNode::Assert(kind) => {
+                let idx = self.state(State::Assert {
+                    kind,
                     out: StateIdx::NONE,
                 });
                 Fragment::new(idx, idx)
@@ -1588,35 +1679,16 @@ impl<'a> Matcher<'a> {
                 self.addstate(out1);
             }
 
-            State::AssertStart { out } => {
-                if self.at_start {
-                    let out = *out;
+            State::Assert { kind, out } => {
+                let (kind, out) = (*kind, *out);
+                // Evaluate with next=None (upcoming byte is unknown in
+                // addstate).  Pass → follow out.  Fail/Defer → don't
+                // follow; the state is still pushed to nlist (below)
+                // and deferred assertions will be resolved in step()
+                // or finish().
+                if kind.eval(self.at_start, self.at_end, self.prev_byte, None) == AssertEval::Pass {
                     self.addstate(out);
                 }
-            }
-
-            State::AssertEnd { out } => {
-                if self.at_end {
-                    let out = *out;
-                    self.addstate(out);
-                }
-            }
-
-            State::AssertStartLF { out } => {
-                if self.at_start || self.prev_byte == Some(b'\n') {
-                    let out = *out;
-                    self.addstate(out);
-                }
-            }
-
-            State::AssertEndLF { out } => {
-                if self.at_end {
-                    let out = *out;
-                    self.addstate(out);
-                }
-                // When !at_end: NOT followed here.  The state is still
-                // pushed to nlist (below) and will be resolved by the
-                // pre-consumption pass in step() when b == '\n'.
             }
 
             State::CounterInstance { out, counter } => {
@@ -1708,31 +1780,45 @@ impl<'a> Matcher<'a> {
     /// position; when `^` is present, the start state is `AssertStart`
     /// and `at_start=false` prevents it from being followed).
     pub fn step(&mut self, b: u8) {
-        // --- Pre-consumption: resolve deferred EndLF assertions ---
-        // When the upcoming byte is '\n', any `AssertEndLF` state parked
-        // in clist should fire (the assertion "end of line" is satisfied
-        // before the newline).  We expand their successors into clist
-        // using the same nlist-as-scratch pattern that finish() uses.
-        if b == b'\n' {
-            self.listid += 1;
-            for counter in self.counters.iter_mut().filter_map(|c| c.as_mut()) {
-                counter.incremented = false;
-            }
-            self.nlist.clear();
+        // --- Pre-consumption: resolve deferred assertions ---
+        // Any `Assert` state parked in clist whose condition now passes
+        // (given `next = Some(b)`) gets its successor expanded into clist.
+        // We use the nlist-as-scratch pattern (same as finish()).
+        {
+            let mut any_expanded = false;
             let clist_len = self.clist.len();
             for i in 0..clist_len {
                 let idx = self.clist[i];
-                if let State::AssertEndLF { out } = self.states[idx] {
+                if let State::Assert { kind, out } = self.states[idx]
+                    && kind.eval(self.at_start, self.at_end, self.prev_byte, None)
+                        == AssertEval::Defer
+                    && kind.eval(self.at_start, self.at_end, self.prev_byte, Some(b))
+                        == AssertEval::Pass
+                {
+                    if !any_expanded {
+                        // Lazy init: bump listid + reset counters
+                        // only when we actually have work to do.
+                        self.listid += 1;
+                        for counter in
+                            self.counters.iter_mut().filter_map(|c| c.as_mut())
+                        {
+                            counter.incremented = false;
+                        }
+                        self.nlist.clear();
+                        any_expanded = true;
+                    }
                     self.addstate(out);
                 }
             }
-            self.clist.append(self.nlist);
+            if any_expanded {
+                self.clist.append(self.nlist);
 
-            // The expansion may have reached Match (e.g. `(?m)abc$`
-            // followed by `\n`).  Record it now before the consumption
-            // loop discards clist.
-            if !self.ever_matched {
-                self.ever_matched = self.clist_has_match();
+                // The expansion may have reached Match (e.g. `(?m)abc$`
+                // followed by `\n`).  Record it now before the consumption
+                // loop discards clist.
+                if !self.ever_matched {
+                    self.ever_matched = self.clist_has_match();
+                }
             }
         }
 
@@ -1843,17 +1929,17 @@ impl<'a> Matcher<'a> {
                 counter.incremented = false;
             }
 
-            // Follow the AssertEnd / AssertEndLF targets, building new
-            // states into nlist.  (End-of-input satisfies both `$` and
-            // `(?m:$)`.)
+            // Resolve all deferred assertions at end-of-input (at_end=true,
+            // next=None).  This satisfies End, EndLF, EndCRLF, and also
+            // StartCRLF when prev_byte=='\r' (no '\n' follows at EOF).
             self.nlist.clear();
             for i in 0..clist_len {
                 let idx = self.clist[i];
-                match self.states[idx] {
-                    State::AssertEnd { out } | State::AssertEndLF { out } => {
-                        self.addstate(out);
-                    }
-                    _ => {}
+                if let State::Assert { kind, out } = self.states[idx]
+                    && kind.eval(self.at_start, true, self.prev_byte, None)
+                        == AssertEval::Pass
+                {
+                    self.addstate(out);
                 }
             }
 
@@ -4576,5 +4662,183 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abc\ndef");
         assert_matches_regex_crate(p, &re, "xabc"); // no match: ^ is not multiline
         assert_matches_regex_crate(p, &re, "\nabc"); // no match: ^ is not multiline
+    }
+
+    // -------------------------------------------------------------------
+    // CRLF multiline tests  ((?Rm) → StartCRLF / EndCRLF)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_crlf_start_basic() {
+        // (?Rm:^) matches at start of input, after \n, and after bare \r
+        // (but NOT between \r and \n — \r\n is a single line terminator).
+        let p = r"(?Rm)^abc";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "\nabc");
+        assert_matches_regex_crate(p, &re, "\rabc");
+        assert_matches_regex_crate(p, &re, "\r\nabc");
+        assert_matches_regex_crate(p, &re, "xxx\nabc");
+        assert_matches_regex_crate(p, &re, "xxx\rabc");
+        assert_matches_regex_crate(p, &re, "xxx\r\nabc");
+        assert_matches_regex_crate(p, &re, "xabc"); // no match
+    }
+
+    #[test]
+    fn test_crlf_end_basic() {
+        // (?Rm:$) matches at end of input, before \r, and before \n
+        // (but NOT between \r and \n).
+        let p = r"(?Rm)abc$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "abc\n");
+        assert_matches_regex_crate(p, &re, "abc\r");
+        assert_matches_regex_crate(p, &re, "abc\r\n");
+        assert_matches_regex_crate(p, &re, "abc\nxxx");
+        assert_matches_regex_crate(p, &re, "abc\rxxx");
+        assert_matches_regex_crate(p, &re, "abc\r\nxxx");
+        assert_matches_regex_crate(p, &re, "abcx"); // no match
+    }
+
+    #[test]
+    fn test_crlf_both_anchors() {
+        let p = r"(?Rm)^abc$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "abc\r\n");
+        assert_matches_regex_crate(p, &re, "\r\nabc");
+        assert_matches_regex_crate(p, &re, "\r\nabc\r\n");
+        assert_matches_regex_crate(p, &re, "xxx\r\nabc\r\nyyy");
+        assert_matches_regex_crate(p, &re, "abc\n");
+        assert_matches_regex_crate(p, &re, "\nabc\n");
+        assert_matches_regex_crate(p, &re, "abc\r");
+        assert_matches_regex_crate(p, &re, "\rabc\r");
+        assert_matches_regex_crate(p, &re, "xabc"); // no match
+        assert_matches_regex_crate(p, &re, "abcx"); // no match
+    }
+
+    #[test]
+    fn test_crlf_empty_lines() {
+        // (?Rm)^$ matches any empty line, including empty input and
+        // positions between \r\n line terminators.
+        let p = r"(?Rm)^$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "\n");
+        assert_matches_regex_crate(p, &re, "\r\n");
+        assert_matches_regex_crate(p, &re, "\r");
+        assert_matches_regex_crate(p, &re, "\r\n\r\n");
+        assert_matches_regex_crate(p, &re, "abc\r\n\r\ndef");
+        assert_matches_regex_crate(p, &re, "abc"); // no empty line
+    }
+
+    #[test]
+    fn test_crlf_multiline_vs_lf() {
+        // Demonstrate difference between LF-mode and CRLF-mode.
+        // In CRLF mode, \r\n is a single terminator, so ^ after \r
+        // does NOT match between \r and \n.
+        let p_crlf = r"(?Rm)^abc$";
+        let re_crlf = build_regex_unchecked(p_crlf);
+
+        // \r\nabc\r\n — should match in CRLF mode
+        assert_matches_regex_crate(p_crlf, &re_crlf, "\r\nabc\r\n");
+
+        let p_lf = r"(?m)^abc$";
+        let re_lf = build_regex_unchecked(p_lf);
+
+        // In LF mode, \r is NOT a line terminator:
+        // \r\nabc\r\n — the "line" is "\rabc\r" which doesn't match "abc"
+        assert_matches_regex_crate(p_lf, &re_lf, "\r\nabc\r\n");
+    }
+
+    #[test]
+    fn test_crlf_with_dot_plus() {
+        let p = r"(?Rm)^.+$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "abc\r\ndef");
+        assert_matches_regex_crate(p, &re, "\r\nabc");
+        assert_matches_regex_crate(p, &re, "abc\r\n");
+        assert_matches_regex_crate(p, &re, ""); // no match
+        assert_matches_regex_crate(p, &re, "\r\n"); // no match: lines are empty
+        assert_matches_regex_crate(p, &re, "\r\n\r\n");
+    }
+
+    #[test]
+    fn test_crlf_with_counting() {
+        let p = r"(?Rm)^\d{2,4}$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "12");
+        assert_matches_regex_crate(p, &re, "1234");
+        assert_matches_regex_crate(p, &re, "12345"); // too long
+        assert_matches_regex_crate(p, &re, "xx\r\n12\r\nyy");
+        assert_matches_regex_crate(p, &re, "xx\r\n1\r\nyy"); // too short
+    }
+
+    #[test]
+    fn test_crlf_bare_cr_as_line_terminator() {
+        // Bare \r (without following \n) acts as a line terminator in
+        // CRLF mode.
+        let p = r"(?Rm)^abc$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "xxx\rabc\ryyy");
+        assert_matches_regex_crate(p, &re, "xxx\rabc");
+        assert_matches_regex_crate(p, &re, "abc\ryyy");
+    }
+
+    #[test]
+    fn test_crlf_end_before_cr() {
+        // EndCRLF fires before \r.
+        let p = r"(?Rm)abc$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc\r");
+        assert_matches_regex_crate(p, &re, "abc\r\n");
+        assert_matches_regex_crate(p, &re, "abc\rxxx");
+    }
+
+    #[test]
+    fn test_crlf_start_after_lf_not_crlf_middle() {
+        // StartCRLF after \n: matches. Between \r and \n: does NOT match.
+        let p = r"(?Rm)^x";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "\nx"); // match: after \n
+        assert_matches_regex_crate(p, &re, "\r\nx"); // match: after \r\n
+        assert_matches_regex_crate(p, &re, "\rx"); // match: after bare \r
+    }
+
+    #[test]
+    fn test_crlf_mixed_terminators() {
+        // Input with mixed \n, \r, and \r\n terminators.
+        let p = r"(?Rm)^abc$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "xxx\nabc\ryyy");
+        assert_matches_regex_crate(p, &re, "xxx\rabc\nyyy");
+        assert_matches_regex_crate(p, &re, "xxx\r\nabc\r\nyyy");
+        assert_matches_regex_crate(p, &re, "xxx\nabc\r\nyyy");
+        assert_matches_regex_crate(p, &re, "xxx\r\nabc\nyyy");
+    }
+
+    #[test]
+    fn test_crlf_end_only() {
+        let p = r"(?Rm)$";
+        let re = build_regex_unchecked(p);
+        // EndCRLF always matches (every input has end-of-input).
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "\r\n");
+        assert_matches_regex_crate(p, &re, "\r");
+        assert_matches_regex_crate(p, &re, "\n");
+    }
+
+    #[test]
+    fn test_crlf_start_only() {
+        let p = r"(?Rm)^";
+        let re = build_regex_unchecked(p);
+        // StartCRLF always matches (every input has position 0).
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "\r\n");
+        assert_matches_regex_crate(p, &re, "\r");
+        assert_matches_regex_crate(p, &re, "\n");
     }
 }
