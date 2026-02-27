@@ -3198,21 +3198,16 @@ mod tests {
             .expect("regex-syntax HIR translation should succeed")
     }
 
-    /// Build a compiled [`Regex`] from a pattern string and assert that
-    /// its memory footprint equals `expected_bytes`.
-    fn build_regex(pattern: &str, expected_bytes: usize) -> Regex {
-        let hir = parse_hir_bytes(pattern);
-        let mut builder = RegexBuilder::default();
-        let regex = builder
-            .build(&hir)
-            .expect("our builder should accept the HIR");
+    /// Assert that a compiled [`Regex`]'s memory footprint equals
+    /// `expected_bytes`.  Placed at the end of tests so that matching
+    /// failures are surfaced before size mismatches.
+    fn assert_memory_size(pattern: &str, regex: &Regex, expected_bytes: usize) {
         let actual = regex.memory_size();
         assert_eq!(
             actual, expected_bytes,
             "memory_size mismatch for pattern `{}`: actual={}, expected={}",
             pattern, actual, expected_bytes,
         );
-        regex
     }
 
     /// Assert that our NFA matcher and the `regex` crate agree on whether
@@ -3268,7 +3263,7 @@ mod tests {
     #[test]
     fn test_counting() {
         let p = "^.*a.{3}bc$";
-        let re = build_regex(p, 1152);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "aybzbc");
         assert_matches_regex_crate(p, &re, "axaybzbc");
         assert_matches_regex_crate(p, &re, "a123bc");
@@ -3284,6 +3279,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "bc");
         assert_matches_regex_crate(p, &re, "a123b");
         assert_matches_regex_crate(p, &re, "a123");
+        assert_memory_size(p, &re, 1152);
     }
 
     /// `(a|bc){1,2}` — flat range repetition with all combos up to 3.
@@ -3292,7 +3288,7 @@ mod tests {
         use itertools::Itertools;
 
         let p = "^(a|bc){1,2}$";
-        let re = build_regex(p, 1024);
+        let re = build_regex_unchecked(p);
 
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "bc");
@@ -3322,6 +3318,7 @@ mod tests {
             let input = v.into_iter().collect::<String>();
             assert_matches_regex_crate(p, &re, &input);
         }
+        assert_memory_size(p, &re, 1024);
     }
 
     /// `((a|bc){1,2}){2,3}` — nested counting constraints.
@@ -3330,7 +3327,7 @@ mod tests {
         use itertools::Itertools;
 
         let p = "^((a|bc){1,2}){2,3}$";
-        let re = build_regex(p, 2000);
+        let re = build_regex_unchecked(p);
 
         // negatives: below outer min, wrong chars
         assert_matches_regex_crate(p, &re, "");
@@ -3358,6 +3355,7 @@ mod tests {
             let input = v.into_iter().collect::<String>();
             assert_matches_regex_crate(p, &re, &input);
         }
+        assert_memory_size(p, &re, 2000);
     }
 
     /// `(a|a?){2,3}` — epsilon-matchable body (the `a?` branch can match
@@ -3365,7 +3363,7 @@ mod tests {
     #[test]
     fn test_aaaaa() {
         let p = "^(a|a?){2,3}$";
-        let re = build_regex(p, 992);
+        let re = build_regex_unchecked(p);
 
         // positives (epsilon branches make all lengths 0..=3 matchable)
         assert_matches_regex_crate(p, &re, "");
@@ -3380,13 +3378,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "aab");
+        assert_memory_size(p, &re, 992);
     }
 
     /// `a+` — basic one-or-more repetition.
     #[test]
     fn test_one_plus_basic() {
         let p = "^a+$";
-        let re = build_regex(p, 408);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "aaa");
@@ -3396,24 +3395,26 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "aab");
+        assert_memory_size(p, &re, 408);
     }
 
     /// `.+` — one-or-more wildcard.
     #[test]
     fn test_one_plus_wildcard() {
         let p = "^.+$";
-        let re = build_regex(p, 664);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
+        assert_memory_size(p, &re, 664);
     }
 
     /// `a+b+` — consecutive one-or-more repetitions.
     #[test]
     fn test_one_plus_catenation() {
         let p = "^a+b+$";
-        let re = build_regex(p, 536);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "b");
@@ -3422,26 +3423,28 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abb");
         assert_matches_regex_crate(p, &re, "aabb");
         assert_matches_regex_crate(p, &re, "ba");
+        assert_memory_size(p, &re, 536);
     }
 
     /// `(ab)+` — one-or-more of a multi-byte sequence.
     #[test]
     fn test_one_plus_group() {
         let p = "^(ab)+$";
-        let re = build_regex(p, 472);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abab");
         assert_matches_regex_crate(p, &re, "ababab");
         assert_matches_regex_crate(p, &re, "aba");
+        assert_memory_size(p, &re, 472);
     }
 
     /// `(a|b)+` — one-or-more alternation.
     #[test]
     fn test_one_plus_alternate() {
         let p = "^(a|b)+$";
-        let re = build_regex(p, 664);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
@@ -3455,13 +3458,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ac");
         assert_matches_regex_crate(p, &re, "ca");
         assert_matches_regex_crate(p, &re, "abc");
+        assert_memory_size(p, &re, 664);
     }
 
     /// `.*a.{3}b+c` — one-or-more mixed with counting constraints.
     #[test]
     fn test_one_plus_with_counting() {
         let p = "^.*a.{3}b+c$";
-        let re = build_regex(p, 1216);
+        let re = build_regex_unchecked(p);
         // positives
         assert_matches_regex_crate(p, &re, "a123bc");
         assert_matches_regex_crate(p, &re, "a123bbc");
@@ -3479,6 +3483,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "x123bc");
         assert_matches_regex_crate(p, &re, "a123b");
+        assert_memory_size(p, &re, 1216);
     }
 
     /// `(a{2,3})+` — inner repetition, outer one-or-more.
@@ -3486,7 +3491,7 @@ mod tests {
     #[test]
     fn test_repetition_inside_one_plus() {
         let p = "^(a{2,3})+$";
-        let re = build_regex(p, 640);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -3498,6 +3503,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaaaaa");
         assert_matches_regex_crate(p, &re, "aaaaaaaaa");
         assert_matches_regex_crate(p, &re, "b");
+        assert_memory_size(p, &re, 640);
     }
 
     /// `((a|bc){1,2})+` — inner range repetition of alternation, outer `+`.
@@ -3506,7 +3512,7 @@ mod tests {
         use itertools::Itertools;
 
         let p = "^((a|bc){1,2})+$";
-        let re = build_regex(p, 1088);
+        let re = build_regex_unchecked(p);
 
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
@@ -3524,13 +3530,14 @@ mod tests {
                 assert_matches_regex_crate(p, &re, &input);
             }
         }
+        assert_memory_size(p, &re, 1088);
     }
 
     /// `(a+){2,3}` — inner one-or-more, outer counted repetition.
     #[test]
     fn test_one_plus_inside_repetition() {
         let p = "^(a+){2,3}$";
-        let re = build_regex(p, 704);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -3540,6 +3547,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaaa");
         assert_matches_regex_crate(p, &re, "aaaaaaa");
         assert_matches_regex_crate(p, &re, "b");
+        assert_memory_size(p, &re, 704);
     }
 
     /// `((a|b)+){2,4}` — inner `+` of alternation, outer counted repetition.
@@ -3548,7 +3556,7 @@ mod tests {
         use itertools::Itertools;
 
         let p = "^((a|b)+){2,4}$";
-        let re = build_regex(p, 960);
+        let re = build_regex_unchecked(p);
 
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
@@ -3564,6 +3572,7 @@ mod tests {
                 assert_matches_regex_crate(p, &re, &input);
             }
         }
+        assert_memory_size(p, &re, 960);
     }
 
     /// `(a+b{2,3})+` — inner `+` and inner repetition side-by-side,
@@ -3571,7 +3580,7 @@ mod tests {
     #[test]
     fn test_mixed_plus_and_repetition_inside_one_plus() {
         let p = "^(a+b{2,3})+$";
-        let re = build_regex(p, 768);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -3585,6 +3594,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abbabbbabb");
         assert_matches_regex_crate(p, &re, "aabbaabbb");
         assert_matches_regex_crate(p, &re, "aabbbaabbb");
+        assert_memory_size(p, &re, 768);
     }
 
     // -- min=0 repetition tests ---------------------------------------------
@@ -3593,23 +3603,25 @@ mod tests {
     #[test]
     fn test_min_zero_basic() {
         let p = "^a{0,2}$";
-        let re = build_regex(p, 640);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "aaa");
         assert_matches_regex_crate(p, &re, "b");
+        assert_memory_size(p, &re, 640);
     }
 
     /// `a{0,1}` — equivalent to `a?`.
     #[test]
     fn test_min_zero_max_one() {
         let p = "^a{0,1}$";
-        let re = build_regex(p, 408);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "b");
+        assert_memory_size(p, &re, 408);
     }
 
     /// `(a|bc){0,3}` — zero to three of an alternation.
@@ -3618,7 +3630,7 @@ mod tests {
         use itertools::Itertools;
 
         let p = "^(a|bc){0,3}$";
-        let re = build_regex(p, 1088);
+        let re = build_regex_unchecked(p);
 
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
@@ -3634,13 +3646,14 @@ mod tests {
                 assert_matches_regex_crate(p, &re, &input);
             }
         }
+        assert_memory_size(p, &re, 1088);
     }
 
     /// `a{0,}` — zero or more, lowered to `a*` (no counter overhead).
     #[test]
     fn test_min_zero_unbounded() {
         let p = "^a{0,}$";
-        let re = build_regex(p, 408);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -3652,26 +3665,28 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "aab");
         assert_matches_regex_crate(p, &re, "baa");
+        assert_memory_size(p, &re, 408);
     }
 
     /// `(ab){0,}` — zero or more of a group, lowered to `(ab)*`.
     #[test]
     fn test_min_zero_unbounded_group() {
         let p = "^(ab){0,}$";
-        let re = build_regex(p, 472);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abab");
         assert_matches_regex_crate(p, &re, "ababab");
         assert_matches_regex_crate(p, &re, "aba");
+        assert_memory_size(p, &re, 472);
     }
 
     /// `x(a{0,2})+y` — min=0 repetition nested inside `+`.
     #[test]
     fn test_min_zero_inside_one_plus() {
         let p = "^x(a{0,2})+y$";
-        let re = build_regex(p, 832);
+        let re = build_regex_unchecked(p);
         // positives
         assert_matches_regex_crate(p, &re, "xy");
         assert_matches_regex_crate(p, &re, "xay");
@@ -3689,13 +3704,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ay");
         assert_matches_regex_crate(p, &re, "xa");
         assert_matches_regex_crate(p, &re, "aay");
+        assert_memory_size(p, &re, 832);
     }
 
     /// `(a{0,2}){2,3}` — min=0 inner, counted outer.
     #[test]
     fn test_min_zero_inside_repetition() {
         let p = "^(a{0,2}){2,3}$";
-        let re = build_regex(p, 1168);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -3705,13 +3721,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaaa");
         assert_matches_regex_crate(p, &re, "aaaaaaa");
         assert_matches_regex_crate(p, &re, "b");
+        assert_memory_size(p, &re, 1168);
     }
 
     /// `(a+){0,3}` — `+` inside a min=0 counted repetition.
     #[test]
     fn test_one_plus_inside_min_zero_repetition() {
         let p = "^(a+){0,3}$";
-        let re = build_regex(p, 768);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -3720,25 +3737,27 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaa");
         assert_matches_regex_crate(p, &re, "aaaaaa");
         assert_matches_regex_crate(p, &re, "b");
+        assert_memory_size(p, &re, 768);
     }
 
     /// `.{0,3}` — min=0 repetition on wildcard.
     #[test]
     fn test_min_zero_wildcard() {
         let p = "^.{0,3}$";
-        let re = build_regex(p, 896);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "abcd");
+        assert_memory_size(p, &re, 896);
     }
 
     /// `a{0,3}` — same as `a{0,3}` (the old test used `min: None`).
     #[test]
     fn test_none_min_repetition() {
         let p = "^a{0,3}$";
-        let re = build_regex(p, 640);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -3749,6 +3768,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "aab");
+        assert_memory_size(p, &re, 640);
     }
 
     // -- Standalone primitive tests ------------------------------------------
@@ -3757,7 +3777,7 @@ mod tests {
     #[test]
     fn test_literal_single() {
         let p = "^a$";
-        let re = build_regex(p, 344);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "a");
         // negatives
         assert_matches_regex_crate(p, &re, "");
@@ -3765,13 +3785,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "ba");
+        assert_memory_size(p, &re, 344);
     }
 
     /// `abc` — multi-byte literal concatenation.
     #[test]
     fn test_literal_multi() {
         let p = "^abc$";
-        let re = build_regex(p, 472);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "abc");
         // negatives
         assert_matches_regex_crate(p, &re, "");
@@ -3784,13 +3805,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "xabcx");
         assert_matches_regex_crate(p, &re, "cba");
         assert_matches_regex_crate(p, &re, "bac");
+        assert_memory_size(p, &re, 472);
     }
 
     /// `.` — bare wildcard (matches exactly one byte).
     #[test]
     fn test_dot_single() {
         let p = "^.$";
-        let re = build_regex(p, 600);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "z");
         assert_matches_regex_crate(p, &re, "0");
@@ -3799,13 +3821,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
+        assert_memory_size(p, &re, 600);
     }
 
     /// `a|bc` — bare alternation (no repetition).
     #[test]
     fn test_alternation_bare() {
         let p = "^(a|bc)$";
-        let re = build_regex(p, 536);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "bc");
         // negatives
@@ -3816,13 +3839,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "x");
         assert_matches_regex_crate(p, &re, "bca");
+        assert_memory_size(p, &re, 536);
     }
 
     /// `a|b|c` — three-way alternation.
     #[test]
     fn test_alternation_three_way() {
         let p = "^(a|b|c)$";
-        let re = build_regex(p, 600);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "c");
@@ -3831,26 +3855,28 @@ mod tests {
         assert_matches_regex_crate(p, &re, "d");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
+        assert_memory_size(p, &re, 600);
     }
 
     /// `a?` — standalone zero-or-one.
     #[test]
     fn test_question_mark_single() {
         let p = "^a?$";
-        let re = build_regex(p, 408);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         // negatives
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
+        assert_memory_size(p, &re, 408);
     }
 
     /// `(ab)?` — zero-or-one of a group.
     #[test]
     fn test_question_mark_group() {
         let p = "^(ab)?$";
-        let re = build_regex(p, 472);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "ab");
         // negatives
@@ -3859,13 +3885,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "abab");
         assert_matches_regex_crate(p, &re, "abc");
+        assert_memory_size(p, &re, 472);
     }
 
     /// `a?b` — optional prefix followed by a literal.
     #[test]
     fn test_question_mark_prefix() {
         let p = "^a?b$";
-        let re = build_regex(p, 472);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
         // negatives
@@ -3875,13 +3902,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "bb");
         assert_matches_regex_crate(p, &re, "cb");
         assert_matches_regex_crate(p, &re, "abc");
+        assert_memory_size(p, &re, 472);
     }
 
     /// `a*` — standalone zero-or-more.
     #[test]
     fn test_star_single() {
         let p = "^a*$";
-        let re = build_regex(p, 408);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -3893,13 +3921,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "aab");
         assert_matches_regex_crate(p, &re, "baa");
+        assert_memory_size(p, &re, 408);
     }
 
     /// `(ab)*` — zero-or-more of a group.
     #[test]
     fn test_star_group() {
         let p = "^(ab)*$";
-        let re = build_regex(p, 472);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abab");
@@ -3911,13 +3940,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aba");
         assert_matches_regex_crate(p, &re, "abba");
         assert_matches_regex_crate(p, &re, "abc");
+        assert_memory_size(p, &re, 472);
     }
 
     /// `a*b` — star followed by a literal.
     #[test]
     fn test_star_then_literal() {
         let p = "^a*b$";
-        let re = build_regex(p, 472);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "aab");
@@ -3930,13 +3960,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "aabb");
+        assert_memory_size(p, &re, 472);
     }
 
     /// `a{2,}` — unbounded min with n>0.
     #[test]
     fn test_min_n_unbounded() {
         let p = "^a{2,}$";
-        let re = build_regex(p, 576);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "aaa");
         assert_matches_regex_crate(p, &re, "aaaa");
@@ -3948,13 +3979,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "aab");
         assert_matches_regex_crate(p, &re, "baa");
+        assert_memory_size(p, &re, 576);
     }
 
     /// `(ab){2,}` — unbounded min of a group.
     #[test]
     fn test_min_n_unbounded_group() {
         let p = "^(ab){2,}$";
-        let re = build_regex(p, 736);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "abab");
         assert_matches_regex_crate(p, &re, "ababab");
         assert_matches_regex_crate(p, &re, "abababab");
@@ -3966,13 +3998,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abba");
         assert_matches_regex_crate(p, &re, "ababc");
         assert_matches_regex_crate(p, &re, "xabab");
+        assert_memory_size(p, &re, 736);
     }
 
     /// `a{3,5}` — bounded min>0 range.
     #[test]
     fn test_bounded_range() {
         let p = "^a{3,5}$";
-        let re = build_regex(p, 576);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "aaa");
         assert_matches_regex_crate(p, &re, "aaaa");
         assert_matches_regex_crate(p, &re, "aaaaa");
@@ -3984,13 +4017,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "aaab");
         assert_matches_regex_crate(p, &re, "baaa");
+        assert_memory_size(p, &re, 576);
     }
 
     /// `a{3,3}` — exact repetition.
     #[test]
     fn test_exact_repetition() {
         let p = "^a{3,3}$";
-        let re = build_regex(p, 576);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "aaa");
         // negatives
         assert_matches_regex_crate(p, &re, "");
@@ -4000,6 +4034,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaa");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "bbb");
+        assert_memory_size(p, &re, 576);
     }
 
     // -- Byte class tests ---------------------------------------------------
@@ -4008,33 +4043,35 @@ mod tests {
     #[test]
     fn test_byte_class_range() {
         let p = "^[a-c]$";
-        let re = build_regex(p, 600);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "c");
         assert_matches_regex_crate(p, &re, "d");
         assert_matches_regex_crate(p, &re, "ab");
+        assert_memory_size(p, &re, 600);
     }
 
     /// `[a-c]+` — one-or-more of a byte class.
     #[test]
     fn test_byte_class_one_plus() {
         let p = "^[a-c]+$";
-        let re = build_regex(p, 664);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "cba");
         assert_matches_regex_crate(p, &re, "abcd");
         assert_matches_regex_crate(p, &re, "d");
+        assert_memory_size(p, &re, 664);
     }
 
     /// `[a-c]{2,3}` — counted repetition of a byte class.
     #[test]
     fn test_byte_class_counted() {
         let p = "^[a-c]{2,3}$";
-        let re = build_regex(p, 832);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -4042,25 +4079,27 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abca");
         assert_matches_regex_crate(p, &re, "cc");
         assert_matches_regex_crate(p, &re, "dd");
+        assert_memory_size(p, &re, 832);
     }
 
     /// `[ax]` — disjoint single bytes (multi-range Class::Bytes).
     #[test]
     fn test_byte_class_disjoint() {
         let p = "^[ax]$";
-        let re = build_regex(p, 600);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "x");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ax");
+        assert_memory_size(p, &re, 600);
     }
 
     /// `[a-cx-z]+` — multiple disjoint ranges in a byte class.
     #[test]
     fn test_byte_class_multi_range() {
         let p = "^[a-cx-z]+$";
-        let re = build_regex(p, 664);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "x");
@@ -4068,19 +4107,21 @@ mod tests {
         assert_matches_regex_crate(p, &re, "d");
         assert_matches_regex_crate(p, &re, "w");
         assert_matches_regex_crate(p, &re, "abcxyz");
+        assert_memory_size(p, &re, 664);
     }
 
     /// `[a-c].*[x-z]` — byte classes mixed with wildcard.
     #[test]
     fn test_byte_class_with_wildcard() {
         let p = "^[a-c].*[x-z]$";
-        let re = build_regex(p, 1304);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "ax");
         assert_matches_regex_crate(p, &re, "a123z");
         assert_matches_regex_crate(p, &re, "bx");
         assert_matches_regex_crate(p, &re, "dx");
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
+        assert_memory_size(p, &re, 1304);
     }
 
     // -- Predefined character class tests -----------------------------------
@@ -4089,7 +4130,7 @@ mod tests {
     #[test]
     fn test_digit() {
         let p = r"^\d$";
-        let re = build_regex(p, 600);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "5");
         assert_matches_regex_crate(p, &re, "9");
@@ -4100,13 +4141,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "00");
         assert_matches_regex_crate(p, &re, "12");
+        assert_memory_size(p, &re, 600);
     }
 
     /// `\d+` — one-or-more digits.
     #[test]
     fn test_digit_plus() {
         let p = r"^\d+$";
-        let re = build_regex(p, 664);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "42");
         assert_matches_regex_crate(p, &re, "999");
@@ -4117,13 +4159,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "12a");
         assert_matches_regex_crate(p, &re, "a12");
         assert_matches_regex_crate(p, &re, "1 2");
+        assert_memory_size(p, &re, 664);
     }
 
     /// `\d{3,5}` — counted digit repetition.
     #[test]
     fn test_digit_counted() {
         let p = r"^\d{3,5}$";
-        let re = build_regex(p, 832);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "123");
         assert_matches_regex_crate(p, &re, "1234");
         assert_matches_regex_crate(p, &re, "12345");
@@ -4134,13 +4177,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "123456");
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "12a");
+        assert_memory_size(p, &re, 832);
     }
 
     /// `\D` — matches a single non-digit byte.
     #[test]
     fn test_non_digit() {
         let p = r"^\D$";
-        let re = build_regex(p, 600);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "z");
         assert_matches_regex_crate(p, &re, " ");
@@ -4151,13 +4195,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "5");
         assert_matches_regex_crate(p, &re, "9");
         assert_matches_regex_crate(p, &re, "aa");
+        assert_memory_size(p, &re, 600);
     }
 
     /// `\D+` — one-or-more non-digits.
     #[test]
     fn test_non_digit_plus() {
         let p = r"^\D+$";
-        let re = build_regex(p, 664);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "hello world");
         assert_matches_regex_crate(p, &re, "!@#");
@@ -4166,13 +4211,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "abc1");
         assert_matches_regex_crate(p, &re, "1abc");
+        assert_memory_size(p, &re, 664);
     }
 
     /// `\s` — matches a single ASCII whitespace byte.
     #[test]
     fn test_space() {
         let p = r"^\s$";
-        let re = build_regex(p, 600);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "\t");
         assert_matches_regex_crate(p, &re, "\n");
@@ -4182,13 +4228,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "  ");
+        assert_memory_size(p, &re, 600);
     }
 
     /// `\s+` — one-or-more whitespace.
     #[test]
     fn test_space_plus() {
         let p = r"^\s+$";
-        let re = build_regex(p, 664);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "   ");
         assert_matches_regex_crate(p, &re, " \t\n\r");
@@ -4197,13 +4244,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, " a");
         assert_matches_regex_crate(p, &re, "a ");
+        assert_memory_size(p, &re, 664);
     }
 
     /// `\S` — matches a single non-whitespace byte.
     #[test]
     fn test_non_space() {
         let p = r"^\S$";
-        let re = build_regex(p, 600);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "!");
@@ -4213,13 +4261,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "\t");
         assert_matches_regex_crate(p, &re, "\n");
         assert_matches_regex_crate(p, &re, "aa");
+        assert_memory_size(p, &re, 600);
     }
 
     /// `\S+` — one-or-more non-whitespace.
     #[test]
     fn test_non_space_plus() {
         let p = r"^\S+$";
-        let re = build_regex(p, 664);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "123");
         assert_matches_regex_crate(p, &re, "a1!");
@@ -4228,13 +4277,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "a b");
         assert_matches_regex_crate(p, &re, " abc");
+        assert_memory_size(p, &re, 664);
     }
 
     /// `\w` — matches a single ASCII word byte (`[0-9A-Za-z_]`).
     #[test]
     fn test_word() {
         let p = r"^\w$";
-        let re = build_regex(p, 600);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "Z");
         assert_matches_regex_crate(p, &re, "0");
@@ -4246,13 +4296,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "!");
         assert_matches_regex_crate(p, &re, "-");
         assert_matches_regex_crate(p, &re, "ab");
+        assert_memory_size(p, &re, 600);
     }
 
     /// `\w+` — one-or-more word bytes.
     #[test]
     fn test_word_plus() {
         let p = r"^\w+$";
-        let re = build_regex(p, 664);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "hello");
         assert_matches_regex_crate(p, &re, "foo_bar");
         assert_matches_regex_crate(p, &re, "x123");
@@ -4262,13 +4313,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "hello world");
         assert_matches_regex_crate(p, &re, "foo-bar");
+        assert_memory_size(p, &re, 664);
     }
 
     /// `\w{2,4}` — counted word repetition.
     #[test]
     fn test_word_counted() {
         let p = r"^\w{2,4}$";
-        let re = build_regex(p, 832);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "a1_Z");
@@ -4278,13 +4330,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abcde");
         assert_matches_regex_crate(p, &re, "!!");
         assert_matches_regex_crate(p, &re, "a b");
+        assert_memory_size(p, &re, 832);
     }
 
     /// `\W` — matches a single non-word byte.
     #[test]
     fn test_non_word() {
         let p = r"^\W$";
-        let re = build_regex(p, 600);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "!");
         assert_matches_regex_crate(p, &re, "-");
@@ -4295,13 +4348,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "_");
         assert_matches_regex_crate(p, &re, "  ");
+        assert_memory_size(p, &re, 600);
     }
 
     /// `\W+` — one-or-more non-word bytes.
     #[test]
     fn test_non_word_plus() {
         let p = r"^\W+$";
-        let re = build_regex(p, 664);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "!@#");
         assert_matches_regex_crate(p, &re, " - ");
@@ -4311,13 +4365,14 @@ mod tests {
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, " a ");
         assert_matches_regex_crate(p, &re, "!a!");
+        assert_memory_size(p, &re, 664);
     }
 
     /// `\d+\s+\w+` — mixed predefined classes in concatenation.
     #[test]
     fn test_predefined_mixed() {
         let p = r"^\d+\s+\w+$";
-        let re = build_regex(p, 1432);
+        let re = build_regex_unchecked(p);
         assert_matches_regex_crate(p, &re, "42 hello");
         assert_matches_regex_crate(p, &re, "0\tfoo");
         assert_matches_regex_crate(p, &re, "123  x");
@@ -4329,6 +4384,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, " hello");
         assert_matches_regex_crate(p, &re, "hello 42");
         assert_matches_regex_crate(p, &re, "42hello");
+        assert_memory_size(p, &re, 1432);
     }
 
     // -- Byte-class deduplication tests --------------------------------------
