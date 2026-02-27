@@ -1441,16 +1441,21 @@ struct Counter {
     tail: usize,
 }
 
+impl Counter {
+    const EMPTY: Self = Self {
+        incremented: false,
+        body_alive_gen: 0,
+        value: 0,
+        delta: 0,
+        head: SENTINEL,
+        tail: SENTINEL,
+    };
+}
+
 impl Default for Counter {
+    #[inline]
     fn default() -> Self {
-        Self {
-            incremented: false,
-            body_alive_gen: 0,
-            value: 0,
-            delta: 0,
-            head: SENTINEL,
-            tail: SENTINEL,
-        }
+        Self::EMPTY
     }
 }
 
@@ -1501,22 +1506,6 @@ impl Counter {
     /// active instance).
     fn is_single(&self) -> bool {
         self.head == SENTINEL
-    }
-
-    /// Check whether any active instance's value falls in `[min, max]`.
-    ///
-    /// O(1): instance values are strictly decreasing from `value`
-    /// (oldest) downward, and the runtime guarantees `value <= max`
-    /// (instances are popped when they reach `max`).  Therefore the
-    /// only question is whether the oldest instance has reached `min`.
-    fn any_instance_in_range(&self, min: usize, max: usize) -> bool {
-        debug_assert!(
-            self.value <= max,
-            "oldest instance {} should not exceed max {}",
-            self.value,
-            max
-        );
-        self.value >= min
     }
 }
 
@@ -1688,6 +1677,9 @@ pub struct MatcherMemory {
     /// Current and next state lists (swapped each step).
     clist: Vec<StateIdx>,
     nlist: Vec<StateIdx>,
+    /// Explicit work stack used by [`Matcher::addstate`] to avoid
+    /// recursive epsilon-closure traversal.
+    addstack: Vec<AddStateOp>,
     /// Per-state snapshot of [`CounterGeneration`] at first visit in the
     /// current step.  See the module-level doc comment for the motivation.
     ci_gen_at_visit: Vec<CounterGeneration>,
@@ -1702,6 +1694,7 @@ impl MatcherMemory {
         self.delta_pool.reset();
         self.clist.clear();
         self.nlist.clear();
+        self.addstack.clear();
         self.ci_gen_at_visit.clear();
         self.ci_gen_at_visit
             .resize(regex.states.len(), CounterGeneration::default());
@@ -1717,6 +1710,7 @@ impl MatcherMemory {
             listid: 0,
             clist: &mut self.clist,
             nlist: &mut self.nlist,
+            addstack: &mut self.addstack,
             ci_gen: CounterGeneration::default(),
             ci_gen_at_visit: &mut self.ci_gen_at_visit,
             start: regex.start,
@@ -1752,6 +1746,9 @@ pub struct Matcher<'a> {
     clist: &'a mut Vec<StateIdx>,
     /// Next active state list (built during a step).
     nlist: &'a mut Vec<StateIdx>,
+    /// Explicit work stack for iterative epsilon-closure traversal in
+    /// [`addstate`](Self::addstate).
+    addstack: &'a mut Vec<AddStateOp>,
     /// Monotonically increasing generation counter; incremented every
     /// time [`addcounter`](Self::addcounter) is called.  Used together
     /// with `ci_gen_at_visit` to detect whether a `CounterInstance`
@@ -1777,6 +1774,25 @@ pub struct Matcher<'a> {
     /// Tracks whether a `Match` state was ever reached in `clist`
     /// during the simulation (before `finish`).
     ever_matched: bool,
+}
+
+/// Internal operations for iterative [`Matcher::addstate`] traversal.
+#[derive(Clone, Copy, Debug)]
+enum AddStateOp {
+    /// Visit (and epsilon-expand) a state.
+    Visit(StateIdx),
+    /// Push this state to `nlist` after its epsilon successors are handled.
+    PostPush(StateIdx),
+    /// Continuation used by `CounterIncrement` after exploring the
+    /// continue-path epsilon closure.
+    CounterAfterContinue {
+        idx: StateIdx,
+        out1: StateIdx,
+        counter: CounterIdx,
+        min: usize,
+        max: usize,
+        value: usize,
+    },
 }
 
 impl<'a> Matcher<'a> {
@@ -1848,13 +1864,16 @@ impl<'a> Matcher<'a> {
             })
     }
 
-    /// Recursively follow epsilon transitions from state `idx`, adding
-    /// all reachable states to `nlist`.
+    /// Follow epsilon transitions from state `idx`, adding all reachable
+    /// states to `nlist`.
     ///
     /// This is the heart of the Thompson NFA simulation.  The
     /// `lastlist`/`listid` mechanism provides O(1) deduplication so each
     /// state is visited at most once per step (with a controlled exception
     /// for `CounterIncrement` re-entry — see below).
+    ///
+    /// Implemented iteratively with an explicit work stack to avoid call-
+    /// stack growth on deep epsilon-closure graphs.
     ///
     /// ## CounterIncrement re-entry
     ///
@@ -1877,124 +1896,171 @@ impl<'a> Matcher<'a> {
     /// reachable and we always allow the break.
     #[inline]
     fn addstate(&mut self, idx: StateIdx) {
-        let i = idx.idx();
-        if self.lastlist[i] == self.listid {
-            let should_reenter = match &self.states[idx] {
-                State::CounterIncrement { counter, .. } => {
-                    self.counter_is_processable(*counter, idx)
-                }
-                _ => false,
-            };
-            if !should_reenter {
-                return;
-            }
-        }
+        self.addstack.clear();
+        self.addstack.push(AddStateOp::Visit(idx));
 
-        // Record ci_gen only on first visit so re-entry compares against
-        // the original snapshot.
-        if self.lastlist[i] != self.listid {
-            self.ci_gen_at_visit[idx] = self.ci_gen;
-        }
-        self.lastlist[i] = self.listid;
+        while let Some(op) = self.addstack.pop() {
+            match op {
+                AddStateOp::Visit(idx) => {
+                    let i = idx.idx();
+                    if self.lastlist[i] == self.listid {
+                        let should_reenter = match self.states[idx] {
+                            State::CounterIncrement { counter, .. } => {
+                                self.counter_is_processable(counter, idx)
+                            }
+                            _ => false,
+                        };
+                        if !should_reenter {
+                            continue;
+                        }
+                    }
 
-        match &self.states[idx] {
-            State::Split { out, out1 } => {
-                let (out, out1) = (*out, *out1);
-                self.addstate(out);
-                self.addstate(out1);
-            }
-
-            State::Assert { kind, out } => {
-                let (kind, out) = (*kind, *out);
-                // Evaluate with next=None (upcoming byte is unknown in
-                // addstate).  Pass → follow out.  Fail/Defer → don't
-                // follow; the state is still pushed to nlist (below)
-                // and deferred assertions will be resolved in step()
-                // or finish().
-                if kind.eval(self.at_start, self.at_end, self.prev_byte, None) == AssertEval::Pass {
-                    self.addstate(out);
-                }
-            }
-
-            State::CounterInstance { out, counter } => {
-                let (out, counter) = (*out, *counter);
-                self.addcounter(counter);
-                self.addstate(out);
-            }
-
-            State::CounterIncrement {
-                out,
-                out1,
-                counter,
-                min,
-                max,
-            } if self.counter_is_processable(*counter, idx) => {
-                let (out, out1, counter, min, max) = (*out, *out1, *counter, *min, *max);
-                // Re-create the counter if it was exhausted (None).  This
-                // only happens when ci_gen advanced (i.e. a CounterInstance
-                // for an inner counter fired since our first visit).
-                if self.counters[counter].is_none() {
-                    self.counters[counter] = Some(Counter::default());
-                }
-
-                self.inccounter(counter);
-                let value = self.counters[counter].as_ref().unwrap().value;
-                debug_assert!(value > 0 && value <= max);
-                let is_single = self.counters[counter].as_ref().unwrap().is_single();
-
-                // -- Continue path --
-                // Follow the body again unless the single remaining
-                // instance has reached max.
-                let should_continue = value != max || !is_single;
-                let mut is_epsilon_body = false;
-                if should_continue {
-                    // Temporarily clear our mark to detect epsilon-body
-                    // loops.  The `incremented` flag (set by inccounter)
-                    // prevents the recursive call from re-processing this
-                    // state — it just sets lastlist[idx] and falls through.
-                    self.lastlist[i] = self.listid.wrapping_sub(1);
-                    self.addstate(out);
-                    is_epsilon_body = self.lastlist[i] == self.listid;
+                    // Record ci_gen only on first visit so re-entry compares
+                    // against the original snapshot.
+                    if self.lastlist[i] != self.listid {
+                        self.ci_gen_at_visit[idx] = self.ci_gen;
+                    }
                     self.lastlist[i] = self.listid;
+
+                    // Post-order push: state is appended to nlist only after
+                    // all recursively reachable epsilon successors.
+                    self.addstack.push(AddStateOp::PostPush(idx));
+
+                    match self.states[idx] {
+                        State::Split { out, out1 } => {
+                            // Preserve recursive order: out, then out1.
+                            self.addstack.push(AddStateOp::Visit(out1));
+                            self.addstack.push(AddStateOp::Visit(out));
+                        }
+
+                        State::Assert { kind, out } => {
+                            // Evaluate with next=None (upcoming byte is
+                            // unknown in addstate). Pass -> follow out.
+                            // Fail/Defer -> don't follow; the state is still
+                            // pushed to nlist and deferred assertions are
+                            // resolved in step() or finish().
+                            if kind.eval(self.at_start, self.at_end, self.prev_byte, None)
+                                == AssertEval::Pass
+                            {
+                                self.addstack.push(AddStateOp::Visit(out));
+                            }
+                        }
+
+                        State::CounterInstance { out, counter } => {
+                            self.addcounter(counter);
+                            self.addstack.push(AddStateOp::Visit(out));
+                        }
+
+                        State::CounterIncrement {
+                            out,
+                            out1,
+                            counter,
+                            min,
+                            max,
+                        } if self.counter_is_processable(counter, idx) => {
+                            // Re-create the counter if it was exhausted
+                            // (None). This only happens when ci_gen advanced
+                            // (i.e. a CounterInstance for an inner counter
+                            // fired since our first visit).
+                            if self.counters[counter].is_none() {
+                                self.counters[counter] = Some(Counter::default());
+                            }
+
+                            self.inccounter(counter);
+                            let value = self.counters[counter].as_ref().unwrap().value;
+                            debug_assert!(value > 0 && value <= max);
+                            let is_single = self.counters[counter].as_ref().unwrap().is_single();
+
+                            // Follow the body again unless the single
+                            // remaining instance has reached max.
+                            let should_continue = value != max || !is_single;
+                            if should_continue {
+                                // Temporarily clear our mark to detect
+                                // epsilon-body loops. The `incremented` flag
+                                // (set by inccounter) prevents immediate
+                                // re-processing of this same state.
+                                self.lastlist[i] = self.listid.wrapping_sub(1);
+                                self.addstack.push(AddStateOp::CounterAfterContinue {
+                                    idx,
+                                    out1,
+                                    counter,
+                                    min,
+                                    max,
+                                    value,
+                                });
+                                self.addstack.push(AddStateOp::Visit(out));
+                            } else {
+                                debug_assert!(
+                                    self.counters[counter].as_ref().unwrap().value <= max,
+                                    "oldest instance {} should not exceed max {}",
+                                    self.counters[counter].as_ref().unwrap().value,
+                                    max
+                                );
+                                let stop = self.counters[counter].as_ref().unwrap().value >= min;
+
+                                if value == max {
+                                    self.delcounter(counter);
+                                }
+
+                                if stop {
+                                    self.addstack.push(AddStateOp::Visit(out1));
+                                }
+                            }
+                        }
+
+                        State::Match => {
+                            self.ever_matched = true;
+                        }
+
+                        // Byte, ByteClass, ByteTable, or CounterIncrement
+                        // whose guard failed — just record the state for
+                        // step() to inspect.
+                        _ => {}
+                    }
                 }
 
-                // -- Break condition --
-                // For epsilon bodies the counter can freely advance to any
-                // value in [value, max] via empty matches, so the break
-                // condition is always satisfiable when min <= max (which
-                // is an invariant).  For normal bodies, check all current
-                // counter instances against [min, max].
-                let stop = if is_epsilon_body {
-                    min <= max
-                } else {
-                    self.counters[counter]
-                        .as_ref()
-                        .unwrap()
-                        .any_instance_in_range(min, max)
-                };
+                AddStateOp::CounterAfterContinue {
+                    idx,
+                    out1,
+                    counter,
+                    min,
+                    max,
+                    value,
+                } => {
+                    let i = idx.idx();
+                    let is_epsilon_body = self.lastlist[i] == self.listid;
+                    self.lastlist[i] = self.listid;
 
-                // De-allocate the oldest instance if it reached max.
-                if value == max {
-                    self.delcounter(counter);
+                    debug_assert!(
+                        self.counters[counter].as_ref().unwrap().value <= max,
+                        "oldest instance {} should not exceed max {}",
+                        self.counters[counter].as_ref().unwrap().value,
+                        max
+                    );
+
+                    // For epsilon bodies the counter can freely advance to
+                    // any value in [value, max] via empty matches, so the
+                    // break condition is always satisfiable when min <= max
+                    // (which is an invariant). For normal bodies, check all
+                    // current counter instances against [min, max].
+                    let stop =
+                        is_epsilon_body || self.counters[counter].as_ref().unwrap().value >= min;
+
+                    // De-allocate the oldest instance if it reached max.
+                    if value == max {
+                        self.delcounter(counter);
+                    }
+
+                    // Follow the break path if any instance satisfies the
+                    // counting constraint.
+                    if stop {
+                        self.addstack.push(AddStateOp::Visit(out1));
+                    }
                 }
 
-                // Follow the break path if any instance satisfies the
-                // counting constraint.
-                if stop {
-                    self.addstate(out1);
-                }
+                AddStateOp::PostPush(idx) => self.nlist.push(idx),
             }
-
-            State::Match => {
-                self.ever_matched = true;
-            }
-
-            // Byte, ByteClass, or CounterIncrement whose guard failed —
-            // just record the state for step() to inspect.
-            _ => {}
         }
-
-        self.nlist.push(idx);
     }
 
     /// Advance the simulation by one input byte.
@@ -2460,64 +2526,6 @@ mod tests {
         assert_eq!(pool.free_head, SENTINEL);
         c.pop(&mut pool);
         assert_ne!(pool.free_head, SENTINEL);
-    }
-
-    #[test]
-    fn test_counter_any_instance_in_range_single() {
-        let mut c = Counter::default();
-        for _ in 0..5 {
-            c.incr();
-        }
-        // value=5.  Runtime invariant: value <= max.
-        assert!(c.any_instance_in_range(3, 7)); // 5 >= 3
-        assert!(c.any_instance_in_range(5, 5)); // 5 >= 5
-        assert!(c.any_instance_in_range(1, 5)); // 5 >= 1
-        assert!(!c.any_instance_in_range(6, 10)); // 5 < 6
-    }
-
-    #[test]
-    fn test_counter_any_instance_in_range_multiple() {
-        let mut pool = DeltaPool::default();
-        let mut c = Counter::default();
-        // Instance 1: 3 increments.
-        for _ in 0..3 {
-            c.incr();
-        }
-        c.push(&mut pool);
-        // Instance 2: 2 increments.
-        for _ in 0..2 {
-            c.incr();
-        }
-        // Instances: 5, 2.  value=5.
-        // Runtime invariant: value <= max, so max >= 5.
-        assert!(c.any_instance_in_range(5, 5)); // 5 >= 5
-        assert!(c.any_instance_in_range(2, 5)); // 5 >= 2
-        assert!(c.any_instance_in_range(1, 10)); // 5 >= 1
-        assert!(!c.any_instance_in_range(6, 10)); // 5 < 6
-    }
-
-    #[test]
-    fn test_counter_any_instance_in_range_three_instances() {
-        let mut pool = DeltaPool::default();
-        let mut c = Counter::default();
-        for _ in 0..4 {
-            c.incr();
-        }
-        c.push(&mut pool); // delta=4
-        for _ in 0..3 {
-            c.incr();
-        }
-        c.push(&mut pool); // delta=3
-        for _ in 0..2 {
-            c.incr();
-        }
-        // value=9, instances: 9, 5, 2.
-        assert_eq!(collect_instance_values(&c, &pool), vec![9, 5, 2]);
-        // Runtime invariant: value <= max, so max >= 9.
-        assert!(c.any_instance_in_range(9, 9)); // 9 >= 9
-        assert!(c.any_instance_in_range(3, 9)); // 9 >= 3
-        assert!(c.any_instance_in_range(1, 10)); // 9 >= 1
-        assert!(!c.any_instance_in_range(10, 15)); // 9 < 10
     }
 
     #[test]
@@ -5553,5 +5561,30 @@ mod tests {
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a\nab\na");
         assert_matches_regex_crate(p, &re, "x\na\na\nx");
+    }
+
+    /// Deep epsilon-closure chain should not depend on call stack depth.
+    #[test]
+    fn test_addstate_deep_epsilon_chain() {
+        const N: usize = 30_000;
+
+        let mut pattern = String::with_capacity(2 + 2 * N);
+        pattern.push('^');
+        for _ in 0..N {
+            pattern.push_str("a?");
+        }
+        pattern.push('$');
+
+        let re = build_regex_unchecked(&pattern);
+        let mut mem = MatcherMemory::default();
+
+        // All pieces are optional, so empty input matches.
+        let m = mem.matcher(&re);
+        assert!(m.finish());
+
+        // A short input should also match.
+        let mut m = mem.matcher(&re);
+        m.chunk(b"aaa");
+        assert!(m.finish());
     }
 }
