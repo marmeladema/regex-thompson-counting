@@ -631,6 +631,14 @@ pub struct Regex {
     /// Each entry maps a byte value to a target state index, or
     /// [`StateIdx::NONE`] for "no transition".
     byte_tables: Box<[ByteMap]>,
+    /// For each consuming state `s`, the list of counters whose loop body
+    /// contains `s`.  Used by the pre-mark pass in [`Matcher::step`] to
+    /// stamp `body_alive_gen` on counters that have a legitimate thread
+    /// consuming the current byte, so [`Matcher::addcounter`] can
+    /// distinguish live re-entries from stale phantom instances.
+    ///
+    /// Indexed by `StateIdx`; non-consuming states have an empty `Vec`.
+    body_counter_map: Box<[Vec<CounterIdx>]>,
 }
 
 impl Regex {
@@ -642,13 +650,27 @@ impl Regex {
     /// - The `states` boxed slice (header + per-state inline size).
     /// - The `classes` boxed slice (byte-class lookup tables).
     /// - The `counters` boxed slice.
+    /// - The `body_counter_map` boxed slice (per-state `Vec<CounterIdx>`
+    ///   headers + any heap-allocated counter-index lists).
     pub fn memory_size(&self) -> usize {
         let inline = std::mem::size_of::<Self>();
         let states_alloc = self.states.len() * std::mem::size_of::<State>();
         let classes_alloc = self.classes.len() * std::mem::size_of::<ByteClass>();
         let counters_alloc = self.counters.len() * std::mem::size_of::<usize>();
         let byte_tables_alloc = self.byte_tables.len() * std::mem::size_of::<ByteMap>();
-        inline + states_alloc + classes_alloc + counters_alloc + byte_tables_alloc
+        let bcm_headers = self.body_counter_map.len() * std::mem::size_of::<Vec<CounterIdx>>();
+        let bcm_heap: usize = self
+            .body_counter_map
+            .iter()
+            .map(|v| v.capacity() * std::mem::size_of::<CounterIdx>())
+            .sum();
+        inline
+            + states_alloc
+            + classes_alloc
+            + counters_alloc
+            + byte_tables_alloc
+            + bcm_headers
+            + bcm_heap
     }
 
     /// Emit a Graphviz DOT representation of the NFA.
@@ -1173,6 +1195,7 @@ impl RegexBuilder {
         };
 
         self.optimize_byte_tables();
+        let body_counter_map = self.build_body_counter_map();
 
         Ok(Regex {
             states: StateList(self.states.to_vec().into_boxed_slice()),
@@ -1185,6 +1208,7 @@ impl RegexBuilder {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             byte_tables: self.byte_tables.to_vec().into_boxed_slice(),
+            body_counter_map,
         })
     }
 
@@ -1250,6 +1274,86 @@ impl RegexBuilder {
             self.states.as_mut_slice()[idx] = State::ByteTable { table: table_idx };
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Build the body-counter map for stale-instance detection.
+    // -----------------------------------------------------------------------
+
+    /// For every consuming state, compute which counters' loop bodies
+    /// contain it.  This is the compile-time component of the stale
+    /// Becchi-counter fix.
+    ///
+    /// Algorithm: for each `CounterIncrement` state at index `ci`, BFS
+    /// forward from `ci.out` (the "continue" edge, i.e. the loop body
+    /// re-entry) collecting every consuming state (`Byte`, `ByteClass`,
+    /// `ByteTable`) reachable before returning to `ci`.  Each such
+    /// consuming state records the counter index associated with `ci`.
+    ///
+    /// The BFS follows `out` edges of consuming states too, because a
+    /// loop body may contain multi-byte sequences (e.g. `bc` in
+    /// `(a|bc){2,3}`) where the second byte is only reachable through
+    /// the first.
+    fn build_body_counter_map(&self) -> Box<[Vec<CounterIdx>]> {
+        let n = self.states.len();
+        let mut map: Vec<Vec<CounterIdx>> = vec![Vec::new(); n];
+        let mut visited = vec![false; n];
+        let mut queue = std::collections::VecDeque::new();
+
+        for ci_raw in 0..n {
+            let ci_idx = StateIdx(ci_raw as u32);
+            if let State::CounterIncrement { counter, out, .. } = self.states.as_slice()[ci_idx] {
+                // BFS from the "continue" edge into the loop body.
+                visited.iter_mut().for_each(|v| *v = false);
+                visited[ci_raw] = true; // don't re-enter the increment node
+                queue.clear();
+                queue.push_back(out);
+                while let Some(s) = queue.pop_front() {
+                    let raw = s.raw();
+                    if raw >= n || visited[raw] {
+                        continue;
+                    }
+                    visited[raw] = true;
+                    match self.states.as_slice()[s] {
+                        // Consuming states: record the counter and
+                        // continue BFS through their `out` edge (the
+                        // body may contain multi-byte sequences).
+                        State::Byte { out, .. } | State::ByteClass { out, .. } => {
+                            map[raw].push(counter);
+                            queue.push_back(out);
+                        }
+                        State::ByteTable { table } => {
+                            map[raw].push(counter);
+                            // Follow all non-NONE targets of the table.
+                            for &target in self.byte_tables[table.idx()].0.iter() {
+                                if target != StateIdx::NONE {
+                                    queue.push_back(target);
+                                }
+                            }
+                        }
+                        // Epsilon states: enqueue successors.
+                        State::Split { out, out1 } => {
+                            queue.push_back(out);
+                            queue.push_back(out1);
+                        }
+                        State::CounterInstance { out, .. } => {
+                            queue.push_back(out);
+                        }
+                        State::CounterIncrement { out, out1, .. } => {
+                            // This is a *different* counter's increment
+                            // node (nested counting).  Follow both edges.
+                            queue.push_back(out);
+                            queue.push_back(out1);
+                        }
+                        State::Assert { out, .. } => {
+                            queue.push_back(out);
+                        }
+                        State::Match => {}
+                    }
+                }
+            }
+        }
+        map.into_boxed_slice()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,9 +1384,15 @@ impl RegexBuilder {
 /// - `incremented` — set by [`incr`](Self::incr), cleared at each
 ///   simulation step; used to prevent a `CounterIncrement` state from
 ///   being processed twice in the same epsilon closure.
+/// - `body_alive_gen` — the [`Matcher::listid`] at which the pre-mark
+///   pass last confirmed that a consuming state inside this counter's
+///   loop body matched the current byte.  Used by
+///   [`Matcher::addcounter`] to distinguish legitimate new instances
+///   from stale ones left over from dead threads.
 #[derive(Clone, Copy, Debug)]
 struct Counter {
     incremented: bool,
+    body_alive_gen: usize,
     value: usize,
     delta: usize,
     head: usize,
@@ -1293,6 +1403,7 @@ impl Default for Counter {
     fn default() -> Self {
         Self {
             incremented: false,
+            body_alive_gen: 0,
             value: 0,
             delta: 0,
             head: SENTINEL,
@@ -1444,27 +1555,45 @@ const SENTINEL: usize = usize::MAX;
 ///
 /// All counters share a single `DeltaPool`.  Each counter owns a
 /// linked list (head/tail indices stored in [`Counter`]) whose nodes
-/// live in this pool.  Freed nodes are pushed onto a free-list stack
-/// and recycled by subsequent allocations.
+/// live in this pool.  Freed nodes are threaded into an intrusive
+/// free list through the `next[]` array and recycled by subsequent
+/// allocations.
 ///
-/// Between matches, [`reset`](Self::reset) clears all three backing
-/// vecs (retaining heap capacity), so the pool's memory is reused
-/// across [`MatcherMemory::matcher`] calls without per-counter loops.
-#[derive(Clone, Debug, Default)]
+/// The intrusive free list enables O(1) bulk-free of an entire
+/// counter chain via [`free_chain`](Self::free_chain): set the tail's
+/// `next` to `free_head` and update `free_head` to the chain's head.
+///
+/// Between matches, [`reset`](Self::reset) clears the backing vecs
+/// (retaining heap capacity), so the pool's memory is reused across
+/// [`MatcherMemory::matcher`] calls without per-counter loops.
+#[derive(Clone, Debug)]
 struct DeltaPool {
     /// Node payload (delta value).
     values: Vec<usize>,
     /// `next[i]` = index of the successor node, or [`SENTINEL`].
     next: Vec<usize>,
-    /// Stack of freed node indices available for reuse.
-    free: Vec<usize>,
+    /// Head of the intrusive free list threaded through `next[]`,
+    /// or [`SENTINEL`] if the free list is empty.
+    free_head: usize,
+}
+
+impl Default for DeltaPool {
+    fn default() -> Self {
+        Self {
+            values: Vec::new(),
+            next: Vec::new(),
+            free_head: SENTINEL,
+        }
+    }
 }
 
 impl DeltaPool {
     /// Allocate a node with the given value.  Reuses a freed slot if
     /// available, otherwise appends to the end of the arena.
     fn alloc(&mut self, val: usize) -> usize {
-        if let Some(idx) = self.free.pop() {
+        if self.free_head != SENTINEL {
+            let idx = self.free_head;
+            self.free_head = self.next[idx];
             self.values[idx] = val;
             self.next[idx] = SENTINEL;
             idx
@@ -1476,16 +1605,27 @@ impl DeltaPool {
         }
     }
 
-    /// Return a node to the free list for reuse.
+    /// Return a single node to the free list for reuse.
     fn free_node(&mut self, idx: usize) {
-        self.free.push(idx);
+        self.next[idx] = self.free_head;
+        self.free_head = idx;
+    }
+
+    /// Return an entire linked-list chain `[head … tail]` to the free
+    /// list in O(1).  `tail` must be the last node in the chain
+    /// (i.e. `next[tail] == SENTINEL`).
+    fn free_chain(&mut self, head: usize, tail: usize) {
+        debug_assert_ne!(head, SENTINEL);
+        debug_assert_ne!(tail, SENTINEL);
+        self.next[tail] = self.free_head;
+        self.free_head = head;
     }
 
     /// Clear all nodes (retaining heap capacity).
     fn reset(&mut self) {
         self.values.clear();
         self.next.clear();
-        self.free.clear();
+        self.free_head = SENTINEL;
     }
 }
 
@@ -1532,6 +1672,7 @@ impl MatcherMemory {
             states: &regex.states,
             classes: &regex.classes,
             byte_tables: &regex.byte_tables,
+            body_counter_map: &regex.body_counter_map,
             lastlist: &mut self.lastlist,
             listid: 0,
             clist: &mut self.clist,
@@ -1561,6 +1702,8 @@ pub struct Matcher<'a> {
     classes: &'a [ByteClass],
     /// Byte dispatch tables referenced by [`State::ByteTable::table`].
     byte_tables: &'a [ByteMap],
+    /// Per consuming-state: which counters' loop bodies contain it.
+    body_counter_map: &'a [Vec<CounterIdx>],
     /// Per-state deduplication stamp (compared against `listid`).
     lastlist: &'a mut [usize],
     /// Monotonically increasing step ID.
@@ -1608,14 +1751,28 @@ impl<'a> Matcher<'a> {
 
     /// Allocate (or push) a counter instance.  If the counter is `None`
     /// (not yet created or previously exhausted), a fresh default counter
-    /// is created.  Otherwise a new instance is pushed onto the existing
-    /// counter.
+    /// is created.  Otherwise, check `body_alive_gen`: if the pre-mark
+    /// pass confirmed a thread inside this counter's body matched the
+    /// current byte, push a new instance; otherwise the counter holds
+    /// stale instances from dead threads — free them and start fresh.
     ///
     /// Increments `ci_gen` so that downstream `CounterIncrement` re-entry
     /// checks can detect that a new instance was allocated.
     fn addcounter(&mut self, idx: CounterIdx) {
         if let Some(counter) = self.counters[idx].as_mut() {
-            counter.push(self.delta_pool);
+            if counter.body_alive_gen == self.listid {
+                // A consuming state inside this counter's body matched
+                // the current byte — this is a legitimate new instance.
+                counter.push(self.delta_pool);
+            } else {
+                // No consuming state in this counter's body matched:
+                // all existing instances are stale.  Free the delta
+                // chain and start fresh.
+                if counter.head != SENTINEL {
+                    self.delta_pool.free_chain(counter.head, counter.tail);
+                }
+                *counter = Counter::default();
+            }
         } else {
             self.counters[idx] = Some(Counter::default());
         }
@@ -1842,6 +1999,14 @@ impl<'a> Matcher<'a> {
             }
             if any_expanded {
                 self.clist.append(self.nlist);
+                // Bump listid again so the consumption loop below gets
+                // a fresh generation.  Without this, states visited
+                // during pre-consumption expansion would be skipped by
+                // `addstate` in the consumption loop (their `lastlist`
+                // already matches `listid`).  This is a correctness bug
+                // for any hybrid assertion that needs both prev_byte
+                // AND next_byte (e.g. CRLF assertions).
+                self.listid += 1;
             }
         }
 
@@ -1864,6 +2029,26 @@ impl<'a> Matcher<'a> {
         // epsilon closure.
         for counter in self.counters.iter_mut().filter_map(|c| c.as_mut()) {
             counter.incremented = false;
+        }
+
+        // --- Pre-mark pass: stamp body_alive_gen on counters whose
+        // loop body contains a consuming state that matches byte `b`.
+        // This tells `addcounter` which counters have a legitimate
+        // thread consuming the current byte vs. stale phantom instances.
+        for &idx in &clist {
+            let matches = match self.states[idx] {
+                State::Byte { byte: b2, .. } => b == b2,
+                State::ByteClass { class, .. } => self.classes[class][b],
+                State::ByteTable { table } => self.byte_tables[table][b] != StateIdx::NONE,
+                _ => false,
+            };
+            if matches {
+                for &ci in &self.body_counter_map[idx.raw()] {
+                    if let Some(counter) = self.counters[ci].as_mut() {
+                        counter.body_alive_gen = self.listid;
+                    }
+                }
+            }
         }
 
         for &idx in &clist {
@@ -2033,7 +2218,7 @@ mod tests {
         pool.reset();
         assert!(pool.values.is_empty());
         assert!(pool.next.is_empty());
-        assert!(pool.free.is_empty());
+        assert_eq!(pool.free_head, SENTINEL);
         assert_eq!(pool.values.capacity(), cap_values);
         assert_eq!(pool.next.capacity(), cap_next);
     }
@@ -2232,9 +2417,9 @@ mod tests {
         c.incr();
         c.push(&mut pool);
         c.incr();
-        assert_eq!(pool.free.len(), 0);
+        assert_eq!(pool.free_head, SENTINEL);
         c.pop(&mut pool);
-        assert_eq!(pool.free.len(), 1);
+        assert_ne!(pool.free_head, SENTINEL);
     }
 
     #[test]
@@ -2356,13 +2541,12 @@ mod tests {
         c1.incr();
         let node_used = c1.head;
         c1.pop(&mut pool);
-        assert_eq!(pool.free.len(), 1);
-        assert_eq!(pool.free[0], node_used);
-        // c2 allocates — should reuse the freed node.
+        assert_eq!(pool.free_head, node_used);
+        // c2 allocates ��� should reuse the freed node.
         c2.incr();
         c2.push(&mut pool);
         assert_eq!(c2.head, node_used);
-        assert_eq!(pool.free.len(), 0);
+        assert_eq!(pool.free_head, SENTINEL);
     }
 
     #[test]
@@ -3043,7 +3227,7 @@ mod tests {
     #[test]
     fn test_counting() {
         let p = "^.*a.{3}bc$";
-        let re = build_regex(p, 816);
+        let re = build_regex(p, 1152);
         assert_matches_regex_crate(p, &re, "aybzbc");
         assert_matches_regex_crate(p, &re, "axaybzbc");
         assert_matches_regex_crate(p, &re, "a123bc");
@@ -3067,7 +3251,7 @@ mod tests {
         use itertools::Itertools;
 
         let p = "^(a|bc){1,2}$";
-        let re = build_regex(p, 600);
+        let re = build_regex(p, 1024);
 
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "bc");
@@ -3105,7 +3289,7 @@ mod tests {
         use itertools::Itertools;
 
         let p = "^((a|bc){1,2}){2,3}$";
-        let re = build_regex(p, 1096);
+        let re = build_regex(p, 2000);
 
         // negatives: below outer min, wrong chars
         assert_matches_regex_crate(p, &re, "");
@@ -3140,7 +3324,7 @@ mod tests {
     #[test]
     fn test_aaaaa() {
         let p = "^(a|a?){2,3}$";
-        let re = build_regex(p, 600);
+        let re = build_regex(p, 992);
 
         // positives (epsilon branches make all lengths 0..=3 matchable)
         assert_matches_regex_crate(p, &re, "");
@@ -3161,7 +3345,7 @@ mod tests {
     #[test]
     fn test_one_plus_basic() {
         let p = "^a+$";
-        let re = build_regex(p, 272);
+        let re = build_regex(p, 408);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "aaa");
@@ -3177,7 +3361,7 @@ mod tests {
     #[test]
     fn test_one_plus_wildcard() {
         let p = "^.+$";
-        let re = build_regex(p, 528);
+        let re = build_regex(p, 664);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -3188,7 +3372,7 @@ mod tests {
     #[test]
     fn test_one_plus_catenation() {
         let p = "^a+b+$";
-        let re = build_regex(p, 352);
+        let re = build_regex(p, 536);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "b");
@@ -3203,7 +3387,7 @@ mod tests {
     #[test]
     fn test_one_plus_group() {
         let p = "^(ab)+$";
-        let re = build_regex(p, 312);
+        let re = build_regex(p, 472);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -3216,7 +3400,7 @@ mod tests {
     #[test]
     fn test_one_plus_alternate() {
         let p = "^(a|b)+$";
-        let re = build_regex(p, 528);
+        let re = build_regex(p, 664);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
@@ -3236,7 +3420,7 @@ mod tests {
     #[test]
     fn test_one_plus_with_counting() {
         let p = "^.*a.{3}b+c$";
-        let re = build_regex(p, 856);
+        let re = build_regex(p, 1216);
         // positives
         assert_matches_regex_crate(p, &re, "a123bc");
         assert_matches_regex_crate(p, &re, "a123bbc");
@@ -3261,7 +3445,7 @@ mod tests {
     #[test]
     fn test_repetition_inside_one_plus() {
         let p = "^(a{2,3})+$";
-        let re = build_regex(p, 400);
+        let re = build_regex(p, 640);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -3281,7 +3465,7 @@ mod tests {
         use itertools::Itertools;
 
         let p = "^((a|bc){1,2})+$";
-        let re = build_regex(p, 640);
+        let re = build_regex(p, 1088);
 
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
@@ -3305,7 +3489,7 @@ mod tests {
     #[test]
     fn test_one_plus_inside_repetition() {
         let p = "^(a+){2,3}$";
-        let re = build_regex(p, 440);
+        let re = build_regex(p, 704);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -3323,7 +3507,7 @@ mod tests {
         use itertools::Itertools;
 
         let p = "^((a|b)+){2,4}$";
-        let re = build_regex(p, 696);
+        let re = build_regex(p, 960);
 
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
@@ -3346,7 +3530,7 @@ mod tests {
     #[test]
     fn test_mixed_plus_and_repetition_inside_one_plus() {
         let p = "^(a+b{2,3})+$";
-        let re = build_regex(p, 480);
+        let re = build_regex(p, 768);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -3368,7 +3552,7 @@ mod tests {
     #[test]
     fn test_min_zero_basic() {
         let p = "^a{0,2}$";
-        let re = build_regex(p, 400);
+        let re = build_regex(p, 640);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -3380,7 +3564,7 @@ mod tests {
     #[test]
     fn test_min_zero_max_one() {
         let p = "^a{0,1}$";
-        let re = build_regex(p, 272);
+        let re = build_regex(p, 408);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -3393,7 +3577,7 @@ mod tests {
         use itertools::Itertools;
 
         let p = "^(a|bc){0,3}$";
-        let re = build_regex(p, 640);
+        let re = build_regex(p, 1088);
 
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
@@ -3415,7 +3599,7 @@ mod tests {
     #[test]
     fn test_min_zero_unbounded() {
         let p = "^a{0,}$";
-        let re = build_regex(p, 272);
+        let re = build_regex(p, 408);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -3433,7 +3617,7 @@ mod tests {
     #[test]
     fn test_min_zero_unbounded_group() {
         let p = "^(ab){0,}$";
-        let re = build_regex(p, 312);
+        let re = build_regex(p, 472);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -3446,7 +3630,7 @@ mod tests {
     #[test]
     fn test_min_zero_inside_one_plus() {
         let p = "^x(a{0,2})+y$";
-        let re = build_regex(p, 520);
+        let re = build_regex(p, 832);
         // positives
         assert_matches_regex_crate(p, &re, "xy");
         assert_matches_regex_crate(p, &re, "xay");
@@ -3470,7 +3654,7 @@ mod tests {
     #[test]
     fn test_min_zero_inside_repetition() {
         let p = "^(a{0,2}){2,3}$";
-        let re = build_regex(p, 696);
+        let re = build_regex(p, 1168);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -3486,7 +3670,7 @@ mod tests {
     #[test]
     fn test_one_plus_inside_min_zero_repetition() {
         let p = "^(a+){0,3}$";
-        let re = build_regex(p, 480);
+        let re = build_regex(p, 768);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -3501,7 +3685,7 @@ mod tests {
     #[test]
     fn test_min_zero_wildcard() {
         let p = "^.{0,3}$";
-        let re = build_regex(p, 656);
+        let re = build_regex(p, 896);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -3513,7 +3697,7 @@ mod tests {
     #[test]
     fn test_none_min_repetition() {
         let p = "^a{0,3}$";
-        let re = build_regex(p, 400);
+        let re = build_regex(p, 640);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -3532,7 +3716,7 @@ mod tests {
     #[test]
     fn test_literal_single() {
         let p = "^a$";
-        let re = build_regex(p, 232);
+        let re = build_regex(p, 344);
         assert_matches_regex_crate(p, &re, "a");
         // negatives
         assert_matches_regex_crate(p, &re, "");
@@ -3546,7 +3730,7 @@ mod tests {
     #[test]
     fn test_literal_multi() {
         let p = "^abc$";
-        let re = build_regex(p, 312);
+        let re = build_regex(p, 472);
         assert_matches_regex_crate(p, &re, "abc");
         // negatives
         assert_matches_regex_crate(p, &re, "");
@@ -3565,7 +3749,7 @@ mod tests {
     #[test]
     fn test_dot_single() {
         let p = "^.$";
-        let re = build_regex(p, 488);
+        let re = build_regex(p, 600);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "z");
         assert_matches_regex_crate(p, &re, "0");
@@ -3580,7 +3764,7 @@ mod tests {
     #[test]
     fn test_alternation_bare() {
         let p = "^(a|bc)$";
-        let re = build_regex(p, 352);
+        let re = build_regex(p, 536);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "bc");
         // negatives
@@ -3597,7 +3781,7 @@ mod tests {
     #[test]
     fn test_alternation_three_way() {
         let p = "^(a|b|c)$";
-        let re = build_regex(p, 488);
+        let re = build_regex(p, 600);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "c");
@@ -3612,7 +3796,7 @@ mod tests {
     #[test]
     fn test_question_mark_single() {
         let p = "^a?$";
-        let re = build_regex(p, 272);
+        let re = build_regex(p, 408);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         // negatives
@@ -3625,7 +3809,7 @@ mod tests {
     #[test]
     fn test_question_mark_group() {
         let p = "^(ab)?$";
-        let re = build_regex(p, 312);
+        let re = build_regex(p, 472);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "ab");
         // negatives
@@ -3640,7 +3824,7 @@ mod tests {
     #[test]
     fn test_question_mark_prefix() {
         let p = "^a?b$";
-        let re = build_regex(p, 312);
+        let re = build_regex(p, 472);
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
         // negatives
@@ -3656,7 +3840,7 @@ mod tests {
     #[test]
     fn test_star_single() {
         let p = "^a*$";
-        let re = build_regex(p, 272);
+        let re = build_regex(p, 408);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
@@ -3674,7 +3858,7 @@ mod tests {
     #[test]
     fn test_star_group() {
         let p = "^(ab)*$";
-        let re = build_regex(p, 312);
+        let re = build_regex(p, 472);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abab");
@@ -3692,7 +3876,7 @@ mod tests {
     #[test]
     fn test_star_then_literal() {
         let p = "^a*b$";
-        let re = build_regex(p, 312);
+        let re = build_regex(p, 472);
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "aab");
@@ -3711,7 +3895,7 @@ mod tests {
     #[test]
     fn test_min_n_unbounded() {
         let p = "^a{2,}$";
-        let re = build_regex(p, 360);
+        let re = build_regex(p, 576);
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "aaa");
         assert_matches_regex_crate(p, &re, "aaaa");
@@ -3729,7 +3913,7 @@ mod tests {
     #[test]
     fn test_min_n_unbounded_group() {
         let p = "^(ab){2,}$";
-        let re = build_regex(p, 440);
+        let re = build_regex(p, 736);
         assert_matches_regex_crate(p, &re, "abab");
         assert_matches_regex_crate(p, &re, "ababab");
         assert_matches_regex_crate(p, &re, "abababab");
@@ -3747,7 +3931,7 @@ mod tests {
     #[test]
     fn test_bounded_range() {
         let p = "^a{3,5}$";
-        let re = build_regex(p, 360);
+        let re = build_regex(p, 576);
         assert_matches_regex_crate(p, &re, "aaa");
         assert_matches_regex_crate(p, &re, "aaaa");
         assert_matches_regex_crate(p, &re, "aaaaa");
@@ -3765,7 +3949,7 @@ mod tests {
     #[test]
     fn test_exact_repetition() {
         let p = "^a{3,3}$";
-        let re = build_regex(p, 360);
+        let re = build_regex(p, 576);
         assert_matches_regex_crate(p, &re, "aaa");
         // negatives
         assert_matches_regex_crate(p, &re, "");
@@ -3783,7 +3967,7 @@ mod tests {
     #[test]
     fn test_byte_class_range() {
         let p = "^[a-c]$";
-        let re = build_regex(p, 488);
+        let re = build_regex(p, 600);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "b");
@@ -3796,7 +3980,7 @@ mod tests {
     #[test]
     fn test_byte_class_one_plus() {
         let p = "^[a-c]+$";
-        let re = build_regex(p, 528);
+        let re = build_regex(p, 664);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "abc");
@@ -3809,7 +3993,7 @@ mod tests {
     #[test]
     fn test_byte_class_counted() {
         let p = "^[a-c]{2,3}$";
-        let re = build_regex(p, 616);
+        let re = build_regex(p, 832);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
@@ -3823,7 +4007,7 @@ mod tests {
     #[test]
     fn test_byte_class_disjoint() {
         let p = "^[ax]$";
-        let re = build_regex(p, 488);
+        let re = build_regex(p, 600);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "x");
@@ -3835,7 +4019,7 @@ mod tests {
     #[test]
     fn test_byte_class_multi_range() {
         let p = "^[a-cx-z]+$";
-        let re = build_regex(p, 528);
+        let re = build_regex(p, 664);
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "x");
@@ -3849,7 +4033,7 @@ mod tests {
     #[test]
     fn test_byte_class_with_wildcard() {
         let p = "^[a-c].*[x-z]$";
-        let re = build_regex(p, 1120);
+        let re = build_regex(p, 1304);
         assert_matches_regex_crate(p, &re, "ax");
         assert_matches_regex_crate(p, &re, "a123z");
         assert_matches_regex_crate(p, &re, "bx");
@@ -3864,7 +4048,7 @@ mod tests {
     #[test]
     fn test_digit() {
         let p = r"^\d$";
-        let re = build_regex(p, 488);
+        let re = build_regex(p, 600);
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "5");
         assert_matches_regex_crate(p, &re, "9");
@@ -3881,7 +4065,7 @@ mod tests {
     #[test]
     fn test_digit_plus() {
         let p = r"^\d+$";
-        let re = build_regex(p, 528);
+        let re = build_regex(p, 664);
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "42");
         assert_matches_regex_crate(p, &re, "999");
@@ -3898,7 +4082,7 @@ mod tests {
     #[test]
     fn test_digit_counted() {
         let p = r"^\d{3,5}$";
-        let re = build_regex(p, 616);
+        let re = build_regex(p, 832);
         assert_matches_regex_crate(p, &re, "123");
         assert_matches_regex_crate(p, &re, "1234");
         assert_matches_regex_crate(p, &re, "12345");
@@ -3915,7 +4099,7 @@ mod tests {
     #[test]
     fn test_non_digit() {
         let p = r"^\D$";
-        let re = build_regex(p, 488);
+        let re = build_regex(p, 600);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "z");
         assert_matches_regex_crate(p, &re, " ");
@@ -3932,7 +4116,7 @@ mod tests {
     #[test]
     fn test_non_digit_plus() {
         let p = r"^\D+$";
-        let re = build_regex(p, 528);
+        let re = build_regex(p, 664);
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "hello world");
         assert_matches_regex_crate(p, &re, "!@#");
@@ -3947,7 +4131,7 @@ mod tests {
     #[test]
     fn test_space() {
         let p = r"^\s$";
-        let re = build_regex(p, 488);
+        let re = build_regex(p, 600);
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "\t");
         assert_matches_regex_crate(p, &re, "\n");
@@ -3963,7 +4147,7 @@ mod tests {
     #[test]
     fn test_space_plus() {
         let p = r"^\s+$";
-        let re = build_regex(p, 528);
+        let re = build_regex(p, 664);
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "   ");
         assert_matches_regex_crate(p, &re, " \t\n\r");
@@ -3978,7 +4162,7 @@ mod tests {
     #[test]
     fn test_non_space() {
         let p = r"^\S$";
-        let re = build_regex(p, 488);
+        let re = build_regex(p, 600);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "!");
@@ -3994,7 +4178,7 @@ mod tests {
     #[test]
     fn test_non_space_plus() {
         let p = r"^\S+$";
-        let re = build_regex(p, 528);
+        let re = build_regex(p, 664);
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "123");
         assert_matches_regex_crate(p, &re, "a1!");
@@ -4009,7 +4193,7 @@ mod tests {
     #[test]
     fn test_word() {
         let p = r"^\w$";
-        let re = build_regex(p, 488);
+        let re = build_regex(p, 600);
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "Z");
         assert_matches_regex_crate(p, &re, "0");
@@ -4027,7 +4211,7 @@ mod tests {
     #[test]
     fn test_word_plus() {
         let p = r"^\w+$";
-        let re = build_regex(p, 528);
+        let re = build_regex(p, 664);
         assert_matches_regex_crate(p, &re, "hello");
         assert_matches_regex_crate(p, &re, "foo_bar");
         assert_matches_regex_crate(p, &re, "x123");
@@ -4043,7 +4227,7 @@ mod tests {
     #[test]
     fn test_word_counted() {
         let p = r"^\w{2,4}$";
-        let re = build_regex(p, 616);
+        let re = build_regex(p, 832);
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "a1_Z");
@@ -4059,7 +4243,7 @@ mod tests {
     #[test]
     fn test_non_word() {
         let p = r"^\W$";
-        let re = build_regex(p, 488);
+        let re = build_regex(p, 600);
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "!");
         assert_matches_regex_crate(p, &re, "-");
@@ -4076,7 +4260,7 @@ mod tests {
     #[test]
     fn test_non_word_plus() {
         let p = r"^\W+$";
-        let re = build_regex(p, 528);
+        let re = build_regex(p, 664);
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "!@#");
         assert_matches_regex_crate(p, &re, " - ");
@@ -4092,7 +4276,7 @@ mod tests {
     #[test]
     fn test_predefined_mixed() {
         let p = r"^\d+\s+\w+$";
-        let re = build_regex(p, 1200);
+        let re = build_regex(p, 1432);
         assert_matches_regex_crate(p, &re, "42 hello");
         assert_matches_regex_crate(p, &re, "0\tfoo");
         assert_matches_regex_crate(p, &re, "123  x");
@@ -4128,11 +4312,13 @@ mod tests {
         let one = build_regex_unchecked(r"^\d$");
         let two = build_regex_unchecked(r"^\d\d$");
         // The second `\d` adds one ByteClass state but no extra class
-        // table — so the difference is exactly one state.
+        // table — so the difference is exactly one state plus its
+        // body_counter_map Vec header.
         let state_size = std::mem::size_of::<State>();
+        let bcm_header = std::mem::size_of::<Vec<CounterIdx>>();
         assert_eq!(
             two.memory_size() - one.memory_size(),
-            state_size,
+            state_size + bcm_header,
             "second \\d should add one state, no extra class table",
         );
         assert_eq!(one.classes.len(), 1);
@@ -4199,9 +4385,10 @@ mod tests {
         let one_wild = build_regex_unchecked("^.$");
         let two_wild = build_regex_unchecked("^..$");
         let state_size = std::mem::size_of::<State>();
+        let bcm_header = std::mem::size_of::<Vec<CounterIdx>>();
         assert_eq!(
             two_wild.memory_size() - one_wild.memory_size(),
-            state_size,
+            state_size + bcm_header,
             "second `.` should add one state, no extra class table",
         );
         assert_eq!(one_wild.classes.len(), 1);
@@ -4851,5 +5038,425 @@ mod tests {
         assert_matches_regex_crate(p, &re, "\r\n");
         assert_matches_regex_crate(p, &re, "\r");
         assert_matches_regex_crate(p, &re, "\n");
+    }
+
+    // ===================================================================
+    // Stale Becchi counter fix: regression + coverage tests
+    //
+    // These tests exercise unanchored, partially-anchored, and
+    // multi-chunk scenarios that were previously untested and would
+    // have triggered phantom counter accumulation before the fix.
+    // ===================================================================
+
+    /// Simple unanchored counters: `\w{3,5}`, `a{3}`, `[0-9]{4}`.
+    /// Before the fix, gap-separated inputs would accumulate phantom
+    /// counts across non-matching positions.
+    #[test]
+    fn test_unanchored_counter_simple() {
+        // \w{3,5}
+        let p = r"\w{3,5}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "abcde");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "a b c");
+        assert_matches_regex_crate(p, &re, " abc ");
+        assert_matches_regex_crate(p, &re, "x y z");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "abcdef");
+        assert_matches_regex_crate(p, &re, "ab cde fg");
+
+        // a{3} — exact count
+        let p = "a{3}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "aaa");
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "xaaax");
+        assert_matches_regex_crate(p, &re, "a a a");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "aaaa");
+        assert_matches_regex_crate(p, &re, "baaab");
+
+        // [0-9]{4} — digit run
+        let p = "[0-9]{4}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "1234");
+        assert_matches_regex_crate(p, &re, "123");
+        assert_matches_regex_crate(p, &re, "a1234b");
+        assert_matches_regex_crate(p, &re, "1 2 3 4");
+        assert_matches_regex_crate(p, &re, "12345");
+        assert_matches_regex_crate(p, &re, "");
+    }
+
+    /// Unanchored counter with alternation body: `(a|bc){2,4}`.
+    #[test]
+    fn test_unanchored_counter_alternation_body() {
+        let p = "(a|bc){2,4}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "bca");
+        assert_matches_regex_crate(p, &re, "bcbc");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "bc");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "xaay");
+        assert_matches_regex_crate(p, &re, "xbcay");
+        assert_matches_regex_crate(p, &re, "a bc a");
+        assert_matches_regex_crate(p, &re, "abcbca");
+        assert_matches_regex_crate(p, &re, "abcbcbc");
+    }
+
+    /// Unanchored counter with multi-byte body: `(ab){2,3}`.
+    #[test]
+    fn test_unanchored_counter_multi_byte_body() {
+        let p = "(ab){2,3}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abab");
+        assert_matches_regex_crate(p, &re, "ababab");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "xababx");
+        assert_matches_regex_crate(p, &re, "ab ab ab");
+        assert_matches_regex_crate(p, &re, "aab");
+        assert_matches_regex_crate(p, &re, "abb");
+        assert_matches_regex_crate(p, &re, "abababab");
+    }
+
+    /// Unanchored nested counting: `((a|b){1,2}){2,3}`.
+    #[test]
+    fn test_unanchored_counter_nested() {
+        let p = "((a|b){1,2}){2,3}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "aabb");
+        assert_matches_regex_crate(p, &re, "ababab");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "xaby");
+        assert_matches_regex_crate(p, &re, "a b");
+        assert_matches_regex_crate(p, &re, "abba");
+    }
+
+    /// Unanchored counter with min=0: `a{0,3}`.
+    #[test]
+    fn test_unanchored_counter_min_zero() {
+        let p = "a{0,3}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "aaa");
+        assert_matches_regex_crate(p, &re, "aaaa");
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "xaaax");
+    }
+
+    /// Unanchored unbounded counter: `a{2,}`.
+    #[test]
+    fn test_unanchored_counter_unbounded() {
+        let p = "a{2,}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "aaa");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "xaay");
+        assert_matches_regex_crate(p, &re, "a a");
+        assert_matches_regex_crate(p, &re, "baaaab");
+    }
+
+    /// Unanchored counter with wildcard body: `.{3,5}`.
+    #[test]
+    fn test_unanchored_counter_wildcard_body() {
+        let p = ".{3,5}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "abcde");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "abcdef");
+    }
+
+    /// Start-anchored counter: `^a{2,3}`, `^\d{2,4}`.
+    #[test]
+    fn test_partial_anchor_start_counter() {
+        let p = r"^a{2,3}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "aaa");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "aaax");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "xaa");
+
+        let p = r"^\d{2,4}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "12");
+        assert_matches_regex_crate(p, &re, "1234");
+        assert_matches_regex_crate(p, &re, "1");
+        assert_matches_regex_crate(p, &re, "12345");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a12");
+    }
+
+    /// End-anchored counter: `a{2,3}$`, `\d{2,4}$`.
+    #[test]
+    fn test_partial_anchor_end_counter() {
+        let p = r"a{2,3}$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "aaa");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "xaa");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "aax");
+
+        let p = r"\d{2,4}$";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "12");
+        assert_matches_regex_crate(p, &re, "1234");
+        assert_matches_regex_crate(p, &re, "1");
+        assert_matches_regex_crate(p, &re, "x1234");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "12x");
+    }
+
+    /// Unanchored byte-class patterns: `\d+`, `\w+`, `[a-c]+`.
+    #[test]
+    fn test_unanchored_byte_class() {
+        let p = r"\d+";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "123");
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "a1b2c3");
+        assert_matches_regex_crate(p, &re, "");
+
+        let p = r"\w+";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "hello");
+        assert_matches_regex_crate(p, &re, " ");
+        assert_matches_regex_crate(p, &re, "a b c");
+        assert_matches_regex_crate(p, &re, "");
+
+        let p = "[a-c]+";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "abcabc");
+        assert_matches_regex_crate(p, &re, "xyz");
+        assert_matches_regex_crate(p, &re, "xabcy");
+        assert_matches_regex_crate(p, &re, "");
+    }
+
+    /// Unanchored ByteTable with counter: `(ab|cd|ef){2,3}`.
+    #[test]
+    fn test_unanchored_byte_table_counter() {
+        let p = "(ab|cd|ef){2,3}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abcd");
+        assert_matches_regex_crate(p, &re, "abcdef");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "xabcdy");
+        assert_matches_regex_crate(p, &re, "ab cd ef");
+        assert_matches_regex_crate(p, &re, "ababab");
+        assert_matches_regex_crate(p, &re, "efef");
+        assert_matches_regex_crate(p, &re, "abefcd");
+    }
+
+    /// Counter pattern split across chunk boundaries.
+    #[test]
+    fn test_chunk_boundary_counter() {
+        let p = r"a{3,5}";
+        let re = build_regex_unchecked(p);
+        let mut mem = MatcherMemory::default();
+
+        // "aaa" in one chunk
+        let mut m = mem.matcher(&re);
+        m.chunk(b"aaa");
+        assert!(m.finish(), "aaa should match a{{3,5}}");
+
+        // "aaa" split as "a" + "aa"
+        let mut m = mem.matcher(&re);
+        m.chunk(b"a");
+        m.chunk(b"aa");
+        assert!(m.finish(), "a+aa should match a{{3,5}}");
+
+        // "aaa" split as "aa" + "a"
+        let mut m = mem.matcher(&re);
+        m.chunk(b"aa");
+        m.chunk(b"a");
+        assert!(m.finish(), "aa+a should match a{{3,5}}");
+
+        // "aaaaa" split as "aa" + "aaa"
+        let mut m = mem.matcher(&re);
+        m.chunk(b"aa");
+        m.chunk(b"aaa");
+        assert!(m.finish(), "aa+aaa should match a{{3,5}}");
+
+        // "aa" — too short
+        let mut m = mem.matcher(&re);
+        m.chunk(b"a");
+        m.chunk(b"a");
+        assert!(!m.finish(), "a+a should not match a{{3,5}}");
+
+        // Multi-byte body across chunks: (ab){2,3}
+        let p = "(ab){2,3}";
+        let re = build_regex_unchecked(p);
+
+        let mut m = mem.matcher(&re);
+        m.chunk(b"ab");
+        m.chunk(b"ab");
+        assert!(m.finish(), "ab+ab should match (ab){{2,3}}");
+
+        let mut m = mem.matcher(&re);
+        m.chunk(b"a");
+        m.chunk(b"bab");
+        assert!(m.finish(), "a+bab should match (ab){{2,3}}");
+
+        let mut m = mem.matcher(&re);
+        m.chunk(b"aba");
+        m.chunk(b"b");
+        assert!(m.finish(), "aba+b should match (ab){{2,3}}");
+    }
+
+    /// Multiline assertions across chunk boundaries.
+    #[test]
+    fn test_chunk_boundary_multiline() {
+        let p = r"(?m:^)abc(?m:$)";
+        let re = build_regex_unchecked(p);
+        let mut mem = MatcherMemory::default();
+
+        // Single chunk
+        let mut m = mem.matcher(&re);
+        m.chunk(b"abc");
+        assert!(m.finish(), "abc should match ^abc$");
+
+        // Split across \n boundary
+        let mut m = mem.matcher(&re);
+        m.chunk(b"xxx\n");
+        m.chunk(b"abc\nyyy");
+        assert!(m.finish(), "xxx\\nabc\\nyyy should match ^abc$ multiline");
+
+        // abc split across chunks
+        let mut m = mem.matcher(&re);
+        m.chunk(b"ab");
+        m.chunk(b"c");
+        assert!(m.finish(), "ab+c should match ^abc$");
+
+        // No match
+        let mut m = mem.matcher(&re);
+        m.chunk(b"ab");
+        m.chunk(b"d");
+        assert!(!m.finish(), "ab+d should not match ^abc$");
+    }
+
+    /// Unanchored `?` quantifier: `a?b`.
+    #[test]
+    fn test_unanchored_question_mark() {
+        let p = "a?b";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "xaby");
+        assert_matches_regex_crate(p, &re, "xby");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "aab");
+    }
+
+    /// Degenerate counter `{1,1}`: `a{1,1}`.
+    #[test]
+    fn test_counter_exact_one() {
+        let p = "a{1,1}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "xax");
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "b");
+    }
+
+    /// Multiline + alternation + counter: `(?m:^)(a|bc){2,3}(?m:$)`.
+    #[test]
+    fn test_multiline_alternation_counter() {
+        let p = r"(?m:^)(a|bc){2,3}(?m:$)";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "bcbc");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "xxx\naa\nyyy");
+        assert_matches_regex_crate(p, &re, "xxx\nabc\nyyy");
+        assert_matches_regex_crate(p, &re, "xxx\na\nyyy");
+    }
+
+    /// Empty input with unanchored counter `a{0,3}`.
+    #[test]
+    fn test_empty_input_unanchored_counter() {
+        let p = "a{0,3}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "");
+    }
+
+    /// Unanchored byte-class + counter: `\d{2,4}`.
+    #[test]
+    fn test_unanchored_byte_class_counter() {
+        let p = r"\d{2,4}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "12");
+        assert_matches_regex_crate(p, &re, "1234");
+        assert_matches_regex_crate(p, &re, "1");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a12b");
+        assert_matches_regex_crate(p, &re, "a1b2c");
+        assert_matches_regex_crate(p, &re, "12345");
+        assert_matches_regex_crate(p, &re, "a1234b");
+    }
+
+    /// Counter body containing assertions.
+    ///
+    /// The counted group includes a multiline start-of-line anchor,
+    /// so the assertion must be evaluated inside the loop body on
+    /// each iteration.  This exercises the interaction between the
+    /// pre-consumption assertion expansion and the counter machinery.
+    #[test]
+    fn test_counter_body_with_assertion() {
+        // Each iteration must start at the beginning of a line.
+        // `(?m:^a){2,3}` — "a" at start of line, repeated 2–3 times.
+        let p = r"(?m:^a){2,3}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "a\na");
+        assert_matches_regex_crate(p, &re, "a\na\na");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a\nb\na");
+        assert_matches_regex_crate(p, &re, "ba\na");
+        assert_matches_regex_crate(p, &re, "a\na\na\na");
+
+        // End-of-line assertion inside counted body.
+        // `(?m:a$){2,3}` — "a" at end of line, repeated 2–3 times.
+        let p = r"(?m:a$){2,3}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "a\na");
+        assert_matches_regex_crate(p, &re, "a\na\na");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a\nb\na");
+        assert_matches_regex_crate(p, &re, "xa\nxa");
+
+        // Both anchors inside counted body.
+        // `(?m:^a$){2,3}` — full-line "a", repeated.
+        let p = r"(?m:^a$){2,3}";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "a\na");
+        assert_matches_regex_crate(p, &re, "a\na\na");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a\nab\na");
+        assert_matches_regex_crate(p, &re, "x\na\na\nx");
     }
 }
