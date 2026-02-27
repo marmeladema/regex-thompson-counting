@@ -1835,11 +1835,6 @@ impl<'a> Matcher<'a> {
         self.ci_gen.advance();
     }
 
-    /// Increment all instances of counter `idx`.
-    fn inccounter(&mut self, idx: CounterIdx) {
-        self.counters[idx].as_mut().unwrap().incr();
-    }
-
     /// De-allocate the oldest instance of counter `idx`.  If no instances
     /// remain, the counter is set to `None`.
     fn delcounter(&mut self, idx: CounterIdx) {
@@ -1958,26 +1953,21 @@ impl<'a> Matcher<'a> {
                             min,
                             max,
                         } if self.counter_is_processable(counter, idx) => {
-                            // Re-create the counter if it was exhausted
-                            // (None). This only happens when ci_gen advanced
-                            // (i.e. a CounterInstance for an inner counter
-                            // fired since our first visit).
-                            if self.counters[counter].is_none() {
-                                self.counters[counter] = Some(Counter::default());
-                            }
-
-                            self.inccounter(counter);
-                            let value = self.counters[counter].as_ref().unwrap().value;
+                            // Get or create the counter.  `get_or_insert_default`
+                            // handles the exhausted-counter re-creation that
+                            // previously needed an explicit `is_none` check.
+                            let c = self.counters[counter].get_or_insert_default();
+                            c.incr();
+                            let value = c.value;
                             debug_assert!(value > 0 && value <= max);
-                            let is_single = self.counters[counter].as_ref().unwrap().is_single();
 
                             // Follow the body again unless the single
                             // remaining instance has reached max.
-                            let should_continue = value != max || !is_single;
+                            let should_continue = value != max || !c.is_single();
                             if should_continue {
                                 // Temporarily clear our mark to detect
                                 // epsilon-body loops. The `incremented` flag
-                                // (set by inccounter) prevents immediate
+                                // (set by incr) prevents immediate
                                 // re-processing of this same state.
                                 self.lastlist[i] = self.listid.wrapping_sub(1);
                                 self.addstack.push(AddStateOp::CounterAfterContinue {
@@ -1990,13 +1980,10 @@ impl<'a> Matcher<'a> {
                                 });
                                 self.addstack.push(AddStateOp::Visit(out));
                             } else {
-                                debug_assert!(
-                                    self.counters[counter].as_ref().unwrap().value <= max,
-                                    "oldest instance {} should not exceed max {}",
-                                    self.counters[counter].as_ref().unwrap().value,
-                                    max
-                                );
-                                let stop = self.counters[counter].as_ref().unwrap().value >= min;
+                                // `value` was captured right after incr and
+                                // nothing modifies this counter in between.
+                                debug_assert!(value <= max);
+                                let stop = value >= min;
 
                                 if value == max {
                                     self.delcounter(counter);
@@ -2031,20 +2018,18 @@ impl<'a> Matcher<'a> {
                     let is_epsilon_body = self.lastlist[i] == self.listid;
                     self.lastlist[i] = self.listid;
 
-                    debug_assert!(
-                        self.counters[counter].as_ref().unwrap().value <= max,
-                        "oldest instance {} should not exceed max {}",
-                        self.counters[counter].as_ref().unwrap().value,
-                        max
-                    );
+                    // `value` was captured right after incr(); the
+                    // `incremented` flag prevents this counter from being
+                    // re-processed during the continue-path exploration,
+                    // so the counter's value is still `value`.
+                    debug_assert!(value <= max);
 
                     // For epsilon bodies the counter can freely advance to
                     // any value in [value, max] via empty matches, so the
                     // break condition is always satisfiable when min <= max
-                    // (which is an invariant). For normal bodies, check all
-                    // current counter instances against [min, max].
-                    let stop =
-                        is_epsilon_body || self.counters[counter].as_ref().unwrap().value >= min;
+                    // (which is an invariant). For normal bodies, check
+                    // the oldest instance against [min, max].
+                    let stop = is_epsilon_body || value >= min;
 
                     // De-allocate the oldest instance if it reached max.
                     if value == max {
