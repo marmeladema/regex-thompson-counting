@@ -1203,14 +1203,10 @@ impl std::hash::Hash for CounterCtx {
 }
 
 impl CounterCtx {
-    /// Create a context with all counters inactive.
-    fn new(num_counters: usize) -> Self {
+    /// Create an empty context (all counters inactive, no allocation).
+    fn new() -> Self {
         Self {
-            slots: if num_counters == 0 {
-                Box::new([])
-            } else {
-                vec![COUNTER_INACTIVE; num_counters].into_boxed_slice()
-            },
+            slots: Box::new([]),
             active: 0,
         }
     }
@@ -1224,14 +1220,22 @@ impl CounterCtx {
     /// Get the value of counter `idx`, or `None` if inactive.
     #[inline]
     fn get(&self, idx: CounterIdx) -> Option<usize> {
+        if idx.idx() >= self.slots.len() {
+            return None;
+        }
         let v = self.slots[idx.idx()];
         if v == COUNTER_INACTIVE { None } else { Some(v) }
     }
 
-    /// Set the value of counter `idx`.
+    /// Set the value of counter `idx`.  `num_counters` is the total
+    /// counter count for the regex, used to lazily allocate slots on
+    /// first use.
     #[inline]
-    fn set(&mut self, idx: CounterIdx, value: usize) {
+    fn set(&mut self, idx: CounterIdx, value: usize, num_counters: usize) {
         debug_assert!(value != COUNTER_INACTIVE);
+        if self.slots.is_empty() {
+            self.slots = vec![COUNTER_INACTIVE; num_counters].into_boxed_slice();
+        }
         let slot = &mut self.slots[idx.idx()];
         if *slot == COUNTER_INACTIVE {
             self.active += 1;
@@ -1280,12 +1284,13 @@ impl MatcherMemory {
         self.addstack.clear();
         self.ctx_visited.clear();
 
-        let empty_ctx = CounterCtx::new(regex.num_counters);
+        let empty_ctx = CounterCtx::new();
 
         let mut m = Matcher {
             states: &regex.states,
             classes: &regex.classes,
             byte_tables: &regex.byte_tables,
+            num_counters: regex.num_counters,
             lastlist: &mut self.lastlist,
             listid: 0,
             clist: &mut self.clist,
@@ -1314,6 +1319,7 @@ pub struct Matcher<'a> {
     /// Byte dispatch tables referenced by [`State::ByteTable::table`].
     byte_tables: &'a [ByteMap],
     /// Number of counter variables in the compiled regex.
+    num_counters: usize,
     /// Per-state deduplication stamp (compared against `listid`).
     /// Used for empty-context threads only.
     lastlist: &'a mut [usize],
@@ -1421,8 +1427,9 @@ impl<'a> Matcher<'a> {
                         State::CounterInstance { counter, out } => {
                             // Enter the counted repetition: set counter = 0.
                             // We own ctx — mutate in place, no clone needed.
+                            // Lazy allocation: slots are allocated here on first use.
                             let mut ctx = ctx;
-                            ctx.set(counter, 0);
+                            ctx.set(counter, 0, self.num_counters);
                             self.addstack.push(AddStateOp::Visit(out, ctx));
                         }
 
@@ -1445,13 +1452,13 @@ impl<'a> Matcher<'a> {
                                     break_ctx.remove(counter);
                                     self.addstack.push(AddStateOp::Visit(out1, break_ctx));
                                     let mut ctx = ctx;
-                                    ctx.set(counter, new_value);
+                                    ctx.set(counter, new_value, self.num_counters);
                                     self.addstack.push(AddStateOp::Visit(out, ctx));
                                 }
                                 (true, false) => {
                                     // Continue only: mutate in place.
                                     let mut ctx = ctx;
-                                    ctx.set(counter, new_value);
+                                    ctx.set(counter, new_value, self.num_counters);
                                     self.addstack.push(AddStateOp::Visit(out, ctx));
                                 }
                                 (false, true) => {
@@ -1619,13 +1626,13 @@ mod tests {
 
     #[test]
     fn test_counter_ctx_empty() {
-        let ctx = CounterCtx::new(0);
+        let ctx = CounterCtx::new();
         assert!(ctx.is_empty());
     }
 
     #[test]
     fn test_counter_ctx_all_inactive() {
-        let ctx = CounterCtx::new(3);
+        let ctx = CounterCtx::new();
         assert!(ctx.is_empty());
         assert_eq!(ctx.get(CounterIdx(0)), None);
         assert_eq!(ctx.get(CounterIdx(1)), None);
@@ -1634,8 +1641,8 @@ mod tests {
 
     #[test]
     fn test_counter_ctx_set_get() {
-        let mut ctx = CounterCtx::new(2);
-        ctx.set(CounterIdx(0), 5);
+        let mut ctx = CounterCtx::new();
+        ctx.set(CounterIdx(0), 5, 2);
         assert!(!ctx.is_empty());
         assert_eq!(ctx.get(CounterIdx(0)), Some(5));
         assert_eq!(ctx.get(CounterIdx(1)), None);
@@ -1643,9 +1650,9 @@ mod tests {
 
     #[test]
     fn test_counter_ctx_remove() {
-        let mut ctx = CounterCtx::new(2);
-        ctx.set(CounterIdx(0), 5);
-        ctx.set(CounterIdx(1), 3);
+        let mut ctx = CounterCtx::new();
+        ctx.set(CounterIdx(0), 5, 2);
+        ctx.set(CounterIdx(1), 3, 2);
         ctx.remove(CounterIdx(0));
         assert_eq!(ctx.get(CounterIdx(0)), None);
         assert_eq!(ctx.get(CounterIdx(1)), Some(3));
@@ -1656,18 +1663,18 @@ mod tests {
 
     #[test]
     fn test_counter_ctx_set_mutates() {
-        let mut ctx = CounterCtx::new(2);
+        let mut ctx = CounterCtx::new();
         assert!(ctx.is_empty());
-        ctx.set(CounterIdx(1), 7);
+        ctx.set(CounterIdx(1), 7, 2);
         assert!(!ctx.is_empty());
         assert_eq!(ctx.get(CounterIdx(1)), Some(7));
     }
 
     #[test]
     fn test_counter_ctx_remove_mutates() {
-        let mut ctx = CounterCtx::new(2);
-        ctx.set(CounterIdx(0), 10);
-        ctx.set(CounterIdx(1), 20);
+        let mut ctx = CounterCtx::new();
+        ctx.set(CounterIdx(0), 10, 2);
+        ctx.set(CounterIdx(1), 20, 2);
         ctx.remove(CounterIdx(0));
         assert_eq!(ctx.get(CounterIdx(0)), None);
         assert_eq!(ctx.get(CounterIdx(1)), Some(20));
@@ -1676,12 +1683,12 @@ mod tests {
     #[test]
     fn test_counter_ctx_equality_and_hash() {
         use HashSet;
-        let mut a = CounterCtx::new(2);
-        a.set(CounterIdx(0), 3);
-        let mut b = CounterCtx::new(2);
-        b.set(CounterIdx(0), 3);
-        let mut c = CounterCtx::new(2);
-        c.set(CounterIdx(0), 4);
+        let mut a = CounterCtx::new();
+        a.set(CounterIdx(0), 3, 2);
+        let mut b = CounterCtx::new();
+        b.set(CounterIdx(0), 3, 2);
+        let mut c = CounterCtx::new();
+        c.set(CounterIdx(0), 4, 2);
         assert_eq!(a, b);
         assert_ne!(a, c);
         let mut set = HashSet::new();
