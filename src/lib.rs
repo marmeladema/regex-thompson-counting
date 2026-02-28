@@ -1179,29 +1179,52 @@ const COUNTER_INACTIVE: usize = usize::MAX;
 /// For threads outside all counted repetitions (the common case), the
 /// context is empty (`0.is_empty() == true`) and dedup falls back to
 /// the fast `lastlist` path.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct CounterCtx(Box<[usize]>);
+#[derive(Clone, Debug)]
+struct CounterCtx {
+    slots: Box<[usize]>,
+    /// Number of active (non-`COUNTER_INACTIVE`) slots.  Maintained by
+    /// `set` / `remove` so that `is_empty` is O(1).
+    active: usize,
+}
+
+impl PartialEq for CounterCtx {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.active == other.active && self.slots == other.slots
+    }
+}
+impl Eq for CounterCtx {}
+
+impl std::hash::Hash for CounterCtx {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.slots.hash(state);
+    }
+}
 
 impl CounterCtx {
     /// Create a context with all counters inactive.
     fn new(num_counters: usize) -> Self {
-        if num_counters == 0 {
-            Self(Box::new([]))
-        } else {
-            Self(vec![COUNTER_INACTIVE; num_counters].into_boxed_slice())
+        Self {
+            slots: if num_counters == 0 {
+                Box::new([])
+            } else {
+                vec![COUNTER_INACTIVE; num_counters].into_boxed_slice()
+            },
+            active: 0,
         }
     }
 
     /// True when no counter is active (all slots are `COUNTER_INACTIVE`).
     #[inline]
     fn is_empty(&self) -> bool {
-        self.0.iter().all(|&v| v == COUNTER_INACTIVE)
+        self.active == 0
     }
 
     /// Get the value of counter `idx`, or `None` if inactive.
     #[inline]
     fn get(&self, idx: CounterIdx) -> Option<usize> {
-        let v = self.0[idx.idx()];
+        let v = self.slots[idx.idx()];
         if v == COUNTER_INACTIVE { None } else { Some(v) }
     }
 
@@ -1209,13 +1232,20 @@ impl CounterCtx {
     #[inline]
     fn set(&mut self, idx: CounterIdx, value: usize) {
         debug_assert!(value != COUNTER_INACTIVE);
-        self.0[idx.idx()] = value;
+        let slot = &mut self.slots[idx.idx()];
+        if *slot == COUNTER_INACTIVE {
+            self.active += 1;
+        }
+        *slot = value;
     }
 
-    /// Deactivate counter `idx`.
+    /// Deactivate counter `idx`.  The counter must currently be active.
     #[inline]
     fn remove(&mut self, idx: CounterIdx) {
-        self.0[idx.idx()] = COUNTER_INACTIVE;
+        let slot = &mut self.slots[idx.idx()];
+        debug_assert!(*slot != COUNTER_INACTIVE, "remove on inactive counter");
+        *slot = COUNTER_INACTIVE;
+        self.active -= 1;
     }
 }
 
