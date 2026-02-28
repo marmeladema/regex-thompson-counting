@@ -223,6 +223,17 @@ enum AssertKind {
     /// immediately before `\n` **unless** `\r` precedes (i.e. not
     /// between `\r` and `\n`).
     EndCRLF,
+    /// `\b` — ASCII word boundary.
+    ///
+    /// Matches at a position where the previous byte and next byte
+    /// differ in "word-ness" (one is `[0-9A-Za-z_]` and the other is
+    /// not, or one side is start/end of input).
+    WordAscii,
+    /// `\B` — ASCII non-word boundary.
+    ///
+    /// Matches at a position where both sides are word characters or
+    /// both sides are non-word characters.
+    WordAsciiNegate,
 }
 
 /// Result of evaluating an assertion at a given position.
@@ -236,6 +247,12 @@ enum AssertEval {
     /// The state is parked in the list for deferred resolution in
     /// [`Matcher::step`] or [`Matcher::finish`].
     Defer,
+}
+
+/// Returns `true` if `b` is an ASCII word byte: `[0-9A-Za-z_]`.
+#[inline]
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 impl AssertKind {
@@ -317,6 +334,46 @@ impl AssertKind {
                     None => Defer,
                 }
             }
+            AssertKind::WordAscii => {
+                let prev_w = prev.is_some_and(is_word_byte);
+                match next {
+                    Some(b) => {
+                        if prev_w != is_word_byte(b) {
+                            Pass
+                        } else {
+                            Fail
+                        }
+                    }
+                    None => {
+                        if at_end {
+                            // At end-of-input: boundary iff prev is a word char.
+                            if prev_w { Pass } else { Fail }
+                        } else {
+                            Defer
+                        }
+                    }
+                }
+            }
+            AssertKind::WordAsciiNegate => {
+                let prev_w = prev.is_some_and(is_word_byte);
+                match next {
+                    Some(b) => {
+                        if prev_w == is_word_byte(b) {
+                            Pass
+                        } else {
+                            Fail
+                        }
+                    }
+                    None => {
+                        if at_end {
+                            // At end-of-input: non-boundary iff prev is NOT a word char.
+                            if prev_w { Fail } else { Pass }
+                        } else {
+                            Defer
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -329,6 +386,8 @@ impl AssertKind {
             AssertKind::EndLF => "$LF",
             AssertKind::StartCRLF => "^CRLF",
             AssertKind::EndCRLF => "$CRLF",
+            AssertKind::WordAscii => "\\b",
+            AssertKind::WordAsciiNegate => "\\B",
         }
     }
 }
@@ -816,6 +875,8 @@ impl RegexBuilder {
                     hir::Look::EndLF => AssertKind::EndLF,
                     hir::Look::StartCRLF => AssertKind::StartCRLF,
                     hir::Look::EndCRLF => AssertKind::EndCRLF,
+                    hir::Look::WordAscii => AssertKind::WordAscii,
+                    hir::Look::WordAsciiNegate => AssertKind::WordAsciiNegate,
                     _ => return Err(Error::UnsupportedLook(*look)),
                 };
                 self.postfix.push(RegexHirNode::Assert(kind));
@@ -4382,6 +4443,157 @@ mod tests {
         assert_matches_regex_crate(p, &re, "\r\n");
         assert_matches_regex_crate(p, &re, "\r");
         assert_matches_regex_crate(p, &re, "\n");
+    }
+
+    // ===================================================================
+    // Word boundary assertions: \b (WordAscii) and \B (WordAsciiNegate)
+    // ===================================================================
+
+    /// `\b` — basic word boundary around a literal.
+    #[test]
+    fn test_word_boundary_literal() {
+        let p = r"\bfoo\b";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "foo");
+        assert_matches_regex_crate(p, &re, " foo ");
+        assert_matches_regex_crate(p, &re, "foo bar");
+        assert_matches_regex_crate(p, &re, "bar foo");
+        assert_matches_regex_crate(p, &re, "bar foo baz");
+        assert_matches_regex_crate(p, &re, "(foo)");
+        assert_matches_regex_crate(p, &re, "foobar"); // no match
+        assert_matches_regex_crate(p, &re, "barfoo"); // no match (trailing)
+        assert_matches_regex_crate(p, &re, "xfooy"); // no match
+        assert_matches_regex_crate(p, &re, ""); // no match
+    }
+
+    /// `\b` at start/end of input.
+    #[test]
+    fn test_word_boundary_start_end() {
+        let p = r"\bx";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "x"); // boundary at start
+        assert_matches_regex_crate(p, &re, " x"); // boundary after space
+        assert_matches_regex_crate(p, &re, "ax"); // no boundary: a is word char
+
+        let p = r"x\b";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "x"); // boundary at end
+        assert_matches_regex_crate(p, &re, "x "); // boundary before space
+        assert_matches_regex_crate(p, &re, "xa"); // no boundary: a is word char
+    }
+
+    /// `\b` with quantifiers.
+    #[test]
+    fn test_word_boundary_quantifiers() {
+        let p = r"\b\w+\b";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "hello");
+        assert_matches_regex_crate(p, &re, "hello world");
+        assert_matches_regex_crate(p, &re, "  hello  ");
+        assert_matches_regex_crate(p, &re, ""); // no match
+        assert_matches_regex_crate(p, &re, "   "); // no match
+    }
+
+    /// `\b` with counted repetitions.
+    #[test]
+    fn test_word_boundary_counter() {
+        let p = r"\b\w{3,5}\b";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "abcde");
+        assert_matches_regex_crate(p, &re, "ab"); // too short
+        assert_matches_regex_crate(p, &re, "abcdef"); // 6 chars, but \b\w{3,5}\b matches "abcde"
+        assert_matches_regex_crate(p, &re, " abc ");
+        assert_matches_regex_crate(p, &re, " ab "); // too short
+        assert_matches_regex_crate(p, &re, "hello world");
+    }
+
+    /// `\B` — non-word boundary.
+    #[test]
+    fn test_non_word_boundary() {
+        let p = r"\Bfoo\B";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "xfooy"); // match: word chars on both sides
+        assert_matches_regex_crate(p, &re, "afoobar");
+        assert_matches_regex_crate(p, &re, "foo"); // no match: start/end are non-word
+        assert_matches_regex_crate(p, &re, " foo "); // no match: spaces are non-word
+        assert_matches_regex_crate(p, &re, "xfoo"); // no match: end is non-word
+        assert_matches_regex_crate(p, &re, "fooy"); // no match: start is non-word
+    }
+
+    /// `\b` with digits and underscores (word chars).
+    #[test]
+    fn test_word_boundary_digits_underscore() {
+        let p = r"\b\d+\b";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "123");
+        assert_matches_regex_crate(p, &re, " 456 ");
+        assert_matches_regex_crate(p, &re, "abc123def"); // no boundary match; digits bordered by word chars
+
+        let p = r"\b_test_\b";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "_test_");
+        assert_matches_regex_crate(p, &re, " _test_ ");
+        assert_matches_regex_crate(p, &re, "x_test_y"); // no match: bordered by word chars
+    }
+
+    /// `\b` bare — matches at every word boundary position.
+    #[test]
+    fn test_word_boundary_bare() {
+        let p = r"\b";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "a"); // match: boundary at start
+        assert_matches_regex_crate(p, &re, " "); // no match: no word chars, no boundary
+        assert_matches_regex_crate(p, &re, ""); // no match: empty input, no boundary
+    }
+
+    /// `\B` bare — matches at every non-word boundary position.
+    #[test]
+    fn test_non_word_boundary_bare() {
+        let p = r"\B";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, ""); // match: empty input is non-word/non-word
+        assert_matches_regex_crate(p, &re, " "); // match: between non-word boundaries
+        assert_matches_regex_crate(p, &re, "a"); // no match: start-of-input vs word char is a word boundary
+    }
+
+    /// Mixed `\b` and `\B` in the same pattern.
+    #[test]
+    fn test_word_boundary_mixed() {
+        // Match a word that starts at a word boundary but whose end
+        // is NOT at a word boundary (i.e., followed by another word char).
+        let p = r"\bfoo\B";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "foobar"); // match
+        assert_matches_regex_crate(p, &re, " foobar"); // match
+        assert_matches_regex_crate(p, &re, "foo"); // no match: end is at boundary
+        assert_matches_regex_crate(p, &re, "foo "); // no match: space after
+        assert_matches_regex_crate(p, &re, "xfoobar"); // no match: x before foo
+    }
+
+    /// `\b` with alternation.
+    #[test]
+    fn test_word_boundary_alternation() {
+        let p = r"\b(cat|dog)\b";
+        let re = build_regex_unchecked(p);
+        assert_matches_regex_crate(p, &re, "cat");
+        assert_matches_regex_crate(p, &re, "dog");
+        assert_matches_regex_crate(p, &re, "the cat sat");
+        assert_matches_regex_crate(p, &re, "hotdog"); // no match
+        assert_matches_regex_crate(p, &re, "concatenate"); // no match
+    }
+
+    /// `\b` with special ASCII boundary characters.
+    #[test]
+    fn test_word_boundary_special_chars() {
+        let p = r"\btest\b";
+        let re = build_regex_unchecked(p);
+        // Punctuation and control chars are not word characters, so
+        // they act as boundaries.
+        assert_matches_regex_crate(p, &re, "\x00test\x00");
+        assert_matches_regex_crate(p, &re, ".test.");
+        assert_matches_regex_crate(p, &re, "\ttest\n");
+        assert_matches_regex_crate(p, &re, "/test/");
     }
 
     // ===================================================================
