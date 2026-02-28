@@ -1381,15 +1381,24 @@ impl<'a> Matcher<'a> {
             match op {
                 AddStateOp::Visit(idx, ctx) => {
                     // --- Dedup ---
-                    if ctx.is_empty() {
+                    let ctx = if ctx.is_empty() {
                         let i = idx.idx();
                         if self.lastlist[i] == self.listid {
                             continue;
                         }
                         self.lastlist[i] = self.listid;
-                    } else if !self.ctx_visited.insert((idx, ctx.clone())) {
-                        continue;
-                    }
+                        ctx
+                    } else {
+                        // Borrow-only containment check (no clone).
+                        let key = (idx, ctx);
+                        if self.ctx_visited.contains(&key) {
+                            continue;
+                        }
+                        let (_, ctx) = key;
+                        // Clone only for genuinely new entries.
+                        self.ctx_visited.insert((idx, ctx.clone()));
+                        ctx
+                    };
 
                     match self.states[idx] {
                         State::Split { out, out1 } => {
