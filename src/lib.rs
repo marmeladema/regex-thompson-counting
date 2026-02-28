@@ -1,11 +1,8 @@
-//! Thompson NFA with multi-instance counting constraints.
+//! Thompson NFA with per-thread counting constraints.
 //!
 //! Based on Russ Cox's article <https://swtch.com/~rsc/regexp/regexp1.html>
 //! (Thompson NFA construction and simulation) with additional support for
-//! bounded repetitions (`{min,max}`) via the counting-FA model described in
-//! Becchi & Crowley, "Extending Finite Automata to Efficiently Match
-//! Perl-Compatible Regular Expressions" (CoNEXT 2008)
-//! <https://www.arl.wustl.edu/~pcrowley/a25-becchi.pdf>.
+//! bounded repetitions (`{min,max}`) via per-thread counter contexts.
 //!
 //! # Architecture
 //!
@@ -17,31 +14,7 @@
 //!
 //! ## Counting constraints
 //!
-//! A repetition `body{min,max}` is lowered to a **two-copy** NFA:
-//!
-//! ```text
-//! body₁ ── CounterInstance(c) ── body₂ ── CounterIncrement(c, min, max)
-//!                                  ^                    │
-//!                                  └── continue ────────┘
-//!                                            break ──> (next)
-//! ```
-//!
-//! `body₁` is the mandatory initial match.  `CounterInstance` allocates a
-//! new counter instance (or creates the counter from scratch).  The
-//! `body₂` + `CounterIncrement` loop runs zero or more additional times.
-//! `CounterIncrement` increments all active instances; when the oldest
-//! instance's value falls in `[min, max]`, the break path is followed.
-//! When it reaches `max`, the oldest instance is de-allocated.
-//!
-//! Counters use a **differential representation** (from the Becchi paper)
-//! so that increment and condition-evaluation require O(1) work regardless
-//! of how many instances are active.
-//!
-//! ### Why two copies are required
-//!
-//! It may seem wasteful to duplicate the body NFA (O(2·b) states per
-//! repetition, O(b·2^d) for d levels of nesting).  A tempting
-//! optimisation is to share a single body copy in a loop:
+//! A repetition `body{min,max}` is lowered to a **single-copy** NFA:
 //!
 //! ```text
 //! CounterInstance(c) ── body ── CounterIncrement(c, min, max)
@@ -50,87 +23,44 @@
 //!                                  break ──> (next)
 //! ```
 //!
-//! This **does not work** when multiple counter instances overlap — that
-//! is, when the NFA can enter the repetition from multiple match threads
-//! simultaneously (e.g. `^.*a.{3}bc$` on "axaybzbc", where `.*`
-//! produces two threads entering `.{3}` via different `a` positions).
+//! `CounterInstance` is an epsilon state that adds `(counter, 0)` to the
+//! thread's counter context.  The body runs, then `CounterIncrement`
+//! increments the counter in the context.  If `value < max`, the
+//! continue path loops back to the body.  If `value >= min`, the break
+//! path exits the repetition (removing the counter from context).
 //!
-//! The root cause is the Thompson NFA's state deduplication.  During
-//! `step()`, each consuming state (Byte, ByteClass) appears at most once
-//! in the current state list (`clist`).  With a shared body, both the
-//! *loop re-entry* from `CounterIncrement` (for an existing counter
-//! instance) and the *initial entry* from `CounterInstance` (for a newly
-//! pushed instance) feed into the **same** body state.  NFA
-//! deduplication merges them into a single entry, so the body is only
-//! processed once per step.
+//! ## Per-thread counter contexts
 //!
-//! The problem manifests during a step where **both** `CounterInstance`
-//! (push) and `CounterIncrement` (increment) fire for the same counter:
+//! Each thread carries a [`CounterCtx`] — a fixed-length vector indexed
+//! by counter, where each slot holds the counter's current value or
+//! `COUNTER_INACTIVE`.  This replaces the Becchi multi-instance
+//! differential counter representation, eliminating the need for:
 //!
-//!  1. Consuming state A matches byte `b`, triggering
-//!     `addstate(CounterInstance)` which **pushes** a new counter
-//!     instance (delta=0) and follows `out` to the shared `body`.
-//!     The body is a consuming state, so it is recorded in `nlist`.
+//! - Two-copy body duplication (body₁/body₂ with counter index remapping)
+//! - DeltaPool (arena-backed linked-list for counter deltas)
+//! - `body_counter_map` (compile-time BFS for stale-instance detection)
+//! - `single_byte_body` flags and `anchored_start` bypass
+//! - `CounterGeneration` stamps for epsilon-closure re-entry detection
 //!
-//!  2. Consuming state B (the shared body, from an older instance's loop)
-//!     also matches byte `b`, triggering `addstate(CounterIncrement)`
-//!     which **increments** all counter instances — including the one
-//!     just pushed in (1) that has not yet consumed a body byte.
+//! ## Deduplication
 //!
-//! The new instance receives an "unearned" increment because the
-//! `CounterIncrement` from the *old* instance's body match blindly
-//! advances all instances.  This causes an **off-by-one** in the new
-//! instance's counter value: it reaches `max` one step too early,
-//! breaking the `break` condition and producing false negatives.
+//! Two-tier dedup prevents duplicate work in the epsilon closure:
 //!
-//! Concrete example — `^.*a.{3}bc$` on "axaybzbc":
+//! - **Empty context** (threads outside all repetitions): fast O(1)
+//!   dedup via `lastlist[state] == listid`.
+//! - **Non-empty context**: `HashSet<(StateIdx, CounterCtx)>` cleared
+//!   per step.
 //!
-//! - Position 0: `a` matches → `CounterInstance` pushes instance A,
-//!   body enters `nlist`.
-//! - Position 1: `x` consumed by body → `CounterIncrement` (A.value=1).
-//! - Position 2: `a` matches again → `CounterInstance` pushes instance B
-//!   (B.delta=0).  **In the same step**, the shared body (from A's loop)
-//!   matches `a` → `CounterIncrement` fires, incrementing **both** A
-//!   (value=2) and B (delta=0→1).  But B has not consumed a body byte
-//!   yet — this increment is wrong.
-//! - The off-by-one propagates: B reaches max=3 at position 4 instead
-//!   of position 5, causing the break to `Byte(b)` one position too
-//!   early.  The trailing `bc` then fails to match "zbc".
+//! ## Complexity
 //!
-//! With **two copies**, the problem disappears: `body₁` (state X) and
-//! `body₂` (state Y) are distinct NFA states, so they coexist in `clist`
-//! independently.  `body₁`'s match triggers `CounterInstance` (push) then
-//! `CounterIncrement` (increment), while `body₂`'s match triggers only
-//! `CounterIncrement` — but the `incremented` flag prevents double-
-//! processing in the same epsilon closure.  The push and increment are
-//! thus properly synchronized: each body match contributes exactly one
-//! increment to the instances it belongs to.
-//!
-//! Attempts to fix the shared-body approach (e.g. a `pushed_this_pass`
-//! flag to suppress the spurious delta increment) break the Becchi
-//! differential representation's invariant (`value == delta` when only
-//! one instance remains), causing assertion failures in `pop()`.
-//!
-//! The two-copy design is therefore **necessary for correctness** with
-//! the Becchi multi-instance counter representation, and is used for all
-//! bounded repetitions.
-//!
-//! ## Nested repetitions
-//!
-//! When a repetition body itself contains a repetition, the body copy in
-//! the outer counting loop gets **remapped** counter indices so that each
-//! copy of the inner repetition operates its own independent counter.
-//!
-//! A subtle interaction arises when the outer counter is exhausted
-//! (`None`) by one NFA path in the same simulation step, and a second
-//! path (arriving via an inner `CounterInstance`) legitimately needs to
-//! restart the outer counter.  We distinguish this from the
-//! epsilon-body case (where no `CounterInstance` fired and the `None`
-//! counter should stay dead) using a **generation counter** (`ci_gen`)
-//! that increments every time any `CounterInstance` fires.  Re-entry at
-//! a `CounterIncrement` with a `None` counter is allowed only if `ci_gen`
-//! has advanced since the state's first visit in the current step.
+//! - **Anchored patterns** (`^...$`): only 1 counter instance per
+//!   repetition (no re-seeding).  O(|states|) per step — identical to
+//!   the delta approach.
+//! - **Unanchored patterns**: O(|states| × max) per step.  The
+//!   `max_repetition` compile-time cap (default 1000) bounds this for
+//!   untrusted patterns.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::io::Write;
 use std::ops::{Index, IndexMut};
@@ -153,6 +83,9 @@ pub enum Error {
     /// A look-around assertion other than `^` (Start) or `$` (End) was
     /// encountered (e.g. `\b`, `\B`).
     UnsupportedLook(hir::Look),
+    /// A bounded repetition `{n,m}` where `m` exceeds the configured
+    /// `max_repetition` limit.  Contains `(actual_max, limit)`.
+    RepetitionTooLarge(usize, usize),
 }
 
 impl fmt::Display for Error {
@@ -163,6 +96,9 @@ impl fmt::Display for Error {
             }
             Self::UnsupportedLook(look) => {
                 write!(f, "unsupported look-around assertion: {:?}", look)
+            }
+            Self::RepetitionTooLarge(max, limit) => {
+                write!(f, "repetition max {} exceeds limit {}", max, limit)
             }
         }
     }
@@ -588,10 +524,9 @@ enum RegexHirNode {
     RepeatOnePlus,
     /// Index into [`RegexBuilder::classes`].
     ByteClass(ClassIdx),
-    CounterInstance {
-        counter: CounterIdx,
-    },
-    CounterIncrement {
+    /// Single-copy counter loop: pops the body fragment and wires
+    /// CI → body → CInc with a break exit.
+    CounterLoop {
         counter: CounterIdx,
         min: usize,
         max: usize,
@@ -623,39 +558,15 @@ impl std::ops::Deref for StateList {
 pub struct Regex {
     states: StateList,
     start: StateIdx,
-    /// One slot per counter variable allocated during compilation.
-    counters: Box<[usize]>,
+    /// Number of counter variables allocated during compilation.
+    num_counters: usize,
     /// Byte-class lookup tables referenced by [`State::ByteClass::class`].
     classes: Box<[ByteClass]>,
     /// Byte dispatch tables referenced by [`State::ByteTable::table`].
     /// Each entry maps a byte value to a target state index, or
     /// [`StateIdx::NONE`] for "no transition".
     byte_tables: Box<[ByteMap]>,
-    /// For each consuming state `s`, the list of counters whose loop body
-    /// contains `s`.  Used by the pre-mark pass in [`Matcher::step`] to
-    /// stamp `body_alive_gen` on counters that have a legitimate thread
-    /// consuming the current byte, so [`Matcher::addcounter`] can
-    /// distinguish live re-entries from stale phantom instances.
-    ///
-    /// Indexed by `StateIdx`; non-consuming states have an empty `Vec`.
-    body_counter_map: Box<[Vec<CounterIdx>]>,
-    /// Per-counter flag: `true` when the minimum number of consuming
-    /// states on any path through one body iteration is exactly 1 (the
-    /// Becchi multi-instance `push` + `incr` model is valid because all
-    /// instances advance in lock-step).  `false` for multi-byte or
-    /// nested bodies where instances may advance at different rates and
-    /// `push` must be suppressed in unanchored matching.
-    single_byte_body: Box<[bool]>,
-    /// `true` when the NFA start state is `Assert(Start)`, meaning the
-    /// pattern is anchored at the beginning of input.  After the first
-    /// step, re-seeding is effectively disabled (`at_start=false`
-    /// prevents `Assert(Start)` from passing), so there can be no
-    /// concurrent threads from different starting positions.  This
-    /// makes counter `push` always safe, bypassing the
-    /// `single_byte_body` suppression.
-    anchored_start: bool,
 }
-
 impl Regex {
     /// Return the total memory footprint (in bytes) of this compiled
     /// regex, including both inline and heap-allocated data.
@@ -664,32 +575,14 @@ impl Regex {
     /// - The `Regex` struct itself (inline fields).
     /// - The `states` boxed slice (header + per-state inline size).
     /// - The `classes` boxed slice (byte-class lookup tables).
-    /// - The `counters` boxed slice.
-    /// - The `body_counter_map` boxed slice (per-state `Vec<CounterIdx>`
-    ///   headers + any heap-allocated counter-index lists).
+    /// - The `byte_tables` boxed slice.
     pub fn memory_size(&self) -> usize {
         let inline = std::mem::size_of::<Self>();
         let states_alloc = self.states.len() * std::mem::size_of::<State>();
         let classes_alloc = self.classes.len() * std::mem::size_of::<ByteClass>();
-        let counters_alloc = self.counters.len() * std::mem::size_of::<usize>();
         let byte_tables_alloc = self.byte_tables.len() * std::mem::size_of::<ByteMap>();
-        let bcm_headers = self.body_counter_map.len() * std::mem::size_of::<Vec<CounterIdx>>();
-        let bcm_heap: usize = self
-            .body_counter_map
-            .iter()
-            .map(|v| v.capacity() * std::mem::size_of::<CounterIdx>())
-            .sum();
-        let sbb_alloc = self.single_byte_body.len() * std::mem::size_of::<bool>();
-        inline
-            + states_alloc
-            + classes_alloc
-            + counters_alloc
-            + byte_tables_alloc
-            + bcm_headers
-            + bcm_heap
-            + sbb_alloc
+        inline + states_alloc + classes_alloc + byte_tables_alloc
     }
-
     /// Emit a Graphviz DOT representation of the NFA.
     pub fn to_dot(&self, mut buffer: impl Write) {
         let mut visited = vec![false; self.states.len()];
@@ -795,7 +688,7 @@ impl Regex {
 ///    fragment to the `Match` state.
 use indexmap::IndexSet;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RegexBuilder {
     postfix: Vec<RegexHirNode>,
     states: Vec<State>,
@@ -807,8 +700,25 @@ pub struct RegexBuilder {
     /// Byte dispatch tables created by the post-construction
     /// [`optimize_byte_tables`](Self::optimize_byte_tables) pass.
     byte_tables: Vec<ByteMap>,
+    /// Maximum allowed `max` value for bounded repetitions (e.g.
+    /// `a{1,1000}`).  Patterns exceeding this limit are rejected at
+    /// compile time.  Default: 1000.
+    pub max_repetition: usize,
 }
 
+impl Default for RegexBuilder {
+    fn default() -> Self {
+        Self {
+            postfix: Vec::new(),
+            states: Vec::new(),
+            frags: Vec::new(),
+            counters: Vec::new(),
+            classes: IndexSet::new(),
+            byte_tables: Vec::new(),
+            max_repetition: 1000,
+        }
+    }
+}
 impl RegexBuilder {
     /// Allocate a fresh counter index.
     fn next_counter(&mut self) -> CounterIdx {
@@ -829,11 +739,10 @@ impl RegexBuilder {
     /// Recursively lower a `regex-syntax` HIR node into a postfix sequence
     /// appended to `self.postfix`.
     ///
-    /// For bounded repetitions, the body is emitted twice: once before
-    /// `CounterInstance` (the mandatory first match) and once inside the
-    /// counting loop (before `CounterIncrement`).  The second copy has all
-    /// inner counter indices **remapped** so that nested repetitions get
-    /// independent counters.
+    /// Bounded repetitions are lowered to a single `CounterLoop` node
+    /// that wires CI → body → CInc in a single-copy loop.  Nested
+    /// repetitions share the same body copy (each gets its own counter
+    /// index, no remapping needed).
     fn hir2postfix(&mut self, hir: &Hir) -> Result<(), Error> {
         match hir.kind() {
             HirKind::Empty => {
@@ -944,6 +853,11 @@ impl RegexBuilder {
                 let max = rep.max.map_or(usize::MAX, |m| m as usize);
                 assert!(min <= max);
 
+                // Reject repetitions exceeding the compile-time cap.
+                if max != usize::MAX && max > self.max_repetition {
+                    return Err(Error::RepetitionTooLarge(max, self.max_repetition));
+                }
+
                 // Special-case common quantifiers to avoid counter overhead.
                 if min == 0 && max == 1 {
                     // `?`
@@ -966,87 +880,25 @@ impl RegexBuilder {
 
                 if min > 0 {
                     let counter = self.next_counter();
-
-                    // Two-copy lowering: body₁ · CounterInstance · body₂ · CounterIncrement
-                    //
-                    // The body is emitted twice (body₁ and body₂).  This is
-                    // necessary for correct multi-instance counter tracking;
-                    // sharing a single body copy causes an off-by-one when
-                    // overlapping instances exist.  See the module-level
-                    // "Why two copies are required" section for details.
-                    let start = self.postfix.len();
                     self.hir2postfix(&rep.sub)?;
-                    let end = self.postfix.len();
-
-                    self.postfix.push(RegexHirNode::CounterInstance { counter });
-
-                    // Copy the body HIR for the counting loop, remapping
-                    // counter indices for nested repetitions.
-                    self.emit_remapped_body(start, end);
-
                     self.postfix
-                        .push(RegexHirNode::CounterIncrement { counter, min, max });
-                    self.postfix.push(RegexHirNode::Catenate);
+                        .push(RegexHirNode::CounterLoop { counter, min, max });
                 } else {
                     // {0,max}: lower to (body{1,max})? — the `?` wrapping
-                    // provides the zero-match path without polluting the
-                    // body with an epsilon alternative.
+                    // provides the zero-match path.
                     let counter = self.next_counter();
-
-                    let start = self.postfix.len();
                     self.hir2postfix(&rep.sub)?;
-                    let end = self.postfix.len();
-
-                    self.postfix.push(RegexHirNode::CounterInstance { counter });
-
-                    self.emit_remapped_body(start, end);
-
-                    self.postfix.push(RegexHirNode::CounterIncrement {
+                    self.postfix.push(RegexHirNode::CounterLoop {
                         counter,
                         min: 1,
                         max,
                     });
-                    self.postfix.push(RegexHirNode::Catenate);
-
-                    // Wrap in `?` to provide the zero-match path.
                     self.postfix.push(RegexHirNode::RepeatZeroOne);
                 }
                 Ok(())
             }
         }
     }
-
-    /// Copy the body HIR slice `postfix[start..end]` into postfix,
-    /// remapping any counter indices so that each copy of a nested
-    /// repetition gets its own independent counter.
-    fn emit_remapped_body(&mut self, start: usize, end: usize) {
-        let body = self.postfix[start..end].to_vec();
-        let mut counter_map = std::collections::HashMap::new();
-        for hir_node in body {
-            let remapped = match hir_node {
-                RegexHirNode::CounterInstance { counter: c } => {
-                    let new_c = *counter_map.entry(c).or_insert_with(|| self.next_counter());
-                    RegexHirNode::CounterInstance { counter: new_c }
-                }
-                RegexHirNode::CounterIncrement {
-                    counter: c,
-                    min: mn,
-                    max: mx,
-                } => {
-                    let new_c = *counter_map.entry(c).or_insert_with(|| self.next_counter());
-                    RegexHirNode::CounterIncrement {
-                        counter: new_c,
-                        min: mn,
-                        max: mx,
-                    }
-                }
-                other => other,
-            };
-            self.postfix.push(remapped);
-        }
-    }
-
-    // -- Low-level NFA construction helpers ----------------------------------
 
     /// Push a new NFA state and return its index.
     fn state(&mut self, state: State) -> StateIdx {
@@ -1138,26 +990,27 @@ impl RegexBuilder {
                 self.patch(e.out, s);
                 Fragment::new(e.start, s)
             }
-            RegexHirNode::CounterInstance { counter } => {
-                let e = self.frags.pop().unwrap();
-                let s = self.state(State::CounterInstance {
-                    counter,
-                    out: StateIdx::NONE,
-                });
-                self.patch(e.out, s);
-                Fragment::new(e.start, s)
-            }
-            RegexHirNode::CounterIncrement { counter, min, max } => {
-                let e = self.frags.pop().unwrap();
-                let s = self.state(State::CounterIncrement {
-                    out: e.start,
-                    out1: StateIdx::NONE,
+            RegexHirNode::CounterLoop { counter, min, max } => {
+                // Single-copy NFA:
+                //   CI → body.start → ... → body.end → CInc
+                //          ↑                            | (continue)
+                //          └────────────────────────────┘
+                //                                       | (break)
+                //                                       ↓ [exit]
+                let body = self.frags.pop().unwrap();
+                let cinc = self.state(State::CounterIncrement {
+                    out: body.start,      // continue → body start
+                    out1: StateIdx::NONE, // break (dangling exit)
                     min,
                     max,
                     counter,
                 });
-                self.patch(e.out, s);
-                Fragment::new(s, s)
+                self.patch(body.out, cinc); // body end → CInc
+                let ci = self.state(State::CounterInstance {
+                    counter,
+                    out: body.start, // CI → body start
+                });
+                Fragment::new(ci, cinc) // entry=CI, exit=CInc.out1
             }
             RegexHirNode::ByteClass(class) => {
                 let idx = self.state(State::ByteClass {
@@ -1212,17 +1065,11 @@ impl RegexBuilder {
         };
 
         self.optimize_byte_tables();
-        let (body_counter_map, single_byte_body) = self.build_body_counter_map();
-
-        let anchored_start = matches!(
-            self.states.as_slice()[start],
-            State::Assert { kind: AssertKind::Start, .. }
-        );
 
         Ok(Regex {
             states: StateList(self.states.to_vec().into_boxed_slice()),
             start,
-            counters: self.counters.to_vec().into_boxed_slice(),
+            num_counters: self.counters.len(),
             classes: self
                 .classes
                 .iter()
@@ -1230,12 +1077,8 @@ impl RegexBuilder {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             byte_tables: self.byte_tables.to_vec().into_boxed_slice(),
-            body_counter_map,
-            single_byte_body,
-            anchored_start,
         })
     }
-
     // -----------------------------------------------------------------------
     // Post-construction optimisation: collapse Split+Byte chains into
     // ByteTable dispatch tables.
@@ -1300,373 +1143,13 @@ impl RegexBuilder {
     }
 
     // -----------------------------------------------------------------------
-    // Build the body-counter map for stale-instance detection.
-    // -----------------------------------------------------------------------
-
-    /// For every consuming state, compute which counters' loop bodies
-    /// contain it.  This is the compile-time component of the stale
-    /// Becchi-counter fix.
-    ///
-    /// # The stale-instance problem
-    ///
-    /// The Becchi multi-instance counter model assumes all instances
-    /// belong to the same logical match attempt and count in lockstep.
-    /// This breaks when multiple independent threads enter the same
-    /// counted sub-expression from different input positions, because
-    /// `inccounter` increments ALL instances — including ones left
-    /// behind by threads that already died.
-    ///
-    /// This happens whenever the NFA can enter the counted pattern at
-    /// every position.  The most obvious case is unanchored matching
-    /// (re-seeding the start state at each step), but prepending `.*`
-    /// and anchoring would not help either: in a Thompson NFA, the
-    /// `.*` loop spawns a new thread into the counted pattern at every
-    /// position — it is functionally equivalent to re-seeding.
-    ///
-    /// Example: `\w{3,5}` on `"x y z"` (no 3+ consecutive word chars):
-    ///
-    /// - Position 0 (`x`): CounterInstance fires, instance pushed,
-    ///   value = 1.
-    /// - Position 1 (` `): no `\w` match — the thread that consumed
-    ///   `x` dies.  But the counter instance persists.
-    /// - Position 2 (`y`): re-seed enters CounterInstance again and
-    ///   pushes a new instance.  `inccounter` increments BOTH: the
-    ///   stale instance (from `x`) reaches 2, the new one reaches 1.
-    /// - Position 4 (`z`): same thing — stale instance reaches 3,
-    ///   hits `min=3`, spurious match.
-    ///
-    /// # The fix
-    ///
-    /// At compile time, this method records which counters' loop bodies
-    /// contain each consuming state.  At runtime, a pre-mark pass in
-    /// [`Matcher::step`] checks which consuming states in `clist`
-    /// actually match the current byte and stamps `body_alive_gen` on
-    /// their counters.  Then [`Matcher::addcounter`] uses this stamp
-    /// to distinguish legitimate new instances from stale ones: if no
-    /// consuming state in the counter's body matched, the existing
-    /// instances are from dead threads and get freed.
-    ///
-    /// # Algorithm
-    ///
-    /// For each `CounterIncrement` state at index `ci`, BFS forward
-    /// from `ci.out` (the "continue" edge, i.e. the loop body
-    /// re-entry) collecting every consuming state (`Byte`, `ByteClass`,
-    /// `ByteTable`) reachable before returning to `ci`.  Each such
-    /// consuming state records the counter index associated with `ci`.
-    ///
-    /// The BFS follows `out` edges of consuming states too, because a
-    /// loop body may contain multi-byte sequences (e.g. `bc` in
-    /// `(a|bc){2,3}`) where the second byte is only reachable through
-    /// the first.
-    fn build_body_counter_map(
-        &self,
-    ) -> (Box<[Vec<CounterIdx>]>, Box<[bool]>) {
-        let n = self.states.len();
-        let num_counters = self.counters.len();
-        let mut map: Vec<Vec<CounterIdx>> = vec![Vec::new(); n];
-        let mut visited = vec![false; n];
-        let mut queue = std::collections::VecDeque::new();
-
-        // For each counter, find its CounterIncrement state index.
-        // A counter may have multiple CounterIncrement nodes (the
-        // compiler duplicates inner counters across outer iterations),
-        // but they share the same counter index.
-        let mut ci_nodes: Vec<Vec<usize>> = vec![Vec::new(); num_counters];
-        for raw in 0..n {
-            if let State::CounterIncrement { counter, .. } = self.states.as_slice()[StateIdx(raw as u32)] {
-                ci_nodes[counter.idx()].push(raw);
-            }
-        }
-
-        // --- Phase 1: BFS to populate `map` (body_counter_map) ---
-        for ci_raw in 0..n {
-            let ci_idx = StateIdx(ci_raw as u32);
-            if let State::CounterIncrement { counter, out, .. } = self.states.as_slice()[ci_idx] {
-                visited.iter_mut().for_each(|v| *v = false);
-                visited[ci_raw] = true;
-                queue.clear();
-                queue.push_back(out);
-                while let Some(s) = queue.pop_front() {
-                    let raw = s.raw();
-                    if raw >= n || visited[raw] {
-                        continue;
-                    }
-                    visited[raw] = true;
-                    match self.states.as_slice()[s] {
-                        State::Byte { out, .. } | State::ByteClass { out, .. } => {
-                            map[raw].push(counter);
-                            queue.push_back(out);
-                        }
-                        State::ByteTable { table } => {
-                            map[raw].push(counter);
-                            for &target in self.byte_tables[table.idx()].0.iter() {
-                                if target != StateIdx::NONE {
-                                    queue.push_back(target);
-                                }
-                            }
-                        }
-                        State::Split { out, out1 } => {
-                            queue.push_back(out);
-                            queue.push_back(out1);
-                        }
-                        State::CounterInstance { out, .. } => {
-                            queue.push_back(out);
-                        }
-                        State::CounterIncrement { out, out1, .. } => {
-                            queue.push_back(out);
-                            queue.push_back(out1);
-                        }
-                        State::Assert { out, .. } => {
-                            queue.push_back(out);
-                        }
-                        State::Match => {}
-                    }
-                }
-            }
-        }
-
-        // --- Phase 2: compute min body length per counter ---
-        //
-        // For each counter, find the minimum number of consuming
-        // states on any path through one body iteration (from the
-        // "continue" edge back to the same `CounterIncrement`).
-        //
-        // Inner counter semantics: when a path reaches an inner
-        // counter's `CounterIncrement` break edge (out1), the inner
-        // counter must have completed at least `min` iterations.
-        // Each inner iteration consumes at least `min_body_len(inner)`
-        // bytes.  So the effective weight of traversing the inner
-        // counter is `inner_min * min_body_len(inner)`.
-        //
-        // We process counters bottom-up: innermost first.  A simple
-        // iterative fixed-point works since counter nesting is acyclic.
-        let mut min_body_len: Vec<usize> = vec![usize::MAX; num_counters];
-        // Temporary distance array for 0-1 BFS (reused across iterations).
-        let mut dist: Vec<usize> = vec![usize::MAX; n];
-        // Fixed-point: repeat until stable.  In practice this
-        // converges in depth-of-nesting iterations (usually 1-2).
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for ci_raw in 0..n {
-                let ci_idx = StateIdx(ci_raw as u32);
-                if let State::CounterIncrement { counter, out, .. } = self.states.as_slice()[ci_idx] {
-                    // Weighted 0-1 BFS from body entry to ci_idx.
-                    dist.iter_mut().for_each(|d| *d = usize::MAX);
-                    queue.clear();
-                    dist[out.raw()] = 0;
-                    queue.push_back(out);
-                    while let Some(s) = queue.pop_front() {
-                        let raw = s.raw();
-                        if raw >= n {
-                            continue;
-                        }
-                        let d = dist[raw];
-                        macro_rules! relax {
-                            ($target:expr, $w:expr) => {{
-                                let t = $target;
-                                let tr = t.raw();
-                                if tr < n {
-                                    let nd = d.saturating_add($w);
-                                    if nd < dist[tr] {
-                                        dist[tr] = nd;
-                                        if $w == 0 {
-                                            queue.push_front(t);
-                                        } else {
-                                            queue.push_back(t);
-                                        }
-                                    }
-                                }
-                            }};
-                        }
-                        match self.states.as_slice()[s] {
-                            State::Byte { out, .. } | State::ByteClass { out, .. } => {
-                                relax!(out, 1usize);
-                            }
-                            State::ByteTable { table } => {
-                                for &target in self.byte_tables[table.idx()].0.iter() {
-                                    if target != StateIdx::NONE {
-                                        relax!(target, 1usize);
-                                    }
-                                }
-                            }
-                            State::Split { out, out1 } => {
-                                relax!(out, 0usize);
-                                relax!(out1, 0usize);
-                            }
-                            State::CounterInstance { out, .. } => {
-                                relax!(out, 0usize);
-                            }
-                            State::CounterIncrement { out, out1, counter: inner_c, min: inner_min, .. } => {
-                                if s == ci_idx {
-                                    // Reached our own node; stop.
-                                    continue;
-                                }
-                                // Inner counter.  The "continue" edge
-                                // re-enters the inner body (weight 0
-                                // here; the body's consuming states
-                                // will add their own weight).
-                                relax!(out, 0usize);
-                                // The "break" edge exits the inner
-                                // counter.  To reach it, the counter
-                                // must have done `min` iterations,
-                                // each costing at least
-                                // `min_body_len(inner)` consuming
-                                // states.  If inner hasn't been
-                                // computed yet (usize::MAX), use MAX
-                                // so this path is ignored for now;
-                                // the fixed-point loop will retry.
-                                let inner_mbl = min_body_len[inner_c.idx()];
-                                let exit_cost = if inner_mbl == usize::MAX {
-                                    usize::MAX
-                                } else {
-                                    (inner_min as usize).saturating_mul(inner_mbl)
-                                };
-                                relax!(out1, exit_cost);
-                            }
-                            State::Assert { out, .. } => {
-                                relax!(out, 0usize);
-                            }
-                            State::Match => {}
-                        }
-                    }
-                    let d = dist[ci_raw];
-                    if d < min_body_len[counter.idx()] {
-                        min_body_len[counter.idx()] = d;
-                        changed = true;
-                    }
-                }
-            }
-        }
-
-        // The Becchi multi-instance `push` + `incr` model is valid
-        // only when the minimum body length is exactly 1: every body
-        // traversal consumes exactly one byte, so all instances
-        // advance in lock-step.  When the minimum is 0 (epsilon body)
-        // or > 1 (multi-byte/nested body), instances may advance at
-        // different rates and `push` must be suppressed.
-        let single_byte_body: Box<[bool]> = min_body_len
-            .iter()
-            .map(|&m| m == 1)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        (map.into_boxed_slice(), single_byte_body)
-    }
 }
 
 // ---------------------------------------------------------------------------
-// Multi-instance counter (Becchi differential representation)
+// Counter context (per-thread counter values)
 // ---------------------------------------------------------------------------
 
-/// A multi-instance counter using the differential representation from
-/// the Becchi paper.
-///
-/// Multiple overlapping occurrences of a counted sub-expression can be
-/// tracked simultaneously.  All instances are incremented in parallel,
-/// and the oldest instance is always the one with the highest `value`.
-///
-/// The *deltas* between consecutive instances are stored as a linked
-/// list in a shared [`DeltaPool`] (held in [`MatcherMemory`]).  The
-/// counter only stores `head`/`tail` indices into that pool, so it
-/// remains a small `Copy`-able struct with no per-counter heap
-/// allocation.  The pool retains its capacity across `matcher()` calls.
-///
-/// # Fields
-///
-/// - `value` — the oldest (highest) instance's value.
-/// - `delta` — how much the newest instance has accumulated since the
-///   last [`push`](Self::push).
-/// - `head` / `tail` — indices into `DeltaPool` forming a singly-linked
-///   FIFO of deltas for intermediate instances.  Both are [`SENTINEL`]
-///   when the list is empty.
-/// - `incremented` — set by [`incr`](Self::incr), cleared at each
-///   simulation step; used to prevent a `CounterIncrement` state from
-///   being processed twice in the same epsilon closure.
-/// - `body_alive_gen` — the [`Matcher::listid`] at which the pre-mark
-///   pass last confirmed that a consuming state inside this counter's
-///   loop body matched the current byte.  Used by
-///   [`Matcher::addcounter`] to distinguish legitimate new instances
-///   from stale ones left over from dead threads.
-#[derive(Clone, Copy, Debug)]
-struct Counter {
-    incremented: bool,
-    body_alive_gen: usize,
-    /// The oldest (highest) instance's count.
-    value: usize,
-    delta: usize,
-    head: usize,
-    tail: usize,
-}
-
-impl Counter {
-    const EMPTY: Self = Self {
-        incremented: false,
-        body_alive_gen: 0,
-        value: 0,
-        delta: 0,
-        head: SENTINEL,
-        tail: SENTINEL,
-    };
-}
-
-impl Default for Counter {
-    #[inline]
-    fn default() -> Self {
-        Self::EMPTY
-    }
-}
-
-impl Counter {
-    /// Push (allocate) a new instance.  The current `delta` is saved
-    /// as a new node in `pool` and reset to zero.
-    fn push(&mut self, pool: &mut DeltaPool) {
-        assert!(self.delta > 0);
-        let node = pool.alloc(self.delta);
-        if self.tail != SENTINEL {
-            pool.next[self.tail] = node;
-        } else {
-            self.head = node;
-        }
-        self.tail = node;
-        self.delta = 0;
-    }
-
-    /// Increment all instances by 1.
-    fn incr(&mut self) {
-        self.value += 1;
-        self.delta += 1;
-        self.incremented = true;
-    }
-
-    /// De-allocate the oldest instance.  Returns `true` if the counter
-    /// has no instances left (should be set to `None`).
-    fn pop(&mut self, pool: &mut DeltaPool) -> bool {
-        assert!(self.value > 0);
-        if self.head != SENTINEL {
-            let old_head = self.head;
-            let delta = pool.values[old_head];
-            self.head = pool.next[old_head];
-            if self.head == SENTINEL {
-                self.tail = SENTINEL;
-            }
-            pool.free_node(old_head);
-            assert!(delta < self.value);
-            self.value -= delta;
-            false
-        } else {
-            assert_eq!(self.value, self.delta);
-            true
-        }
-    }
-
-    /// Returns `true` when the delta linked list is empty (exactly one
-    /// active instance).
-    fn is_single(&self) -> bool {
-        self.head == SENTINEL
-    }
-}
-
-/// Index into the counter variable array ([`Regex::counters`]).
+/// Index into the counter variable array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct CounterIdx(usize);
 
@@ -1683,200 +1166,108 @@ impl fmt::Display for CounterIdx {
     }
 }
 
-/// `counters[counter_idx]` — typed access to the counter variable array.
-impl Index<CounterIdx> for [Option<Counter>] {
-    type Output = Option<Counter>;
+/// Sentinel value: this counter slot is inactive (thread is not inside
+/// this counter's repetition body).
+const COUNTER_INACTIVE: usize = usize::MAX;
 
-    #[inline]
-    fn index(&self, idx: CounterIdx) -> &Option<Counter> {
-        &self[idx.idx()]
-    }
-}
-
-impl IndexMut<CounterIdx> for [Option<Counter>] {
-    #[inline]
-    fn index_mut(&mut self, idx: CounterIdx) -> &mut Option<Counter> {
-        &mut self[idx.idx()]
-    }
-}
-
-/// Monotonically increasing generation stamp used to detect whether a
-/// [`CounterInstance`](State::CounterInstance) fired between two visits
-/// to the same [`CounterIncrement`](State::CounterIncrement) state.
+/// Per-thread counter context.
 ///
-/// See the module-level doc comment ("multi-instance counting") for
-/// the full motivation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-struct CounterGeneration(usize);
-
-impl CounterGeneration {
-    /// Advance the generation by one tick.
-    #[inline]
-    fn advance(&mut self) {
-        self.0 += 1;
-    }
-}
-
-/// `ci_gen_at_visit[state_idx]` — typed access to per-state generation snapshots.
-impl Index<StateIdx> for [CounterGeneration] {
-    type Output = CounterGeneration;
-
-    #[inline]
-    fn index(&self, idx: StateIdx) -> &CounterGeneration {
-        &self[idx.idx()]
-    }
-}
-
-impl IndexMut<StateIdx> for [CounterGeneration] {
-    #[inline]
-    fn index_mut(&mut self, idx: StateIdx) -> &mut CounterGeneration {
-        &mut self[idx.idx()]
-    }
-}
-
-/// Sentinel value meaning "no node" (end of linked list / empty).
-const SENTINEL: usize = usize::MAX;
-
-/// Arena-backed pool of linked-list nodes for counter deltas.
+/// A fixed-length vector indexed by [`CounterIdx`]: `values[i]` holds
+/// the iteration count for counter `i`, or [`COUNTER_INACTIVE`] when
+/// the thread is not inside counter `i`'s repetition body.
 ///
-/// All counters share a single `DeltaPool`.  Each counter owns a
-/// linked list (head/tail indices stored in [`Counter`]) whose nodes
-/// live in this pool.  Freed nodes are threaded into an intrusive
-/// free list through the `next[]` array and recycled by subsequent
-/// allocations.
-///
-/// The intrusive free list enables O(1) bulk-free of an entire
-/// counter chain via [`free_chain`](Self::free_chain): set the tail's
-/// `next` to `free_head` and update `free_head` to the chain's head.
-///
-/// Between matches, [`reset`](Self::reset) clears the backing vecs
-/// (retaining heap capacity), so the pool's memory is reused across
-/// [`MatcherMemory::matcher`] calls without per-counter loops.
-#[derive(Clone, Debug)]
-struct DeltaPool {
-    /// Node payload (delta value).
-    values: Vec<usize>,
-    /// `next[i]` = index of the successor node, or [`SENTINEL`].
-    next: Vec<usize>,
-    /// Head of the intrusive free list threaded through `next[]`,
-    /// or [`SENTINEL`] if the free list is empty.
-    free_head: usize,
-}
+/// For threads outside all counted repetitions (the common case), the
+/// context is empty (`0.is_empty() == true`) and dedup falls back to
+/// the fast `lastlist` path.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CounterCtx(Box<[usize]>);
 
-impl Default for DeltaPool {
-    fn default() -> Self {
-        Self {
-            values: Vec::new(),
-            next: Vec::new(),
-            free_head: SENTINEL,
-        }
-    }
-}
-
-impl DeltaPool {
-    /// Allocate a node with the given value.  Reuses a freed slot if
-    /// available, otherwise appends to the end of the arena.
-    fn alloc(&mut self, val: usize) -> usize {
-        if self.free_head != SENTINEL {
-            let idx = self.free_head;
-            self.free_head = self.next[idx];
-            self.values[idx] = val;
-            self.next[idx] = SENTINEL;
-            idx
+impl CounterCtx {
+    /// Create a context with all counters inactive.
+    fn new(num_counters: usize) -> Self {
+        if num_counters == 0 {
+            Self(Box::new([]))
         } else {
-            let idx = self.values.len();
-            self.values.push(val);
-            self.next.push(SENTINEL);
-            idx
+            Self(vec![COUNTER_INACTIVE; num_counters].into_boxed_slice())
         }
     }
 
-    /// Return a single node to the free list for reuse.
-    fn free_node(&mut self, idx: usize) {
-        self.next[idx] = self.free_head;
-        self.free_head = idx;
+    /// True when no counter is active (all slots are `COUNTER_INACTIVE`).
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(|&v| v == COUNTER_INACTIVE)
     }
 
-    /// Return an entire linked-list chain `[head … tail]` to the free
-    /// list in O(1).  `tail` must be the last node in the chain
-    /// (i.e. `next[tail] == SENTINEL`).
-    fn free_chain(&mut self, head: usize, tail: usize) {
-        debug_assert_ne!(head, SENTINEL);
-        debug_assert_ne!(tail, SENTINEL);
-        self.next[tail] = self.free_head;
-        self.free_head = head;
+    /// Get the value of counter `idx`, or `None` if inactive.
+    #[inline]
+    fn get(&self, idx: CounterIdx) -> Option<usize> {
+        let v = self.0[idx.idx()];
+        if v == COUNTER_INACTIVE { None } else { Some(v) }
     }
 
-    /// Clear all nodes (retaining heap capacity).
-    fn reset(&mut self) {
-        self.values.clear();
-        self.next.clear();
-        self.free_head = SENTINEL;
+    /// Set the value of counter `idx`.
+    #[inline]
+    fn set(&mut self, idx: CounterIdx, value: usize) {
+        debug_assert!(value != COUNTER_INACTIVE);
+        self.0[idx.idx()] = value;
+    }
+
+    /// Deactivate counter `idx`.
+    #[inline]
+    fn remove(&mut self, idx: CounterIdx) {
+        self.0[idx.idx()] = COUNTER_INACTIVE;
     }
 }
 
 // ---------------------------------------------------------------------------
 // Matcher (NFA simulation)
-// ---------------------------------------------------------------------------
 
 /// Reusable memory for [`Matcher`].  Create once, call
 /// [`matcher`](Self::matcher) for each regex to match.
 #[derive(Debug, Default)]
 pub struct MatcherMemory {
     /// Per-state: the `listid` when the state was last added.  Used for
-    /// O(1) deduplication in `addstate`.
+    /// O(1) deduplication of empty-context threads in `addstate`.
     lastlist: Vec<usize>,
-    /// One slot per counter variable.
-    counters: Vec<Option<Counter>>,
-    /// Shared arena for counter delta linked lists.  Retains heap
-    /// capacity across `matcher()` calls.
-    delta_pool: DeltaPool,
     /// Current and next state lists (swapped each step).
-    clist: Vec<StateIdx>,
-    nlist: Vec<StateIdx>,
+    /// Each entry carries the state index and its counter context.
+    clist: Vec<(StateIdx, CounterCtx)>,
+    nlist: Vec<(StateIdx, CounterCtx)>,
     /// Explicit work stack used by [`Matcher::addstate`] to avoid
     /// recursive epsilon-closure traversal.
     addstack: Vec<AddStateOp>,
-    /// Per-state snapshot of [`CounterGeneration`] at first visit in the
-    /// current step.  See the module-level doc comment for the motivation.
-    ci_gen_at_visit: Vec<CounterGeneration>,
+    /// Context-aware dedup for threads with non-empty counter contexts.
+    /// Cleared at each step.
+    ctx_visited: HashSet<(StateIdx, CounterCtx)>,
 }
 
 impl MatcherMemory {
     pub fn matcher<'a>(&'a mut self, regex: &'a Regex) -> Matcher<'a> {
         self.lastlist.clear();
         self.lastlist.resize(regex.states.len(), usize::MAX);
-        self.counters.clear();
-        self.counters.resize(regex.counters.len(), None);
-        self.delta_pool.reset();
         self.clist.clear();
         self.nlist.clear();
         self.addstack.clear();
-        self.ci_gen_at_visit.clear();
-        self.ci_gen_at_visit
-            .resize(regex.states.len(), CounterGeneration::default());
+        self.ctx_visited.clear();
+
+        let empty_ctx = CounterCtx::new(regex.num_counters);
 
         let mut m = Matcher {
-            counters: &mut self.counters,
-            delta_pool: &mut self.delta_pool,
             states: &regex.states,
             classes: &regex.classes,
             byte_tables: &regex.byte_tables,
-            body_counter_map: &regex.body_counter_map,
-            single_byte_body: &regex.single_byte_body,
-            anchored_start: regex.anchored_start,
             lastlist: &mut self.lastlist,
             listid: 0,
             clist: &mut self.clist,
             nlist: &mut self.nlist,
             addstack: &mut self.addstack,
-            ci_gen: CounterGeneration::default(),
-            ci_gen_at_visit: &mut self.ci_gen_at_visit,
+            ctx_visited: &mut self.ctx_visited,
             start: regex.start,
             at_start: true,
             at_end: false,
             prev_byte: None,
             ever_matched: false,
+            empty_ctx,
         };
 
         m.startlist(m.start);
@@ -1884,79 +1275,51 @@ impl MatcherMemory {
     }
 }
 
-/// Runs a Thompson NFA simulation with counting-constraint support.
+/// Runs a Thompson NFA simulation with per-thread counter contexts.
 #[derive(Debug)]
 pub struct Matcher<'a> {
-    counters: &'a mut [Option<Counter>],
-    /// Shared arena for counter delta linked lists.
-    delta_pool: &'a mut DeltaPool,
     states: &'a [State],
     /// Byte-class lookup tables referenced by [`State::ByteClass::class`].
     classes: &'a [ByteClass],
     /// Byte dispatch tables referenced by [`State::ByteTable::table`].
     byte_tables: &'a [ByteMap],
-    /// Per consuming-state: which counters' loop bodies contain it.
-    body_counter_map: &'a [Vec<CounterIdx>],
-    /// Per-counter: `true` if the body is a single consuming state.
-    single_byte_body: &'a [bool],
-    /// `true` when the pattern is anchored at the start of input.
-    /// See [`Regex::anchored_start`].
-    anchored_start: bool,
+    /// Number of counter variables in the compiled regex.
     /// Per-state deduplication stamp (compared against `listid`).
+    /// Used for empty-context threads only.
     lastlist: &'a mut [usize],
     /// Monotonically increasing step ID.
     listid: usize,
     /// Current active state list.
-    clist: &'a mut Vec<StateIdx>,
+    clist: &'a mut Vec<(StateIdx, CounterCtx)>,
     /// Next active state list (built during a step).
-    nlist: &'a mut Vec<StateIdx>,
-    /// Explicit work stack for iterative epsilon-closure traversal in
-    /// [`addstate`](Self::addstate).
+    nlist: &'a mut Vec<(StateIdx, CounterCtx)>,
+    /// Explicit work stack for iterative epsilon-closure traversal.
     addstack: &'a mut Vec<AddStateOp>,
-    /// Monotonically increasing generation counter; incremented every
-    /// time [`addcounter`](Self::addcounter) is called.  Used together
-    /// with `ci_gen_at_visit` to detect whether a `CounterInstance`
-    /// fired between the first visit and a re-entry at a
-    /// `CounterIncrement` state.
-    ci_gen: CounterGeneration,
-    /// Per-state snapshot of [`CounterGeneration`] recorded on first visit.
-    ci_gen_at_visit: &'a mut [CounterGeneration],
+    /// Context-aware dedup for non-empty counter contexts.
+    ctx_visited: &'a mut HashSet<(StateIdx, CounterCtx)>,
 
-    /// The NFA start state index, used for re-seeding at each step
-    /// (unanchored matching).
+    /// The NFA start state index.
     start: StateIdx,
-    /// `true` until the first [`step`](Self::step) call.  Controls
-    /// whether `AssertStart` / `AssertStartLF` states are followed
-    /// in `addstate`.
+    /// `true` until the first [`step`](Self::step) call.
     at_start: bool,
-    /// Set to `true` by [`finish`](Self::finish); controls whether
-    /// `AssertEnd` / `AssertEndLF` states are followed in `addstate`.
+    /// Set to `true` by [`finish`](Self::finish).
     at_end: bool,
-    /// The last byte consumed by [`step`](Self::step), or `None` before
-    /// the first step.  Used by `AssertStartLF` to detect line boundaries.
+    /// The last byte consumed by [`step`](Self::step).
     prev_byte: Option<u8>,
-    /// Tracks whether a `Match` state was ever reached in `clist`
-    /// during the simulation (before `finish`).
+    /// Tracks whether a `Match` state was ever reached.
     ever_matched: bool,
+    /// Pre-allocated empty context (all counters inactive).
+    empty_ctx: CounterCtx,
 }
 
 /// Internal operations for iterative [`Matcher::addstate`] traversal.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum AddStateOp {
-    /// Visit (and epsilon-expand) a state.
-    Visit(StateIdx),
-    /// Push this state to `nlist` after its epsilon successors are handled.
-    PostPush(StateIdx),
-    /// Continuation used by `CounterIncrement` after exploring the
-    /// continue-path epsilon closure.
-    CounterAfterContinue {
-        idx: StateIdx,
-        out1: StateIdx,
-        counter: CounterIdx,
-        min: usize,
-        max: usize,
-        value: usize,
-    },
+    /// Visit (and epsilon-expand) a state with the given context.
+    Visit(StateIdx, CounterCtx),
+    /// Push this state + context to `nlist` after its epsilon successors
+    /// are handled.  Only used for consuming and Assert states.
+    PostPush(StateIdx, CounterCtx),
 }
 
 impl<'a> Matcher<'a> {
@@ -1964,230 +1327,101 @@ impl<'a> Matcher<'a> {
     /// from `start`.
     #[inline]
     fn startlist(&mut self, start: StateIdx) {
-        self.addstate(start);
+        self.addstate(start, self.empty_ctx.clone());
         std::mem::swap(self.clist, self.nlist);
         self.listid += 1;
     }
 
-    /// Allocate (or push) a counter instance.  If the counter is `None`
-    /// (not yet created or previously exhausted), a fresh default counter
-    /// is created.  Otherwise, check `body_alive_gen`: if the pre-mark
-    /// pass confirmed a thread inside this counter's body matched the
-    /// current byte, push a new instance; otherwise the counter holds
-    /// stale instances from dead threads — free them and start fresh.
+    /// Follow epsilon transitions from state `idx` with counter context
+    /// `ctx`, adding all reachable states to `nlist`.
     ///
-    /// Returns `false` when the new thread is dropped (multi-byte body
-    /// counter already has an active instance — the Becchi push+incr
-    /// model doesn't support concurrent instances with non-uniform
-    /// advancement).  The caller must skip `Visit(out)` in that case.
-    ///
-    /// Increments `ci_gen` so that downstream `CounterIncrement` re-entry
-    /// checks can detect that a new instance was allocated.
-    fn addcounter(&mut self, idx: CounterIdx) -> bool {
-        if let Some(counter) = self.counters[idx].as_mut() {
-            if counter.body_alive_gen == self.listid {
-                if self.single_byte_body[idx.idx()] || self.anchored_start {
-                    // Either:
-                    // (a) Single-byte body — all instances advance
-                    //     uniformly; the Becchi push+incr model works.
-                    // (b) The pattern is start-anchored — no re-seeding
-                    //     means no concurrent threads from different
-                    //     starting positions, so push is always safe
-                    //     (the re-entry is a same-thread NFA path).
-                    counter.push(self.delta_pool);
-                } else {
-                    // Multi-byte/nested body in an unanchored pattern:
-                    // a re-seeded thread from a different starting
-                    // position is entering a counter that already has
-                    // an active body traversal.  Pushing would cause
-                    // `incr()` to spuriously advance old instances.
-                    // Drop the new thread — the existing (earliest)
-                    // thread will match first if any match exists.
-                    self.ci_gen.advance();
-                    return false;
-                }
-            } else {
-                // No consuming state in this counter's body matched:
-                // all existing instances are stale.  Free the delta
-                // chain and start fresh.
-                if counter.head != SENTINEL {
-                    self.delta_pool.free_chain(counter.head, counter.tail);
-                }
-                *counter = Counter::default();
-            }
-        } else {
-            self.counters[idx] = Some(Counter::default());
-        }
-        self.ci_gen.advance();
-        true
-    }
-
-    /// De-allocate the oldest instance of counter `idx`.  If no instances
-    /// remain, the counter is set to `None`.
-    fn delcounter(&mut self, idx: CounterIdx) {
-        if self.counters[idx].as_mut().unwrap().pop(self.delta_pool) {
-            self.counters[idx] = None;
-        }
-    }
-
-    /// Returns `true` if a `CounterIncrement` for `counter` should be
-    /// allowed to proceed.
-    ///
-    /// The counter is processable when:
-    /// - It is `Some` and has not yet been incremented in this epsilon
-    ///   closure pass (`!incremented`), OR
-    /// - It is `None` (exhausted) and a `CounterInstance` fired since
-    ///   this state's first visit in the current step (`ci_gen` advanced).
-    fn counter_is_processable(&self, counter: CounterIdx, state_idx: StateIdx) -> bool {
-        self.counters[counter]
-            .as_ref()
-            .map_or(self.ci_gen > self.ci_gen_at_visit[state_idx], |c| {
-                !c.incremented
-            })
-    }
-
-    /// Follow epsilon transitions from state `idx`, adding all reachable
-    /// states to `nlist`.
-    ///
-    /// This is the heart of the Thompson NFA simulation.  The
-    /// `lastlist`/`listid` mechanism provides O(1) deduplication so each
-    /// state is visited at most once per step (with a controlled exception
-    /// for `CounterIncrement` re-entry — see below).
-    ///
-    /// Implemented iteratively with an explicit work stack to avoid call-
-    /// stack growth on deep epsilon-closure graphs.
-    ///
-    /// ## CounterIncrement re-entry
-    ///
-    /// Normally each state is visited at most once.  However, a
-    /// `CounterIncrement` state may need to be re-visited when a new
-    /// counter instance arrives via a different path in the same epsilon
-    /// closure.  Re-entry is allowed when
-    /// [`counter_is_processable`](Self::counter_is_processable) returns
-    /// `true`.
-    ///
-    /// ## Epsilon-body detection
-    ///
-    /// If the repetition body can match the empty string (e.g. `(a?)`),
-    /// the continue path's epsilon closure will loop back to this same
-    /// `CounterIncrement` state.  We detect this by temporarily clearing
-    /// our `lastlist` mark before following the continue path: if the
-    /// epsilon closure re-marks us, the body is epsilon-matchable.  In
-    /// that case, the break condition is relaxed: since epsilon matches
-    /// can advance the counter for free, any value in `[min, max]` is
-    /// reachable and we always allow the break.
+    /// Dedup strategy:
+    /// - Empty context: fast path via `lastlist`/`listid` (O(1) per state).
+    /// - Non-empty context: `ctx_visited` HashSet keyed on `(state, ctx)`.
     #[inline]
-    fn addstate(&mut self, idx: StateIdx) {
+    fn addstate(&mut self, idx: StateIdx, ctx: CounterCtx) {
         self.addstack.clear();
-        self.addstack.push(AddStateOp::Visit(idx));
+        self.addstack.push(AddStateOp::Visit(idx, ctx));
         self.drain_addstack();
     }
 
     /// Process all operations on the work stack until empty.
-    ///
-    /// This is the core of the iterative epsilon-closure traversal.
-    /// Callers seed `addstack` with one or more `Visit` operations and
-    /// then call this method to expand them.
     fn drain_addstack(&mut self) {
         while let Some(op) = self.addstack.pop() {
             match op {
-                AddStateOp::Visit(idx) => {
-                    let i = idx.idx();
-                    if self.lastlist[i] == self.listid {
-                        let should_reenter = match self.states[idx] {
-                            State::CounterIncrement { counter, .. } => {
-                                self.counter_is_processable(counter, idx)
-                            }
-                            _ => false,
-                        };
-                        if !should_reenter {
+                AddStateOp::Visit(idx, ctx) => {
+                    // --- Dedup ---
+                    if ctx.is_empty() {
+                        let i = idx.idx();
+                        if self.lastlist[i] == self.listid {
                             continue;
                         }
+                        self.lastlist[i] = self.listid;
+                    } else if !self.ctx_visited.insert((idx, ctx.clone())) {
+                        continue;
                     }
-
-                    // Record ci_gen only on first visit so re-entry compares
-                    // against the original snapshot.
-                    if self.lastlist[i] != self.listid {
-                        self.ci_gen_at_visit[idx] = self.ci_gen;
-                    }
-                    self.lastlist[i] = self.listid;
-
-                    // Post-order push: state is appended to nlist only after
-                    // all recursively reachable epsilon successors.
-                    self.addstack.push(AddStateOp::PostPush(idx));
 
                     match self.states[idx] {
                         State::Split { out, out1 } => {
-                            // Preserve recursive order: out, then out1.
-                            self.addstack.push(AddStateOp::Visit(out1));
-                            self.addstack.push(AddStateOp::Visit(out));
+                            // No PostPush for epsilon states.
+                            self.addstack.push(AddStateOp::Visit(out1, ctx.clone()));
+                            self.addstack.push(AddStateOp::Visit(out, ctx));
                         }
 
                         State::Assert { kind, out } => {
-                            // Evaluate with next=None (upcoming byte is
-                            // unknown in addstate). Pass -> follow out.
-                            // Fail/Defer -> don't follow; the state is still
-                            // pushed to nlist and deferred assertions are
-                            // resolved in step() or finish().
+                            // PostPush so the Assert is in nlist for
+                            // deferred resolution in step()/finish().
+                            self.addstack.push(AddStateOp::PostPush(idx, ctx.clone()));
                             if kind.eval(self.at_start, self.at_end, self.prev_byte, None)
                                 == AssertEval::Pass
                             {
-                                self.addstack.push(AddStateOp::Visit(out));
+                                self.addstack.push(AddStateOp::Visit(out, ctx));
                             }
                         }
 
-                        State::CounterInstance { out, counter } => {
-                            if self.addcounter(counter) {
-                                self.addstack.push(AddStateOp::Visit(out));
-                            }
+                        State::CounterInstance { counter, out } => {
+                            // Enter the counted repetition: set counter = 0.
+                            // We own ctx — mutate in place, no clone needed.
+                            let mut ctx = ctx;
+                            ctx.set(counter, 0);
+                            self.addstack.push(AddStateOp::Visit(out, ctx));
                         }
 
                         State::CounterIncrement {
+                            counter,
                             out,
                             out1,
-                            counter,
                             min,
                             max,
-                        } if self.counter_is_processable(counter, idx) => {
-                            // Get or create the counter.  `get_or_insert_default`
-                            // handles the exhausted-counter re-creation that
-                            // previously needed an explicit `is_none` check.
-                            let c = self.counters[counter].get_or_insert_default();
-                            c.incr();
-                            let value = c.value;
-                            debug_assert!(value > 0 && value <= max);
+                        } => {
+                            let value = ctx.get(counter).expect("counter must be active at CInc");
+                            let new_value = value + 1;
+                            let take_continue = new_value < max;
+                            let take_break = new_value >= min;
 
-                            // Follow the body again unless the single
-                            // remaining instance has reached max.
-                            let should_continue = value != max || !c.is_single();
-                            if should_continue {
-                                // Temporarily clear our mark to detect
-                                // epsilon-body loops. The `incremented` flag
-                                // (set by incr) prevents immediate
-                                // re-processing of this same state.
-                                self.lastlist[i] = self.listid.wrapping_sub(1);
-                                self.addstack.push(AddStateOp::CounterAfterContinue {
-                                    idx,
-                                    out1,
-                                    counter,
-                                    min,
-                                    max,
-                                    value,
-                                });
-                                self.addstack.push(AddStateOp::Visit(out));
-                            } else {
-                                // `value` was captured right after incr and
-                                // nothing modifies this counter in between.
-                                debug_assert!(value <= max);
-                                let stop = value >= min;
-
-                                if value == max {
-                                    self.delcounter(counter);
+                            match (take_continue, take_break) {
+                                (true, true) => {
+                                    // Both paths: clone once for break, mutate for continue.
+                                    let mut break_ctx = ctx.clone();
+                                    break_ctx.remove(counter);
+                                    self.addstack.push(AddStateOp::Visit(out1, break_ctx));
+                                    let mut ctx = ctx;
+                                    ctx.set(counter, new_value);
+                                    self.addstack.push(AddStateOp::Visit(out, ctx));
                                 }
-
-                                if stop {
-                                    self.addstack.push(AddStateOp::Visit(out1));
+                                (true, false) => {
+                                    // Continue only: mutate in place.
+                                    let mut ctx = ctx;
+                                    ctx.set(counter, new_value);
+                                    self.addstack.push(AddStateOp::Visit(out, ctx));
                                 }
+                                (false, true) => {
+                                    // Break only: mutate in place.
+                                    let mut ctx = ctx;
+                                    ctx.remove(counter);
+                                    self.addstack.push(AddStateOp::Visit(out1, ctx));
+                                }
+                                (false, false) => {}
                             }
                         }
 
@@ -2195,76 +1429,28 @@ impl<'a> Matcher<'a> {
                             self.ever_matched = true;
                         }
 
-                        // Byte, ByteClass, ByteTable, or CounterIncrement
-                        // whose guard failed — just record the state for
-                        // step() to inspect.
-                        _ => {}
+                        // Consuming states: record in nlist for step().
+                        State::Byte { .. } | State::ByteClass { .. } | State::ByteTable { .. } => {
+                            self.addstack.push(AddStateOp::PostPush(idx, ctx));
+                        }
                     }
                 }
 
-                AddStateOp::CounterAfterContinue {
-                    idx,
-                    out1,
-                    counter,
-                    min,
-                    max,
-                    value,
-                } => {
-                    let i = idx.idx();
-                    let is_epsilon_body = self.lastlist[i] == self.listid;
-                    self.lastlist[i] = self.listid;
-
-                    // `value` was captured right after incr(); the
-                    // `incremented` flag prevents this counter from being
-                    // re-processed during the continue-path exploration,
-                    // so the counter's value is still `value`.
-                    debug_assert!(value <= max);
-
-                    // For epsilon bodies the counter can freely advance to
-                    // any value in [value, max] via empty matches, so the
-                    // break condition is always satisfiable when min <= max
-                    // (which is an invariant). For normal bodies, check
-                    // the oldest instance against [min, max].
-                    let stop = is_epsilon_body || value >= min;
-
-                    // De-allocate the oldest instance if it reached max.
-                    if value == max {
-                        self.delcounter(counter);
-                    }
-
-                    // Follow the break path if any instance satisfies the
-                    // counting constraint.
-                    if stop {
-                        self.addstack.push(AddStateOp::Visit(out1));
-                    }
+                AddStateOp::PostPush(idx, ctx) => {
+                    self.nlist.push((idx, ctx));
                 }
-
-                AddStateOp::PostPush(idx) => self.nlist.push(idx),
             }
         }
     }
 
     /// Advance the simulation by one input byte.
-    ///
-    /// For each state in `clist`, if the byte matches (`Byte` or
-    /// `ByteClass`), follow the `out` pointer through `addstate` to build
-    /// the next `nlist`.
-    ///
-    /// After processing `clist`, the start state is re-seeded into `nlist`
-    /// to support unanchored matching (when there is no leading `^`, the
-    /// start state is a consuming state that will try matching from every
-    /// position; when `^` is present, the start state is `AssertStart`
-    /// and `at_start=false` prevents it from being followed).
     pub fn step(&mut self, b: u8) {
         // --- Pre-consumption: resolve deferred assertions ---
-        // Any `Assert` state parked in clist whose condition now passes
-        // (given `next = Some(b)`) gets its successor expanded into clist.
-        // We use the nlist-as-scratch pattern (same as finish()).
         {
             let mut any_expanded = false;
             let clist_len = self.clist.len();
             for i in 0..clist_len {
-                let idx = self.clist[i];
+                let (idx, ref ctx) = self.clist[i];
                 if let State::Assert { kind, out } = self.states[idx]
                     && kind.eval(self.at_start, self.at_end, self.prev_byte, None)
                         == AssertEval::Defer
@@ -2272,62 +1458,36 @@ impl<'a> Matcher<'a> {
                         == AssertEval::Pass
                 {
                     if !any_expanded {
-                        // Lazy init: bump listid + reset counters
-                        // only when we actually have work to do.
                         self.listid += 1;
-                        for counter in self.counters.iter_mut().filter_map(|c| c.as_mut()) {
-                            counter.incremented = false;
-                        }
+                        self.ctx_visited.clear();
                         self.nlist.clear();
                         any_expanded = true;
                     }
-                    self.addstate(out);
+                    self.addstate(out, ctx.clone());
                 }
             }
             if any_expanded {
                 self.clist.append(self.nlist);
-                // Bump listid again so the consumption loop below gets
-                // a fresh generation.  Without this, states visited
-                // during pre-consumption expansion would be skipped by
-                // `addstate` in the consumption loop (their `lastlist`
-                // already matches `listid`).  This is a correctness bug
-                // for any hybrid assertion that needs both prev_byte
-                // AND next_byte (e.g. CRLF assertions).
                 self.listid += 1;
+                self.ctx_visited.clear();
             }
         }
 
-        // `at_start` is cleared before processing so that `^` cannot
-        // match at any position other than the very beginning.
         self.at_start = false;
-
-        // Update prev_byte AFTER the pre-consumption EndLF pass (which
-        // needs the old prev_byte for any StartLF it encounters at the
-        // current position) but BEFORE consumption + re-seed (which
-        // produce states at the next position, where StartLF needs to
-        // see the byte just consumed).
         self.prev_byte = Some(b);
 
         self.nlist.clear();
+        self.ctx_visited.clear();
         let clist = std::mem::take(self.clist);
 
-        // Reset the per-step `incremented` flag on every active counter
-        // so that CounterIncrement states can be processed in the new
-        // epsilon closure.
-        for counter in self.counters.iter_mut().filter_map(|c| c.as_mut()) {
-            counter.incremented = false;
-        }
-
-        // Single fused pass: iterate clist in reverse, stamping
-        // body_alive_gen on counters and pushing Visit ops.  Reverse
-        // iteration ensures that after LIFO drain the ops execute in
-        // original clist order.  The re-seed Visit(start) is pushed
-        // first so it runs last.
+        // Fused pass: push Visit ops for matching consuming states
+        // (in reverse for LIFO ordering) + re-seed.
         self.addstack.clear();
-        self.addstack.push(AddStateOp::Visit(self.start));
+        self.addstack
+            .push(AddStateOp::Visit(self.start, self.empty_ctx.clone()));
 
-        for &idx in clist.iter().rev() {
-            let target = match self.states[idx] {
+        for (idx, ctx) in clist.iter().rev() {
+            let target = match self.states[*idx] {
                 State::Byte { byte: b2, out } if b == b2 => out,
                 State::ByteClass { class, out } if self.classes[class][b] => out,
                 State::ByteTable { table } => {
@@ -2339,18 +1499,14 @@ impl<'a> Matcher<'a> {
                 }
                 _ => continue,
             };
-            for &ci in &self.body_counter_map[idx.raw()] {
-                if let Some(counter) = self.counters[ci].as_mut() {
-                    counter.body_alive_gen = self.listid;
-                }
-            }
-            self.addstack.push(AddStateOp::Visit(target));
+            self.addstack.push(AddStateOp::Visit(target, ctx.clone()));
         }
 
         self.drain_addstack();
 
         *self.clist = std::mem::replace(self.nlist, clist);
         self.listid += 1;
+        self.ctx_visited.clear();
     }
 
     /// Feed an entire byte slice through the matcher, one byte at a time.
@@ -2361,26 +1517,13 @@ impl<'a> Matcher<'a> {
     }
 
     /// Check whether the matcher has reached an accepting state so far.
-    ///
-    /// This returns `true` if a `Match` state was reached during
-    /// [`start`](MatcherMemory::matcher) or any previous
-    /// [`step`](Self::step).  It does **not** signal end-of-input, so
-    /// `$` assertions are not evaluated — use
-    /// [`finish`](Self::finish) for that.
     pub fn ismatch(&self) -> bool {
         self.ever_matched
     }
 
     /// Signal end-of-input and return the final match result.
     ///
-    /// This allows `$` (`AssertEnd`) and `(?m:$)` (`AssertEndLF`) states
-    /// to fire: `at_end` is set to `true` and any such states currently
-    /// in `clist` have their `out` pointers followed through `addstate`.
-    ///
-    /// Only end-of-line/input assertion states are re-expanded — other
-    /// states (counters, splits, consuming states) were already fully
-    /// epsilon-expanded when they entered `clist` and must not be
-    /// re-processed.
+    /// Allows `$` / `(?m:$)` assertions to fire.
     ///
     /// Consumes the matcher, since no further input can be fed after
     /// end-of-input has been signalled.
@@ -2391,36 +1534,24 @@ impl<'a> Matcher<'a> {
 
         self.at_end = true;
 
-        // Walk clist by index to avoid holding a borrow across addstate().
-        // addstate() only writes to nlist, never clist, so this is safe.
         let clist_len = self.clist.len();
         if clist_len > 0 {
-            // Bump listid so addstate can visit new states.
             self.listid += 1;
+            self.ctx_visited.clear();
 
-            // Reset counter incremented flags for the new epsilon closure.
-            for counter in self.counters.iter_mut().filter_map(|c| c.as_mut()) {
-                counter.incremented = false;
-            }
-
-            // Resolve all deferred assertions at end-of-input (at_end=true,
-            // next=None).  This satisfies End, EndLF, EndCRLF, and also
-            // StartCRLF when prev_byte=='\r' (no '\n' follows at EOF).
             self.nlist.clear();
             for i in 0..clist_len {
-                let idx = self.clist[i];
+                let (idx, ref ctx) = self.clist[i];
                 if let State::Assert { kind, out } = self.states[idx]
                     && kind.eval(self.at_start, true, self.prev_byte, None) == AssertEval::Pass
                 {
-                    self.addstate(out);
+                    self.addstate(out, ctx.clone());
                 }
             }
 
-            // Append the newly discovered states to clist.
             self.clist.append(self.nlist);
         }
 
-        // ever_matched was set by addstate if Match was reached.
         self.ever_matched
     }
 }
@@ -2432,379 +1563,81 @@ impl<'a> Matcher<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     // -----------------------------------------------------------------------
-    // DeltaPool unit tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_delta_pool_alloc_sequential() {
-        let mut pool = DeltaPool::default();
-        let a = pool.alloc(10);
-        let b = pool.alloc(20);
-        let c = pool.alloc(30);
-        assert_eq!(a, 0);
-        assert_eq!(b, 1);
-        assert_eq!(c, 2);
-        assert_eq!(pool.values[a], 10);
-        assert_eq!(pool.values[b], 20);
-        assert_eq!(pool.values[c], 30);
-        assert_eq!(pool.next[a], SENTINEL);
-        assert_eq!(pool.next[b], SENTINEL);
-        assert_eq!(pool.next[c], SENTINEL);
-    }
-
-    #[test]
-    fn test_delta_pool_free_and_reuse() {
-        let mut pool = DeltaPool::default();
-        let a = pool.alloc(10);
-        let b = pool.alloc(20);
-        pool.free_node(a);
-        // Next alloc should reuse slot `a`.
-        let c = pool.alloc(99);
-        assert_eq!(c, a);
-        assert_eq!(pool.values[c], 99);
-        assert_eq!(pool.next[c], SENTINEL);
-        // `b` is unaffected.
-        assert_eq!(pool.values[b], 20);
-    }
-
-    #[test]
-    fn test_delta_pool_free_lifo_order() {
-        let mut pool = DeltaPool::default();
-        let a = pool.alloc(1);
-        let b = pool.alloc(2);
-        let c = pool.alloc(3);
-        pool.free_node(a);
-        pool.free_node(b);
-        pool.free_node(c);
-        // Free stack is LIFO: c, b, a.
-        assert_eq!(pool.alloc(10), c);
-        assert_eq!(pool.alloc(20), b);
-        assert_eq!(pool.alloc(30), a);
-    }
-
-    #[test]
-    fn test_delta_pool_reset_retains_capacity() {
-        let mut pool = DeltaPool::default();
-        for i in 0..100 {
-            pool.alloc(i);
-        }
-        let cap_values = pool.values.capacity();
-        let cap_next = pool.next.capacity();
-        pool.reset();
-        assert!(pool.values.is_empty());
-        assert!(pool.next.is_empty());
-        assert_eq!(pool.free_head, SENTINEL);
-        assert_eq!(pool.values.capacity(), cap_values);
-        assert_eq!(pool.next.capacity(), cap_next);
-    }
-
-    #[test]
-    fn test_delta_pool_alloc_after_reset() {
-        let mut pool = DeltaPool::default();
-        pool.alloc(42);
-        pool.alloc(43);
-        pool.reset();
-        // After reset, free list is empty, vecs are empty — fresh allocs
-        // start from index 0 again.
-        let a = pool.alloc(99);
-        assert_eq!(a, 0);
-        assert_eq!(pool.values[a], 99);
-    }
-
-    #[test]
-    fn test_delta_pool_mixed_alloc_free_alloc() {
-        let mut pool = DeltaPool::default();
-        let a = pool.alloc(1);
-        let b = pool.alloc(2);
-        let c = pool.alloc(3);
-        // Free middle node.
-        pool.free_node(b);
-        // Alloc reuses `b`.
-        let d = pool.alloc(4);
-        assert_eq!(d, b);
-        assert_eq!(pool.values[d], 4);
-        // Alloc new — extends the arena.
-        let e = pool.alloc(5);
-        assert_eq!(e, 3);
-        // Original a, c untouched.
-        assert_eq!(pool.values[a], 1);
-        assert_eq!(pool.values[c], 3);
-    }
-
-    // -----------------------------------------------------------------------
-    // Counter + DeltaPool integration tests
+    // CounterCtx unit tests
     // -----------------------------------------------------------------------
 
-    /// Helper: collect all instance values from a counter (oldest to
-    /// newest) by walking the linked list.
-    fn collect_instance_values(c: &Counter, pool: &DeltaPool) -> Vec<usize> {
-        let mut vals = vec![c.value];
-        let mut val = c.value;
-        let mut node = c.head;
-        while node != SENTINEL {
-            val -= pool.values[node];
-            vals.push(val);
-            node = pool.next[node];
-        }
-        vals
+    #[test]
+    fn test_counter_ctx_empty() {
+        let ctx = CounterCtx::new(0);
+        assert!(ctx.is_empty());
     }
 
     #[test]
-    fn test_counter_default_is_single() {
-        let c = Counter::default();
-        assert!(c.is_single());
-        assert_eq!(c.value, 0);
-        assert_eq!(c.delta, 0);
-        assert!(!c.incremented);
-        assert_eq!(c.head, SENTINEL);
-        assert_eq!(c.tail, SENTINEL);
+    fn test_counter_ctx_all_inactive() {
+        let ctx = CounterCtx::new(3);
+        assert!(ctx.is_empty());
+        assert_eq!(ctx.get(CounterIdx(0)), None);
+        assert_eq!(ctx.get(CounterIdx(1)), None);
+        assert_eq!(ctx.get(CounterIdx(2)), None);
     }
 
     #[test]
-    fn test_counter_incr_single_instance() {
-        let mut c = Counter::default();
-        c.incr();
-        assert_eq!(c.value, 1);
-        assert_eq!(c.delta, 1);
-        assert!(c.incremented);
-        assert!(c.is_single());
-        c.incr();
-        assert_eq!(c.value, 2);
-        assert_eq!(c.delta, 2);
+    fn test_counter_ctx_set_get() {
+        let mut ctx = CounterCtx::new(2);
+        ctx.set(CounterIdx(0), 5);
+        assert!(!ctx.is_empty());
+        assert_eq!(ctx.get(CounterIdx(0)), Some(5));
+        assert_eq!(ctx.get(CounterIdx(1)), None);
     }
 
     #[test]
-    fn test_counter_push_creates_linked_list() {
-        let mut pool = DeltaPool::default();
-        let mut c = Counter::default();
-        // Instance 1: increment 3 times.
-        c.incr();
-        c.incr();
-        c.incr();
-        assert_eq!(c.value, 3);
-        assert_eq!(c.delta, 3);
-        // Push: saves delta=3 to pool, resets delta to 0.
-        c.push(&mut pool);
-        assert_eq!(c.value, 3);
-        assert_eq!(c.delta, 0);
-        assert!(!c.is_single());
-        // Instance 2: increment 2 times.
-        c.incr();
-        c.incr();
-        assert_eq!(c.value, 5);
-        assert_eq!(c.delta, 2);
-        // Values: oldest=5 (value), newest=5-3=2.
-        assert_eq!(collect_instance_values(&c, &pool), vec![5, 2]);
+    fn test_counter_ctx_remove() {
+        let mut ctx = CounterCtx::new(2);
+        ctx.set(CounterIdx(0), 5);
+        ctx.set(CounterIdx(1), 3);
+        ctx.remove(CounterIdx(0));
+        assert_eq!(ctx.get(CounterIdx(0)), None);
+        assert_eq!(ctx.get(CounterIdx(1)), Some(3));
+        assert!(!ctx.is_empty());
+        ctx.remove(CounterIdx(1));
+        assert!(ctx.is_empty());
     }
 
     #[test]
-    fn test_counter_push_multiple() {
-        let mut pool = DeltaPool::default();
-        let mut c = Counter::default();
-        // Instance 1: 3 increments.
-        for _ in 0..3 {
-            c.incr();
-        }
-        c.push(&mut pool);
-        // Instance 2: 2 increments.
-        for _ in 0..2 {
-            c.incr();
-        }
-        c.push(&mut pool);
-        // Instance 3: 1 increment.
-        c.incr();
-        assert_eq!(c.value, 6);
-        assert_eq!(c.delta, 1);
-        // Instances: 6, 6-3=3, 3-2=1
-        assert_eq!(collect_instance_values(&c, &pool), vec![6, 3, 1]);
+    fn test_counter_ctx_set_mutates() {
+        let mut ctx = CounterCtx::new(2);
+        assert!(ctx.is_empty());
+        ctx.set(CounterIdx(1), 7);
+        assert!(!ctx.is_empty());
+        assert_eq!(ctx.get(CounterIdx(1)), Some(7));
     }
 
     #[test]
-    fn test_counter_pop_oldest() {
-        let mut pool = DeltaPool::default();
-        let mut c = Counter::default();
-        // Two instances: delta 3, then delta 2.
-        for _ in 0..3 {
-            c.incr();
-        }
-        c.push(&mut pool);
-        for _ in 0..2 {
-            c.incr();
-        }
-        assert_eq!(c.value, 5);
-        // Instances: 5, 2.
-        // Pop oldest (value=5), remaining value becomes 5-3=2.
-        let exhausted = c.pop(&mut pool);
-        assert!(!exhausted);
-        assert_eq!(c.value, 2);
-        assert!(c.is_single());
-        assert_eq!(collect_instance_values(&c, &pool), vec![2]);
+    fn test_counter_ctx_remove_mutates() {
+        let mut ctx = CounterCtx::new(2);
+        ctx.set(CounterIdx(0), 10);
+        ctx.set(CounterIdx(1), 20);
+        ctx.remove(CounterIdx(0));
+        assert_eq!(ctx.get(CounterIdx(0)), None);
+        assert_eq!(ctx.get(CounterIdx(1)), Some(20));
     }
 
     #[test]
-    fn test_counter_pop_last_instance_returns_true() {
-        let mut pool = DeltaPool::default();
-        let mut c = Counter::default();
-        c.incr();
-        c.incr();
-        // Single instance, no deltas in list.
-        assert!(c.is_single());
-        let exhausted = c.pop(&mut pool);
-        assert!(exhausted);
-    }
-
-    #[test]
-    fn test_counter_push_pop_cycle() {
-        let mut pool = DeltaPool::default();
-        let mut c = Counter::default();
-        // Push 3 instances, then pop them all.
-        for _ in 0..2 {
-            c.incr();
-        }
-        c.push(&mut pool); // delta=2
-        for _ in 0..3 {
-            c.incr();
-        }
-        c.push(&mut pool); // delta=3
-        c.incr(); // delta=1
-        // value=6, instances: 6, 6-2=4, 4-3=1
-        assert_eq!(collect_instance_values(&c, &pool), vec![6, 4, 1]);
-
-        // Pop oldest (6).
-        assert!(!c.pop(&mut pool));
-        assert_eq!(c.value, 4);
-        assert_eq!(collect_instance_values(&c, &pool), vec![4, 1]);
-
-        // Pop oldest (4).
-        assert!(!c.pop(&mut pool));
-        assert_eq!(c.value, 1);
-        assert!(c.is_single());
-
-        // Pop last.
-        assert!(c.pop(&mut pool));
-    }
-
-    #[test]
-    fn test_counter_pop_recycles_pool_nodes() {
-        let mut pool = DeltaPool::default();
-        let mut c = Counter::default();
-        // Create 2 instances, pop one, verify pool free list.
-        c.incr();
-        c.push(&mut pool);
-        c.incr();
-        assert_eq!(pool.free_head, SENTINEL);
-        c.pop(&mut pool);
-        assert_ne!(pool.free_head, SENTINEL);
-    }
-
-    #[test]
-    fn test_counter_is_single_transitions() {
-        let mut pool = DeltaPool::default();
-        let mut c = Counter::default();
-        assert!(c.is_single());
-        c.incr(); // value=1, delta=1
-        assert!(c.is_single());
-        c.push(&mut pool); // saves delta=1
-        assert!(!c.is_single());
-        c.incr(); // value=2, delta=1
-        c.push(&mut pool); // saves delta=1
-        assert!(!c.is_single());
-        c.incr(); // value=3, delta=1
-        // Instances: 3, 2, 1.  Pop oldest (3) → value=2.
-        c.pop(&mut pool);
-        assert!(!c.is_single());
-        // Pop oldest (2) → value=1.
-        c.pop(&mut pool);
-        assert!(c.is_single());
-    }
-
-    #[test]
-    fn test_two_counters_share_pool() {
-        let mut pool = DeltaPool::default();
-        let mut c1 = Counter::default();
-        let mut c2 = Counter::default();
-        // Counter 1: push delta=2.
-        c1.incr();
-        c1.incr();
-        c1.push(&mut pool);
-        // Counter 2: push delta=5.
-        for _ in 0..5 {
-            c2.incr();
-        }
-        c2.push(&mut pool);
-        // Continue incrementing both.
-        c1.incr();
-        c2.incr();
-        // c1 instances: 3, 1.  c2 instances: 6, 1.
-        assert_eq!(collect_instance_values(&c1, &pool), vec![3, 1]);
-        assert_eq!(collect_instance_values(&c2, &pool), vec![6, 1]);
-        // Pop from c1 ��� should not affect c2.
-        c1.pop(&mut pool);
-        assert_eq!(collect_instance_values(&c1, &pool), vec![1]);
-        assert_eq!(collect_instance_values(&c2, &pool), vec![6, 1]);
-    }
-
-    #[test]
-    fn test_pool_node_reuse_across_counters() {
-        let mut pool = DeltaPool::default();
-        let mut c1 = Counter::default();
-        let mut c2 = Counter::default();
-        // c1 allocates and frees a node.
-        c1.incr();
-        c1.push(&mut pool);
-        c1.incr();
-        let node_used = c1.head;
-        c1.pop(&mut pool);
-        assert_eq!(pool.free_head, node_used);
-        // c2 allocates ��� should reuse the freed node.
-        c2.incr();
-        c2.push(&mut pool);
-        assert_eq!(c2.head, node_used);
-        assert_eq!(pool.free_head, SENTINEL);
-    }
-
-    #[test]
-    fn test_counter_push_pop_interleaved_with_incr() {
-        let mut pool = DeltaPool::default();
-        let mut c = Counter::default();
-        // Simulate a realistic pattern: push, incr everything, pop, push.
-        c.incr();
-        c.push(&mut pool);
-        c.incr();
-        // Instances: 2, 1.
-        assert_eq!(collect_instance_values(&c, &pool), vec![2, 1]);
-        c.push(&mut pool);
-        c.incr();
-        // Instances: 3, 2, 1.
-        assert_eq!(collect_instance_values(&c, &pool), vec![3, 2, 1]);
-        // Pop the oldest (3).
-        c.pop(&mut pool);
-        // Instances: 2, 1.
-        assert_eq!(collect_instance_values(&c, &pool), vec![2, 1]);
-        // Push again.
-        c.push(&mut pool);
-        c.incr();
-        // Instances: 3, 2, 1.
-        assert_eq!(collect_instance_values(&c, &pool), vec![3, 2, 1]);
-    }
-
-    #[test]
-    fn test_pool_reset_then_counter_from_scratch() {
-        let mut pool = DeltaPool::default();
-        let mut c = Counter::default();
-        c.incr();
-        c.push(&mut pool);
-        c.incr();
-        pool.reset();
-        // After reset, start fresh.
-        let mut c2 = Counter::default();
-        c2.incr();
-        c2.incr();
-        c2.push(&mut pool);
-        c2.incr();
-        assert_eq!(collect_instance_values(&c2, &pool), vec![3, 1]);
+    fn test_counter_ctx_equality_and_hash() {
+        use HashSet;
+        let mut a = CounterCtx::new(2);
+        a.set(CounterIdx(0), 3);
+        let mut b = CounterCtx::new(2);
+        b.set(CounterIdx(0), 3);
+        let mut c = CounterCtx::new(2);
+        c.set(CounterIdx(0), 4);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        let mut set = HashSet::new();
+        assert!(set.insert(a.clone()));
+        assert!(!set.insert(b)); // duplicate
+        assert!(set.insert(c));
     }
 
     // -----------------------------------------------------------------------
@@ -3382,11 +2215,9 @@ mod tests {
         let actual = regex.memory_size();
         assert_eq!(
             actual, expected_bytes,
-            "memory_size mismatch for pattern `{}`: actual={}, expected={}",
-            pattern, actual, expected_bytes,
+            "memory_size mismatch for pattern `{pattern}`: actual={actual}, expected={expected_bytes}"
         );
     }
-
     /// Assert that our NFA matcher and the `regex` crate agree on whether
     /// `input` matches the given pattern.
     ///
@@ -3456,7 +2287,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "bc");
         assert_matches_regex_crate(p, &re, "a123b");
         assert_matches_regex_crate(p, &re, "a123");
-        assert_memory_size(p, &re, 1169);
+        assert_memory_size(p, &re, 760);
     }
 
     /// `(a|bc){1,2}` — flat range repetition with all combos up to 3.
@@ -3495,7 +2326,7 @@ mod tests {
             let input = v.into_iter().collect::<String>();
             assert_matches_regex_crate(p, &re, &input);
         }
-        assert_memory_size(p, &re, 1041);
+        assert_memory_size(p, &re, 424);
     }
 
     /// `((a|bc){1,2}){2,3}` — nested counting constraints.
@@ -3532,7 +2363,7 @@ mod tests {
             let input = v.into_iter().collect::<String>();
             assert_matches_regex_crate(p, &re, &input);
         }
-        assert_memory_size(p, &re, 2019);
+        assert_memory_size(p, &re, 504);
     }
 
     /// `(a|a?){2,3}` — epsilon-matchable body (the `a?` branch can match
@@ -3555,7 +2386,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "aab");
-        assert_memory_size(p, &re, 1009);
+        assert_memory_size(p, &re, 424);
     }
 
     /// `a+` — basic one-or-more repetition.
@@ -3572,7 +2403,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "aab");
-        assert_memory_size(p, &re, 424);
+        assert_memory_size(p, &re, 264);
     }
 
     /// `.+` — one-or-more wildcard.
@@ -3584,7 +2415,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 680);
+        assert_memory_size(p, &re, 520);
     }
 
     /// `a+b+` — consecutive one-or-more repetitions.
@@ -3600,7 +2431,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abb");
         assert_matches_regex_crate(p, &re, "aabb");
         assert_matches_regex_crate(p, &re, "ba");
-        assert_memory_size(p, &re, 552);
+        assert_memory_size(p, &re, 344);
     }
 
     /// `(ab)+` — one-or-more of a multi-byte sequence.
@@ -3614,7 +2445,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abab");
         assert_matches_regex_crate(p, &re, "ababab");
         assert_matches_regex_crate(p, &re, "aba");
-        assert_memory_size(p, &re, 488);
+        assert_memory_size(p, &re, 304);
     }
 
     /// `(a|b)+` — one-or-more alternation.
@@ -3635,7 +2466,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ac");
         assert_matches_regex_crate(p, &re, "ca");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 680);
+        assert_memory_size(p, &re, 520);
     }
 
     /// `.*a.{3}b+c` — one-or-more mixed with counting constraints.
@@ -3660,7 +2491,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "x123bc");
         assert_matches_regex_crate(p, &re, "a123b");
-        assert_memory_size(p, &re, 1233);
+        assert_memory_size(p, &re, 800);
     }
 
     /// `(a{2,3})+` — inner repetition, outer one-or-more.
@@ -3680,7 +2511,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaaaaa");
         assert_matches_regex_crate(p, &re, "aaaaaaaaa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 657);
+        assert_memory_size(p, &re, 344);
     }
 
     /// `((a|bc){1,2})+` — inner range repetition of alternation, outer `+`.
@@ -3707,7 +2538,7 @@ mod tests {
                 assert_matches_regex_crate(p, &re, &input);
             }
         }
-        assert_memory_size(p, &re, 1105);
+        assert_memory_size(p, &re, 464);
     }
 
     /// `(a+){2,3}` — inner one-or-more, outer counted repetition.
@@ -3724,7 +2555,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaaa");
         assert_matches_regex_crate(p, &re, "aaaaaaa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 721);
+        assert_memory_size(p, &re, 344);
     }
 
     /// `((a|b)+){2,4}` — inner `+` of alternation, outer counted repetition.
@@ -3749,7 +2580,7 @@ mod tests {
                 assert_matches_regex_crate(p, &re, &input);
             }
         }
-        assert_memory_size(p, &re, 977);
+        assert_memory_size(p, &re, 600);
     }
 
     /// `(a+b{2,3})+` — inner `+` and inner repetition side-by-side,
@@ -3771,7 +2602,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abbabbbabb");
         assert_matches_regex_crate(p, &re, "aabbaabbb");
         assert_matches_regex_crate(p, &re, "aabbbaabbb");
-        assert_memory_size(p, &re, 785);
+        assert_memory_size(p, &re, 424);
     }
 
     // -- min=0 repetition tests ---------------------------------------------
@@ -3786,7 +2617,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "aaa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 657);
+        assert_memory_size(p, &re, 344);
     }
 
     /// `a{0,1}` — equivalent to `a?`.
@@ -3798,7 +2629,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 424);
+        assert_memory_size(p, &re, 264);
     }
 
     /// `(a|bc){0,3}` — zero to three of an alternation.
@@ -3823,7 +2654,7 @@ mod tests {
                 assert_matches_regex_crate(p, &re, &input);
             }
         }
-        assert_memory_size(p, &re, 1105);
+        assert_memory_size(p, &re, 464);
     }
 
     /// `a{0,}` — zero or more, lowered to `a*` (no counter overhead).
@@ -3842,7 +2673,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "aab");
         assert_matches_regex_crate(p, &re, "baa");
-        assert_memory_size(p, &re, 424);
+        assert_memory_size(p, &re, 264);
     }
 
     /// `(ab){0,}` — zero or more of a group, lowered to `(ab)*`.
@@ -3856,7 +2687,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abab");
         assert_matches_regex_crate(p, &re, "ababab");
         assert_matches_regex_crate(p, &re, "aba");
-        assert_memory_size(p, &re, 488);
+        assert_memory_size(p, &re, 304);
     }
 
     /// `x(a{0,2})+y` — min=0 repetition nested inside `+`.
@@ -3881,7 +2712,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ay");
         assert_matches_regex_crate(p, &re, "xa");
         assert_matches_regex_crate(p, &re, "aay");
-        assert_memory_size(p, &re, 849);
+        assert_memory_size(p, &re, 464);
     }
 
     /// `(a{0,2}){2,3}` — min=0 inner, counted outer.
@@ -3898,7 +2729,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaaa");
         assert_matches_regex_crate(p, &re, "aaaaaaa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 1187);
+        assert_memory_size(p, &re, 424);
     }
 
     /// `(a+){0,3}` — `+` inside a min=0 counted repetition.
@@ -3914,7 +2745,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaa");
         assert_matches_regex_crate(p, &re, "aaaaaa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 785);
+        assert_memory_size(p, &re, 384);
     }
 
     /// `.{0,3}` — min=0 repetition on wildcard.
@@ -3927,7 +2758,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "abcd");
-        assert_memory_size(p, &re, 913);
+        assert_memory_size(p, &re, 600);
     }
 
     /// `a{0,3}` — same as `a{0,3}` (the old test used `min: None`).
@@ -3945,7 +2776,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "aab");
-        assert_memory_size(p, &re, 657);
+        assert_memory_size(p, &re, 344);
     }
 
     // -- Standalone primitive tests ------------------------------------------
@@ -3962,7 +2793,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "ba");
-        assert_memory_size(p, &re, 360);
+        assert_memory_size(p, &re, 224);
     }
 
     /// `abc` — multi-byte literal concatenation.
@@ -3982,7 +2813,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "xabcx");
         assert_matches_regex_crate(p, &re, "cba");
         assert_matches_regex_crate(p, &re, "bac");
-        assert_memory_size(p, &re, 488);
+        assert_memory_size(p, &re, 304);
     }
 
     /// `.` — bare wildcard (matches exactly one byte).
@@ -3998,7 +2829,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 616);
+        assert_memory_size(p, &re, 480);
     }
 
     /// `a|bc` — bare alternation (no repetition).
@@ -4016,7 +2847,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "x");
         assert_matches_regex_crate(p, &re, "bca");
-        assert_memory_size(p, &re, 552);
+        assert_memory_size(p, &re, 344);
     }
 
     /// `a|b|c` — three-way alternation.
@@ -4032,7 +2863,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "d");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 616);
+        assert_memory_size(p, &re, 480);
     }
 
     /// `a?` — standalone zero-or-one.
@@ -4046,7 +2877,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
-        assert_memory_size(p, &re, 424);
+        assert_memory_size(p, &re, 264);
     }
 
     /// `(ab)?` — zero-or-one of a group.
@@ -4062,7 +2893,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "abab");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 488);
+        assert_memory_size(p, &re, 304);
     }
 
     /// `a?b` — optional prefix followed by a literal.
@@ -4079,7 +2910,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "bb");
         assert_matches_regex_crate(p, &re, "cb");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 488);
+        assert_memory_size(p, &re, 304);
     }
 
     /// `a*` — standalone zero-or-more.
@@ -4098,7 +2929,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "aab");
         assert_matches_regex_crate(p, &re, "baa");
-        assert_memory_size(p, &re, 424);
+        assert_memory_size(p, &re, 264);
     }
 
     /// `(ab)*` — zero-or-more of a group.
@@ -4117,7 +2948,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aba");
         assert_matches_regex_crate(p, &re, "abba");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 488);
+        assert_memory_size(p, &re, 304);
     }
 
     /// `a*b` — star followed by a literal.
@@ -4137,7 +2968,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "aabb");
-        assert_memory_size(p, &re, 488);
+        assert_memory_size(p, &re, 304);
     }
 
     /// `a{2,}` — unbounded min with n>0.
@@ -4156,7 +2987,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "aab");
         assert_matches_regex_crate(p, &re, "baa");
-        assert_memory_size(p, &re, 593);
+        assert_memory_size(p, &re, 304);
     }
 
     /// `(ab){2,}` — unbounded min of a group.
@@ -4175,7 +3006,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abba");
         assert_matches_regex_crate(p, &re, "ababc");
         assert_matches_regex_crate(p, &re, "xabab");
-        assert_memory_size(p, &re, 753);
+        assert_memory_size(p, &re, 344);
     }
 
     /// `a{3,5}` — bounded min>0 range.
@@ -4194,7 +3025,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "aaab");
         assert_matches_regex_crate(p, &re, "baaa");
-        assert_memory_size(p, &re, 593);
+        assert_memory_size(p, &re, 304);
     }
 
     /// `a{3,3}` — exact repetition.
@@ -4211,7 +3042,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaa");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "bbb");
-        assert_memory_size(p, &re, 593);
+        assert_memory_size(p, &re, 304);
     }
 
     // -- Byte class tests ---------------------------------------------------
@@ -4227,7 +3058,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "c");
         assert_matches_regex_crate(p, &re, "d");
         assert_matches_regex_crate(p, &re, "ab");
-        assert_memory_size(p, &re, 616);
+        assert_memory_size(p, &re, 480);
     }
 
     /// `[a-c]+` — one-or-more of a byte class.
@@ -4241,7 +3072,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "cba");
         assert_matches_regex_crate(p, &re, "abcd");
         assert_matches_regex_crate(p, &re, "d");
-        assert_memory_size(p, &re, 680);
+        assert_memory_size(p, &re, 520);
     }
 
     /// `[a-c]{2,3}` — counted repetition of a byte class.
@@ -4256,7 +3087,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abca");
         assert_matches_regex_crate(p, &re, "cc");
         assert_matches_regex_crate(p, &re, "dd");
-        assert_memory_size(p, &re, 849);
+        assert_memory_size(p, &re, 560);
     }
 
     /// `[ax]` — disjoint single bytes (multi-range Class::Bytes).
@@ -4269,7 +3100,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "x");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ax");
-        assert_memory_size(p, &re, 616);
+        assert_memory_size(p, &re, 480);
     }
 
     /// `[a-cx-z]+` — multiple disjoint ranges in a byte class.
@@ -4284,7 +3115,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "d");
         assert_matches_regex_crate(p, &re, "w");
         assert_matches_regex_crate(p, &re, "abcxyz");
-        assert_memory_size(p, &re, 680);
+        assert_memory_size(p, &re, 520);
     }
 
     /// `[a-c].*[x-z]` — byte classes mixed with wildcard.
@@ -4298,7 +3129,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "dx");
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
-        assert_memory_size(p, &re, 1320);
+        assert_memory_size(p, &re, 1112);
     }
 
     // -- Predefined character class tests -----------------------------------
@@ -4318,7 +3149,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "00");
         assert_matches_regex_crate(p, &re, "12");
-        assert_memory_size(p, &re, 616);
+        assert_memory_size(p, &re, 480);
     }
 
     /// `\d+` — one-or-more digits.
@@ -4336,7 +3167,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "12a");
         assert_matches_regex_crate(p, &re, "a12");
         assert_matches_regex_crate(p, &re, "1 2");
-        assert_memory_size(p, &re, 680);
+        assert_memory_size(p, &re, 520);
     }
 
     /// `\d{3,5}` — counted digit repetition.
@@ -4354,7 +3185,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "123456");
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "12a");
-        assert_memory_size(p, &re, 849);
+        assert_memory_size(p, &re, 560);
     }
 
     /// `\D` — matches a single non-digit byte.
@@ -4372,7 +3203,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "5");
         assert_matches_regex_crate(p, &re, "9");
         assert_matches_regex_crate(p, &re, "aa");
-        assert_memory_size(p, &re, 616);
+        assert_memory_size(p, &re, 480);
     }
 
     /// `\D+` — one-or-more non-digits.
@@ -4388,7 +3219,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "abc1");
         assert_matches_regex_crate(p, &re, "1abc");
-        assert_memory_size(p, &re, 680);
+        assert_memory_size(p, &re, 520);
     }
 
     /// `\s` — matches a single ASCII whitespace byte.
@@ -4405,7 +3236,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "  ");
-        assert_memory_size(p, &re, 616);
+        assert_memory_size(p, &re, 480);
     }
 
     /// `\s+` — one-or-more whitespace.
@@ -4421,7 +3252,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, " a");
         assert_matches_regex_crate(p, &re, "a ");
-        assert_memory_size(p, &re, 680);
+        assert_memory_size(p, &re, 520);
     }
 
     /// `\S` — matches a single non-whitespace byte.
@@ -4438,7 +3269,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "\t");
         assert_matches_regex_crate(p, &re, "\n");
         assert_matches_regex_crate(p, &re, "aa");
-        assert_memory_size(p, &re, 616);
+        assert_memory_size(p, &re, 480);
     }
 
     /// `\S+` — one-or-more non-whitespace.
@@ -4454,7 +3285,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "a b");
         assert_matches_regex_crate(p, &re, " abc");
-        assert_memory_size(p, &re, 680);
+        assert_memory_size(p, &re, 520);
     }
 
     /// `\w` — matches a single ASCII word byte (`[0-9A-Za-z_]`).
@@ -4473,7 +3304,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "!");
         assert_matches_regex_crate(p, &re, "-");
         assert_matches_regex_crate(p, &re, "ab");
-        assert_memory_size(p, &re, 616);
+        assert_memory_size(p, &re, 480);
     }
 
     /// `\w+` — one-or-more word bytes.
@@ -4490,7 +3321,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "hello world");
         assert_matches_regex_crate(p, &re, "foo-bar");
-        assert_memory_size(p, &re, 680);
+        assert_memory_size(p, &re, 520);
     }
 
     /// `\w{2,4}` — counted word repetition.
@@ -4507,7 +3338,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abcde");
         assert_matches_regex_crate(p, &re, "!!");
         assert_matches_regex_crate(p, &re, "a b");
-        assert_memory_size(p, &re, 849);
+        assert_memory_size(p, &re, 560);
     }
 
     /// `\W` — matches a single non-word byte.
@@ -4525,7 +3356,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "_");
         assert_matches_regex_crate(p, &re, "  ");
-        assert_memory_size(p, &re, 616);
+        assert_memory_size(p, &re, 480);
     }
 
     /// `\W+` — one-or-more non-word bytes.
@@ -4542,7 +3373,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, " a ");
         assert_matches_regex_crate(p, &re, "!a!");
-        assert_memory_size(p, &re, 680);
+        assert_memory_size(p, &re, 520);
     }
 
     /// `\d+\s+\w+` — mixed predefined classes in concatenation.
@@ -4561,7 +3392,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, " hello");
         assert_matches_regex_crate(p, &re, "hello 42");
         assert_matches_regex_crate(p, &re, "42hello");
-        assert_memory_size(p, &re, 1448);
+        assert_memory_size(p, &re, 1192);
     }
 
     // -- Byte-class deduplication tests --------------------------------------
@@ -4585,14 +3416,12 @@ mod tests {
     fn test_dedup_same_class() {
         let one = build_regex_unchecked(r"^\d$");
         let two = build_regex_unchecked(r"^\d\d$");
-        // The second `\d` adds one ByteClass state but no extra class
-        // table — so the difference is exactly one state plus its
-        // body_counter_map Vec header.
+        // The second \`\d\` adds one ByteClass state and one Catenate
+        // join — so the difference is exactly one State.
         let state_size = std::mem::size_of::<State>();
-        let bcm_header = std::mem::size_of::<Vec<CounterIdx>>();
         assert_eq!(
             two.memory_size() - one.memory_size(),
-            state_size + bcm_header,
+            state_size,
             "second \\d should add one state, no extra class table",
         );
         assert_eq!(one.classes.len(), 1);
@@ -4659,10 +3488,9 @@ mod tests {
         let one_wild = build_regex_unchecked("^.$");
         let two_wild = build_regex_unchecked("^..$");
         let state_size = std::mem::size_of::<State>();
-        let bcm_header = std::mem::size_of::<Vec<CounterIdx>>();
         assert_eq!(
             two_wild.memory_size() - one_wild.memory_size(),
-            state_size + bcm_header,
+            state_size,
             "second `.` should add one state, no extra class table",
         );
         assert_eq!(one_wild.classes.len(), 1);
@@ -5885,11 +4713,7 @@ mod tests {
             // variable-inner-length cases
             ("^(a{1,2}){2}$", "aa"),
             ("^(a{1,2}){2}$", "aaa"),
-            // NOTE: ("^(a{1,2}){2}$", "aaaa") is a pre-existing Becchi
-            // model limitation for variable-length inner counters —
-            // the early-break path exhausts the outer counter before
-            // the full input is consumed.  Not a regression from this
-            // fix; excluded from the survey.
+            ("^(a{1,2}){2}$", "aaaa"),
         ];
         let mut failures = Vec::new();
         for &(pat, input) in cases {
@@ -5914,5 +4738,4 @@ mod tests {
             panic!("{msg}");
         }
     }
-
 }
