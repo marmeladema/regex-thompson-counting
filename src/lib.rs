@@ -1490,7 +1490,10 @@ impl<'a> Matcher<'a> {
                     if !any_expanded {
                         self.listid += 1;
                         self.ctx_visited.clear();
-                        self.nlist.clear();
+                        debug_assert!(
+                            self.nlist.is_empty(),
+                            "nlist must be empty before assert expansion"
+                        );
                         any_expanded = true;
                     }
                     self.addstate(out, ctx.clone());
@@ -1506,18 +1509,22 @@ impl<'a> Matcher<'a> {
         self.at_start = false;
         self.prev_byte = Some(b);
 
-        self.nlist.clear();
+        debug_assert!(
+            self.nlist.is_empty(),
+            "nlist must be empty before consumption"
+        );
         self.ctx_visited.clear();
-        let clist = std::mem::take(self.clist);
+        let mut clist = std::mem::take(self.clist);
 
         // Fused pass: push Visit ops for matching consuming states
         // (in reverse for LIFO ordering) + re-seed.
+        // drain(..).rev() gives us owned ctx values — no clones needed.
         self.addstack.clear();
         self.addstack
             .push(AddStateOp::Visit(self.start, self.empty_ctx.clone()));
 
-        for (idx, ctx) in clist.iter().rev() {
-            let target = match self.states[*idx] {
+        for (idx, ctx) in clist.drain(..).rev() {
+            let target = match self.states[idx] {
                 State::Byte { byte: b2, out } if b == b2 => out,
                 State::ByteClass { class, out } if self.classes[class][b] => out,
                 State::ByteTable { table } => {
@@ -1529,11 +1536,12 @@ impl<'a> Matcher<'a> {
                 }
                 _ => continue,
             };
-            self.addstack.push(AddStateOp::Visit(target, ctx.clone()));
+            self.addstack.push(AddStateOp::Visit(target, ctx));
         }
 
         self.drain_addstack();
 
+        // clist is empty after drain but retains its capacity for reuse.
         *self.clist = std::mem::replace(self.nlist, clist);
         self.listid += 1;
         self.ctx_visited.clear();
@@ -1569,7 +1577,10 @@ impl<'a> Matcher<'a> {
             self.listid += 1;
             self.ctx_visited.clear();
 
-            self.nlist.clear();
+            debug_assert!(
+                self.nlist.is_empty(),
+                "nlist must be empty before finish expansion"
+            );
             for i in 0..clist_len {
                 let (idx, ref ctx) = self.clist[i];
                 if let State::Assert { kind, out } = self.states[idx]
