@@ -48,8 +48,8 @@
 //!
 //! - **Empty context** (threads outside all repetitions): fast O(1)
 //!   dedup via `lastlist[state] == listid`.
-//! - **Non-empty context**: `HashSet<(StateIdx, CounterCtx)>` cleared
-//!   per step.
+//! - **Non-empty context**: linear scan of a `Vec<(StateIdx, CounterCtx)>`
+//!   with value comparison through the [`CounterPool`], cleared per step.
 //!
 //! ## Complexity
 //!
@@ -60,10 +60,9 @@
 //!   `max_repetition` compile-time cap (default 1000) bounds this for
 //!   untrusted patterns.
 
-use std::collections::HashSet;
 use std::fmt;
 use std::io::Write;
-use std::ops::{Index, IndexMut};
+use std::ops::{Index, IndexMut, Range};
 
 use regex_syntax::hir::{self, HirKind};
 
@@ -1170,43 +1169,95 @@ impl fmt::Display for CounterIdx {
 /// this counter's repetition body).
 const COUNTER_INACTIVE: usize = usize::MAX;
 
+/// Arena allocator for counter context slots.
+///
+/// All [`CounterCtx`] slot data lives here in a flat `Vec<usize>`.
+/// Each context holds a `Range<usize>` into this arena.  "Cloning" a
+/// context copies only the lightweight range + active count; the
+/// actual slot data is shared (copy-on-write via [`allocate_clone`]).
+#[derive(Clone, Debug, Default)]
+struct CounterPool {
+    arena: Vec<usize>,
+    free: Vec<Range<usize>>,
+    num_counters: usize,
+}
+
+impl CounterPool {
+    /// Allocate a fresh slot (all counters inactive).
+    fn allocate(&mut self) -> Range<usize> {
+        debug_assert!(self.num_counters > 0);
+        if let Some(range) = self.free.pop() {
+            debug_assert_eq!(range.len(), self.num_counters);
+            // Re-initialize to inactive.
+            self.arena[range.clone()].fill(COUNTER_INACTIVE);
+            return range;
+        }
+        let start = self.arena.len();
+        self.arena
+            .resize(start + self.num_counters, COUNTER_INACTIVE);
+        start..self.arena.len()
+    }
+
+    /// Allocate a new slot that is a copy of `src`.
+    fn allocate_clone(&mut self, src: &Range<usize>) -> Range<usize> {
+        debug_assert_eq!(src.len(), self.num_counters);
+        let dst = self.allocate();
+        self.arena.copy_within(src.start..src.end, dst.start);
+        dst
+    }
+
+    /// Return a slot to the free list for reuse.
+    #[inline]
+    #[allow(dead_code)]
+    fn free(&mut self, range: Range<usize>) {
+        if !range.is_empty() {
+            debug_assert_eq!(range.len(), self.num_counters);
+            self.free.push(range);
+        }
+    }
+
+    /// Read the slot values for a context.
+    #[inline]
+    fn slots(&self, range: &Range<usize>) -> &[usize] {
+        &self.arena[range.start..range.end]
+    }
+
+    /// Compare two contexts by value through the pool.
+    #[inline]
+    fn ctx_eq(&self, a: &CounterCtx, b: &CounterCtx) -> bool {
+        a.active == b.active && self.slots(&a.range) == self.slots(&b.range)
+    }
+
+    /// Reset the pool for a new match (keeps allocated memory).
+    fn clear(&mut self) {
+        self.arena.clear();
+        self.free.clear();
+    }
+}
+
 /// Per-thread counter context.
 ///
-/// A fixed-length vector indexed by [`CounterIdx`]: `values[i]` holds
-/// the iteration count for counter `i`, or [`COUNTER_INACTIVE`] when
-/// the thread is not inside counter `i`'s repetition body.
+/// A lightweight handle into a [`CounterPool`].  The `range` field
+/// indexes a contiguous slice of counter values in the pool's arena.
+/// An empty range (`0..0`) means the context has never entered a
+/// counted repetition (lazy allocation).
 ///
 /// For threads outside all counted repetitions (the common case), the
-/// context is empty (`0.is_empty() == true`) and dedup falls back to
+/// context is empty (`is_empty() == true`) and dedup falls back to
 /// the fast `lastlist` path.
 #[derive(Clone, Debug)]
 struct CounterCtx {
-    slots: Box<[usize]>,
+    range: Range<usize>,
     /// Number of active (non-`COUNTER_INACTIVE`) slots.  Maintained by
     /// `set` / `remove` so that `is_empty` is O(1).
     active: usize,
-}
-
-impl PartialEq for CounterCtx {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.active == other.active && self.slots == other.slots
-    }
-}
-impl Eq for CounterCtx {}
-
-impl std::hash::Hash for CounterCtx {
-    #[inline]
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.slots.hash(state);
-    }
 }
 
 impl CounterCtx {
     /// Create an empty context (all counters inactive, no allocation).
     fn new() -> Self {
         Self {
-            slots: Box::new([]),
+            range: 0..0,
             active: 0,
         }
     }
@@ -1219,24 +1270,23 @@ impl CounterCtx {
 
     /// Get the value of counter `idx`, or `None` if inactive.
     #[inline]
-    fn get(&self, idx: CounterIdx) -> Option<usize> {
-        if idx.idx() >= self.slots.len() {
+    fn get(&self, idx: CounterIdx, pool: &CounterPool) -> Option<usize> {
+        if idx.idx() >= self.range.len() {
             return None;
         }
-        let v = self.slots[idx.idx()];
+        let v = pool.arena[self.range.start + idx.idx()];
         if v == COUNTER_INACTIVE { None } else { Some(v) }
     }
 
-    /// Set the value of counter `idx`.  `num_counters` is the total
-    /// counter count for the regex, used to lazily allocate slots on
-    /// first use.
+    /// Set the value of counter `idx`.  Lazily allocates a pool slot
+    /// on first use.
     #[inline]
-    fn set(&mut self, idx: CounterIdx, value: usize, num_counters: usize) {
+    fn set(&mut self, idx: CounterIdx, value: usize, pool: &mut CounterPool) {
         debug_assert!(value != COUNTER_INACTIVE);
-        if self.slots.is_empty() {
-            self.slots = vec![COUNTER_INACTIVE; num_counters].into_boxed_slice();
+        if self.range.is_empty() {
+            self.range = pool.allocate();
         }
-        let slot = &mut self.slots[idx.idx()];
+        let slot = &mut pool.arena[self.range.start + idx.idx()];
         if *slot == COUNTER_INACTIVE {
             self.active += 1;
         }
@@ -1245,11 +1295,23 @@ impl CounterCtx {
 
     /// Deactivate counter `idx`.  The counter must currently be active.
     #[inline]
-    fn remove(&mut self, idx: CounterIdx) {
-        let slot = &mut self.slots[idx.idx()];
+    fn remove(&mut self, idx: CounterIdx, pool: &mut CounterPool) {
+        let slot = &mut pool.arena[self.range.start + idx.idx()];
         debug_assert!(*slot != COUNTER_INACTIVE, "remove on inactive counter");
         *slot = COUNTER_INACTIVE;
         self.active -= 1;
+    }
+
+    /// Create an independent copy of this context with its own pool
+    /// slot, so mutations don't affect the original.
+    fn deep_clone(&self, pool: &mut CounterPool) -> Self {
+        if self.range.is_empty() {
+            return self.clone();
+        }
+        Self {
+            range: pool.allocate_clone(&self.range),
+            active: self.active,
+        }
     }
 }
 
@@ -1271,8 +1333,10 @@ pub struct MatcherMemory {
     /// recursive epsilon-closure traversal.
     addstack: Vec<AddStateOp>,
     /// Context-aware dedup for threads with non-empty counter contexts.
-    /// Cleared at each step.
-    ctx_visited: HashSet<(StateIdx, CounterCtx)>,
+    /// Cleared at each step.  Linear scan with value comparison through
+    /// the counter pool.
+    ctx_visited: Vec<(StateIdx, CounterCtx)>,
+    counter_pool: CounterPool,
 }
 
 impl MatcherMemory {
@@ -1283,6 +1347,8 @@ impl MatcherMemory {
         self.nlist.clear();
         self.addstack.clear();
         self.ctx_visited.clear();
+        self.counter_pool.clear();
+        self.counter_pool.num_counters = regex.num_counters;
 
         let empty_ctx = CounterCtx::new();
 
@@ -1290,7 +1356,6 @@ impl MatcherMemory {
             states: &regex.states,
             classes: &regex.classes,
             byte_tables: &regex.byte_tables,
-            num_counters: regex.num_counters,
             lastlist: &mut self.lastlist,
             listid: 0,
             clist: &mut self.clist,
@@ -1303,6 +1368,7 @@ impl MatcherMemory {
             prev_byte: None,
             ever_matched: false,
             empty_ctx,
+            counter_pool: &mut self.counter_pool,
         };
 
         m.startlist(m.start);
@@ -1318,8 +1384,6 @@ pub struct Matcher<'a> {
     classes: &'a [ByteClass],
     /// Byte dispatch tables referenced by [`State::ByteTable::table`].
     byte_tables: &'a [ByteMap],
-    /// Number of counter variables in the compiled regex.
-    num_counters: usize,
     /// Per-state deduplication stamp (compared against `listid`).
     /// Used for empty-context threads only.
     lastlist: &'a mut [usize],
@@ -1331,8 +1395,9 @@ pub struct Matcher<'a> {
     nlist: &'a mut Vec<(StateIdx, CounterCtx)>,
     /// Explicit work stack for iterative epsilon-closure traversal.
     addstack: &'a mut Vec<AddStateOp>,
-    /// Context-aware dedup for non-empty counter contexts.
-    ctx_visited: &'a mut HashSet<(StateIdx, CounterCtx)>,
+    /// Context-aware dedup for threads with non-empty counter contexts.
+    /// Linear scan with value comparison through the counter pool.
+    ctx_visited: &'a mut Vec<(StateIdx, CounterCtx)>,
 
     /// The NFA start state index.
     start: StateIdx,
@@ -1346,6 +1411,7 @@ pub struct Matcher<'a> {
     ever_matched: bool,
     /// Pre-allocated empty context (all counters inactive).
     empty_ctx: CounterCtx,
+    counter_pool: &'a mut CounterPool,
 }
 
 /// Internal operations for iterative [`Matcher::addstate`] traversal.
@@ -1373,7 +1439,8 @@ impl<'a> Matcher<'a> {
     ///
     /// Dedup strategy:
     /// - Empty context: fast path via `lastlist`/`listid` (O(1) per state).
-    /// - Non-empty context: `ctx_visited` HashSet keyed on `(state, ctx)`.
+    /// - Non-empty context: linear scan of `ctx_visited` with value
+    ///   comparison through the counter pool.
     #[inline]
     fn addstate(&mut self, idx: StateIdx, ctx: CounterCtx) {
         self.addstack.clear();
@@ -1395,28 +1462,36 @@ impl<'a> Matcher<'a> {
                         self.lastlist[i] = self.listid;
                         ctx
                     } else {
-                        // Borrow-only containment check (no clone).
-                        let key = (idx, ctx);
-                        if self.ctx_visited.contains(&key) {
+                        // Linear scan with value comparison through the pool.
+                        let already_seen = self
+                            .ctx_visited
+                            .iter()
+                            .any(|(s, c)| *s == idx && self.counter_pool.ctx_eq(c, &ctx));
+                        if already_seen {
                             continue;
                         }
-                        let (_, ctx) = key;
-                        // Clone only for genuinely new entries.
-                        self.ctx_visited.insert((idx, ctx.clone()));
+                        // Record for future dedup.  Deep-clone so the dedup
+                        // entry is independent of later mutations to ctx.
+                        self.ctx_visited
+                            .push((idx, ctx.deep_clone(self.counter_pool)));
                         ctx
                     };
 
                     match self.states[idx] {
                         State::Split { out, out1 } => {
                             // No PostPush for epsilon states.
-                            self.addstack.push(AddStateOp::Visit(out1, ctx.clone()));
+                            // Deep-clone for out1 so each branch gets its own
+                            // pool slot and mutations are independent.
+                            let ctx1 = ctx.deep_clone(self.counter_pool);
+                            self.addstack.push(AddStateOp::Visit(out1, ctx1));
                             self.addstack.push(AddStateOp::Visit(out, ctx));
                         }
 
                         State::Assert { kind, out } => {
                             // PostPush so the Assert is in nlist for
                             // deferred resolution in step()/finish().
-                            self.addstack.push(AddStateOp::PostPush(idx, ctx.clone()));
+                            let post_ctx = ctx.deep_clone(self.counter_pool);
+                            self.addstack.push(AddStateOp::PostPush(idx, post_ctx));
                             if kind.eval(self.at_start, self.at_end, self.prev_byte, None)
                                 == AssertEval::Pass
                             {
@@ -1426,10 +1501,9 @@ impl<'a> Matcher<'a> {
 
                         State::CounterInstance { counter, out } => {
                             // Enter the counted repetition: set counter = 0.
-                            // We own ctx — mutate in place, no clone needed.
-                            // Lazy allocation: slots are allocated here on first use.
-                            let mut ctx = ctx;
-                            ctx.set(counter, 0, self.num_counters);
+                            // Deep-clone so we get our own mutable pool slot.
+                            let mut ctx = ctx.deep_clone(self.counter_pool);
+                            ctx.set(counter, 0, self.counter_pool);
                             self.addstack.push(AddStateOp::Visit(out, ctx));
                         }
 
@@ -1440,31 +1514,34 @@ impl<'a> Matcher<'a> {
                             min,
                             max,
                         } => {
-                            let value = ctx.get(counter).expect("counter must be active at CInc");
+                            let value = ctx
+                                .get(counter, self.counter_pool)
+                                .expect("counter must be active at CInc");
                             let new_value = value + 1;
                             let take_continue = new_value < max;
                             let take_break = new_value >= min;
 
                             match (take_continue, take_break) {
                                 (true, true) => {
-                                    // Both paths: clone once for break, mutate for continue.
-                                    let mut break_ctx = ctx.clone();
-                                    break_ctx.remove(counter);
+                                    // Both paths need independent slots.
+                                    let mut break_ctx = ctx.deep_clone(self.counter_pool);
+                                    break_ctx.remove(counter, self.counter_pool);
                                     self.addstack.push(AddStateOp::Visit(out1, break_ctx));
+                                    // Mutate the original for the continue path.
                                     let mut ctx = ctx;
-                                    ctx.set(counter, new_value, self.num_counters);
+                                    ctx.set(counter, new_value, self.counter_pool);
                                     self.addstack.push(AddStateOp::Visit(out, ctx));
                                 }
                                 (true, false) => {
                                     // Continue only: mutate in place.
                                     let mut ctx = ctx;
-                                    ctx.set(counter, new_value, self.num_counters);
+                                    ctx.set(counter, new_value, self.counter_pool);
                                     self.addstack.push(AddStateOp::Visit(out, ctx));
                                 }
                                 (false, true) => {
                                     // Break only: mutate in place.
                                     let mut ctx = ctx;
-                                    ctx.remove(counter);
+                                    ctx.remove(counter, self.counter_pool);
                                     self.addstack.push(AddStateOp::Visit(out1, ctx));
                                 }
                                 (false, false) => {}
@@ -1621,8 +1698,16 @@ impl<'a> Matcher<'a> {
 mod tests {
     use super::*;
     // -----------------------------------------------------------------------
-    // CounterCtx unit tests
+    // CounterCtx + CounterPool unit tests
     // -----------------------------------------------------------------------
+
+    fn test_pool(num_counters: usize) -> CounterPool {
+        CounterPool {
+            arena: Vec::new(),
+            free: Vec::new(),
+            num_counters,
+        }
+    }
 
     #[test]
     fn test_counter_ctx_empty() {
@@ -1632,69 +1717,169 @@ mod tests {
 
     #[test]
     fn test_counter_ctx_all_inactive() {
+        let pool = test_pool(3);
         let ctx = CounterCtx::new();
         assert!(ctx.is_empty());
-        assert_eq!(ctx.get(CounterIdx(0)), None);
-        assert_eq!(ctx.get(CounterIdx(1)), None);
-        assert_eq!(ctx.get(CounterIdx(2)), None);
+        assert_eq!(ctx.get(CounterIdx(0), &pool), None);
+        assert_eq!(ctx.get(CounterIdx(1), &pool), None);
+        assert_eq!(ctx.get(CounterIdx(2), &pool), None);
     }
 
     #[test]
     fn test_counter_ctx_set_get() {
+        let mut pool = test_pool(2);
         let mut ctx = CounterCtx::new();
-        ctx.set(CounterIdx(0), 5, 2);
+        ctx.set(CounterIdx(0), 5, &mut pool);
         assert!(!ctx.is_empty());
-        assert_eq!(ctx.get(CounterIdx(0)), Some(5));
-        assert_eq!(ctx.get(CounterIdx(1)), None);
+        assert_eq!(ctx.get(CounterIdx(0), &pool), Some(5));
+        assert_eq!(ctx.get(CounterIdx(1), &pool), None);
     }
 
     #[test]
     fn test_counter_ctx_remove() {
+        let mut pool = test_pool(2);
         let mut ctx = CounterCtx::new();
-        ctx.set(CounterIdx(0), 5, 2);
-        ctx.set(CounterIdx(1), 3, 2);
-        ctx.remove(CounterIdx(0));
-        assert_eq!(ctx.get(CounterIdx(0)), None);
-        assert_eq!(ctx.get(CounterIdx(1)), Some(3));
+        ctx.set(CounterIdx(0), 5, &mut pool);
+        ctx.set(CounterIdx(1), 3, &mut pool);
+        ctx.remove(CounterIdx(0), &mut pool);
+        assert_eq!(ctx.get(CounterIdx(0), &pool), None);
+        assert_eq!(ctx.get(CounterIdx(1), &pool), Some(3));
         assert!(!ctx.is_empty());
-        ctx.remove(CounterIdx(1));
+        ctx.remove(CounterIdx(1), &mut pool);
         assert!(ctx.is_empty());
     }
 
     #[test]
     fn test_counter_ctx_set_mutates() {
+        let mut pool = test_pool(2);
         let mut ctx = CounterCtx::new();
         assert!(ctx.is_empty());
-        ctx.set(CounterIdx(1), 7, 2);
+        ctx.set(CounterIdx(1), 7, &mut pool);
         assert!(!ctx.is_empty());
-        assert_eq!(ctx.get(CounterIdx(1)), Some(7));
+        assert_eq!(ctx.get(CounterIdx(1), &pool), Some(7));
     }
 
     #[test]
     fn test_counter_ctx_remove_mutates() {
+        let mut pool = test_pool(2);
         let mut ctx = CounterCtx::new();
-        ctx.set(CounterIdx(0), 10, 2);
-        ctx.set(CounterIdx(1), 20, 2);
-        ctx.remove(CounterIdx(0));
-        assert_eq!(ctx.get(CounterIdx(0)), None);
-        assert_eq!(ctx.get(CounterIdx(1)), Some(20));
+        ctx.set(CounterIdx(0), 10, &mut pool);
+        ctx.set(CounterIdx(1), 20, &mut pool);
+        ctx.remove(CounterIdx(0), &mut pool);
+        assert_eq!(ctx.get(CounterIdx(0), &pool), None);
+        assert_eq!(ctx.get(CounterIdx(1), &pool), Some(20));
     }
 
     #[test]
-    fn test_counter_ctx_equality_and_hash() {
-        use HashSet;
+    fn test_counter_ctx_pool_eq() {
+        let mut pool = test_pool(2);
         let mut a = CounterCtx::new();
-        a.set(CounterIdx(0), 3, 2);
+        a.set(CounterIdx(0), 3, &mut pool);
         let mut b = CounterCtx::new();
-        b.set(CounterIdx(0), 3, 2);
+        b.set(CounterIdx(0), 3, &mut pool);
         let mut c = CounterCtx::new();
-        c.set(CounterIdx(0), 4, 2);
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-        let mut set = HashSet::new();
-        assert!(set.insert(a.clone()));
-        assert!(!set.insert(b)); // duplicate
-        assert!(set.insert(c));
+        c.set(CounterIdx(0), 4, &mut pool);
+        assert!(pool.ctx_eq(&a, &b));
+        assert!(!pool.ctx_eq(&a, &c));
+    }
+
+    #[test]
+    fn test_counter_ctx_deep_clone() {
+        let mut pool = test_pool(2);
+        let mut ctx = CounterCtx::new();
+        ctx.set(CounterIdx(0), 5, &mut pool);
+        ctx.set(CounterIdx(1), 10, &mut pool);
+        let mut cloned = ctx.deep_clone(&mut pool);
+        // Values are identical.
+        assert!(pool.ctx_eq(&ctx, &cloned));
+        // Mutating the clone doesn't affect the original.
+        cloned.set(CounterIdx(0), 99, &mut pool);
+        assert_eq!(ctx.get(CounterIdx(0), &pool), Some(5));
+        assert_eq!(cloned.get(CounterIdx(0), &pool), Some(99));
+    }
+
+    #[test]
+    fn test_counter_pool_free_reuse() {
+        let mut pool = test_pool(2);
+        let mut ctx = CounterCtx::new();
+        ctx.set(CounterIdx(0), 42, &mut pool);
+        let range = ctx.range.clone();
+        // Free the slot.
+        pool.free(ctx.range);
+        // Next allocation should reuse it, with values re-initialized.
+        let mut ctx2 = CounterCtx::new();
+        ctx2.set(CounterIdx(0), 7, &mut pool);
+        assert_eq!(ctx2.range, range);
+        assert_eq!(ctx2.get(CounterIdx(0), &pool), Some(7));
+        assert_eq!(ctx2.get(CounterIdx(1), &pool), None);
+    }
+
+    #[test]
+    fn test_counter_ctx_eq_both_empty() {
+        let pool = test_pool(2);
+        let a = CounterCtx::new();
+        let b = CounterCtx::new();
+        assert!(pool.ctx_eq(&a, &b));
+    }
+
+    #[test]
+    fn test_counter_ctx_eq_active_fast_reject() {
+        let mut pool = test_pool(2);
+        let mut a = CounterCtx::new();
+        a.set(CounterIdx(0), 3, &mut pool);
+        // b has one counter active, different from a's two-slot layout
+        let mut b = CounterCtx::new();
+        b.set(CounterIdx(0), 3, &mut pool);
+        b.set(CounterIdx(1), 1, &mut pool);
+        // Same slot 0 value but different active counts → not equal.
+        assert!(!pool.ctx_eq(&a, &b));
+    }
+
+    #[test]
+    fn test_counter_ctx_deep_clone_empty() {
+        let mut pool = test_pool(2);
+        let ctx = CounterCtx::new();
+        let cloned = ctx.deep_clone(&mut pool);
+        assert!(cloned.is_empty());
+        assert!(cloned.range.is_empty());
+        // Pool arena should be untouched — no allocation for empty ctx.
+        assert!(pool.arena.is_empty());
+    }
+
+    #[test]
+    fn test_counter_ctx_deep_clone_independence() {
+        let mut pool = test_pool(2);
+        let mut src = CounterCtx::new();
+        src.set(CounterIdx(0), 10, &mut pool);
+        src.set(CounterIdx(1), 20, &mut pool);
+        let mut c1 = src.deep_clone(&mut pool);
+        let mut c2 = src.deep_clone(&mut pool);
+        // All three start equal.
+        assert!(pool.ctx_eq(&src, &c1));
+        assert!(pool.ctx_eq(&src, &c2));
+        // Mutate each independently.
+        c1.set(CounterIdx(0), 99, &mut pool);
+        c2.set(CounterIdx(1), 77, &mut pool);
+        // Original unchanged.
+        assert_eq!(src.get(CounterIdx(0), &pool), Some(10));
+        assert_eq!(src.get(CounterIdx(1), &pool), Some(20));
+        // Clones are independent.
+        assert_eq!(c1.get(CounterIdx(0), &pool), Some(99));
+        assert_eq!(c1.get(CounterIdx(1), &pool), Some(20));
+        assert_eq!(c2.get(CounterIdx(0), &pool), Some(10));
+        assert_eq!(c2.get(CounterIdx(1), &pool), Some(77));
+    }
+
+    #[test]
+    fn test_counter_ctx_set_overwrites_active() {
+        let mut pool = test_pool(2);
+        let mut ctx = CounterCtx::new();
+        ctx.set(CounterIdx(0), 5, &mut pool);
+        assert_eq!(ctx.active, 1);
+        // Overwrite with a new value — active count should stay 1.
+        ctx.set(CounterIdx(0), 10, &mut pool);
+        assert_eq!(ctx.active, 1);
+        assert_eq!(ctx.get(CounterIdx(0), &pool), Some(10));
     }
 
     // -----------------------------------------------------------------------
