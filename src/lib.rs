@@ -1775,8 +1775,8 @@ impl<'a> Matcher<'a> {
         let mut clist = std::mem::take(self.clist);
 
         // Fused pass: push Visit ops for matching consuming states
-        // (in reverse for LIFO ordering) + re-seed.
-        // drain(..).rev() gives us owned ctx values — no clones needed.
+        // (back-to-front for LIFO ordering) + re-seed.
+        // pop() yields owned values back-to-front — no clones needed.
         self.addstack.clear();
 
         if self.start_closure.is_none() {
@@ -1787,7 +1787,7 @@ impl<'a> Matcher<'a> {
                 .push(AddStateOp::Visit(self.start, CounterCtx::new()));
         }
 
-        for (idx, ctx) in clist.drain(..).rev() {
+        while let Some((idx, ctx)) = clist.pop() {
             let target = match self.states[idx] {
                 State::Byte { byte: b2, out } if b == b2 => out,
                 State::ByteClass { class, out } if self.classes[class][b] => out,
