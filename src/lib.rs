@@ -63,8 +63,12 @@
 use std::fmt;
 use std::io::Write;
 use std::ops::{Index, IndexMut, Range};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use regex_syntax::hir::{self, HirKind};
+
+/// Global counter for assigning unique IDs to compiled regexes.
+static NEXT_REGEX_ID: AtomicU64 = AtomicU64::new(1);
 
 mod dfa;
 use dfa::{DfaCache, DfaMatcher};
@@ -617,6 +621,10 @@ impl std::ops::Deref for StateList {
 /// A compiled NFA ready for matching.
 #[derive(Debug)]
 pub struct Regex {
+    /// Unique identity for this compiled regex, used by [] to
+    /// detect when its cached DFA states are stale (built for a different
+    /// regex).  Assigned from a global atomic counter at build time.
+    pub(crate) id: u64,
     pub(crate) states: StateList,
     pub(crate) start: StateIdx,
     /// Number of counter variables allocated during compilation.
@@ -1168,6 +1176,7 @@ impl RegexBuilder {
         let dfa_eligible = !has_counters && !has_complex_assert;
 
         Ok(Regex {
+            id: NEXT_REGEX_ID.fetch_add(1, Ordering::Relaxed),
             states: StateList(self.states.to_vec().into_boxed_slice()),
             start,
             num_counters: self.counters.len(),
@@ -1500,11 +1509,13 @@ impl MatcherMemory {
     /// lazy DFA (for DFA-eligible patterns) or the NFA simulator.
     pub fn matcher<'a>(&'a mut self, regex: &'a Regex) -> AnyMatcher<'a> {
         if regex.dfa_eligible {
-            // Lazy-init or reset the DFA cache.
+            // Lazy-init the DFA cache, then prepare it for this regex.
+            // If the same regex is reused, all interned DFA states and
+            // transitions are kept — no rebuild cost.
             let cache = self
                 .dfa_cache
                 .get_or_insert_with(|| DfaCache::new(regex.states.len()));
-            cache.clear(regex.states.len());
+            cache.prepare(regex);
             let dfa = DfaMatcher::new(cache, regex);
             AnyMatcher::Dfa(dfa)
         } else {
@@ -2843,7 +2854,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "bc");
         assert_matches_regex_crate(p, &re, "a123b");
         assert_matches_regex_crate(p, &re, "a123");
-        assert_memory_size(p, &re, 776);
+        assert_memory_size(p, &re, 784);
     }
 
     /// `(a|bc){1,2}` — flat range repetition with all combos up to 3.
@@ -2882,7 +2893,7 @@ mod tests {
             let input = v.into_iter().collect::<String>();
             assert_matches_regex_crate(p, &re, &input);
         }
-        assert_memory_size(p, &re, 440);
+        assert_memory_size(p, &re, 448);
     }
 
     /// `((a|bc){1,2}){2,3}` — nested counting constraints.
@@ -2919,7 +2930,7 @@ mod tests {
             let input = v.into_iter().collect::<String>();
             assert_matches_regex_crate(p, &re, &input);
         }
-        assert_memory_size(p, &re, 520);
+        assert_memory_size(p, &re, 528);
     }
 
     /// `(a|a?){2,3}` — epsilon-matchable body (the `a?` branch can match
@@ -2942,7 +2953,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "aab");
-        assert_memory_size(p, &re, 440);
+        assert_memory_size(p, &re, 448);
     }
 
     /// `a+` — basic one-or-more repetition.
@@ -2959,7 +2970,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "aab");
-        assert_memory_size(p, &re, 280);
+        assert_memory_size(p, &re, 288);
     }
 
     /// `.+` — one-or-more wildcard.
@@ -2971,7 +2982,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 536);
+        assert_memory_size(p, &re, 544);
     }
 
     /// `a+b+` — consecutive one-or-more repetitions.
@@ -2987,7 +2998,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abb");
         assert_matches_regex_crate(p, &re, "aabb");
         assert_matches_regex_crate(p, &re, "ba");
-        assert_memory_size(p, &re, 360);
+        assert_memory_size(p, &re, 368);
     }
 
     /// `(ab)+` — one-or-more of a multi-byte sequence.
@@ -3001,7 +3012,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abab");
         assert_matches_regex_crate(p, &re, "ababab");
         assert_matches_regex_crate(p, &re, "aba");
-        assert_memory_size(p, &re, 320);
+        assert_memory_size(p, &re, 328);
     }
 
     /// `(a|b)+` — one-or-more alternation.
@@ -3022,7 +3033,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ac");
         assert_matches_regex_crate(p, &re, "ca");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 536);
+        assert_memory_size(p, &re, 544);
     }
 
     /// `.*a.{3}b+c` — one-or-more mixed with counting constraints.
@@ -3047,7 +3058,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "x123bc");
         assert_matches_regex_crate(p, &re, "a123b");
-        assert_memory_size(p, &re, 816);
+        assert_memory_size(p, &re, 824);
     }
 
     /// `(a{2,3})+` — inner repetition, outer one-or-more.
@@ -3067,7 +3078,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaaaaa");
         assert_matches_regex_crate(p, &re, "aaaaaaaaa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 360);
+        assert_memory_size(p, &re, 368);
     }
 
     /// `((a|bc){1,2})+` — inner range repetition of alternation, outer `+`.
@@ -3094,7 +3105,7 @@ mod tests {
                 assert_matches_regex_crate(p, &re, &input);
             }
         }
-        assert_memory_size(p, &re, 480);
+        assert_memory_size(p, &re, 488);
     }
 
     /// `(a+){2,3}` — inner one-or-more, outer counted repetition.
@@ -3111,7 +3122,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaaa");
         assert_matches_regex_crate(p, &re, "aaaaaaa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 360);
+        assert_memory_size(p, &re, 368);
     }
 
     /// `((a|b)+){2,4}` — inner `+` of alternation, outer counted repetition.
@@ -3136,7 +3147,7 @@ mod tests {
                 assert_matches_regex_crate(p, &re, &input);
             }
         }
-        assert_memory_size(p, &re, 616);
+        assert_memory_size(p, &re, 624);
     }
 
     /// `(a+b{2,3})+` — inner `+` and inner repetition side-by-side,
@@ -3158,7 +3169,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abbabbbabb");
         assert_matches_regex_crate(p, &re, "aabbaabbb");
         assert_matches_regex_crate(p, &re, "aabbbaabbb");
-        assert_memory_size(p, &re, 440);
+        assert_memory_size(p, &re, 448);
     }
 
     // -- min=0 repetition tests ---------------------------------------------
@@ -3173,7 +3184,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "aaa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 360);
+        assert_memory_size(p, &re, 368);
     }
 
     /// `a{0,1}` — equivalent to `a?`.
@@ -3185,7 +3196,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 280);
+        assert_memory_size(p, &re, 288);
     }
 
     /// `(a|bc){0,3}` — zero to three of an alternation.
@@ -3210,7 +3221,7 @@ mod tests {
                 assert_matches_regex_crate(p, &re, &input);
             }
         }
-        assert_memory_size(p, &re, 480);
+        assert_memory_size(p, &re, 488);
     }
 
     /// `a{0,}` — zero or more, lowered to `a*` (no counter overhead).
@@ -3229,7 +3240,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "aab");
         assert_matches_regex_crate(p, &re, "baa");
-        assert_memory_size(p, &re, 280);
+        assert_memory_size(p, &re, 288);
     }
 
     /// `(ab){0,}` — zero or more of a group, lowered to `(ab)*`.
@@ -3243,7 +3254,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abab");
         assert_matches_regex_crate(p, &re, "ababab");
         assert_matches_regex_crate(p, &re, "aba");
-        assert_memory_size(p, &re, 320);
+        assert_memory_size(p, &re, 328);
     }
 
     /// `x(a{0,2})+y` — min=0 repetition nested inside `+`.
@@ -3268,7 +3279,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ay");
         assert_matches_regex_crate(p, &re, "xa");
         assert_matches_regex_crate(p, &re, "aay");
-        assert_memory_size(p, &re, 480);
+        assert_memory_size(p, &re, 488);
     }
 
     /// `(a{0,2}){2,3}` — min=0 inner, counted outer.
@@ -3285,7 +3296,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaaa");
         assert_matches_regex_crate(p, &re, "aaaaaaa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 440);
+        assert_memory_size(p, &re, 448);
     }
 
     /// `(a+){0,3}` — `+` inside a min=0 counted repetition.
@@ -3301,7 +3312,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaa");
         assert_matches_regex_crate(p, &re, "aaaaaa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 400);
+        assert_memory_size(p, &re, 408);
     }
 
     /// `.{0,3}` — min=0 repetition on wildcard.
@@ -3314,7 +3325,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "abcd");
-        assert_memory_size(p, &re, 616);
+        assert_memory_size(p, &re, 624);
     }
 
     /// `a{0,3}` — same as `a{0,3}` (the old test used `min: None`).
@@ -3332,7 +3343,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "aab");
-        assert_memory_size(p, &re, 360);
+        assert_memory_size(p, &re, 368);
     }
 
     // -- Standalone primitive tests ------------------------------------------
@@ -3349,7 +3360,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "ba");
-        assert_memory_size(p, &re, 240);
+        assert_memory_size(p, &re, 248);
     }
 
     /// `abc` — multi-byte literal concatenation.
@@ -3369,7 +3380,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "xabcx");
         assert_matches_regex_crate(p, &re, "cba");
         assert_matches_regex_crate(p, &re, "bac");
-        assert_memory_size(p, &re, 320);
+        assert_memory_size(p, &re, 328);
     }
 
     /// `.` — bare wildcard (matches exactly one byte).
@@ -3385,7 +3396,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 496);
+        assert_memory_size(p, &re, 504);
     }
 
     /// `a|bc` — bare alternation (no repetition).
@@ -3403,7 +3414,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "x");
         assert_matches_regex_crate(p, &re, "bca");
-        assert_memory_size(p, &re, 360);
+        assert_memory_size(p, &re, 368);
     }
 
     /// `a|b|c` — three-way alternation.
@@ -3419,7 +3430,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "d");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 496);
+        assert_memory_size(p, &re, 504);
     }
 
     /// `a?` — standalone zero-or-one.
@@ -3433,7 +3444,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
-        assert_memory_size(p, &re, 280);
+        assert_memory_size(p, &re, 288);
     }
 
     /// `(ab)?` — zero-or-one of a group.
@@ -3449,7 +3460,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "abab");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 320);
+        assert_memory_size(p, &re, 328);
     }
 
     /// `a?b` — optional prefix followed by a literal.
@@ -3466,7 +3477,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "bb");
         assert_matches_regex_crate(p, &re, "cb");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 320);
+        assert_memory_size(p, &re, 328);
     }
 
     /// `a*` — standalone zero-or-more.
@@ -3485,7 +3496,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "aab");
         assert_matches_regex_crate(p, &re, "baa");
-        assert_memory_size(p, &re, 280);
+        assert_memory_size(p, &re, 288);
     }
 
     /// `(ab)*` — zero-or-more of a group.
@@ -3504,7 +3515,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aba");
         assert_matches_regex_crate(p, &re, "abba");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 320);
+        assert_memory_size(p, &re, 328);
     }
 
     /// `a*b` — star followed by a literal.
@@ -3524,7 +3535,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "aabb");
-        assert_memory_size(p, &re, 320);
+        assert_memory_size(p, &re, 328);
     }
 
     /// `a{2,}` — unbounded min with n>0.
@@ -3543,7 +3554,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "aab");
         assert_matches_regex_crate(p, &re, "baa");
-        assert_memory_size(p, &re, 320);
+        assert_memory_size(p, &re, 328);
     }
 
     /// `(ab){2,}` — unbounded min of a group.
@@ -3562,7 +3573,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abba");
         assert_matches_regex_crate(p, &re, "ababc");
         assert_matches_regex_crate(p, &re, "xabab");
-        assert_memory_size(p, &re, 360);
+        assert_memory_size(p, &re, 368);
     }
 
     /// `a{3,5}` — bounded min>0 range.
@@ -3581,7 +3592,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "aaab");
         assert_matches_regex_crate(p, &re, "baaa");
-        assert_memory_size(p, &re, 320);
+        assert_memory_size(p, &re, 328);
     }
 
     /// `a{3,3}` — exact repetition.
@@ -3598,7 +3609,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaa");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "bbb");
-        assert_memory_size(p, &re, 320);
+        assert_memory_size(p, &re, 328);
     }
 
     // -- Byte class tests ---------------------------------------------------
@@ -3614,7 +3625,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "c");
         assert_matches_regex_crate(p, &re, "d");
         assert_matches_regex_crate(p, &re, "ab");
-        assert_memory_size(p, &re, 496);
+        assert_memory_size(p, &re, 504);
     }
 
     /// `[a-c]+` — one-or-more of a byte class.
@@ -3628,7 +3639,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "cba");
         assert_matches_regex_crate(p, &re, "abcd");
         assert_matches_regex_crate(p, &re, "d");
-        assert_memory_size(p, &re, 536);
+        assert_memory_size(p, &re, 544);
     }
 
     /// `[a-c]{2,3}` — counted repetition of a byte class.
@@ -3643,7 +3654,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abca");
         assert_matches_regex_crate(p, &re, "cc");
         assert_matches_regex_crate(p, &re, "dd");
-        assert_memory_size(p, &re, 576);
+        assert_memory_size(p, &re, 584);
     }
 
     /// `[ax]` — disjoint single bytes (multi-range Class::Bytes).
@@ -3656,7 +3667,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "x");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ax");
-        assert_memory_size(p, &re, 496);
+        assert_memory_size(p, &re, 504);
     }
 
     /// `[a-cx-z]+` — multiple disjoint ranges in a byte class.
@@ -3671,7 +3682,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "d");
         assert_matches_regex_crate(p, &re, "w");
         assert_matches_regex_crate(p, &re, "abcxyz");
-        assert_memory_size(p, &re, 536);
+        assert_memory_size(p, &re, 544);
     }
 
     /// `[a-c].*[x-z]` — byte classes mixed with wildcard.
@@ -3685,7 +3696,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "dx");
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
-        assert_memory_size(p, &re, 1128);
+        assert_memory_size(p, &re, 1136);
     }
 
     // -- Predefined character class tests -----------------------------------
@@ -3705,7 +3716,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "00");
         assert_matches_regex_crate(p, &re, "12");
-        assert_memory_size(p, &re, 496);
+        assert_memory_size(p, &re, 504);
     }
 
     /// `\d+` — one-or-more digits.
@@ -3723,7 +3734,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "12a");
         assert_matches_regex_crate(p, &re, "a12");
         assert_matches_regex_crate(p, &re, "1 2");
-        assert_memory_size(p, &re, 536);
+        assert_memory_size(p, &re, 544);
     }
 
     /// `\d{3,5}` — counted digit repetition.
@@ -3741,7 +3752,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "123456");
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "12a");
-        assert_memory_size(p, &re, 576);
+        assert_memory_size(p, &re, 584);
     }
 
     /// `\D` — matches a single non-digit byte.
@@ -3759,7 +3770,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "5");
         assert_matches_regex_crate(p, &re, "9");
         assert_matches_regex_crate(p, &re, "aa");
-        assert_memory_size(p, &re, 496);
+        assert_memory_size(p, &re, 504);
     }
 
     /// `\D+` — one-or-more non-digits.
@@ -3775,7 +3786,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "abc1");
         assert_matches_regex_crate(p, &re, "1abc");
-        assert_memory_size(p, &re, 536);
+        assert_memory_size(p, &re, 544);
     }
 
     /// `\s` — matches a single ASCII whitespace byte.
@@ -3792,7 +3803,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "  ");
-        assert_memory_size(p, &re, 496);
+        assert_memory_size(p, &re, 504);
     }
 
     /// `\s+` — one-or-more whitespace.
@@ -3808,7 +3819,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, " a");
         assert_matches_regex_crate(p, &re, "a ");
-        assert_memory_size(p, &re, 536);
+        assert_memory_size(p, &re, 544);
     }
 
     /// `\S` — matches a single non-whitespace byte.
@@ -3825,7 +3836,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "\t");
         assert_matches_regex_crate(p, &re, "\n");
         assert_matches_regex_crate(p, &re, "aa");
-        assert_memory_size(p, &re, 496);
+        assert_memory_size(p, &re, 504);
     }
 
     /// `\S+` — one-or-more non-whitespace.
@@ -3841,7 +3852,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "a b");
         assert_matches_regex_crate(p, &re, " abc");
-        assert_memory_size(p, &re, 536);
+        assert_memory_size(p, &re, 544);
     }
 
     /// `\w` — matches a single ASCII word byte (`[0-9A-Za-z_]`).
@@ -3860,7 +3871,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "!");
         assert_matches_regex_crate(p, &re, "-");
         assert_matches_regex_crate(p, &re, "ab");
-        assert_memory_size(p, &re, 496);
+        assert_memory_size(p, &re, 504);
     }
 
     /// `\w+` — one-or-more word bytes.
@@ -3877,7 +3888,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "hello world");
         assert_matches_regex_crate(p, &re, "foo-bar");
-        assert_memory_size(p, &re, 536);
+        assert_memory_size(p, &re, 544);
     }
 
     /// `\w{2,4}` — counted word repetition.
@@ -3894,7 +3905,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abcde");
         assert_matches_regex_crate(p, &re, "!!");
         assert_matches_regex_crate(p, &re, "a b");
-        assert_memory_size(p, &re, 576);
+        assert_memory_size(p, &re, 584);
     }
 
     /// `\W` — matches a single non-word byte.
@@ -3912,7 +3923,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "_");
         assert_matches_regex_crate(p, &re, "  ");
-        assert_memory_size(p, &re, 496);
+        assert_memory_size(p, &re, 504);
     }
 
     /// `\W+` — one-or-more non-word bytes.
@@ -3929,7 +3940,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, " a ");
         assert_matches_regex_crate(p, &re, "!a!");
-        assert_memory_size(p, &re, 536);
+        assert_memory_size(p, &re, 544);
     }
 
     /// `\d+\s+\w+` — mixed predefined classes in concatenation.
@@ -3948,7 +3959,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, " hello");
         assert_matches_regex_crate(p, &re, "hello 42");
         assert_matches_regex_crate(p, &re, "42hello");
-        assert_memory_size(p, &re, 1208);
+        assert_memory_size(p, &re, 1216);
     }
 
     // -- Byte-class deduplication tests --------------------------------------

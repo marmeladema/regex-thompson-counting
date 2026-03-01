@@ -59,6 +59,10 @@ const DFA_CACHE_CAPACITY: usize = 16_384;
 /// referenced by `DfaStateId`).  The transition cache uses LRU eviction
 /// via `CLruCache`; evicting a transition is always safe — it just
 /// causes a cache miss that triggers re-population.
+///
+/// The cache is **persisted across `matcher()` calls** for the same
+/// `Regex`.  A pointer-based identity check (`regex_id`) detects when
+/// a different regex is used and clears the cache.
 pub(crate) struct DfaCache {
     /// Append-only table of DFA states.  Index = `DfaStateId`.
     states: Vec<DfaState>,
@@ -77,6 +81,13 @@ pub(crate) struct DfaCache {
     closure_result: Vec<StateIdx>,
     /// Scratch visited set for epsilon closure.
     closure_visited: Vec<bool>,
+    /// Identity of the regex this cache was built for (see `Regex::id`).
+    /// If a different regex is used, the cache is cleared.
+    regex_id: u64,
+    /// Cached start state (at_start=true, position 0).
+    start_id: DfaStateId,
+    /// Whether the start state is itself a match.
+    start_is_match: bool,
 }
 
 impl fmt::Debug for DfaCache {
@@ -96,6 +107,9 @@ impl DfaCache {
             closure_stack: Vec::new(),
             closure_result: Vec::new(),
             closure_visited: vec![false; num_nfa_states],
+            regex_id: 0,
+            start_id: DfaStateId::DEAD,
+            start_is_match: false,
         }
     }
 
@@ -310,7 +324,11 @@ impl DfaCache {
                     State::ByteClass { class, out } if regex.classes[class][byte] => Some(out),
                     State::ByteTable { table } => {
                         let t = regex.byte_tables[table][byte];
-                        if t != StateIdx::NONE { Some(t) } else { None }
+                        if t != StateIdx::NONE {
+                            Some(t)
+                        } else {
+                            None
+                        }
                     }
                     _ => None,
                 };
@@ -350,12 +368,44 @@ impl DfaCache {
     }
 
     /// Reset the cache for reuse with a new regex (keeps allocated memory).
-    pub(crate) fn clear(&mut self, num_nfa_states: usize) {
+    fn clear(&mut self, num_nfa_states: usize) {
         self.states.clear();
         self.state_map.clear();
         self.transitions.clear();
         self.closure_visited.clear();
         self.closure_visited.resize(num_nfa_states, false);
+        self.regex_id = 0;
+        self.start_id = DfaStateId::DEAD;
+        self.start_is_match = false;
+    }
+
+    /// Prepare the cache for use with `regex`.
+    ///
+    /// If the cache already holds data for the same regex (identified by
+    /// pointer identity of its states slice), this is a no-op and the
+    /// previously interned DFA states and transitions are reused.
+    ///
+    /// If the regex is different, the cache is cleared and the start
+    /// state is computed fresh.
+    pub(crate) fn prepare(&mut self, regex: &Regex) {
+        let id = regex.id;
+        if self.regex_id == id && self.start_id != DfaStateId::DEAD {
+            // Cache is valid for this regex — reuse everything.
+            return;
+        }
+
+        // Different regex (or first use): clear and compute start state.
+        self.clear(regex.states.len());
+        self.regex_id = id;
+
+        let (nfa_set, is_match, is_match_at_end) = self.epsilon_closure(
+            std::iter::once(regex.start),
+            &regex.states,
+            true, // at_start = true (position 0, ^ passes)
+            None, // no prev byte
+        );
+        self.start_id = self.intern_state(nfa_set, is_match, is_match_at_end);
+        self.start_is_match = self.states[self.start_id.idx()].is_match;
     }
 }
 
@@ -377,23 +427,15 @@ pub struct DfaMatcher<'a> {
 }
 
 impl<'a> DfaMatcher<'a> {
+    /// Create a new DFA matcher.
+    ///
+    /// Assumes `cache.prepare(regex)` has already been called.
     pub(crate) fn new(cache: &'a mut DfaCache, regex: &'a Regex) -> Self {
-        // Compute the start DFA state at position 0 (at_start=true).
-        let (nfa_set, is_match, is_match_at_end) = cache.epsilon_closure(
-            std::iter::once(regex.start),
-            &regex.states,
-            true, // at_start = true (position 0, ^ passes)
-            None, // no prev byte
-        );
-        let start_id = cache.intern_state(nfa_set, is_match, is_match_at_end);
-
-        let ever_matched = cache.states[start_id.idx()].is_match;
-
         DfaMatcher {
+            current: cache.start_id,
+            ever_matched: cache.start_is_match,
             cache,
             regex,
-            current: start_id,
-            ever_matched,
         }
     }
 
