@@ -1486,6 +1486,8 @@ impl MatcherMemory {
             at_end: false,
             prev_byte: None,
             ever_matched: false,
+            has_assert: false,
+            nlist_has_assert: false,
             counter_pool: &mut self.counter_pool,
         };
 
@@ -1529,6 +1531,13 @@ pub struct Matcher<'a> {
     prev_byte: Option<u8>,
     /// Tracks whether a `Match` state was ever reached.
     ever_matched: bool,
+    /// Whether `clist` contains any `Assert` states that need deferred
+    /// resolution in the pre-consumption phase of [`step`](Self::step).
+    /// Maintained by `drain_addstack` and swapped with `nlist_has_assert`
+    /// at the end of each step.
+    has_assert: bool,
+    /// Whether `nlist` (being built) contains any `Assert` states.
+    nlist_has_assert: bool,
     counter_pool: &'a mut CounterPool,
 }
 
@@ -1569,6 +1578,8 @@ impl<'a> Matcher<'a> {
             self.addstate(start, CounterCtx::new());
         }
         std::mem::swap(self.clist, self.nlist);
+        self.has_assert = self.nlist_has_assert;
+        self.nlist_has_assert = false;
         self.listid += 1;
     }
 
@@ -1629,6 +1640,7 @@ impl<'a> Matcher<'a> {
                         State::Assert { kind, out } => {
                             // PostPush so the Assert is in nlist for
                             // deferred resolution in step()/finish().
+                            self.nlist_has_assert = true;
                             let post_ctx = ctx.clone(self.counter_pool);
                             self.addstack.push(AddStateOp::PostPush(idx, post_ctx));
                             if kind.eval(self.at_start, self.at_end, self.prev_byte, None)
@@ -1714,7 +1726,7 @@ impl<'a> Matcher<'a> {
     /// Advance the simulation by one input byte.
     pub fn step(&mut self, b: u8) {
         // --- Pre-consumption: resolve deferred assertions ---
-        {
+        if self.has_assert {
             let mut any_expanded = false;
             let clist_len = self.clist.len();
             for i in 0..clist_len {
@@ -1818,6 +1830,8 @@ impl<'a> Matcher<'a> {
 
         // clist is empty after drain but retains its capacity for reuse.
         *self.clist = std::mem::replace(self.nlist, clist);
+        self.has_assert = self.nlist_has_assert;
+        self.nlist_has_assert = false;
         self.listid += 1;
         self.free_ctx_visited();
     }
