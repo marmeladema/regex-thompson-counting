@@ -1823,8 +1823,15 @@ impl<'a> Matcher<'a> {
     }
 
     /// Feed an entire byte slice through the matcher, one byte at a time.
+    ///
+    /// Stops early if a match has already been found, since further input
+    /// cannot change the outcome (our API only reports existence, not
+    /// positions or counts).
     pub fn chunk(&mut self, input: &[u8]) {
         for &b in input {
+            if self.ever_matched {
+                return;
+            }
             self.step(b);
         }
     }
