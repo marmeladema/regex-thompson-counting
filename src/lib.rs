@@ -624,18 +624,24 @@ pub struct Regex {
     /// Each entry maps a byte value to a target state index, or
     /// [`StateIdx::NONE`] for "no transition".
     byte_tables: Box<[ByteMap]>,
-    /// Precomputed epsilon closure of the start state.
+    /// Precomputed epsilon closure of the start state (consuming leaves only).
     ///
     /// If the start state's epsilon closure contains only `Split` transitions
-    /// leading to consuming states (`Byte`, `ByteClass`, `ByteTable`) and
-    /// `Match`, this caches the list of those leaf states.  During
-    /// [`Matcher::step`] re-seeding, these are inserted directly into
-    /// `nlist` (with `lastlist` dedup), bypassing the epsilon-closure
-    /// walk entirely.
+    /// leading to consuming states (`Byte`, `ByteClass`, `ByteTable`) or
+    /// `Match`, the consuming leaves are cached here.  `Match` states are
+    /// recorded separately in [`start_closure_matches`] and excluded from
+    /// this array so the re-seed loop needs no per-state type check.
     ///
-    /// `None` if the closure contains `CounterInstance`, `Assert`, or
-    /// `CounterIncrement` states (which require context manipulation).
-    start_closure: Option<Box<[StateIdx]>>,
+    /// Empty if the closure contains `CounterInstance`, `Assert`, or
+    /// `CounterIncrement` states (which require context manipulation);
+    /// the runtime falls back to full epsilon-closure via `addstate()`.
+    start_closure: Box<[StateIdx]>,
+    /// `true` if `Match` is reachable from the start state through
+    /// the precomputed start closure (i.e. the pattern can match the
+    /// empty string without consuming any input).  Used to initialise
+    /// `Matcher::ever_matched` so that `chunk()` can short-circuit
+    /// immediately.
+    start_closure_matches: bool,
 }
 impl Regex {
     /// Return the total memory footprint (in bytes) of this compiled
@@ -1137,7 +1143,7 @@ impl RegexBuilder {
         };
 
         self.optimize_byte_tables();
-        let start_closure = self.compute_start_closure(start);
+        let (start_closure, start_closure_matches) = self.compute_start_closure(start);
 
         Ok(Regex {
             states: StateList(self.states.to_vec().into_boxed_slice()),
@@ -1151,6 +1157,7 @@ impl RegexBuilder {
                 .into_boxed_slice(),
             byte_tables: self.byte_tables.to_vec().into_boxed_slice(),
             start_closure,
+            start_closure_matches,
         })
     }
     // -----------------------------------------------------------------------
@@ -1226,8 +1233,9 @@ impl RegexBuilder {
     /// or `Match`, return the collected list.  Returns `None` if any
     /// `CounterInstance`, `CounterIncrement`, or `Assert` is encountered,
     /// since those require context manipulation during traversal.
-    fn compute_start_closure(&self, start: StateIdx) -> Option<Box<[StateIdx]>> {
+    fn compute_start_closure(&self, start: StateIdx) -> (Box<[StateIdx]>, bool) {
         let mut leaves = Vec::new();
+        let mut has_match = false;
         let mut stack = vec![start];
         let mut visited = vec![false; self.states.len()];
         while let Some(idx) = stack.pop() {
@@ -1245,21 +1253,22 @@ impl RegexBuilder {
                     leaves.push(idx);
                 }
                 State::Match => {
-                    // Match is reachable from start — still cacheable,
-                    // but we must record it so startlist/re-seed can
-                    // set ever_matched.
-                    leaves.push(idx);
+                    // Match is reachable from start — the pattern can
+                    // match without consuming input.  Record the fact
+                    // but do NOT include Match in the closure array;
+                    // the caller stores it as start_closure_matches.
+                    has_match = true;
                 }
                 // Counter or assertion states require context work;
                 // fall back to full epsilon-closure at runtime.
                 State::CounterInstance { .. }
                 | State::CounterIncrement { .. }
                 | State::Assert { .. } => {
-                    return None;
+                    return (Box::default(), false);
                 }
             }
         }
-        Some(leaves.into_boxed_slice())
+        (leaves.into_boxed_slice(), has_match)
     }
 
     // -----------------------------------------------------------------------
@@ -1481,11 +1490,11 @@ impl MatcherMemory {
             addstack: &mut self.addstack,
             ctx_visited: &mut self.ctx_visited,
             start: regex.start,
-            start_closure: regex.start_closure.as_deref(),
+            start_closure: &regex.start_closure,
             at_start: true,
             at_end: false,
             prev_byte: None,
-            ever_matched: false,
+            ever_matched: regex.start_closure_matches,
             has_assert: false,
             nlist_has_assert: false,
             counter_pool: &mut self.counter_pool,
@@ -1522,7 +1531,7 @@ pub struct Matcher<'a> {
     /// The NFA start state index.
     start: StateIdx,
     /// Precomputed start closure (see [`Regex::start_closure`]).
-    start_closure: Option<&'a [StateIdx]>,
+    start_closure: &'a [StateIdx],
     /// `true` until the first [`step`](Self::step) call.
     at_start: bool,
     /// Set to `true` by [`finish`](Self::finish).
@@ -1564,15 +1573,13 @@ impl<'a> Matcher<'a> {
     /// from `start`.
     #[inline]
     fn startlist(&mut self, start: StateIdx) {
-        if let Some(closure) = self.start_closure {
+        if !self.start_closure.is_empty() {
             // Fast path: directly insert precomputed consuming leaves.
-            for &idx in closure {
-                if matches!(self.states[idx], State::Match) {
-                    self.ever_matched = true;
-                } else {
-                    self.nlist.push((idx, CounterCtx::new()));
-                    self.lastlist[idx.idx()] = self.listid;
-                }
+            // Match states are excluded from the closure array;
+            // ever_matched was initialised from start_closure_matches.
+            for &idx in self.start_closure {
+                self.nlist.push((idx, CounterCtx::new()));
+                self.lastlist[idx.idx()] = self.listid;
             }
         } else {
             self.addstate(start, CounterCtx::new());
@@ -1779,7 +1786,7 @@ impl<'a> Matcher<'a> {
         // pop() yields owned values back-to-front — no clones needed.
         self.addstack.clear();
 
-        if self.start_closure.is_none() {
+        if self.start_closure.is_empty() {
             // Slow path: push re-seed as lowest-priority item (processed
             // last by the LIFO addstack, so it appears after all
             // continuing threads in nlist).
@@ -1814,16 +1821,14 @@ impl<'a> Matcher<'a> {
         // threads have higher priority.  lastlist dedup ensures no
         // duplicates if a continuing thread already reached one of
         // these states.
-        if let Some(closure) = self.start_closure {
-            for &idx in closure {
-                if matches!(self.states[idx], State::Match) {
-                    self.ever_matched = true;
-                } else {
-                    let i = idx.idx();
-                    if self.lastlist[i] != self.listid {
-                        self.lastlist[i] = self.listid;
-                        self.nlist.push((idx, CounterCtx::new()));
-                    }
+        if !self.start_closure.is_empty() {
+            // Match states are excluded from the closure array;
+            // ever_matched was initialised from start_closure_matches.
+            for &idx in self.start_closure {
+                let i = idx.idx();
+                if self.lastlist[i] != self.listid {
+                    self.lastlist[i] = self.listid;
+                    self.nlist.push((idx, CounterCtx::new()));
                 }
             }
         }
@@ -5345,49 +5350,41 @@ mod tests {
 
     #[test]
     fn test_start_closure_computed() {
-        // Pure alternation of literals: closure should be Some
+        // Pure alternation of literals: closure should be non-empty
         let re = build_regex_unchecked("(a|b|c)");
         assert!(
-            re.start_closure.is_some(),
+            !re.start_closure.is_empty(),
             "pure alt should have start_closure"
         );
 
-        // Pattern starting with counter: closure should be None
+        // Pattern starting with counter: closure should be empty
         let re = build_regex_unchecked("a{2,3}");
         assert!(
-            re.start_closure.is_none(),
+            re.start_closure.is_empty(),
             "counter at start should disable start_closure"
         );
 
-        // Pattern starting with assertion: closure should be None
+        // Pattern starting with assertion: closure should be empty
         let re = build_regex_unchecked("^abc");
         assert!(
-            re.start_closure.is_none(),
+            re.start_closure.is_empty(),
             "assertion at start should disable start_closure"
         );
 
-        // Simple literal: closure should be Some (single Byte leaf)
+        // Simple literal: closure should have a single Byte leaf
         let re = build_regex_unchecked("abc");
         assert!(
-            re.start_closure.is_some(),
+            !re.start_closure.is_empty(),
             "simple literal should have start_closure"
         );
-        assert_eq!(
-            re.start_closure.as_ref().unwrap().len(),
-            1,
-            "literal has 1 start leaf"
-        );
+        assert_eq!(re.start_closure.len(), 1, "literal has 1 start leaf");
 
-        // aws-keys-like pattern: should be Some with 4 leaves
+        // aws-keys-like pattern: should have 4 leaves
         let re = build_regex_unchecked("(?:ASIA|AKIA|AROA|AIDA)");
         assert!(
-            re.start_closure.is_some(),
+            !re.start_closure.is_empty(),
             "aws-keys alt should have start_closure"
         );
-        assert_eq!(
-            re.start_closure.as_ref().unwrap().len(),
-            4,
-            "4 branches = 4 leaves"
-        );
+        assert_eq!(re.start_closure.len(), 4, "4 branches = 4 leaves");
     }
 }
