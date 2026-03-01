@@ -9,9 +9,22 @@ name = "rethoc"
 path = "src/main.rs"
 
 [dev-dependencies]
+gungraun = "0.17.2"
 itertools = "0.10"
+memchr = "2.8.0"
 regex = "1"
 
 [dependencies]
+clru = "0.6.2"
 indexmap = "2"
 regex-syntax = "0.8.9"
+
+[profile.release]
+debug = true
+
+[profile.bench]
+debug = true
+
+[[bench]]
+name = "flamegraph"
+harness = false

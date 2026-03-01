@@ -66,6 +66,9 @@ use std::ops::{Index, IndexMut, Range};
 
 use regex_syntax::hir::{self, HirKind};
 
+mod dfa;
+use dfa::{DfaCache, DfaMatcher};
+
 /// Re-export so users do not need a direct `regex-syntax` dependency.
 pub use regex_syntax::hir::Hir;
 
@@ -108,7 +111,7 @@ impl std::error::Error for Error {}
 /// A 256-entry boolean lookup table indicating which byte values belong
 /// to a character class.  `class[b]` is `true` when byte `b` matches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct ByteClass([bool; 256]);
+pub(crate) struct ByteClass([bool; 256]);
 
 impl ByteClass {
     /// A class that matches every byte value (`[true; 256]` — equivalent to `.`).
@@ -131,7 +134,7 @@ impl Index<u8> for ByteClass {
 
 /// Index into the byte-class lookup tables ([`Regex::classes`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct ClassIdx(usize);
+pub(crate) struct ClassIdx(usize);
 
 impl ClassIdx {
     #[inline]
@@ -152,7 +155,7 @@ impl Index<ClassIdx> for [ByteClass] {
 
 /// Index into the byte-dispatch tables ([`Regex::byte_tables`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct ByteTableIdx(usize);
+pub(crate) struct ByteTableIdx(usize);
 
 impl ByteTableIdx {
     #[inline]
@@ -164,7 +167,7 @@ impl ByteTableIdx {
 /// A 256-entry dispatch table mapping each byte value to a target
 /// [`StateIdx`], or [`StateIdx::NONE`] for "no transition".
 #[derive(Clone, Copy, Debug)]
-struct ByteMap([StateIdx; 256]);
+pub(crate) struct ByteMap([StateIdx; 256]);
 
 impl ByteMap {
     /// A table with no transitions (all entries are [`StateIdx::NONE`]).
@@ -202,7 +205,7 @@ impl Index<ByteTableIdx> for [ByteMap] {
 ///
 /// [`eval`]: AssertKind::eval
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AssertKind {
+pub(crate) enum AssertKind {
     /// `^`  — start of input only.
     Start,
     /// `$`  — end of input only.
@@ -403,7 +406,7 @@ impl AssertKind {
 /// Byte-consuming states (`Byte`, `ByteClass`) are stepped over in
 /// [`Matcher::step`].
 #[derive(Clone, Copy, Debug)]
-enum State {
+pub(crate) enum State {
     /// Epsilon fork: follow both `out` and `out1`.
     Split { out: StateIdx, out1: StateIdx },
 
@@ -490,7 +493,7 @@ impl State {
 /// [`StateIdx::NONE`] is used both as a "dangling/unpatched" marker
 /// during construction and as "no transition" in byte-table entries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct StateIdx(u32);
+pub(crate) struct StateIdx(pub(crate) u32);
 
 impl StateIdx {
     /// Sentinel value for unpatched `out` pointers during construction
@@ -596,7 +599,7 @@ enum RegexHirNode {
 // Compiled regex
 // ---------------------------------------------------------------------------
 
-struct StateList(Box<[State]>);
+pub(crate) struct StateList(Box<[State]>);
 
 impl fmt::Debug for StateList {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
@@ -614,16 +617,16 @@ impl std::ops::Deref for StateList {
 /// A compiled NFA ready for matching.
 #[derive(Debug)]
 pub struct Regex {
-    states: StateList,
-    start: StateIdx,
+    pub(crate) states: StateList,
+    pub(crate) start: StateIdx,
     /// Number of counter variables allocated during compilation.
     num_counters: usize,
     /// Byte-class lookup tables referenced by [`State::ByteClass::class`].
-    classes: Box<[ByteClass]>,
+    pub(crate) classes: Box<[ByteClass]>,
     /// Byte dispatch tables referenced by [`State::ByteTable::table`].
     /// Each entry maps a byte value to a target state index, or
     /// [`StateIdx::NONE`] for "no transition".
-    byte_tables: Box<[ByteMap]>,
+    pub(crate) byte_tables: Box<[ByteMap]>,
     /// Precomputed epsilon closure of the start state (consuming leaves only).
     ///
     /// If the start state's epsilon closure contains only `Split` transitions
@@ -642,6 +645,10 @@ pub struct Regex {
     /// `Matcher::ever_matched` so that `chunk()` can short-circuit
     /// immediately.
     start_closure_matches: bool,
+    /// `true` when this pattern can be matched using the lazy DFA
+    /// (Tier 1: no counters, no deferred-assertion types like \b/\B
+    /// /EndLF/EndCRLF/StartCRLF).
+    dfa_eligible: bool,
 }
 impl Regex {
     /// Return the total memory footprint (in bytes) of this compiled
@@ -1145,6 +1152,21 @@ impl RegexBuilder {
         self.optimize_byte_tables();
         let (start_closure, start_closure_matches) = self.compute_start_closure(start);
 
+        // DFA eligibility: no counters and no deferred-assertion types.
+        let has_counters = !self.counters.is_empty();
+        let has_complex_assert = self.states.iter().any(|s| {
+            matches!(s,
+                State::Assert { kind, .. } if matches!(kind,
+                    AssertKind::EndLF
+                    | AssertKind::EndCRLF
+                    | AssertKind::StartCRLF
+                    | AssertKind::WordAscii
+                    | AssertKind::WordAsciiNegate
+                )
+            )
+        });
+        let dfa_eligible = !has_counters && !has_complex_assert;
+
         Ok(Regex {
             states: StateList(self.states.to_vec().into_boxed_slice()),
             start,
@@ -1158,6 +1180,7 @@ impl RegexBuilder {
             byte_tables: self.byte_tables.to_vec().into_boxed_slice(),
             start_closure,
             start_closure_matches,
+            dfa_eligible,
         })
     }
     // -----------------------------------------------------------------------
@@ -1280,7 +1303,7 @@ impl RegexBuilder {
 
 /// Index into the counter variable array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct CounterIdx(usize);
+pub(crate) struct CounterIdx(usize);
 
 impl CounterIdx {
     #[inline]
@@ -1466,10 +1489,32 @@ pub struct MatcherMemory {
     /// the counter pool.
     ctx_visited: Vec<(StateIdx, CounterCtx)>,
     counter_pool: CounterPool,
+    /// Lazy DFA cache (allocated on first use with a DFA-eligible regex).
+    dfa_cache: Option<DfaCache>,
 }
 
 impl MatcherMemory {
-    pub fn matcher<'a>(&'a mut self, regex: &'a Regex) -> Matcher<'a> {
+    /// Create a matcher for the given regex.
+    ///
+    /// Returns an [`AnyMatcher`] that transparently dispatches to the
+    /// lazy DFA (for DFA-eligible patterns) or the NFA simulator.
+    pub fn matcher<'a>(&'a mut self, regex: &'a Regex) -> AnyMatcher<'a> {
+        if regex.dfa_eligible {
+            // Lazy-init or reset the DFA cache.
+            let cache = self
+                .dfa_cache
+                .get_or_insert_with(|| DfaCache::new(regex.states.len()));
+            cache.clear(regex.states.len());
+            let dfa = DfaMatcher::new(cache, regex);
+            AnyMatcher::Dfa(dfa)
+        } else {
+            let nfa = self.nfa_matcher(regex);
+            AnyMatcher::Nfa(nfa)
+        }
+    }
+
+    /// Create an NFA matcher (always available, used as fallback).
+    fn nfa_matcher<'a>(&'a mut self, regex: &'a Regex) -> Matcher<'a> {
         self.lastlist.clear();
         self.lastlist.resize(regex.states.len(), usize::MAX);
         self.clist.clear();
@@ -1502,6 +1547,58 @@ impl MatcherMemory {
 
         m.startlist(m.start);
         m
+    }
+}
+
+/// A matcher that dispatches to either the lazy DFA or the NFA simulator.
+pub enum AnyMatcher<'a> {
+    /// Lazy DFA path (Tier 1: counter-free, simple-assertion patterns).
+    Dfa(DfaMatcher<'a>),
+    /// NFA simulator path (general case).
+    Nfa(Matcher<'a>),
+}
+
+impl<'a> AnyMatcher<'a> {
+    /// Feed an entire byte slice through the matcher.
+    pub fn chunk(&mut self, input: &[u8]) {
+        match self {
+            Self::Dfa(d) => d.chunk(input),
+            Self::Nfa(n) => n.chunk(input),
+        }
+    }
+
+    /// Advance the simulation by one input byte.
+    pub fn step(&mut self, b: u8) {
+        match self {
+            Self::Dfa(d) => d.step(b),
+            Self::Nfa(n) => n.step(b),
+        }
+    }
+
+    /// Signal end-of-input and return the final match result.
+    pub fn finish(self) -> bool {
+        match self {
+            Self::Dfa(d) => d.finish(),
+            Self::Nfa(n) => n.finish(),
+        }
+    }
+
+    /// Check whether the matcher has reached an accepting state so far.
+    #[allow(dead_code)]
+    pub fn ismatch(&self) -> bool {
+        match self {
+            Self::Dfa(d) => d.ismatch(),
+            Self::Nfa(n) => n.ismatch(),
+        }
+    }
+}
+
+impl<'a> fmt::Debug for AnyMatcher<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Dfa(d) => f.debug_tuple("AnyMatcher::Dfa").field(d).finish(),
+            Self::Nfa(n) => f.debug_tuple("AnyMatcher::Nfa").field(n).finish(),
+        }
     }
 }
 
