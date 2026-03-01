@@ -1269,7 +1269,6 @@ impl CounterPool {
 
     /// Return a slot to the free list for reuse.
     #[inline]
-    #[allow(dead_code)]
     fn free(&mut self, range: Range<usize>) {
         if !range.is_empty() {
             debug_assert_eq!(range.len(), self.num_counters);
@@ -1306,7 +1305,7 @@ impl CounterPool {
 /// For threads outside all counted repetitions (the common case), the
 /// context is empty (`is_empty() == true`) and dedup falls back to
 /// the fast `lastlist` path.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct CounterCtx {
     range: Range<usize>,
     /// Number of active (non-`COUNTER_INACTIVE`) slots.  Maintained by
@@ -1365,9 +1364,9 @@ impl CounterCtx {
 
     /// Create an independent copy of this context with its own pool
     /// slot, so mutations don't affect the original.
-    fn deep_clone(&self, pool: &mut CounterPool) -> Self {
+    fn clone(&self, pool: &mut CounterPool) -> Self {
         if self.range.is_empty() {
-            return self.clone();
+            return Self::new();
         }
         Self {
             range: pool.allocate_clone(&self.range),
@@ -1411,8 +1410,6 @@ impl MatcherMemory {
         self.counter_pool.clear();
         self.counter_pool.num_counters = regex.num_counters;
 
-        let empty_ctx = CounterCtx::new();
-
         let mut m = Matcher {
             states: &regex.states,
             classes: &regex.classes,
@@ -1428,7 +1425,6 @@ impl MatcherMemory {
             at_end: false,
             prev_byte: None,
             ever_matched: false,
-            empty_ctx,
             counter_pool: &mut self.counter_pool,
         };
 
@@ -1470,13 +1466,11 @@ pub struct Matcher<'a> {
     prev_byte: Option<u8>,
     /// Tracks whether a `Match` state was ever reached.
     ever_matched: bool,
-    /// Pre-allocated empty context (all counters inactive).
-    empty_ctx: CounterCtx,
     counter_pool: &'a mut CounterPool,
 }
 
 /// Internal operations for iterative [`Matcher::addstate`] traversal.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 enum AddStateOp {
     /// Visit (and epsilon-expand) a state with the given context.
     Visit(StateIdx, CounterCtx),
@@ -1486,11 +1480,19 @@ enum AddStateOp {
 }
 
 impl<'a> Matcher<'a> {
+    /// Drain `ctx_visited` and return all arena slots to the pool.
+    #[inline]
+    fn free_ctx_visited(&mut self) {
+        for (_, ctx) in self.ctx_visited.drain(..) {
+            self.counter_pool.free(ctx.range);
+        }
+    }
+
     /// Compute the initial state list by following all epsilon transitions
     /// from `start`.
     #[inline]
     fn startlist(&mut self, start: StateIdx) {
-        self.addstate(start, self.empty_ctx.clone());
+        self.addstate(start, CounterCtx::new());
         std::mem::swap(self.clist, self.nlist);
         self.listid += 1;
     }
@@ -1518,6 +1520,7 @@ impl<'a> Matcher<'a> {
                     let ctx = if ctx.is_empty() {
                         let i = idx.idx();
                         if self.lastlist[i] == self.listid {
+                            self.counter_pool.free(ctx.range);
                             continue;
                         }
                         self.lastlist[i] = self.listid;
@@ -1529,12 +1532,12 @@ impl<'a> Matcher<'a> {
                             .iter()
                             .any(|(s, c)| *s == idx && self.counter_pool.ctx_eq(c, &ctx));
                         if already_seen {
+                            self.counter_pool.free(ctx.range);
                             continue;
                         }
                         // Record for future dedup.  Deep-clone so the dedup
                         // entry is independent of later mutations to ctx.
-                        self.ctx_visited
-                            .push((idx, ctx.deep_clone(self.counter_pool)));
+                        self.ctx_visited.push((idx, ctx.clone(self.counter_pool)));
                         ctx
                     };
 
@@ -1543,7 +1546,7 @@ impl<'a> Matcher<'a> {
                             // No PostPush for epsilon states.
                             // Deep-clone for out1 so each branch gets its own
                             // pool slot and mutations are independent.
-                            let ctx1 = ctx.deep_clone(self.counter_pool);
+                            let ctx1 = ctx.clone(self.counter_pool);
                             self.addstack.push(AddStateOp::Visit(out1, ctx1));
                             self.addstack.push(AddStateOp::Visit(out, ctx));
                         }
@@ -1551,21 +1554,24 @@ impl<'a> Matcher<'a> {
                         State::Assert { kind, out } => {
                             // PostPush so the Assert is in nlist for
                             // deferred resolution in step()/finish().
-                            let post_ctx = ctx.deep_clone(self.counter_pool);
+                            let post_ctx = ctx.clone(self.counter_pool);
                             self.addstack.push(AddStateOp::PostPush(idx, post_ctx));
                             if kind.eval(self.at_start, self.at_end, self.prev_byte, None)
                                 == AssertEval::Pass
                             {
                                 self.addstack.push(AddStateOp::Visit(out, ctx));
+                            } else {
+                                self.counter_pool.free(ctx.range);
                             }
                         }
 
                         State::CounterInstance { counter, out } => {
                             // Enter the counted repetition: set counter = 0.
                             // Deep-clone so we get our own mutable pool slot.
-                            let mut ctx = ctx.deep_clone(self.counter_pool);
-                            ctx.set(counter, 0, self.counter_pool);
-                            self.addstack.push(AddStateOp::Visit(out, ctx));
+                            let mut new_ctx = ctx.clone(self.counter_pool);
+                            self.counter_pool.free(ctx.range);
+                            new_ctx.set(counter, 0, self.counter_pool);
+                            self.addstack.push(AddStateOp::Visit(out, new_ctx));
                         }
 
                         State::CounterIncrement {
@@ -1585,7 +1591,7 @@ impl<'a> Matcher<'a> {
                             match (take_continue, take_break) {
                                 (true, true) => {
                                     // Both paths need independent slots.
-                                    let mut break_ctx = ctx.deep_clone(self.counter_pool);
+                                    let mut break_ctx = ctx.clone(self.counter_pool);
                                     break_ctx.remove(counter, self.counter_pool);
                                     self.addstack.push(AddStateOp::Visit(out1, break_ctx));
                                     // Mutate the original for the continue path.
@@ -1605,11 +1611,14 @@ impl<'a> Matcher<'a> {
                                     ctx.remove(counter, self.counter_pool);
                                     self.addstack.push(AddStateOp::Visit(out1, ctx));
                                 }
-                                (false, false) => {}
+                                (false, false) => {
+                                    self.counter_pool.free(ctx.range);
+                                }
                             }
                         }
 
                         State::Match => {
+                            self.counter_pool.free(ctx.range);
                             self.ever_matched = true;
                         }
 
@@ -1643,20 +1652,28 @@ impl<'a> Matcher<'a> {
                 {
                     if !any_expanded {
                         self.listid += 1;
-                        self.ctx_visited.clear();
+                        // Inline free_ctx_visited: can't call &mut self
+                        // method while self.clist[i] is borrowed.
+                        for (_, c) in self.ctx_visited.drain(..) {
+                            self.counter_pool.free(c.range);
+                        }
                         debug_assert!(
                             self.nlist.is_empty(),
                             "nlist must be empty before assert expansion"
                         );
                         any_expanded = true;
                     }
-                    self.addstate(out, ctx.clone());
+                    // Deep-clone so the context owns its own arena slot.
+                    // A shallow clone() would alias the clist entry's range,
+                    // causing use-after-free when addstate frees dead contexts.
+                    let ctx_clone = ctx.clone(self.counter_pool);
+                    self.addstate(out, ctx_clone);
                 }
             }
             if any_expanded {
                 self.clist.append(self.nlist);
                 self.listid += 1;
-                self.ctx_visited.clear();
+                self.free_ctx_visited();
             }
         }
 
@@ -1667,7 +1684,7 @@ impl<'a> Matcher<'a> {
             self.nlist.is_empty(),
             "nlist must be empty before consumption"
         );
-        self.ctx_visited.clear();
+        self.free_ctx_visited();
         let mut clist = std::mem::take(self.clist);
 
         // Fused pass: push Visit ops for matching consuming states
@@ -1675,7 +1692,7 @@ impl<'a> Matcher<'a> {
         // drain(..).rev() gives us owned ctx values — no clones needed.
         self.addstack.clear();
         self.addstack
-            .push(AddStateOp::Visit(self.start, self.empty_ctx.clone()));
+            .push(AddStateOp::Visit(self.start, CounterCtx::new()));
 
         for (idx, ctx) in clist.drain(..).rev() {
             let target = match self.states[idx] {
@@ -1684,11 +1701,15 @@ impl<'a> Matcher<'a> {
                 State::ByteTable { table } => {
                     let t = self.byte_tables[table][b];
                     if t == StateIdx::NONE {
+                        self.counter_pool.free(ctx.range);
                         continue;
                     }
                     t
                 }
-                _ => continue,
+                _ => {
+                    self.counter_pool.free(ctx.range);
+                    continue;
+                }
             };
             self.addstack.push(AddStateOp::Visit(target, ctx));
         }
@@ -1698,7 +1719,7 @@ impl<'a> Matcher<'a> {
         // clist is empty after drain but retains its capacity for reuse.
         *self.clist = std::mem::replace(self.nlist, clist);
         self.listid += 1;
-        self.ctx_visited.clear();
+        self.free_ctx_visited();
     }
 
     /// Feed an entire byte slice through the matcher, one byte at a time.
@@ -1721,31 +1742,39 @@ impl<'a> Matcher<'a> {
     /// end-of-input has been signalled.
     pub fn finish(mut self) -> bool {
         if self.ever_matched {
+            // Free all remaining contexts before returning.
+            for (_, ctx) in self.clist.drain(..) {
+                self.counter_pool.free(ctx.range);
+            }
+            self.free_ctx_visited();
             return true;
         }
 
         self.at_end = true;
 
-        let clist_len = self.clist.len();
-        if clist_len > 0 {
-            self.listid += 1;
-            self.ctx_visited.clear();
+        debug_assert!(
+            self.nlist.is_empty(),
+            "nlist must be empty before finish expansion"
+        );
 
-            debug_assert!(
-                self.nlist.is_empty(),
-                "nlist must be empty before finish expansion"
-            );
-            for i in 0..clist_len {
-                let (idx, ref ctx) = self.clist[i];
+        if !self.clist.is_empty() {
+            self.listid += 1;
+            self.free_ctx_visited();
+
+            // Take clist out so addstate can borrow &mut self.
+            let clist = std::mem::take(self.clist);
+            for (idx, ctx) in clist.into_iter() {
                 if let State::Assert { kind, out } = self.states[idx]
                     && kind.eval(self.at_start, true, self.prev_byte, None) == AssertEval::Pass
                 {
-                    self.addstate(out, ctx.clone());
+                    self.addstate(out, ctx);
+                } else {
+                    self.counter_pool.free(ctx.range);
                 }
             }
-
-            self.clist.append(self.nlist);
         }
+
+        self.free_ctx_visited();
 
         self.ever_matched
     }
@@ -1845,12 +1874,12 @@ mod tests {
     }
 
     #[test]
-    fn test_counter_ctx_deep_clone() {
+    fn test_counter_ctx_clone() {
         let mut pool = test_pool(2);
         let mut ctx = CounterCtx::new();
         ctx.set(CounterIdx(0), 5, &mut pool);
         ctx.set(CounterIdx(1), 10, &mut pool);
-        let mut cloned = ctx.deep_clone(&mut pool);
+        let mut cloned = ctx.clone(&mut pool);
         // Values are identical.
         assert!(pool.ctx_eq(&ctx, &cloned));
         // Mutating the clone doesn't affect the original.
@@ -1897,10 +1926,10 @@ mod tests {
     }
 
     #[test]
-    fn test_counter_ctx_deep_clone_empty() {
+    fn test_counter_ctx_clone_empty() {
         let mut pool = test_pool(2);
         let ctx = CounterCtx::new();
-        let cloned = ctx.deep_clone(&mut pool);
+        let cloned = ctx.clone(&mut pool);
         assert!(cloned.is_empty());
         assert!(cloned.range.is_empty());
         // Pool arena should be untouched — no allocation for empty ctx.
@@ -1908,13 +1937,13 @@ mod tests {
     }
 
     #[test]
-    fn test_counter_ctx_deep_clone_independence() {
+    fn test_counter_ctx_clone_independence() {
         let mut pool = test_pool(2);
         let mut src = CounterCtx::new();
         src.set(CounterIdx(0), 10, &mut pool);
         src.set(CounterIdx(1), 20, &mut pool);
-        let mut c1 = src.deep_clone(&mut pool);
-        let mut c2 = src.deep_clone(&mut pool);
+        let mut c1 = src.clone(&mut pool);
+        let mut c2 = src.clone(&mut pool);
         // All three start equal.
         assert!(pool.ctx_eq(&src, &c1));
         assert!(pool.ctx_eq(&src, &c2));
