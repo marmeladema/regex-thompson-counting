@@ -1731,7 +1731,8 @@ impl<'a> Matcher<'a> {
     }
 
     /// Advance the simulation by one input byte.
-    pub fn step(&mut self, b: u8) {
+    #[inline(always)]
+    fn step(&mut self, b: u8) {
         // --- Pre-consumption: resolve deferred assertions ---
         if self.has_assert {
             let mut any_expanded = false;
