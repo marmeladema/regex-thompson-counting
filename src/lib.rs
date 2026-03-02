@@ -71,7 +71,7 @@ use regex_syntax::hir::{self, HirKind};
 static NEXT_REGEX_ID: AtomicU64 = AtomicU64::new(1);
 
 mod dfa;
-use dfa::{DfaCache, DfaMatcher};
+use dfa::{CountingDfaCache, CountingDfaMatcher, DfaCache, DfaMatcher};
 
 /// Re-export so users do not need a direct `regex-syntax` dependency.
 pub use regex_syntax::hir::Hir;
@@ -628,7 +628,7 @@ pub struct Regex {
     pub(crate) states: StateList,
     pub(crate) start: StateIdx,
     /// Number of counter variables allocated during compilation.
-    num_counters: usize,
+    pub(crate) num_counters: usize,
     /// Byte-class lookup tables referenced by [`State::ByteClass::class`].
     pub(crate) classes: Box<[ByteClass]>,
     /// Byte dispatch tables referenced by [`State::ByteTable::table`].
@@ -657,6 +657,9 @@ pub struct Regex {
     /// (Tier 1: no counters, no deferred-assertion types like \b/\B
     /// /EndLF/EndCRLF/StartCRLF).
     dfa_eligible: bool,
+    /// `true` when this pattern has counters but can use the counting DFA
+    /// (Tier 3: no complex assertions).
+    counting_dfa_eligible: bool,
 }
 impl Regex {
     /// Return the total memory footprint (in bytes) of this compiled
@@ -1175,6 +1178,53 @@ impl RegexBuilder {
         });
         let dfa_eligible = !has_counters && !has_complex_assert;
 
+        // The counting DFA cannot handle zero-width counter bodies
+        // (where the body can match empty, creating epsilon-only loops
+        // through CounterIncrement).  Detect this by checking if any
+        // CounterInstance can reach its corresponding CounterIncrement
+        // via epsilon transitions only.
+        let has_zero_width_counter_body = has_counters && {
+            let states = &self.states;
+            fn can_reach_cinc_via_epsilon(
+                idx: StateIdx,
+                counter: CounterIdx,
+                states: &[State],
+                visited: &mut Vec<bool>,
+            ) -> bool {
+                let i = idx.idx();
+                if visited[i] {
+                    return false;
+                }
+                visited[i] = true;
+                match states[idx] {
+                    State::CounterIncrement { counter: c, .. } if c == counter => true,
+                    State::Split { out, out1 } => {
+                        can_reach_cinc_via_epsilon(out, counter, states, visited)
+                            || can_reach_cinc_via_epsilon(out1, counter, states, visited)
+                    }
+                    State::Assert { out, .. } => {
+                        can_reach_cinc_via_epsilon(out, counter, states, visited)
+                    }
+                    State::CounterInstance { out, .. } => {
+                        can_reach_cinc_via_epsilon(out, counter, states, visited)
+                    }
+                    // Consuming states or Match block the path.
+                    _ => false,
+                }
+            }
+
+            states.iter().any(|s| {
+                if let State::CounterInstance { counter, out } = s {
+                    let mut visited = vec![false; states.len()];
+                    can_reach_cinc_via_epsilon(*out, *counter, states, &mut visited)
+                } else {
+                    false
+                }
+            })
+        };
+        let counting_dfa_eligible =
+            has_counters && !has_complex_assert && !has_zero_width_counter_body;
+
         Ok(Regex {
             id: NEXT_REGEX_ID.fetch_add(1, Ordering::Relaxed),
             states: StateList(self.states.to_vec().into_boxed_slice()),
@@ -1190,6 +1240,7 @@ impl RegexBuilder {
             start_closure,
             start_closure_matches,
             dfa_eligible,
+            counting_dfa_eligible,
         })
     }
     // -----------------------------------------------------------------------
@@ -1338,15 +1389,15 @@ const COUNTER_INACTIVE: usize = usize::MAX;
 /// context copies only the lightweight range + active count; the
 /// actual slot data is shared (copy-on-write via [`allocate_clone`]).
 #[derive(Clone, Debug, Default)]
-struct CounterPool {
+pub(crate) struct CounterPool {
     arena: Vec<usize>,
     free: Vec<Range<usize>>,
-    num_counters: usize,
+    pub(crate) num_counters: usize,
 }
 
 impl CounterPool {
     /// Allocate a fresh slot (all counters inactive).
-    fn allocate(&mut self) -> Range<usize> {
+    pub(crate) fn allocate(&mut self) -> Range<usize> {
         debug_assert!(self.num_counters > 0);
         if let Some(range) = self.free.pop() {
             debug_assert_eq!(range.len(), self.num_counters);
@@ -1361,7 +1412,7 @@ impl CounterPool {
     }
 
     /// Allocate a new slot that is a copy of `src`.
-    fn allocate_clone(&mut self, src: &Range<usize>) -> Range<usize> {
+    pub(crate) fn allocate_clone(&mut self, src: &Range<usize>) -> Range<usize> {
         debug_assert_eq!(src.len(), self.num_counters);
         let dst = self.allocate();
         self.arena.copy_within(src.start..src.end, dst.start);
@@ -1370,7 +1421,7 @@ impl CounterPool {
 
     /// Return a slot to the free list for reuse.
     #[inline]
-    fn free(&mut self, range: Range<usize>) {
+    pub(crate) fn free(&mut self, range: Range<usize>) {
         if !range.is_empty() {
             debug_assert_eq!(range.len(), self.num_counters);
             self.free.push(range);
@@ -1385,12 +1436,12 @@ impl CounterPool {
 
     /// Compare two contexts by value through the pool.
     #[inline]
-    fn ctx_eq(&self, a: &CounterCtx, b: &CounterCtx) -> bool {
+    pub(crate) fn ctx_eq(&self, a: &CounterCtx, b: &CounterCtx) -> bool {
         a.active == b.active && self.slots(&a.range) == self.slots(&b.range)
     }
 
     /// Reset the pool for a new match (keeps allocated memory).
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.arena.clear();
         self.free.clear();
     }
@@ -1407,7 +1458,7 @@ impl CounterPool {
 /// context is empty (`is_empty() == true`) and dedup falls back to
 /// the fast `lastlist` path.
 #[derive(Debug)]
-struct CounterCtx {
+pub(crate) struct CounterCtx {
     range: Range<usize>,
     /// Number of active (non-`COUNTER_INACTIVE`) slots.  Maintained by
     /// `set` / `remove` so that `is_empty` is O(1).
@@ -1416,7 +1467,7 @@ struct CounterCtx {
 
 impl CounterCtx {
     /// Create an empty context (all counters inactive, no allocation).
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             range: 0..0,
             active: 0,
@@ -1425,13 +1476,13 @@ impl CounterCtx {
 
     /// True when no counter is active (all slots are `COUNTER_INACTIVE`).
     #[inline]
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.active == 0
     }
 
     /// Get the value of counter `idx`, or `None` if inactive.
     #[inline]
-    fn get(&self, idx: CounterIdx, pool: &CounterPool) -> Option<usize> {
+    pub(crate) fn get(&self, idx: CounterIdx, pool: &CounterPool) -> Option<usize> {
         if idx.idx() >= self.range.len() {
             return None;
         }
@@ -1442,7 +1493,7 @@ impl CounterCtx {
     /// Set the value of counter `idx`.  Lazily allocates a pool slot
     /// on first use.
     #[inline]
-    fn set(&mut self, idx: CounterIdx, value: usize, pool: &mut CounterPool) {
+    pub(crate) fn set(&mut self, idx: CounterIdx, value: usize, pool: &mut CounterPool) {
         debug_assert!(value != COUNTER_INACTIVE);
         if self.range.is_empty() {
             self.range = pool.allocate();
@@ -1456,7 +1507,7 @@ impl CounterCtx {
 
     /// Deactivate counter `idx`.  The counter must currently be active.
     #[inline]
-    fn remove(&mut self, idx: CounterIdx, pool: &mut CounterPool) {
+    pub(crate) fn remove(&mut self, idx: CounterIdx, pool: &mut CounterPool) {
         let slot = &mut pool.arena[self.range.start + idx.idx()];
         debug_assert!(*slot != COUNTER_INACTIVE, "remove on inactive counter");
         *slot = COUNTER_INACTIVE;
@@ -1465,7 +1516,7 @@ impl CounterCtx {
 
     /// Create an independent copy of this context with its own pool
     /// slot, so mutations don't affect the original.
-    fn clone(&self, pool: &mut CounterPool) -> Self {
+    pub(crate) fn clone(&self, pool: &mut CounterPool) -> Self {
         if self.range.is_empty() {
             return Self::new();
         }
@@ -1473,6 +1524,11 @@ impl CounterCtx {
             range: pool.allocate_clone(&self.range),
             active: self.active,
         }
+    }
+
+    /// Consume this context and return its pool range for freeing.
+    pub(crate) fn into_range(self) -> std::ops::Range<usize> {
+        self.range
     }
 }
 
@@ -1500,6 +1556,10 @@ pub struct MatcherMemory {
     counter_pool: CounterPool,
     /// Lazy DFA cache (allocated on first use with a DFA-eligible regex).
     dfa_cache: Option<DfaCache>,
+    /// Counting DFA cache (Tier 3: patterns with counters).
+    counting_dfa_cache: Option<CountingDfaCache>,
+    /// Counter pool for the counting DFA (separate from NFA's pool).
+    counting_pool: CounterPool,
 }
 
 impl MatcherMemory {
@@ -1509,15 +1569,21 @@ impl MatcherMemory {
     /// lazy DFA (for DFA-eligible patterns) or the NFA simulator.
     pub fn matcher<'a>(&'a mut self, regex: &'a Regex) -> AnyMatcher<'a> {
         if regex.dfa_eligible {
-            // Lazy-init the DFA cache, then prepare it for this regex.
-            // If the same regex is reused, all interned DFA states and
-            // transitions are kept — no rebuild cost.
+            // Tier 1: pure DFA (no counters, simple assertions).
             let cache = self
                 .dfa_cache
                 .get_or_insert_with(|| DfaCache::new(regex.states.len()));
             cache.prepare(regex);
             let dfa = DfaMatcher::new(cache, regex);
             AnyMatcher::Dfa(dfa)
+        } else if regex.counting_dfa_eligible {
+            // Tier 3: DFA + explicit counter contexts.
+            let cache = self
+                .counting_dfa_cache
+                .get_or_insert_with(|| CountingDfaCache::new(regex.states.len()));
+            cache.prepare(regex);
+            let dfa = CountingDfaMatcher::new(cache, regex, &mut self.counting_pool);
+            AnyMatcher::CountingDfa(dfa)
         } else {
             let nfa = self.nfa_matcher(regex);
             AnyMatcher::Nfa(nfa)
@@ -1565,6 +1631,8 @@ impl MatcherMemory {
 pub enum AnyMatcher<'a> {
     /// Lazy DFA path (Tier 1: counter-free, simple-assertion patterns).
     Dfa(DfaMatcher<'a>),
+    /// Counting DFA path (Tier 3: DFA + explicit counter contexts).
+    CountingDfa(CountingDfaMatcher<'a>),
     /// NFA simulator path (general case).
     Nfa(Matcher<'a>),
 }
@@ -1574,6 +1642,7 @@ impl<'a> AnyMatcher<'a> {
     pub fn chunk(&mut self, input: &[u8]) {
         match self {
             Self::Dfa(d) => d.chunk(input),
+            Self::CountingDfa(d) => d.chunk(input),
             Self::Nfa(n) => n.chunk(input),
         }
     }
@@ -1582,6 +1651,7 @@ impl<'a> AnyMatcher<'a> {
     pub fn step(&mut self, b: u8) {
         match self {
             Self::Dfa(d) => d.step(b),
+            Self::CountingDfa(d) => d.step(b),
             Self::Nfa(n) => n.step(b),
         }
     }
@@ -1590,6 +1660,7 @@ impl<'a> AnyMatcher<'a> {
     pub fn finish(self) -> bool {
         match self {
             Self::Dfa(d) => d.finish(),
+            Self::CountingDfa(d) => d.finish(),
             Self::Nfa(n) => n.finish(),
         }
     }
@@ -1599,6 +1670,7 @@ impl<'a> AnyMatcher<'a> {
     pub fn ismatch(&self) -> bool {
         match self {
             Self::Dfa(d) => d.ismatch(),
+            Self::CountingDfa(d) => d.ismatch(),
             Self::Nfa(n) => n.ismatch(),
         }
     }
@@ -1608,6 +1680,7 @@ impl<'a> fmt::Debug for AnyMatcher<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Dfa(d) => f.debug_tuple("AnyMatcher::Dfa").field(d).finish(),
+            Self::CountingDfa(d) => f.debug_tuple("AnyMatcher::CountingDfa").field(d).finish(),
             Self::Nfa(n) => f.debug_tuple("AnyMatcher::Nfa").field(n).finish(),
         }
     }

@@ -105,12 +105,32 @@ fn bench_grep_every_line() {
     black_box(count);
 }
 
+// ---- Tier 1 DFA on same haystack for per-byte cost comparison ----
+
+/// Same haystack, DFA-eligible equivalent of the aws-keys pattern.
+/// The `{16}` repetition is expanded into 16 copies of the character class
+/// so the pattern remains counter-free and uses the Tier 1 DFA path.
+const AWS_PREFIX_PATTERN: &str = r"(?:ASIA|AKIA|AROA|AIDA)[A-Z0-7][A-Z0-7][A-Z0-7][A-Z0-7][A-Z0-7][A-Z0-7][A-Z0-7][A-Z0-7][A-Z0-7][A-Z0-7][A-Z0-7][A-Z0-7][A-Z0-7][A-Z0-7][A-Z0-7][A-Z0-7]";
+
+#[library_benchmark]
+fn bench_aws_prefix_tier1() {
+    let haystack = aws_haystack();
+    let hir = parse_hir(AWS_PREFIX_PATTERN);
+    let re = RegexBuilder::default().build(&hir).unwrap();
+    let mut mem = MatcherMemory::default();
+    let mut matcher = mem.matcher(&re);
+    matcher.chunk(black_box(&haystack));
+    let matched = matcher.finish();
+    black_box(matched);
+}
+
 library_benchmark_group!(name = aws_keys_group, benchmarks = bench_aws_keys_quick);
+library_benchmark_group!(name = aws_prefix_group, benchmarks = bench_aws_prefix_tier1);
 library_benchmark_group!(name = grep_group, benchmarks = bench_grep_every_line);
 
 // main! must be at file scope — it generates fn main() internally.
 main!(
     config = LibraryBenchmarkConfig::default()
         .tool(Callgrind::default().flamegraph(FlamegraphConfig::default()));
-    library_benchmark_groups = aws_keys_group, grep_group
+    library_benchmark_groups = aws_keys_group, aws_prefix_group, grep_group
 );
