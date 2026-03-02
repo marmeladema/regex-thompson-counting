@@ -677,6 +677,121 @@ impl Regex {
         let byte_tables_alloc = self.byte_tables.len() * std::mem::size_of::<ByteMap>();
         inline + states_alloc + classes_alloc + byte_tables_alloc
     }
+    /// Print diagnostic information about this compiled regex.
+    pub fn info(&self, mut out: impl Write) {
+        // -- Memory --
+        let mem = self.memory_size();
+        writeln!(out, "Memory").unwrap();
+        writeln!(out, "  total:       {} bytes", mem).unwrap();
+        writeln!(
+            out,
+            "  states:      {} bytes ({} states × {} bytes/state)",
+            self.states.len() * std::mem::size_of::<State>(),
+            self.states.len(),
+            std::mem::size_of::<State>()
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "  classes:     {} bytes ({} tables × {} bytes/table)",
+            self.classes.len() * std::mem::size_of::<ByteClass>(),
+            self.classes.len(),
+            std::mem::size_of::<ByteClass>()
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "  byte_tables: {} bytes ({} tables × {} bytes/table)",
+            self.byte_tables.len() * std::mem::size_of::<ByteMap>(),
+            self.byte_tables.len(),
+            std::mem::size_of::<ByteMap>()
+        )
+        .unwrap();
+
+        // -- NFA state breakdown --
+        let mut n_split = 0usize;
+        let mut n_byte = 0usize;
+        let mut n_byte_class = 0usize;
+        let mut n_byte_table = 0usize;
+        let mut n_assert = 0usize;
+        let mut n_counter_instance = 0usize;
+        let mut n_counter_increment = 0usize;
+        let mut n_match = 0usize;
+        for s in self.states.iter() {
+            match s {
+                State::Split { .. } => n_split += 1,
+                State::Byte { .. } => n_byte += 1,
+                State::ByteClass { .. } => n_byte_class += 1,
+                State::ByteTable { .. } => n_byte_table += 1,
+                State::Assert { .. } => n_assert += 1,
+                State::CounterInstance { .. } => n_counter_instance += 1,
+                State::CounterIncrement { .. } => n_counter_increment += 1,
+                State::Match => n_match += 1,
+            }
+        }
+        writeln!(out).unwrap();
+        writeln!(out, "NFA states: {}", self.states.len()).unwrap();
+        writeln!(out, "  Split:            {n_split}").unwrap();
+        writeln!(out, "  Byte:             {n_byte}").unwrap();
+        writeln!(out, "  ByteClass:        {n_byte_class}").unwrap();
+        writeln!(out, "  ByteTable:        {n_byte_table}").unwrap();
+        writeln!(out, "  Assert:           {n_assert}").unwrap();
+        writeln!(out, "  CounterInstance:  {n_counter_instance}").unwrap();
+        writeln!(out, "  CounterIncrement: {n_counter_increment}").unwrap();
+        writeln!(out, "  Match:            {n_match}").unwrap();
+
+        // -- Counters --
+        if self.num_counters > 0 {
+            writeln!(out).unwrap();
+            writeln!(out, "Counters: {}", self.num_counters).unwrap();
+            for s in self.states.iter() {
+                if let State::CounterIncrement {
+                    counter, min, max, ..
+                } = s
+                {
+                    writeln!(out, "  counter[{}]: {{{},{}}}", counter.idx(), min, max).unwrap();
+                }
+            }
+        }
+
+        // -- Assertions --
+        let mut assert_kinds = std::collections::BTreeSet::new();
+        for s in self.states.iter() {
+            if let State::Assert { kind, .. } = s {
+                assert_kinds.insert(format!("{:?}", kind));
+            }
+        }
+        if !assert_kinds.is_empty() {
+            writeln!(out).unwrap();
+            writeln!(out, "Assertions: {}", assert_kinds.len()).unwrap();
+            for k in &assert_kinds {
+                writeln!(out, "  {k}").unwrap();
+            }
+        }
+
+        // -- Execution tier --
+        writeln!(out).unwrap();
+        let tier = if self.dfa_eligible {
+            "Tier 1: Lazy DFA (flat table, no counters)"
+        } else if self.counting_dfa_eligible {
+            "Tier 3: Counting DFA (flat table + counter programs)"
+        } else {
+            "NFA simulator (general case)"
+        };
+        writeln!(out, "Execution: {tier}").unwrap();
+
+        // -- Start closure --
+        writeln!(out).unwrap();
+        writeln!(
+            out,
+            "Start closure: {} consuming states (precomputed: {})",
+            self.start_closure.len(),
+            !self.start_closure.is_empty()
+        )
+        .unwrap();
+        writeln!(out, "Start matches empty: {}", self.start_closure_matches).unwrap();
+    }
+
     /// Emit a Graphviz DOT representation of the NFA.
     pub fn to_dot(&self, mut buffer: impl Write) {
         let mut visited = vec![false; self.states.len()];

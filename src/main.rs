@@ -37,6 +37,7 @@ fn print_usage() {
 Usage: rethoc [OPTIONS] <COMMAND>
 
 Commands:
+  info  <pattern>                Print diagnostic information about the compiled regex
   dot   <pattern>                Output DOT (Graphviz) representation of the NFA
   match <pattern> <input>...     Match pattern against one or more inputs
 
@@ -48,6 +49,9 @@ Options:
 }
 
 enum Command {
+    Info {
+        pattern: String,
+    },
     Dot {
         pattern: String,
     },
@@ -113,6 +117,15 @@ fn parse_args() -> Command {
     }
 
     match positional[0].as_str() {
+        "info" => {
+            if positional.len() != 2 {
+                eprintln!("error: 'info' command takes exactly one pattern argument");
+                process::exit(1);
+            }
+            Command::Info {
+                pattern: positional[1].clone(),
+            }
+        }
         "dot" => {
             if positional.len() != 2 {
                 eprintln!("error: 'dot' command takes exactly one pattern argument");
@@ -140,6 +153,16 @@ fn parse_args() -> Command {
             process::exit(1);
         }
     }
+}
+
+fn run_info(pattern: &str) {
+    let regex = parse_pattern(pattern);
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "Pattern: {pattern}").unwrap();
+    writeln!(out).unwrap();
+    regex.info(&mut out);
+    out.flush().unwrap();
 }
 
 fn run_dot(pattern: &str) {
@@ -215,6 +238,7 @@ fn run_match(pattern: &str, inputs: &[String], chunk_size: Option<usize>, debug:
 
 fn main() {
     match parse_args() {
+        Command::Info { pattern } => run_info(&pattern),
         Command::Dot { pattern } => run_dot(&pattern),
         Command::Match {
             pattern,
