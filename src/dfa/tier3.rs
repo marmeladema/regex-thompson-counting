@@ -9,7 +9,9 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::{AssertKind, CounterCtx, CounterIdx, CounterPool, Regex, State, StateIdx};
+use crate::{
+    AssertKind, CounterCtx, CounterIdx, CounterPool, Regex, State, StateIdx, byte_match_ci,
+};
 
 use super::{DfaState, DfaStateId};
 
@@ -277,7 +279,7 @@ pub(crate) struct CountingDfaCache {
     states: Vec<DfaState>,
     /// Reverse lookup: canonical `DfaState → DfaStateId`.
     state_map: HashMap<DfaState, DfaStateId>,
-    /// Flat transition table: indexed by `state.0 * 256 + byte`.
+    /// Flat transition table: indexed by `state.0 * stride + byte_class`.
     /// Unpopulated slots have `origin_table == OriginTableIdx::NONE`.
     transitions: Vec<CountingTransition>,
     /// Compiled counter programs (append-only).
@@ -292,6 +294,10 @@ pub(crate) struct CountingDfaCache {
     seed_emit_origins: Vec<Option<Box<[StateIdx]>>>,
     /// Scratch visited set for epsilon closure.
     closure_visited: Vec<bool>,
+    /// Number of byte equivalence classes — the stride of each DFA state
+    /// row in the transition table.  Copied from [`Regex::num_byte_classes`]
+    /// during [`prepare()`].
+    stride: usize,
     /// Regex identity for cache reuse.
     regex_id: u64,
     /// Start DFA state (at_start=true, position 0).
@@ -323,6 +329,7 @@ impl CountingDfaCache {
             origin_program_tables: Vec::new(),
             seed_emit_origins: Vec::new(),
             closure_visited: vec![false; num_nfa_states],
+            stride: 256,
             regex_id: 0,
             start_id: DfaStateId::DEAD,
             start_program: CounterProgramIdx(0),
@@ -351,8 +358,10 @@ impl CountingDfaCache {
         let id = DfaStateId(self.states.len() as u32);
         self.state_map.insert(state.clone(), id);
         self.states.push(state);
-        self.transitions
-            .resize(self.states.len() * 256, CountingTransition::UNPOPULATED);
+        self.transitions.resize(
+            self.states.len() * self.stride,
+            CountingTransition::UNPOPULATED,
+        );
         id
     }
 
@@ -620,7 +629,10 @@ impl CountingDfaCache {
                 *is_match = true;
                 ops.push(CounterOp::EmitMatch);
             }
-            State::Byte { .. } | State::ByteClass { .. } | State::ByteTable { .. } => {
+            State::Byte { .. }
+            | State::ByteCI { .. }
+            | State::ByteClass { .. }
+            | State::ByteTable { .. } => {
                 nfa_result.push(idx);
                 ops.push(CounterOp::EmitContinue { origin: idx });
             }
@@ -706,7 +718,7 @@ impl CountingDfaCache {
             let t = self.populate(from, byte, regex);
             return t;
         }
-        let slot = from.0 as usize * 256 + byte as usize;
+        let slot = from.0 as usize * self.stride + regex.byte_classes[byte as usize] as usize;
         let t = self.transitions[slot];
         if !t.is_unpopulated() {
             return t;
@@ -733,6 +745,7 @@ impl CountingDfaCache {
             for &idx in nfa_states.iter() {
                 let target = match regex.states[idx] {
                     State::Byte { byte: b2, out } if byte == b2 => Some(out),
+                    State::ByteCI { byte: b2, out } if byte_match_ci(byte, b2) => Some(out),
                     State::ByteClass { class, out } if regex.classes[class][byte] => Some(out),
                     State::ByteTable { table } => {
                         let t = regex.byte_tables[table][byte];
@@ -801,7 +814,7 @@ impl CountingDfaCache {
     }
 
     /// Reset the cache.
-    fn clear(&mut self, num_nfa_states: usize) {
+    fn clear(&mut self, num_nfa_states: usize, stride: usize) {
         self.states.clear();
         self.state_map.clear();
         self.transitions.clear();
@@ -810,6 +823,7 @@ impl CountingDfaCache {
         self.seed_emit_origins.clear();
         self.closure_visited.clear();
         self.closure_visited.resize(num_nfa_states, false);
+        self.stride = stride;
         self.regex_id = 0;
         self.start_id = DfaStateId::DEAD;
         self.start_program = CounterProgramIdx(0);
@@ -823,7 +837,7 @@ impl CountingDfaCache {
         if self.regex_id == id && self.start_id != DfaStateId::DEAD {
             return;
         }
-        self.clear(regex.states.len());
+        self.clear(regex.states.len(), regex.num_byte_classes);
         self.regex_id = id;
 
         let (nfa_set, is_match, is_match_at_end, ops) = self.epsilon_closure_with_program(

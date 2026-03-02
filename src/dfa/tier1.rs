@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::{AssertEval, AssertKind, Regex, State, StateIdx, is_word_byte};
+use crate::{AssertEval, AssertKind, Regex, State, StateIdx, byte_match_ci, is_word_byte};
 
 use super::{DfaState, DfaStateId};
 
@@ -15,16 +15,17 @@ use super::{DfaState, DfaStateId};
 // ---------------------------------------------------------------------------
 
 /// Maximum number of DFA states before the flat transition table stops
-/// growing.  2048 states × 256 entries × 4 bytes = 2 MB.
+/// growing.  2048 states × stride entries × 4 bytes.
 const DFA_MAX_STATES: usize = 2048;
 
 /// Lazy DFA cache: append-only state table + flat transition table.
 ///
 /// The transition table is a flat `Vec<DfaStateId>` indexed by
-/// `state.0 * 256 + byte`.  Unpopulated slots contain
-/// `DfaStateId::UNPOPULATED`.  When the state count reaches
-/// [`DFA_MAX_STATES`], new states are no longer interned — the
-/// transition falls back to recomputing without caching.
+/// `state.0 * stride + byte_class`, where `stride` is the number
+/// of byte equivalence classes ([`Regex::num_byte_classes`]).
+/// Unpopulated slots contain `DfaStateId::UNPOPULATED`.  When the
+/// state count reaches [`DFA_MAX_STATES`], new states are no longer
+/// interned — the transition falls back to recomputing without caching.
 ///
 /// The cache is **persisted across `matcher()` calls** for the same
 /// `Regex`.  A unique regex ID detects when a different regex is used
@@ -34,9 +35,13 @@ pub(crate) struct DfaCache {
     states: Vec<DfaState>,
     /// Reverse lookup: canonical `DfaState → DfaStateId`.
     state_map: HashMap<DfaState, DfaStateId>,
-    /// Flat transition table: `transitions[state.0 * 256 + byte] -> to_state`.
+    /// Flat transition table: `transitions[state.0 * stride + byte_class]`.
     /// Unpopulated slots contain `DfaStateId::UNPOPULATED`.
     transitions: Vec<DfaStateId>,
+    /// Number of byte equivalence classes — the stride of each DFA state
+    /// row in the transition table.  Copied from [`Regex::num_byte_classes`]
+    /// during [`prepare()`].
+    stride: usize,
     /// Scratch space for epsilon closure (avoids allocation per populate).
     closure_stack: Vec<StateIdx>,
     /// Scratch space for collecting NFA consuming states during closure.
@@ -67,6 +72,7 @@ impl DfaCache {
             states: Vec::new(),
             state_map: HashMap::new(),
             transitions: Vec::new(),
+            stride: 256, // default; overwritten by prepare()
             closure_stack: Vec::new(),
             closure_result: Vec::new(),
             closure_deferred: Vec::new(),
@@ -104,9 +110,9 @@ impl DfaCache {
         let id = DfaStateId(self.states.len() as u32);
         self.state_map.insert(state.clone(), id);
         self.states.push(state);
-        // Extend the flat transition table with 256 UNPOPULATED slots.
+        // Extend the flat transition table with `stride` UNPOPULATED slots.
         self.transitions
-            .extend(std::iter::repeat_n(DfaStateId::UNPOPULATED, 256));
+            .extend(std::iter::repeat_n(DfaStateId::UNPOPULATED, self.stride));
         Some(id)
     }
 
@@ -178,7 +184,10 @@ impl DfaCache {
                 State::Match => {
                     is_match = true;
                 }
-                State::Byte { .. } | State::ByteClass { .. } | State::ByteTable { .. } => {
+                State::Byte { .. }
+                | State::ByteCI { .. }
+                | State::ByteClass { .. }
+                | State::ByteTable { .. } => {
                     self.closure_result.push(idx);
                 }
                 State::CounterInstance { .. } | State::CounterIncrement { .. } => {
@@ -283,7 +292,8 @@ impl DfaCache {
         if from == DfaStateId::DEAD {
             return self.transition_from_dead(byte, regex);
         }
-        let slot = from.idx() * 256 + byte as usize;
+        let class = regex.byte_classes[byte as usize] as usize;
+        let slot = from.idx() * self.stride + class;
         let cached = self.transitions[slot];
         if cached != DfaStateId::UNPOPULATED {
             return cached;
@@ -342,6 +352,7 @@ impl DfaCache {
                 for &idx in resolved_consumers.iter() {
                     let target = match regex.states[idx] {
                         State::Byte { byte: b2, out } if byte == b2 => Some(out),
+                        State::ByteCI { byte: b2, out } if byte_match_ci(byte, b2) => Some(out),
                         State::ByteClass { class, out } if regex.classes[class][byte] => Some(out),
                         State::ByteTable { table } => {
                             let t = regex.byte_tables[table][byte];
@@ -381,6 +392,7 @@ impl DfaCache {
                 for &idx in nfa_states.iter() {
                     let target = match regex.states[idx] {
                         State::Byte { byte: b2, out } if byte == b2 => Some(out),
+                        State::ByteCI { byte: b2, out } if byte_match_ci(byte, b2) => Some(out),
                         State::ByteClass { class, out } if regex.classes[class][byte] => Some(out),
                         State::ByteTable { table } => {
                             let t = regex.byte_tables[table][byte];
@@ -441,6 +453,7 @@ impl DfaCache {
             for &idx in nfa_states.iter() {
                 let target = match regex.states[idx] {
                     State::Byte { byte: b2, out } if byte == b2 => Some(out),
+                    State::ByteCI { byte: b2, out } if byte_match_ci(byte, b2) => Some(out),
                     State::ByteClass { class, out } if regex.classes[class][byte] => Some(out),
                     State::ByteTable { table } => {
                         let t = regex.byte_tables[table][byte];
@@ -493,10 +506,11 @@ impl DfaCache {
     }
 
     /// Reset the cache for reuse with a new regex.
-    fn clear(&mut self, num_nfa_states: usize) {
+    fn clear(&mut self, num_nfa_states: usize, stride: usize) {
         self.states.clear();
         self.state_map.clear();
         self.transitions.clear();
+        self.stride = stride;
         self.closure_deferred.clear();
         self.closure_visited.clear();
         self.closure_visited.resize(num_nfa_states, false);
@@ -517,7 +531,7 @@ impl DfaCache {
         if self.regex_id == id && self.start_id != DfaStateId::DEAD {
             return;
         }
-        self.clear(regex.states.len());
+        self.clear(regex.states.len(), regex.num_byte_classes);
         self.regex_id = id;
 
         // Start state: at_start=true, prev_byte=None, at_end=false.

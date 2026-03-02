@@ -262,6 +262,19 @@ pub(crate) fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Case-insensitive ASCII byte match.
+///
+/// `target` **must** be a lowercase ASCII letter (`b'a'..=b'z'`).
+/// Returns `true` if `input` is the same letter in either case.
+///
+/// Uses the bit-5 trick: for ASCII letters, lowercase and uppercase
+/// differ only in bit 5 (`0x20`), so `input | 0x20` folds to lowercase.
+#[inline]
+pub(crate) fn byte_match_ci(input: u8, target: u8) -> bool {
+    debug_assert!(target.is_ascii_lowercase());
+    input | 0x20 == target
+}
+
 impl AssertKind {
     /// Evaluate this assertion.
     ///
@@ -436,6 +449,17 @@ pub(crate) enum State {
     /// Match a literal byte, then follow `out`.
     Byte { byte: u8, out: StateIdx },
 
+    /// Case-insensitive ASCII byte match, then follow `out`.
+    ///
+    /// `byte` is a **lowercase** ASCII letter (`b'a'..=b'z'`).
+    /// Matches both `byte` and `byte ^ 0x20` (the uppercase variant)
+    /// via [`byte_match_ci`].
+    ///
+    /// Emitted instead of [`ByteClass`] when the class contains exactly
+    /// one ASCII letter pair (e.g. `[cC]` under `(?i)`).  Avoids the
+    /// 256-byte class table lookup — match is a single `OR` + `CMP`.
+    ByteCI { byte: u8, out: StateIdx },
+
     /// Match any byte in the class (lookup table), then follow `out`.
     ///
     /// `class` is an index into [`Regex::classes`], a side-table of
@@ -471,6 +495,7 @@ impl State {
     fn next(&self) -> StateIdx {
         match self {
             State::Byte { out, .. }
+            | State::ByteCI { out, .. }
             | State::ByteClass { out, .. }
             | State::CounterInstance { out, .. }
             | State::Assert { out, .. } => *out,
@@ -483,6 +508,7 @@ impl State {
     fn append(&mut self, next: StateIdx) {
         match self {
             State::Byte { out, .. }
+            | State::ByteCI { out, .. }
             | State::ByteClass { out, .. }
             | State::CounterInstance { out, .. }
             | State::Assert { out, .. } => *out = next,
@@ -584,6 +610,8 @@ enum RegexHirNode {
     Alternate,
     Catenate,
     Byte(u8),
+    /// Case-insensitive ASCII letter.  `byte` is lowercase (`b'a'..=b'z'`).
+    ByteCI(u8),
     RepeatZeroOne,
     RepeatZeroPlus,
     RepeatOnePlus,
@@ -660,6 +688,22 @@ pub struct Regex {
     /// `true` when this pattern has counters but can use the counting DFA
     /// (Tier 3: no complex assertions).
     counting_dfa_eligible: bool,
+    /// Byte equivalence classes for DFA transition table compression.
+    ///
+    /// Maps each input byte (0..255) to a small equivalence class index.
+    /// Two bytes are in the same class when they produce identical
+    /// transitions from *every* DFA state (i.e. they match exactly the
+    /// same set of NFA consuming states, with the same targets, and have
+    /// the same word-ness for deferred assertion resolution).
+    ///
+    /// The DFA transition table is indexed by
+    /// `state * num_byte_classes + byte_classes[byte]` instead of
+    /// `state * 256 + byte`, giving a ~6-7× compression for typical
+    /// case-insensitive patterns.
+    pub(crate) byte_classes: [u8; 256],
+    /// Number of distinct byte equivalence classes (the "stride" of
+    /// each DFA state row in the flat transition table).
+    pub(crate) num_byte_classes: usize,
 }
 impl Regex {
     /// Return the total memory footprint (in bytes) of this compiled
@@ -711,6 +755,7 @@ impl Regex {
         // -- NFA state breakdown --
         let mut n_split = 0usize;
         let mut n_byte = 0usize;
+        let mut n_byte_ci = 0usize;
         let mut n_byte_class = 0usize;
         let mut n_byte_table = 0usize;
         let mut n_assert = 0usize;
@@ -721,6 +766,7 @@ impl Regex {
             match s {
                 State::Split { .. } => n_split += 1,
                 State::Byte { .. } => n_byte += 1,
+                State::ByteCI { .. } => n_byte_ci += 1,
                 State::ByteClass { .. } => n_byte_class += 1,
                 State::ByteTable { .. } => n_byte_table += 1,
                 State::Assert { .. } => n_assert += 1,
@@ -733,6 +779,7 @@ impl Regex {
         writeln!(out, "NFA states: {}", self.states.len()).unwrap();
         writeln!(out, "  Split:            {n_split}").unwrap();
         writeln!(out, "  Byte:             {n_byte}").unwrap();
+        writeln!(out, "  ByteCI:           {n_byte_ci}").unwrap();
         writeln!(out, "  ByteClass:        {n_byte_class}").unwrap();
         writeln!(out, "  ByteTable:        {n_byte_table}").unwrap();
         writeln!(out, "  Assert:           {n_assert}").unwrap();
@@ -791,6 +838,15 @@ impl Regex {
             )
             .unwrap();
         }
+
+        // -- Byte equivalence classes --
+        writeln!(out).unwrap();
+        writeln!(
+            out,
+            "Byte equivalence classes: {} (DFA stride, vs 256 raw)",
+            self.num_byte_classes
+        )
+        .unwrap();
 
         // -- Execution tier --
         writeln!(out).unwrap();
@@ -868,6 +924,15 @@ impl Regex {
             State::Byte { byte: b, out } => {
                 stack.push(out);
                 writeln!(buffer, "\t{} -> {} [label=\"{}\"];", idx, out, b as char).unwrap();
+            }
+            State::ByteCI { byte: b, out } => {
+                stack.push(out);
+                writeln!(
+                    buffer,
+                    "\t{} -> {} [label=\"(?i){}\"];",
+                    idx, out, b as char
+                )
+                .unwrap();
             }
             State::ByteClass { class, out } => {
                 stack.push(out);
@@ -968,6 +1033,159 @@ impl RegexBuilder {
         ClassIdx(idx)
     }
 
+    /// Detect a case-insensitive ASCII letter pair in a byte-class.
+    ///
+    /// Returns `Some(lowercase_byte)` if the class has exactly two
+    /// single-byte ranges that are the upper/lowercase pair of the same
+    /// ASCII letter (e.g. `[Cc]`).
+    fn detect_ci_letter_bytes(ranges: &[hir::ClassBytesRange]) -> Option<u8> {
+        if ranges.len() != 2 {
+            return None;
+        }
+        let (a_lo, a_hi) = (ranges[0].start(), ranges[0].end());
+        let (b_lo, b_hi) = (ranges[1].start(), ranges[1].end());
+        // Both ranges must be single bytes.
+        if a_lo != a_hi || b_lo != b_hi {
+            return None;
+        }
+        // One must be uppercase, the other lowercase of the same letter.
+        let (lo, hi) = if a_lo < b_lo {
+            (a_lo, b_lo)
+        } else {
+            (b_lo, a_lo)
+        };
+        if hi.is_ascii_lowercase() && lo.is_ascii_uppercase() && lo | 0x20 == hi {
+            Some(hi) // lowercase
+        } else {
+            None
+        }
+    }
+
+    /// Detect a case-insensitive ASCII letter pair in a Unicode class.
+    ///
+    /// Same logic as [`detect_ci_letter_bytes`] but for `ClassUnicodeRange`.
+    fn detect_ci_letter_unicode(ranges: &[hir::ClassUnicodeRange]) -> Option<u8> {
+        if ranges.len() != 2 {
+            return None;
+        }
+        let (a_lo, a_hi) = (ranges[0].start() as u32, ranges[0].end() as u32);
+        let (b_lo, b_hi) = (ranges[1].start() as u32, ranges[1].end() as u32);
+        // Both ranges must be single bytes in ASCII.
+        if a_lo != a_hi || b_lo != b_hi || a_lo > 0x7F || b_lo > 0x7F {
+            return None;
+        }
+        let (lo, hi) = if a_lo < b_lo {
+            (a_lo as u8, b_lo as u8)
+        } else {
+            (b_lo as u8, a_lo as u8)
+        };
+        if hi.is_ascii_lowercase() && lo.is_ascii_uppercase() && lo | 0x20 == hi {
+            Some(hi) // lowercase
+        } else {
+            None
+        }
+    }
+
+    /// Compute byte equivalence classes for DFA transition table compression.
+    ///
+    /// Two bytes are in the same class when, for every NFA consuming state,
+    /// they produce the same match outcome (both match to the same target,
+    /// or both fail).  Additionally, when deferred assertions are present,
+    /// bytes with different word-ness are always in different classes.
+    ///
+    /// Returns `(mapping, num_classes)` where `mapping[byte]` is the class
+    /// index for that byte and `num_classes` is the total count.
+    fn compute_byte_classes(
+        states: &[State],
+        classes: &[ByteClass],
+        byte_tables: &[ByteMap],
+        has_deferred_assert: bool,
+    ) -> ([u8; 256], usize) {
+        // For each byte, build a signature: a compact key that captures
+        // its behavior across all consuming states.  Bytes with identical
+        // signatures are placed in the same equivalence class.
+        //
+        // Signature element per consuming state:
+        //   0            → byte does not match this state
+        //   1 + out.idx  → byte matches, transitions to `out`
+        //   (for ByteTable: 1 + table_target.idx, or 0 if NONE)
+
+        // Collect consuming state indices.
+        let consuming: Vec<usize> = states
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| match s {
+                State::Byte { .. }
+                | State::ByteCI { .. }
+                | State::ByteClass { .. }
+                | State::ByteTable { .. } => Some(i),
+                _ => None,
+            })
+            .collect();
+
+        // Build signature for each byte.
+        // To keep things efficient, we hash signatures on the fly.
+        use std::collections::HashMap;
+        let mut class_map: HashMap<Vec<u32>, u8> = HashMap::new();
+        let mut mapping = [0u8; 256];
+        let mut next_class: u8 = 0;
+
+        for b in 0..=255u8 {
+            let mut sig: Vec<u32> = Vec::with_capacity(consuming.len() + 1);
+
+            // First element: word-ness (when deferred assertions are present).
+            if has_deferred_assert {
+                sig.push(if is_word_byte(b) { 1 } else { 0 });
+            }
+
+            for &si in &consuming {
+                let action = match states[si] {
+                    State::Byte { byte, out } => {
+                        if b == byte {
+                            1 + out.0
+                        } else {
+                            0
+                        }
+                    }
+                    State::ByteCI { byte, out } => {
+                        if byte_match_ci(b, byte) {
+                            1 + out.0
+                        } else {
+                            0
+                        }
+                    }
+                    State::ByteClass { class, out } => {
+                        if classes[class][b] {
+                            1 + out.0
+                        } else {
+                            0
+                        }
+                    }
+                    State::ByteTable { table } => {
+                        let t = byte_tables[table][b];
+                        if t != StateIdx::NONE { 1 + t.0 } else { 0 }
+                    }
+                    _ => 0,
+                };
+                sig.push(action);
+            }
+
+            if let Some(&class) = class_map.get(&sig) {
+                mapping[b as usize] = class;
+            } else {
+                let class = next_class;
+                class_map.insert(sig, class);
+                mapping[b as usize] = class;
+                // Safety: we cannot have more than 256 distinct classes.
+                next_class = next_class
+                    .checked_add(1)
+                    .expect("more than 256 byte classes");
+            }
+        }
+
+        (mapping, next_class as usize)
+    }
+
     /// Recursively lower a `regex-syntax` HIR node into a postfix sequence
     /// appended to `self.postfix`.
     ///
@@ -1009,6 +1227,12 @@ impl RegexBuilder {
                 Ok(())
             }
             HirKind::Class(hir::Class::Bytes(class)) => {
+                // Detect case-insensitive ASCII letter pair: exactly two
+                // single-byte ranges like [C-C][c-c].
+                if let Some(lower) = Self::detect_ci_letter_bytes(class.ranges()) {
+                    self.postfix.push(RegexHirNode::ByteCI(lower));
+                    return Ok(());
+                }
                 let mut table = ByteClass::NONE;
                 for range in class.ranges() {
                     for b in range.start()..=range.end() {
@@ -1021,7 +1245,7 @@ impl RegexBuilder {
             }
             HirKind::Class(hir::Class::Unicode(class)) => {
                 // regex-syntax may produce Unicode classes for ASCII-only
-                // patterns like `(a|b)` → `[ab]`.  If all ranges fit in a
+                // patterns like `(a|b)` �� `[ab]`.  If all ranges fit in a
                 // single byte (0x00..=0xFF), lower them to a ByteClass;
                 // otherwise reject.
                 let ranges = class.ranges();
@@ -1030,6 +1254,12 @@ impl RegexBuilder {
                     .all(|r| (r.start() as u32) <= 0xFF && (r.end() as u32) <= 0xFF);
                 if !all_single_byte {
                     return Err(Error::UnsupportedClass(hir::Class::Unicode(class.clone())));
+                }
+                // Detect case-insensitive ASCII letter pair: exactly two
+                // single-char ranges like [C-C][c-c].
+                if let Some(lower) = Self::detect_ci_letter_unicode(ranges) {
+                    self.postfix.push(RegexHirNode::ByteCI(lower));
+                    return Ok(());
                 }
                 let mut table = ByteClass::NONE;
                 for range in ranges {
@@ -1147,6 +1377,7 @@ impl RegexBuilder {
         while let Some(state) = self.states.get_mut_state(list) {
             list = match state {
                 State::Byte { out, .. }
+                | State::ByteCI { out, .. }
                 | State::ByteClass { out, .. }
                 | State::CounterInstance { out, .. }
                 | State::Assert { out, .. } => {
@@ -1249,6 +1480,13 @@ impl RegexBuilder {
             RegexHirNode::ByteClass(class) => {
                 let idx = self.state(State::ByteClass {
                     class,
+                    out: StateIdx::NONE,
+                });
+                Fragment::new(idx, idx)
+            }
+            RegexHirNode::ByteCI(byte) => {
+                let idx = self.state(State::ByteCI {
+                    byte,
                     out: StateIdx::NONE,
                 });
                 Fragment::new(idx, idx)
@@ -1375,22 +1613,41 @@ impl RegexBuilder {
         let counting_dfa_eligible =
             has_counters && !has_deferred_assert && !has_zero_width_counter_body;
 
+        // Compute byte equivalence classes before moving data out.
+        let classes_slice: Vec<ByteClass> = self.classes.iter().copied().collect();
+        let byte_tables_slice: Vec<ByteMap> = self.byte_tables.to_vec();
+        // Deferred assertions need word-ness splitting.
+        let has_any_deferred = self.states.iter().any(|s| {
+            matches!(
+                s,
+                State::Assert { kind, .. } if matches!(
+                    kind,
+                    AssertKind::WordAscii
+                    | AssertKind::WordAsciiNegate
+                    | AssertKind::EndLF
+                )
+            )
+        });
+        let (byte_classes, num_byte_classes) = Self::compute_byte_classes(
+            self.states.as_slice(),
+            &classes_slice,
+            &byte_tables_slice,
+            has_any_deferred,
+        );
+
         Ok(Regex {
             id: NEXT_REGEX_ID.fetch_add(1, Ordering::Relaxed),
             states: StateList(self.states.to_vec().into_boxed_slice()),
             start,
             num_counters: self.counters.len(),
-            classes: self
-                .classes
-                .iter()
-                .copied()
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            byte_tables: self.byte_tables.to_vec().into_boxed_slice(),
+            classes: classes_slice.into_boxed_slice(),
+            byte_tables: byte_tables_slice.into_boxed_slice(),
             start_closure,
             start_closure_matches,
             dfa_eligible,
             counting_dfa_eligible,
+            byte_classes,
+            num_byte_classes,
         })
     }
     // -----------------------------------------------------------------------
@@ -1482,7 +1739,10 @@ impl RegexBuilder {
                     stack.push(out);
                     stack.push(out1);
                 }
-                State::Byte { .. } | State::ByteClass { .. } | State::ByteTable { .. } => {
+                State::Byte { .. }
+                | State::ByteCI { .. }
+                | State::ByteClass { .. }
+                | State::ByteTable { .. } => {
                     leaves.push(idx);
                 }
                 State::Match => {
@@ -2048,7 +2308,10 @@ impl<'a> Matcher<'a> {
                         }
 
                         // Consuming states: record in nlist for step().
-                        State::Byte { .. } | State::ByteClass { .. } | State::ByteTable { .. } => {
+                        State::Byte { .. }
+                        | State::ByteCI { .. }
+                        | State::ByteClass { .. }
+                        | State::ByteTable { .. } => {
                             self.addstack.push(AddStateOp::PostPush(idx, ctx));
                         }
                     }
@@ -2129,6 +2392,7 @@ impl<'a> Matcher<'a> {
         while let Some((idx, ctx)) = clist.pop() {
             let target = match self.states[idx] {
                 State::Byte { byte: b2, out } if b == b2 => out,
+                State::ByteCI { byte: b2, out } if byte_match_ci(b, b2) => out,
                 State::ByteClass { class, out } if self.classes[class][b] => out,
                 State::ByteTable { table } => {
                     let t = self.byte_tables[table][b];
@@ -3077,7 +3341,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "bc");
         assert_matches_regex_crate(p, &re, "a123b");
         assert_matches_regex_crate(p, &re, "a123");
-        assert_memory_size(p, &re, 784);
+        assert_memory_size(p, &re, 1048);
     }
 
     /// `(a|bc){1,2}` — flat range repetition with all combos up to 3.
@@ -3116,7 +3380,7 @@ mod tests {
             let input = v.into_iter().collect::<String>();
             assert_matches_regex_crate(p, &re, &input);
         }
-        assert_memory_size(p, &re, 448);
+        assert_memory_size(p, &re, 712);
     }
 
     /// `((a|bc){1,2}){2,3}` — nested counting constraints.
@@ -3153,7 +3417,7 @@ mod tests {
             let input = v.into_iter().collect::<String>();
             assert_matches_regex_crate(p, &re, &input);
         }
-        assert_memory_size(p, &re, 528);
+        assert_memory_size(p, &re, 792);
     }
 
     /// `(a|a?){2,3}` — epsilon-matchable body (the `a?` branch can match
@@ -3176,7 +3440,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "aab");
-        assert_memory_size(p, &re, 448);
+        assert_memory_size(p, &re, 712);
     }
 
     /// `a+` — basic one-or-more repetition.
@@ -3193,7 +3457,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "aab");
-        assert_memory_size(p, &re, 288);
+        assert_memory_size(p, &re, 552);
     }
 
     /// `.+` — one-or-more wildcard.
@@ -3205,7 +3469,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 544);
+        assert_memory_size(p, &re, 808);
     }
 
     /// `a+b+` — consecutive one-or-more repetitions.
@@ -3221,7 +3485,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abb");
         assert_matches_regex_crate(p, &re, "aabb");
         assert_matches_regex_crate(p, &re, "ba");
-        assert_memory_size(p, &re, 368);
+        assert_memory_size(p, &re, 632);
     }
 
     /// `(ab)+` — one-or-more of a multi-byte sequence.
@@ -3235,7 +3499,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abab");
         assert_matches_regex_crate(p, &re, "ababab");
         assert_matches_regex_crate(p, &re, "aba");
-        assert_memory_size(p, &re, 328);
+        assert_memory_size(p, &re, 592);
     }
 
     /// `(a|b)+` — one-or-more alternation.
@@ -3256,7 +3520,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ac");
         assert_matches_regex_crate(p, &re, "ca");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 544);
+        assert_memory_size(p, &re, 808);
     }
 
     /// `.*a.{3}b+c` — one-or-more mixed with counting constraints.
@@ -3281,7 +3545,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "x123bc");
         assert_matches_regex_crate(p, &re, "a123b");
-        assert_memory_size(p, &re, 824);
+        assert_memory_size(p, &re, 1088);
     }
 
     /// `(a{2,3})+` — inner repetition, outer one-or-more.
@@ -3301,7 +3565,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaaaaa");
         assert_matches_regex_crate(p, &re, "aaaaaaaaa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 368);
+        assert_memory_size(p, &re, 632);
     }
 
     /// `((a|bc){1,2})+` — inner range repetition of alternation, outer `+`.
@@ -3328,7 +3592,7 @@ mod tests {
                 assert_matches_regex_crate(p, &re, &input);
             }
         }
-        assert_memory_size(p, &re, 488);
+        assert_memory_size(p, &re, 752);
     }
 
     /// `(a+){2,3}` — inner one-or-more, outer counted repetition.
@@ -3345,7 +3609,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaaa");
         assert_matches_regex_crate(p, &re, "aaaaaaa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 368);
+        assert_memory_size(p, &re, 632);
     }
 
     /// `((a|b)+){2,4}` — inner `+` of alternation, outer counted repetition.
@@ -3370,7 +3634,7 @@ mod tests {
                 assert_matches_regex_crate(p, &re, &input);
             }
         }
-        assert_memory_size(p, &re, 624);
+        assert_memory_size(p, &re, 888);
     }
 
     /// `(a+b{2,3})+` — inner `+` and inner repetition side-by-side,
@@ -3392,7 +3656,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abbabbbabb");
         assert_matches_regex_crate(p, &re, "aabbaabbb");
         assert_matches_regex_crate(p, &re, "aabbbaabbb");
-        assert_memory_size(p, &re, 448);
+        assert_memory_size(p, &re, 712);
     }
 
     // -- min=0 repetition tests ---------------------------------------------
@@ -3407,7 +3671,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "aaa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 368);
+        assert_memory_size(p, &re, 632);
     }
 
     /// `a{0,1}` — equivalent to `a?`.
@@ -3419,7 +3683,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 288);
+        assert_memory_size(p, &re, 552);
     }
 
     /// `(a|bc){0,3}` — zero to three of an alternation.
@@ -3444,7 +3708,7 @@ mod tests {
                 assert_matches_regex_crate(p, &re, &input);
             }
         }
-        assert_memory_size(p, &re, 488);
+        assert_memory_size(p, &re, 752);
     }
 
     /// `a{0,}` — zero or more, lowered to `a*` (no counter overhead).
@@ -3463,7 +3727,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "aab");
         assert_matches_regex_crate(p, &re, "baa");
-        assert_memory_size(p, &re, 288);
+        assert_memory_size(p, &re, 552);
     }
 
     /// `(ab){0,}` — zero or more of a group, lowered to `(ab)*`.
@@ -3477,7 +3741,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abab");
         assert_matches_regex_crate(p, &re, "ababab");
         assert_matches_regex_crate(p, &re, "aba");
-        assert_memory_size(p, &re, 328);
+        assert_memory_size(p, &re, 592);
     }
 
     /// `x(a{0,2})+y` — min=0 repetition nested inside `+`.
@@ -3502,7 +3766,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ay");
         assert_matches_regex_crate(p, &re, "xa");
         assert_matches_regex_crate(p, &re, "aay");
-        assert_memory_size(p, &re, 488);
+        assert_memory_size(p, &re, 752);
     }
 
     /// `(a{0,2}){2,3}` — min=0 inner, counted outer.
@@ -3519,7 +3783,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaaa");
         assert_matches_regex_crate(p, &re, "aaaaaaa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 448);
+        assert_memory_size(p, &re, 712);
     }
 
     /// `(a+){0,3}` — `+` inside a min=0 counted repetition.
@@ -3535,7 +3799,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaa");
         assert_matches_regex_crate(p, &re, "aaaaaa");
         assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 408);
+        assert_memory_size(p, &re, 672);
     }
 
     /// `.{0,3}` — min=0 repetition on wildcard.
@@ -3548,7 +3812,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "abcd");
-        assert_memory_size(p, &re, 624);
+        assert_memory_size(p, &re, 888);
     }
 
     /// `a{0,3}` — same as `a{0,3}` (the old test used `min: None`).
@@ -3566,7 +3830,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "aab");
-        assert_memory_size(p, &re, 368);
+        assert_memory_size(p, &re, 632);
     }
 
     // -- Standalone primitive tests ------------------------------------------
@@ -3583,7 +3847,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "ba");
-        assert_memory_size(p, &re, 248);
+        assert_memory_size(p, &re, 512);
     }
 
     /// `abc` — multi-byte literal concatenation.
@@ -3603,7 +3867,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "xabcx");
         assert_matches_regex_crate(p, &re, "cba");
         assert_matches_regex_crate(p, &re, "bac");
-        assert_memory_size(p, &re, 328);
+        assert_memory_size(p, &re, 592);
     }
 
     /// `.` — bare wildcard (matches exactly one byte).
@@ -3619,7 +3883,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 504);
+        assert_memory_size(p, &re, 768);
     }
 
     /// `a|bc` — bare alternation (no repetition).
@@ -3637,7 +3901,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "x");
         assert_matches_regex_crate(p, &re, "bca");
-        assert_memory_size(p, &re, 368);
+        assert_memory_size(p, &re, 632);
     }
 
     /// `a|b|c` — three-way alternation.
@@ -3653,7 +3917,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "d");
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 504);
+        assert_memory_size(p, &re, 768);
     }
 
     /// `a?` — standalone zero-or-one.
@@ -3667,7 +3931,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aa");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ab");
-        assert_memory_size(p, &re, 288);
+        assert_memory_size(p, &re, 552);
     }
 
     /// `(ab)?` — zero-or-one of a group.
@@ -3683,7 +3947,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "abab");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 328);
+        assert_memory_size(p, &re, 592);
     }
 
     /// `a?b` — optional prefix followed by a literal.
@@ -3700,7 +3964,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "bb");
         assert_matches_regex_crate(p, &re, "cb");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 328);
+        assert_memory_size(p, &re, 592);
     }
 
     /// `a*` — standalone zero-or-more.
@@ -3719,7 +3983,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "aab");
         assert_matches_regex_crate(p, &re, "baa");
-        assert_memory_size(p, &re, 288);
+        assert_memory_size(p, &re, 552);
     }
 
     /// `(ab)*` — zero-or-more of a group.
@@ -3738,7 +4002,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aba");
         assert_matches_regex_crate(p, &re, "abba");
         assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 328);
+        assert_memory_size(p, &re, 592);
     }
 
     /// `a*b` — star followed by a literal.
@@ -3758,7 +4022,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ba");
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "aabb");
-        assert_memory_size(p, &re, 328);
+        assert_memory_size(p, &re, 592);
     }
 
     /// `a{2,}` — unbounded min with n>0.
@@ -3777,7 +4041,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "ab");
         assert_matches_regex_crate(p, &re, "aab");
         assert_matches_regex_crate(p, &re, "baa");
-        assert_memory_size(p, &re, 328);
+        assert_memory_size(p, &re, 592);
     }
 
     /// `(ab){2,}` — unbounded min of a group.
@@ -3796,7 +4060,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abba");
         assert_matches_regex_crate(p, &re, "ababc");
         assert_matches_regex_crate(p, &re, "xabab");
-        assert_memory_size(p, &re, 368);
+        assert_memory_size(p, &re, 632);
     }
 
     /// `a{3,5}` — bounded min>0 range.
@@ -3815,7 +4079,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "aaab");
         assert_matches_regex_crate(p, &re, "baaa");
-        assert_memory_size(p, &re, 328);
+        assert_memory_size(p, &re, 592);
     }
 
     /// `a{3,3}` — exact repetition.
@@ -3832,7 +4096,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "aaaaa");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "bbb");
-        assert_memory_size(p, &re, 328);
+        assert_memory_size(p, &re, 592);
     }
 
     // -- Byte class tests ---------------------------------------------------
@@ -3848,7 +4112,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "c");
         assert_matches_regex_crate(p, &re, "d");
         assert_matches_regex_crate(p, &re, "ab");
-        assert_memory_size(p, &re, 504);
+        assert_memory_size(p, &re, 768);
     }
 
     /// `[a-c]+` — one-or-more of a byte class.
@@ -3862,7 +4126,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "cba");
         assert_matches_regex_crate(p, &re, "abcd");
         assert_matches_regex_crate(p, &re, "d");
-        assert_memory_size(p, &re, 544);
+        assert_memory_size(p, &re, 808);
     }
 
     /// `[a-c]{2,3}` — counted repetition of a byte class.
@@ -3877,7 +4141,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abca");
         assert_matches_regex_crate(p, &re, "cc");
         assert_matches_regex_crate(p, &re, "dd");
-        assert_memory_size(p, &re, 584);
+        assert_memory_size(p, &re, 848);
     }
 
     /// `[ax]` — disjoint single bytes (multi-range Class::Bytes).
@@ -3890,7 +4154,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "x");
         assert_matches_regex_crate(p, &re, "b");
         assert_matches_regex_crate(p, &re, "ax");
-        assert_memory_size(p, &re, 504);
+        assert_memory_size(p, &re, 768);
     }
 
     /// `[a-cx-z]+` — multiple disjoint ranges in a byte class.
@@ -3905,7 +4169,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "d");
         assert_matches_regex_crate(p, &re, "w");
         assert_matches_regex_crate(p, &re, "abcxyz");
-        assert_memory_size(p, &re, 544);
+        assert_memory_size(p, &re, 808);
     }
 
     /// `[a-c].*[x-z]` — byte classes mixed with wildcard.
@@ -3919,7 +4183,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "dx");
         assert_matches_regex_crate(p, &re, "");
         assert_matches_regex_crate(p, &re, "a");
-        assert_memory_size(p, &re, 1136);
+        assert_memory_size(p, &re, 1400);
     }
 
     // -- Predefined character class tests -----------------------------------
@@ -3939,7 +4203,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "00");
         assert_matches_regex_crate(p, &re, "12");
-        assert_memory_size(p, &re, 504);
+        assert_memory_size(p, &re, 768);
     }
 
     /// `\d+` — one-or-more digits.
@@ -3957,7 +4221,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "12a");
         assert_matches_regex_crate(p, &re, "a12");
         assert_matches_regex_crate(p, &re, "1 2");
-        assert_memory_size(p, &re, 544);
+        assert_memory_size(p, &re, 808);
     }
 
     /// `\d{3,5}` — counted digit repetition.
@@ -3975,7 +4239,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "123456");
         assert_matches_regex_crate(p, &re, "abc");
         assert_matches_regex_crate(p, &re, "12a");
-        assert_memory_size(p, &re, 584);
+        assert_memory_size(p, &re, 848);
     }
 
     /// `\D` — matches a single non-digit byte.
@@ -3993,7 +4257,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "5");
         assert_matches_regex_crate(p, &re, "9");
         assert_matches_regex_crate(p, &re, "aa");
-        assert_memory_size(p, &re, 504);
+        assert_memory_size(p, &re, 768);
     }
 
     /// `\D+` — one-or-more non-digits.
@@ -4009,7 +4273,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "abc1");
         assert_matches_regex_crate(p, &re, "1abc");
-        assert_memory_size(p, &re, 544);
+        assert_memory_size(p, &re, 808);
     }
 
     /// `\s` — matches a single ASCII whitespace byte.
@@ -4026,7 +4290,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "  ");
-        assert_memory_size(p, &re, 504);
+        assert_memory_size(p, &re, 768);
     }
 
     /// `\s+` — one-or-more whitespace.
@@ -4042,7 +4306,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "a");
         assert_matches_regex_crate(p, &re, " a");
         assert_matches_regex_crate(p, &re, "a ");
-        assert_memory_size(p, &re, 544);
+        assert_memory_size(p, &re, 808);
     }
 
     /// `\S` — matches a single non-whitespace byte.
@@ -4059,7 +4323,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "\t");
         assert_matches_regex_crate(p, &re, "\n");
         assert_matches_regex_crate(p, &re, "aa");
-        assert_memory_size(p, &re, 504);
+        assert_memory_size(p, &re, 768);
     }
 
     /// `\S+` — one-or-more non-whitespace.
@@ -4075,7 +4339,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "a b");
         assert_matches_regex_crate(p, &re, " abc");
-        assert_memory_size(p, &re, 544);
+        assert_memory_size(p, &re, 808);
     }
 
     /// `\w` — matches a single ASCII word byte (`[0-9A-Za-z_]`).
@@ -4094,7 +4358,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "!");
         assert_matches_regex_crate(p, &re, "-");
         assert_matches_regex_crate(p, &re, "ab");
-        assert_memory_size(p, &re, 504);
+        assert_memory_size(p, &re, 768);
     }
 
     /// `\w+` — one-or-more word bytes.
@@ -4111,7 +4375,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, " ");
         assert_matches_regex_crate(p, &re, "hello world");
         assert_matches_regex_crate(p, &re, "foo-bar");
-        assert_memory_size(p, &re, 544);
+        assert_memory_size(p, &re, 808);
     }
 
     /// `\w{2,4}` — counted word repetition.
@@ -4128,7 +4392,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "abcde");
         assert_matches_regex_crate(p, &re, "!!");
         assert_matches_regex_crate(p, &re, "a b");
-        assert_memory_size(p, &re, 584);
+        assert_memory_size(p, &re, 848);
     }
 
     /// `\W` — matches a single non-word byte.
@@ -4146,7 +4410,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, "_");
         assert_matches_regex_crate(p, &re, "  ");
-        assert_memory_size(p, &re, 504);
+        assert_memory_size(p, &re, 768);
     }
 
     /// `\W+` — one-or-more non-word bytes.
@@ -4163,7 +4427,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, "0");
         assert_matches_regex_crate(p, &re, " a ");
         assert_matches_regex_crate(p, &re, "!a!");
-        assert_memory_size(p, &re, 544);
+        assert_memory_size(p, &re, 808);
     }
 
     /// `\d+\s+\w+` — mixed predefined classes in concatenation.
@@ -4182,7 +4446,7 @@ mod tests {
         assert_matches_regex_crate(p, &re, " hello");
         assert_matches_regex_crate(p, &re, "hello 42");
         assert_matches_regex_crate(p, &re, "42hello");
-        assert_memory_size(p, &re, 1216);
+        assert_memory_size(p, &re, 1480);
     }
 
     // -- Byte-class deduplication tests --------------------------------------
@@ -5905,5 +6169,1170 @@ baz",
             "aws-keys alt should have start_closure"
         );
         assert_eq!(re.start_closure.len(), 4, "4 branches = 4 leaves");
+    }
+
+    // -----------------------------------------------------------------------
+    // Case-insensitive ((?i)) tests
+    // -----------------------------------------------------------------------
+
+    /// `(?i)a` — single case-insensitive letter (ByteCI optimization).
+    #[test]
+    fn test_ci_literal_single() {
+        let p = "^(?i)a$";
+        let re = build_regex_unchecked(p);
+        // positives: both cases
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "A");
+        // negatives: wrong char, empty, multi-char
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "B");
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "AA");
+        assert_matches_regex_crate(p, &re, "aA");
+        assert_matches_regex_crate(p, &re, "1");
+    }
+
+    /// `(?i)abc` — multi-byte case-insensitive literal.
+    #[test]
+    fn test_ci_literal_multi() {
+        let p = "^(?i)abc$";
+        let re = build_regex_unchecked(p);
+        // positives: all case combos
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "ABC");
+        assert_matches_regex_crate(p, &re, "Abc");
+        assert_matches_regex_crate(p, &re, "aBc");
+        assert_matches_regex_crate(p, &re, "abC");
+        assert_matches_regex_crate(p, &re, "ABc");
+        assert_matches_regex_crate(p, &re, "AbC");
+        assert_matches_regex_crate(p, &re, "aBC");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "AB");
+        assert_matches_regex_crate(p, &re, "abcd");
+        assert_matches_regex_crate(p, &re, "ABCD");
+        assert_matches_regex_crate(p, &re, "xabc");
+        assert_matches_regex_crate(p, &re, "abd");
+        assert_matches_regex_crate(p, &re, "cba");
+        assert_matches_regex_crate(p, &re, "CBA");
+    }
+
+    /// `(?i)a+` — case-insensitive one-or-more.
+    #[test]
+    fn test_ci_one_plus() {
+        let p = "^(?i)a+$";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "A");
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "AA");
+        assert_matches_regex_crate(p, &re, "aAaA");
+        assert_matches_regex_crate(p, &re, "AaAa");
+        assert_matches_regex_crate(p, &re, "aaAAAAaa");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "ba");
+        assert_matches_regex_crate(p, &re, "aab");
+        assert_matches_regex_crate(p, &re, "bAA");
+    }
+
+    /// `(?i)a*` — case-insensitive zero-or-more.
+    #[test]
+    fn test_ci_star() {
+        let p = "^(?i)a*$";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "A");
+        assert_matches_regex_crate(p, &re, "aA");
+        assert_matches_regex_crate(p, &re, "AaA");
+        // negatives
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "Ba");
+    }
+
+    /// `(?i)a?` — case-insensitive optional.
+    #[test]
+    fn test_ci_question() {
+        let p = "^(?i)a?$";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "A");
+        // negatives
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "AA");
+        assert_matches_regex_crate(p, &re, "aA");
+    }
+
+    /// `(?i)a{2,4}` — case-insensitive counted repetition.
+    #[test]
+    fn test_ci_counted() {
+        let p = "^(?i)a{2,4}$";
+        let re = build_regex_unchecked(p);
+        // positives: lengths 2..4, mixed case
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "AA");
+        assert_matches_regex_crate(p, &re, "aA");
+        assert_matches_regex_crate(p, &re, "Aa");
+        assert_matches_regex_crate(p, &re, "aaa");
+        assert_matches_regex_crate(p, &re, "AAA");
+        assert_matches_regex_crate(p, &re, "aAa");
+        assert_matches_regex_crate(p, &re, "aaaa");
+        assert_matches_regex_crate(p, &re, "AAAA");
+        assert_matches_regex_crate(p, &re, "aAaA");
+        assert_matches_regex_crate(p, &re, "AaAa");
+        // negatives: too short, too long, wrong char
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "A");
+        assert_matches_regex_crate(p, &re, "aaaaa");
+        assert_matches_regex_crate(p, &re, "AAAAA");
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "bb");
+        assert_matches_regex_crate(p, &re, "aab");
+        assert_matches_regex_crate(p, &re, "baa");
+    }
+
+    /// `(?i)a{0,3}` — case-insensitive counted with min zero.
+    #[test]
+    fn test_ci_counted_min_zero() {
+        let p = "^(?i)a{0,3}$";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "A");
+        assert_matches_regex_crate(p, &re, "aA");
+        assert_matches_regex_crate(p, &re, "AaA");
+        assert_matches_regex_crate(p, &re, "aAa");
+        // negatives: too long, wrong char
+        assert_matches_regex_crate(p, &re, "aaaa");
+        assert_matches_regex_crate(p, &re, "AAAA");
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "aab");
+    }
+
+    /// `(?i)(a|bc)` — case-insensitive alternation.
+    #[test]
+    fn test_ci_alternation() {
+        let p = "^(?i)(a|bc)$";
+        let re = build_regex_unchecked(p);
+        // positives: all case combos
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "A");
+        assert_matches_regex_crate(p, &re, "bc");
+        assert_matches_regex_crate(p, &re, "BC");
+        assert_matches_regex_crate(p, &re, "Bc");
+        assert_matches_regex_crate(p, &re, "bC");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "B");
+        assert_matches_regex_crate(p, &re, "c");
+        assert_matches_regex_crate(p, &re, "C");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "cb");
+        assert_matches_regex_crate(p, &re, "CB");
+    }
+
+    /// `(?i)(abc|def|ghi)` — three-way case-insensitive alternation.
+    #[test]
+    fn test_ci_alternation_three_way() {
+        let p = "^(?i)(abc|def|ghi)$";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "ABC");
+        assert_matches_regex_crate(p, &re, "AbC");
+        assert_matches_regex_crate(p, &re, "def");
+        assert_matches_regex_crate(p, &re, "DEF");
+        assert_matches_regex_crate(p, &re, "DeF");
+        assert_matches_regex_crate(p, &re, "ghi");
+        assert_matches_regex_crate(p, &re, "GHI");
+        assert_matches_regex_crate(p, &re, "gHi");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "abcd");
+        assert_matches_regex_crate(p, &re, "abcdef");
+        assert_matches_regex_crate(p, &re, "xyz");
+        assert_matches_regex_crate(p, &re, "aef");
+        assert_matches_regex_crate(p, &re, "abi");
+    }
+
+    /// `(?i)hello world` — case-insensitive with non-letter bytes.
+    /// Space and digits are not affected by (?i).
+    #[test]
+    fn test_ci_mixed_letter_nonletter() {
+        let p = "^(?i)hello world$";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "hello world");
+        assert_matches_regex_crate(p, &re, "HELLO WORLD");
+        assert_matches_regex_crate(p, &re, "Hello World");
+        assert_matches_regex_crate(p, &re, "hElLo WoRlD");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "hello");
+        assert_matches_regex_crate(p, &re, "helloworld"); // missing space
+        assert_matches_regex_crate(p, &re, "hello  world"); // double space
+        assert_matches_regex_crate(p, &re, "hello world!");
+        assert_matches_regex_crate(p, &re, "xhello world");
+    }
+
+    /// `(?i)a1b2c` — case-insensitive with interleaved digits.
+    /// Digits are invariant under (?i) and must match exactly.
+    #[test]
+    fn test_ci_with_digits() {
+        let p = "^(?i)a1b2c$";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "a1b2c");
+        assert_matches_regex_crate(p, &re, "A1B2C");
+        assert_matches_regex_crate(p, &re, "A1b2C");
+        assert_matches_regex_crate(p, &re, "a1B2c");
+        // negatives: wrong digit, wrong letter, length
+        assert_matches_regex_crate(p, &re, "a2b2c");
+        assert_matches_regex_crate(p, &re, "a1b1c");
+        assert_matches_regex_crate(p, &re, "a1b2");
+        assert_matches_regex_crate(p, &re, "1b2c");
+        assert_matches_regex_crate(p, &re, "");
+    }
+
+    /// `(?i)[abc]` — case-insensitive character class (single letters).
+    /// Under (?i), [abc] should match a-c and A-C.
+    #[test]
+    fn test_ci_byte_class() {
+        let p = "^(?i)[abc]$";
+        let re = build_regex_unchecked(p);
+        // positives: lower and upper
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "A");
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "B");
+        assert_matches_regex_crate(p, &re, "c");
+        assert_matches_regex_crate(p, &re, "C");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "d");
+        assert_matches_regex_crate(p, &re, "D");
+        assert_matches_regex_crate(p, &re, "z");
+        assert_matches_regex_crate(p, &re, "Z");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "1");
+    }
+
+    /// `(?i)[a-z]` — case-insensitive full alpha range.
+    /// Under (?i), [a-z] already matches A-Z.
+    #[test]
+    fn test_ci_byte_class_full_alpha() {
+        let p = "^(?i)[a-z]$";
+        let re = build_regex_unchecked(p);
+        // positives: lower, upper, boundaries
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "A");
+        assert_matches_regex_crate(p, &re, "m");
+        assert_matches_regex_crate(p, &re, "M");
+        assert_matches_regex_crate(p, &re, "z");
+        assert_matches_regex_crate(p, &re, "Z");
+        // negatives: digits, specials, multi
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "0");
+        assert_matches_regex_crate(p, &re, "9");
+        assert_matches_regex_crate(p, &re, "!");
+        assert_matches_regex_crate(p, &re, "ab");
+    }
+
+    /// `(?i)[a-z0-9]` — case-insensitive class with digit range.
+    #[test]
+    fn test_ci_byte_class_alpha_digit() {
+        let p = "^(?i)[a-z0-9]+$";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "abc123");
+        assert_matches_regex_crate(p, &re, "ABC123");
+        assert_matches_regex_crate(p, &re, "AbC789");
+        assert_matches_regex_crate(p, &re, "0");
+        assert_matches_regex_crate(p, &re, "Z");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "!");
+        assert_matches_regex_crate(p, &re, "abc!");
+        assert_matches_regex_crate(p, &re, " ");
+    }
+
+    /// `(?i)foo` — case-insensitive word boundary.
+    #[test]
+    fn test_ci_word_boundary() {
+        let p = r"(?i)foo";
+        let re = build_regex_unchecked(p);
+        // positives: unanchored, various cases
+        assert_matches_regex_crate(p, &re, "foo");
+        assert_matches_regex_crate(p, &re, "FOO");
+        assert_matches_regex_crate(p, &re, "Foo");
+        assert_matches_regex_crate(p, &re, "fOo");
+        assert_matches_regex_crate(p, &re, " foo ");
+        assert_matches_regex_crate(p, &re, " FOO ");
+        assert_matches_regex_crate(p, &re, "!foo!");
+        assert_matches_regex_crate(p, &re, "x foo y");
+        assert_matches_regex_crate(p, &re, "x FOO y");
+        // negatives: embedded in longer word
+        assert_matches_regex_crate(p, &re, "foobar");
+        assert_matches_regex_crate(p, &re, "FOOBAR");
+        assert_matches_regex_crate(p, &re, "barfoo1");
+        assert_matches_regex_crate(p, &re, "afoo");
+        assert_matches_regex_crate(p, &re, "foob");
+        // negatives: not present at all
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "bar");
+        assert_matches_regex_crate(p, &re, "BAR");
+        assert_matches_regex_crate(p, &re, "fo");
+        assert_matches_regex_crate(p, &re, "oo");
+    }
+
+    /// Unanchored `(?i)select` — finds case-insensitive substring.
+    #[test]
+    fn test_ci_unanchored() {
+        let p = "(?i)select";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "SELECT");
+        assert_matches_regex_crate(p, &re, "select");
+        assert_matches_regex_crate(p, &re, "Select");
+        assert_matches_regex_crate(p, &re, "sElEcT");
+        assert_matches_regex_crate(p, &re, "xxx SELECT yyy");
+        assert_matches_regex_crate(p, &re, "beforeSELECTafter");
+        assert_matches_regex_crate(p, &re, "123select456");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "selec");
+        assert_matches_regex_crate(p, &re, "elect");
+        assert_matches_regex_crate(p, &re, "SELCT"); // missing E
+        assert_matches_regex_crate(p, &re, "slect"); // missing E
+    }
+
+    /// `(?i)(ab){2,3}` — case-insensitive counted group.
+    #[test]
+    fn test_ci_counted_group() {
+        let p = "^(?i)(ab){2,3}$";
+        let re = build_regex_unchecked(p);
+        // positives: 2 reps
+        assert_matches_regex_crate(p, &re, "abab");
+        assert_matches_regex_crate(p, &re, "ABAB");
+        assert_matches_regex_crate(p, &re, "AbAb");
+        assert_matches_regex_crate(p, &re, "aBaB");
+        // positives: 3 reps
+        assert_matches_regex_crate(p, &re, "ababab");
+        assert_matches_regex_crate(p, &re, "ABABAB");
+        assert_matches_regex_crate(p, &re, "AbAbAb");
+        assert_matches_regex_crate(p, &re, "aBAbab");
+        // negatives: 1 rep
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "AB");
+        // negatives: 4 reps
+        assert_matches_regex_crate(p, &re, "abababab");
+        assert_matches_regex_crate(p, &re, "ABABABAB");
+        // negatives: wrong, empty
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "ba");
+        assert_matches_regex_crate(p, &re, "aabb");
+    }
+
+    /// `(?i)a+b+c+` — case-insensitive catenation of one-or-more.
+    #[test]
+    fn test_ci_catenation_one_plus() {
+        let p = "^(?i)a+b+c+$";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "ABC");
+        assert_matches_regex_crate(p, &re, "aaBBcc");
+        assert_matches_regex_crate(p, &re, "AaaBbCcc");
+        assert_matches_regex_crate(p, &re, "aaaBBBccc");
+        // negatives: missing segment, wrong order
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "bc");
+        assert_matches_regex_crate(p, &re, "ac");
+        assert_matches_regex_crate(p, &re, "cba");
+        assert_matches_regex_crate(p, &re, "CBA");
+        assert_matches_regex_crate(p, &re, "abca"); // trailing a
+        assert_matches_regex_crate(p, &re, "aabbc1"); // trailing digit
+    }
+
+    /// `(?i).*foo.*` — case-insensitive with wildcards.
+    #[test]
+    fn test_ci_wildcard() {
+        let p = "^(?i).*foo.*$";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "foo");
+        assert_matches_regex_crate(p, &re, "FOO");
+        assert_matches_regex_crate(p, &re, "Foo");
+        assert_matches_regex_crate(p, &re, "xxxfooyyy");
+        assert_matches_regex_crate(p, &re, "XXXFOOYYY");
+        assert_matches_regex_crate(p, &re, "123Foo456");
+        assert_matches_regex_crate(p, &re, "foobar");
+        assert_matches_regex_crate(p, &re, "barFOO");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "fo");
+        assert_matches_regex_crate(p, &re, "oo");
+        assert_matches_regex_crate(p, &re, "bar");
+        assert_matches_regex_crate(p, &re, "fxoo");
+    }
+
+    /// `(?i)\d+[a-f]+` — case-insensitive hex-like: digits then hex letters.
+    /// \d is not affected by (?i), but [a-f] becomes [a-fA-F].
+    #[test]
+    fn test_ci_digit_then_hex() {
+        let p = r"^(?i)\d+[a-f]+$";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "1a");
+        assert_matches_regex_crate(p, &re, "1A");
+        assert_matches_regex_crate(p, &re, "99ff");
+        assert_matches_regex_crate(p, &re, "99FF");
+        assert_matches_regex_crate(p, &re, "123abcDEF");
+        assert_matches_regex_crate(p, &re, "0fF");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a1"); // wrong order
+        assert_matches_regex_crate(p, &re, "123"); // no hex
+        assert_matches_regex_crate(p, &re, "abc"); // no digits
+        assert_matches_regex_crate(p, &re, "12g"); // g is not hex
+        assert_matches_regex_crate(p, &re, "12G"); // G is not hex
+    }
+
+    /// `(?i)\w+` — case-insensitive word chars (\w is already CI-agnostic).
+    #[test]
+    fn test_ci_word_class() {
+        let p = r"^(?i)\w+$";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "ABC");
+        assert_matches_regex_crate(p, &re, "Hello123");
+        assert_matches_regex_crate(p, &re, "_underscore");
+        assert_matches_regex_crate(p, &re, "MiXeD_CaSe_123");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, " ");
+        assert_matches_regex_crate(p, &re, "hello world");
+        assert_matches_regex_crate(p, &re, "!");
+    }
+
+    /// WAF-like pattern: `(?i)\b(?:select|insert|update|delete)\b`.
+    /// Tests the kind of pattern common in SQL injection rules.
+    #[test]
+    fn test_ci_waf_sql_keywords() {
+        let p = r"(?i)(?:select|insert|update|delete)";
+        let re = build_regex_unchecked(p);
+        // positives: each keyword, various cases
+        assert_matches_regex_crate(p, &re, "SELECT");
+        assert_matches_regex_crate(p, &re, "select");
+        assert_matches_regex_crate(p, &re, "Select");
+        assert_matches_regex_crate(p, &re, "INSERT");
+        assert_matches_regex_crate(p, &re, "insert");
+        assert_matches_regex_crate(p, &re, "Insert");
+        assert_matches_regex_crate(p, &re, "UPDATE");
+        assert_matches_regex_crate(p, &re, "update");
+        assert_matches_regex_crate(p, &re, "UpDaTe");
+        assert_matches_regex_crate(p, &re, "DELETE");
+        assert_matches_regex_crate(p, &re, "delete");
+        assert_matches_regex_crate(p, &re, "DeLeTe");
+        // positives: embedded in sentence (unanchored with word boundary)
+        assert_matches_regex_crate(p, &re, "please SELECT * from");
+        assert_matches_regex_crate(p, &re, "do INSERT into");
+        assert_matches_regex_crate(p, &re, "run UPDATE set");
+        assert_matches_regex_crate(p, &re, "run delete from t");
+        // negatives: not a whole word
+        assert_matches_regex_crate(p, &re, "selected");
+        assert_matches_regex_crate(p, &re, "SELECTED");
+        assert_matches_regex_crate(p, &re, "inserts");
+        assert_matches_regex_crate(p, &re, "updated");
+        assert_matches_regex_crate(p, &re, "deletes");
+        assert_matches_regex_crate(p, &re, "preselect");
+        // negatives: not present
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "hello world");
+        assert_matches_regex_crate(p, &re, "CREATE TABLE");
+    }
+
+    /// `(?i)\bfoo\(\)` — case-insensitive function call pattern.
+    /// Parentheses are literal (escaped), only letters are CI.
+    #[test]
+    fn test_ci_function_call() {
+        let p = r"(?i)foo\(";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "foo(");
+        assert_matches_regex_crate(p, &re, "FOO(");
+        assert_matches_regex_crate(p, &re, "Foo(");
+        assert_matches_regex_crate(p, &re, "x foo(");
+        assert_matches_regex_crate(p, &re, "x FOO( y");
+        assert_matches_regex_crate(p, &re, "!Foo(1)");
+        // negatives: no paren, embedded in word, wrong
+        assert_matches_regex_crate(p, &re, "foo");
+        assert_matches_regex_crate(p, &re, "FOO");
+        assert_matches_regex_crate(p, &re, "barfoo("); // \b fails
+        assert_matches_regex_crate(p, &re, "afoo("); // \b fails
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "bar(");
+    }
+
+    /// `(?i)(a|b){1,2}` — case-insensitive counted alternation.
+    /// Exercises counter + ByteCI interaction.
+    #[test]
+    fn test_ci_counted_alternation() {
+        let p = "^(?i)(a|b){1,2}$";
+        let re = build_regex_unchecked(p);
+        // positives: 1 rep
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "A");
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "B");
+        // positives: 2 reps, all case combos
+        assert_matches_regex_crate(p, &re, "aa");
+        assert_matches_regex_crate(p, &re, "AA");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "AB");
+        assert_matches_regex_crate(p, &re, "aB");
+        assert_matches_regex_crate(p, &re, "Ab");
+        assert_matches_regex_crate(p, &re, "ba");
+        assert_matches_regex_crate(p, &re, "BA");
+        assert_matches_regex_crate(p, &re, "bA");
+        assert_matches_regex_crate(p, &re, "Ba");
+        assert_matches_regex_crate(p, &re, "bb");
+        assert_matches_regex_crate(p, &re, "BB");
+        // negatives: 0 reps, 3 reps, wrong char
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "aab");
+        assert_matches_regex_crate(p, &re, "AAB");
+        assert_matches_regex_crate(p, &re, "c");
+        assert_matches_regex_crate(p, &re, "C");
+    }
+
+    /// `(?i)x.y` — case-insensitive with wildcard in middle.
+    /// The dot is not affected by (?i); x and y are.
+    #[test]
+    fn test_ci_dot_in_middle() {
+        let p = "^(?i)x.y$";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "xay");
+        assert_matches_regex_crate(p, &re, "XAY");
+        assert_matches_regex_crate(p, &re, "xAy");
+        assert_matches_regex_crate(p, &re, "X1Y");
+        assert_matches_regex_crate(p, &re, "x y");
+        assert_matches_regex_crate(p, &re, "X!Y");
+        // negatives: wrong length, missing
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "xy");
+        assert_matches_regex_crate(p, &re, "XY");
+        assert_matches_regex_crate(p, &re, "xaby");
+        assert_matches_regex_crate(p, &re, "axy");
+    }
+
+    /// `(?i)[^a-z]` — case-insensitive negated class.
+    /// Under (?i), [^a-z] excludes both a-z AND A-Z.
+    #[test]
+    fn test_ci_negated_class() {
+        let p = "^(?i)[^a-z]$";
+        let re = build_regex_unchecked(p);
+        // positives: digits, specials
+        assert_matches_regex_crate(p, &re, "0");
+        assert_matches_regex_crate(p, &re, "9");
+        assert_matches_regex_crate(p, &re, "!");
+        assert_matches_regex_crate(p, &re, " ");
+        assert_matches_regex_crate(p, &re, "@");
+        // negatives: any letter
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "A");
+        assert_matches_regex_crate(p, &re, "z");
+        assert_matches_regex_crate(p, &re, "Z");
+        assert_matches_regex_crate(p, &re, "m");
+        assert_matches_regex_crate(p, &re, "M");
+        // negatives: multi-char, empty
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "12");
+    }
+
+    /// Verify ByteCI state is actually emitted for simple (?i) patterns.
+    #[test]
+    fn test_ci_byteci_state_emitted() {
+        let re = build_regex_unchecked("^(?i)a$");
+        let has_byteci = re.states.iter().any(|s| matches!(s, State::ByteCI { .. }));
+        assert!(has_byteci, "expected ByteCI state for (?i)a");
+
+        // Non-CI pattern should NOT have ByteCI
+        let re2 = build_regex_unchecked("^a$");
+        let has_byteci2 = re2.states.iter().any(|s| matches!(s, State::ByteCI { .. }));
+        assert!(!has_byteci2, "plain \"a\" should not use ByteCI");
+    }
+
+    /// Byte equivalence classes compress under (?i).
+    /// A simple (?i)abc should have fewer than 256 classes since
+    /// a/A, b/B, c/C are equivalent pairs.
+    #[test]
+    fn test_ci_byte_classes_compress() {
+        let re = build_regex_unchecked("^(?i)abc$");
+        assert!(
+            re.num_byte_classes < 256,
+            "expected byte class compression under (?i), got {} classes",
+            re.num_byte_classes
+        );
+        // Verify a and A map to the same class
+        assert_eq!(
+            re.byte_classes[b'a' as usize], re.byte_classes[b'A' as usize],
+            "a and A should be in the same byte equivalence class"
+        );
+        assert_eq!(
+            re.byte_classes[b'b' as usize], re.byte_classes[b'B' as usize],
+            "b and B should be in the same byte equivalence class"
+        );
+    }
+
+    /// `(?i).{2,4}` — case-insensitive counted wildcard.
+    /// (?i) does not change dot behavior, but tests interaction.
+    #[test]
+    fn test_ci_counted_wildcard() {
+        let p = "^(?i).{2,4}$";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "AB");
+        assert_matches_regex_crate(p, &re, "12");
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "abcd");
+        assert_matches_regex_crate(p, &re, "!@#");
+        // negatives: too short, too long
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "abcde");
+    }
+
+    /// `(?i)(foo|bar)+` — repeated CI alternation of multi-byte branches.
+    #[test]
+    fn test_ci_repeated_alternation() {
+        let p = "^(?i)(foo|bar)+$";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "foo");
+        assert_matches_regex_crate(p, &re, "FOO");
+        assert_matches_regex_crate(p, &re, "bar");
+        assert_matches_regex_crate(p, &re, "BAR");
+        assert_matches_regex_crate(p, &re, "foobar");
+        assert_matches_regex_crate(p, &re, "FOOBAR");
+        assert_matches_regex_crate(p, &re, "FooBar");
+        assert_matches_regex_crate(p, &re, "barfoo");
+        assert_matches_regex_crate(p, &re, "BARFOO");
+        assert_matches_regex_crate(p, &re, "foofoofoo");
+        assert_matches_regex_crate(p, &re, "FOOBARFOO");
+        assert_matches_regex_crate(p, &re, "barBARbar");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "fo");
+        assert_matches_regex_crate(p, &re, "ba");
+        assert_matches_regex_crate(p, &re, "baz");
+        assert_matches_regex_crate(p, &re, "foobaz");
+        assert_matches_regex_crate(p, &re, "foobarx");
+    }
+
+    /// `(?i)a\Wb` — CI letters around non-word char.
+    #[test]
+    fn test_ci_non_word_class() {
+        let p = r"^(?i)a\Wb$";
+        let re = build_regex_unchecked(p);
+        // positives: various non-word separators
+        assert_matches_regex_crate(p, &re, "a b");
+        assert_matches_regex_crate(p, &re, "A B");
+        assert_matches_regex_crate(p, &re, "a!b");
+        assert_matches_regex_crate(p, &re, "A!B");
+        assert_matches_regex_crate(p, &re, "a.B");
+        assert_matches_regex_crate(p, &re, "A-b");
+        // negatives: word char in middle, wrong letters
+        assert_matches_regex_crate(p, &re, "aab");
+        assert_matches_regex_crate(p, &re, "a1b");
+        assert_matches_regex_crate(p, &re, "a_b");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "c d");
+    }
+
+    // -----------------------------------------------------------------------
+    // Partial case-insensitive tests (mixed CI / case-sensitive regions)
+    // -----------------------------------------------------------------------
+
+    /// `a(?i:b)c` — only the middle letter is case-insensitive.
+    #[test]
+    fn test_partial_ci_middle() {
+        let p = "^a(?i:b)c$";
+        let re = build_regex_unchecked(p);
+        // positives: b/B in the middle, a and c must be lowercase
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "aBc");
+        // negatives: a or c changed case
+        assert_matches_regex_crate(p, &re, "Abc");
+        assert_matches_regex_crate(p, &re, "abC");
+        assert_matches_regex_crate(p, &re, "ABC");
+        assert_matches_regex_crate(p, &re, "aBC");
+        assert_matches_regex_crate(p, &re, "AbC");
+        // negatives: wrong char, length
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "ac");
+        assert_matches_regex_crate(p, &re, "axc");
+        assert_matches_regex_crate(p, &re, "abbc");
+        assert_matches_regex_crate(p, &re, "abcx");
+    }
+
+    /// `(?i:a)b` — first letter CI, second case-sensitive.
+    #[test]
+    fn test_partial_ci_prefix() {
+        let p = "^(?i:a)b$";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "Ab");
+        // negatives: b changed case
+        assert_matches_regex_crate(p, &re, "aB");
+        assert_matches_regex_crate(p, &re, "AB");
+        // negatives: wrong, length
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "cb");
+        assert_matches_regex_crate(p, &re, "abc");
+    }
+
+    /// `a(?i:b)` — first letter case-sensitive, second CI.
+    #[test]
+    fn test_partial_ci_suffix() {
+        let p = "^a(?i:b)$";
+        let re = build_regex_unchecked(p);
+        // positives
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "aB");
+        // negatives: a changed case
+        assert_matches_regex_crate(p, &re, "Ab");
+        assert_matches_regex_crate(p, &re, "AB");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "ac");
+    }
+
+    /// `(?i)a(?-i)b` — toggle on then off.
+    #[test]
+    fn test_partial_ci_toggle_on_off() {
+        let p = "^(?i)a(?-i)b$";
+        let re = build_regex_unchecked(p);
+        // positives: a is CI, b is not
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "Ab");
+        // negatives: b must be lowercase
+        assert_matches_regex_crate(p, &re, "aB");
+        assert_matches_regex_crate(p, &re, "AB");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "b");
+        assert_matches_regex_crate(p, &re, "abc");
+    }
+
+    /// `a(?-i)b(?i)c` — explicit toggle in a non-CI context (no-op, then on).
+    /// Default is case-sensitive, so (?-i) is redundant but legal.
+    #[test]
+    fn test_partial_ci_toggle_off_then_on() {
+        let p = "^a(?-i)b(?i)c$";
+        let re = build_regex_unchecked(p);
+        // a: case-sensitive (default), b: case-sensitive (explicit), c: CI
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "abC");
+        // negatives: a or b changed case
+        assert_matches_regex_crate(p, &re, "Abc");
+        assert_matches_regex_crate(p, &re, "aBc");
+        assert_matches_regex_crate(p, &re, "ABC");
+        assert_matches_regex_crate(p, &re, "ABc");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "abx");
+    }
+
+    /// `a(?i:b)+c` — CI quantified group between case-sensitive letters.
+    #[test]
+    fn test_partial_ci_quantified_group() {
+        let p = "^a(?i:b)+c$";
+        let re = build_regex_unchecked(p);
+        // positives: one or more b/B
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "aBc");
+        assert_matches_regex_crate(p, &re, "abbc");
+        assert_matches_regex_crate(p, &re, "aBBc");
+        assert_matches_regex_crate(p, &re, "aBbBc");
+        assert_matches_regex_crate(p, &re, "abBbc");
+        // negatives: a or c changed case
+        assert_matches_regex_crate(p, &re, "Abc");
+        assert_matches_regex_crate(p, &re, "abC");
+        assert_matches_regex_crate(p, &re, "ABC");
+        // negatives: zero b's, wrong char
+        assert_matches_regex_crate(p, &re, "ac");
+        assert_matches_regex_crate(p, &re, "axc");
+        assert_matches_regex_crate(p, &re, "");
+    }
+
+    /// `a(?i:b)*c` — CI zero-or-more group.
+    #[test]
+    fn test_partial_ci_star_group() {
+        let p = "^a(?i:b)*c$";
+        let re = build_regex_unchecked(p);
+        // positives: zero or more b/B
+        assert_matches_regex_crate(p, &re, "ac");
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "aBc");
+        assert_matches_regex_crate(p, &re, "aBBBc");
+        // negatives: a or c changed case
+        assert_matches_regex_crate(p, &re, "Ac");
+        assert_matches_regex_crate(p, &re, "aC");
+        assert_matches_regex_crate(p, &re, "ABc");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a");
+        assert_matches_regex_crate(p, &re, "axc");
+    }
+
+    /// `a(?i:b){2,4}c` — CI counted group.
+    #[test]
+    fn test_partial_ci_counted_group() {
+        let p = "^a(?i:b){2,4}c$";
+        let re = build_regex_unchecked(p);
+        // positives: 2..4 b/B
+        assert_matches_regex_crate(p, &re, "abbc");
+        assert_matches_regex_crate(p, &re, "aBBc");
+        assert_matches_regex_crate(p, &re, "aBbc");
+        assert_matches_regex_crate(p, &re, "abbbc");
+        assert_matches_regex_crate(p, &re, "aBBBc");
+        assert_matches_regex_crate(p, &re, "abBBc");
+        assert_matches_regex_crate(p, &re, "abbbbc");
+        assert_matches_regex_crate(p, &re, "aBBBBc");
+        // negatives: 1 or 5 b's
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "aBc");
+        assert_matches_regex_crate(p, &re, "abbbbbc");
+        assert_matches_regex_crate(p, &re, "aBBBBBc");
+        // negatives: a or c wrong case
+        assert_matches_regex_crate(p, &re, "ABBc");
+        assert_matches_regex_crate(p, &re, "abbC");
+        // negatives: wrong char
+        assert_matches_regex_crate(p, &re, "axxc");
+        assert_matches_regex_crate(p, &re, "");
+    }
+
+    /// `a(?i:bc)d` — CI group spanning multiple letters.
+    #[test]
+    fn test_partial_ci_multi_letter_group() {
+        let p = "^a(?i:bc)d$";
+        let re = build_regex_unchecked(p);
+        // positives: b and c are CI
+        assert_matches_regex_crate(p, &re, "abcd");
+        assert_matches_regex_crate(p, &re, "aBCd");
+        assert_matches_regex_crate(p, &re, "aBcd");
+        assert_matches_regex_crate(p, &re, "abCd");
+        // negatives: a or d changed case
+        assert_matches_regex_crate(p, &re, "Abcd");
+        assert_matches_regex_crate(p, &re, "abcD");
+        assert_matches_regex_crate(p, &re, "ABCD");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "abxd");
+        assert_matches_regex_crate(p, &re, "axcd");
+    }
+
+    /// `(?i:a)(?i:b)c` — two adjacent CI groups, then case-sensitive.
+    #[test]
+    fn test_partial_ci_adjacent_groups() {
+        let p = "^(?i:a)(?i:b)c$";
+        let re = build_regex_unchecked(p);
+        // positives: a and b CI, c must be lowercase
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "Abc");
+        assert_matches_regex_crate(p, &re, "aBc");
+        assert_matches_regex_crate(p, &re, "ABc");
+        // negatives: c changed case
+        assert_matches_regex_crate(p, &re, "abC");
+        assert_matches_regex_crate(p, &re, "ABC");
+        assert_matches_regex_crate(p, &re, "AbC");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "ab");
+        assert_matches_regex_crate(p, &re, "xbc");
+    }
+
+    /// `(?i:a|bc)d` — CI alternation followed by case-sensitive.
+    #[test]
+    fn test_partial_ci_alternation_then_literal() {
+        let p = "^(?i:a|bc)d$";
+        let re = build_regex_unchecked(p);
+        // positives: alternation is CI, d is not
+        assert_matches_regex_crate(p, &re, "ad");
+        assert_matches_regex_crate(p, &re, "Ad");
+        assert_matches_regex_crate(p, &re, "bcd");
+        assert_matches_regex_crate(p, &re, "BCd");
+        assert_matches_regex_crate(p, &re, "Bcd");
+        assert_matches_regex_crate(p, &re, "bCd");
+        // negatives: d must be lowercase
+        assert_matches_regex_crate(p, &re, "aD");
+        assert_matches_regex_crate(p, &re, "AD");
+        assert_matches_regex_crate(p, &re, "bcD");
+        assert_matches_regex_crate(p, &re, "BCD");
+        // negatives: wrong, partial
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "d");
+        assert_matches_regex_crate(p, &re, "bd");
+        assert_matches_regex_crate(p, &re, "cd");
+    }
+
+    /// `x(?i:foo)y` — case-sensitive x/y wrapping a CI word.
+    #[test]
+    fn test_partial_ci_word_in_middle() {
+        let p = "^x(?i:foo)y$";
+        let re = build_regex_unchecked(p);
+        // positives: foo is CI
+        assert_matches_regex_crate(p, &re, "xfooy");
+        assert_matches_regex_crate(p, &re, "xFOOy");
+        assert_matches_regex_crate(p, &re, "xFooy");
+        assert_matches_regex_crate(p, &re, "xfOoy");
+        assert_matches_regex_crate(p, &re, "xfoOy");
+        // negatives: x or y changed case
+        assert_matches_regex_crate(p, &re, "Xfooy");
+        assert_matches_regex_crate(p, &re, "xfooY");
+        assert_matches_regex_crate(p, &re, "XFOOY");
+        // negatives: wrong inner word
+        assert_matches_regex_crate(p, &re, "xbary");
+        assert_matches_regex_crate(p, &re, "xfoy");
+        assert_matches_regex_crate(p, &re, "");
+    }
+
+    /// `(?i)abc(?-i)def(?i)ghi` — toggle on/off/on across three segments.
+    #[test]
+    fn test_partial_ci_three_segments() {
+        let p = "^(?i)abc(?-i)def(?i)ghi$";
+        let re = build_regex_unchecked(p);
+        // positives: abc CI, def exact, ghi CI
+        assert_matches_regex_crate(p, &re, "abcdefghi");
+        assert_matches_regex_crate(p, &re, "ABCdefGHI");
+        assert_matches_regex_crate(p, &re, "AbcdefGhi");
+        assert_matches_regex_crate(p, &re, "aBcdefgHi");
+        assert_matches_regex_crate(p, &re, "ABCdefghi");
+        assert_matches_regex_crate(p, &re, "abcdefGHI");
+        // negatives: middle segment must be exact lowercase
+        assert_matches_regex_crate(p, &re, "abcDEFghi");
+        assert_matches_regex_crate(p, &re, "ABCDEFghi");
+        assert_matches_regex_crate(p, &re, "abcDefghi");
+        assert_matches_regex_crate(p, &re, "abcdEfghi");
+        assert_matches_regex_crate(p, &re, "abcdeF ghi");
+        assert_matches_regex_crate(p, &re, "ABCDEFGHI");
+        // negatives: length, wrong
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "abcdef");
+        assert_matches_regex_crate(p, &re, "defghi");
+    }
+
+    /// `(?i:select)\s+\w+` — CI keyword then case-sensitive rest (WAF-like).
+    #[test]
+    fn test_partial_ci_waf_keyword_prefix() {
+        let p = r"(?i:select)\s+\w+";
+        let re = build_regex_unchecked(p);
+        // positives: SELECT is CI, rest must match as-is
+        assert_matches_regex_crate(p, &re, "select foo");
+        assert_matches_regex_crate(p, &re, "SELECT foo");
+        assert_matches_regex_crate(p, &re, "Select foo");
+        assert_matches_regex_crate(p, &re, "sElEcT bar");
+        assert_matches_regex_crate(p, &re, "xxx SELECT users yyy");
+        assert_matches_regex_crate(p, &re, "SELECT  a");
+        // negatives: no space, no word after
+        assert_matches_regex_crate(p, &re, "selectfoo");
+        assert_matches_regex_crate(p, &re, "SELECT");
+        assert_matches_regex_crate(p, &re, "SELECT ");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "insert foo");
+    }
+
+    /// `a(?i:b)?c` — CI optional group.
+    #[test]
+    fn test_partial_ci_optional_group() {
+        let p = "^a(?i:b)?c$";
+        let re = build_regex_unchecked(p);
+        // positives: with or without b
+        assert_matches_regex_crate(p, &re, "ac");
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "aBc");
+        // negatives: a or c wrong case
+        assert_matches_regex_crate(p, &re, "Ac");
+        assert_matches_regex_crate(p, &re, "aC");
+        assert_matches_regex_crate(p, &re, "Abc");
+        assert_matches_regex_crate(p, &re, "abC");
+        // negatives: wrong char
+        assert_matches_regex_crate(p, &re, "axc");
+        assert_matches_regex_crate(p, &re, "abbc");
+        assert_matches_regex_crate(p, &re, "");
+    }
+
+    /// Unanchored `x(?i:key)=` — CI key name in a key=value pattern.
+    #[test]
+    fn test_partial_ci_unanchored_key_value() {
+        let p = r"x(?i:key)=";
+        let re = build_regex_unchecked(p);
+        // positives: x must be lowercase, key is CI, = is literal
+        assert_matches_regex_crate(p, &re, "xkey=val");
+        assert_matches_regex_crate(p, &re, "xKEY=val");
+        assert_matches_regex_crate(p, &re, "xKey=123");
+        assert_matches_regex_crate(p, &re, "pre xkEy=v post");
+        // negatives: x or = wrong
+        assert_matches_regex_crate(p, &re, "Xkey=val");
+        assert_matches_regex_crate(p, &re, "xkey:val");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "xkey");
+        assert_matches_regex_crate(p, &re, "ykey=val");
+    }
+
+    /// `(?i:ab){2,3}c` — CI counted group then case-sensitive tail.
+    #[test]
+    fn test_partial_ci_counted_group_then_literal() {
+        let p = "^(?i:ab){2,3}c$";
+        let re = build_regex_unchecked(p);
+        // positives: 2 reps
+        assert_matches_regex_crate(p, &re, "ababc");
+        assert_matches_regex_crate(p, &re, "ABABc");
+        assert_matches_regex_crate(p, &re, "AbAbc");
+        assert_matches_regex_crate(p, &re, "aBaBc");
+        // positives: 3 reps
+        assert_matches_regex_crate(p, &re, "abababc");
+        assert_matches_regex_crate(p, &re, "ABABABc");
+        assert_matches_regex_crate(p, &re, "AbAbAbc");
+        // negatives: c must be lowercase
+        assert_matches_regex_crate(p, &re, "ababC");
+        assert_matches_regex_crate(p, &re, "ABABC");
+        // negatives: 1 rep, 4 reps
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "ababababc");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "xyzc");
+    }
+
+    /// `a(?i:[b-d])e` — CI character class in a partial-CI context.
+    #[test]
+    fn test_partial_ci_class_in_group() {
+        let p = "^a(?i:[b-d])e$";
+        let re = build_regex_unchecked(p);
+        // positives: [b-d] becomes [b-dB-D] under (?i)
+        assert_matches_regex_crate(p, &re, "abe");
+        assert_matches_regex_crate(p, &re, "aBe");
+        assert_matches_regex_crate(p, &re, "ace");
+        assert_matches_regex_crate(p, &re, "aCe");
+        assert_matches_regex_crate(p, &re, "ade");
+        assert_matches_regex_crate(p, &re, "aDe");
+        // negatives: a or e changed case
+        assert_matches_regex_crate(p, &re, "Abe");
+        assert_matches_regex_crate(p, &re, "abE");
+        assert_matches_regex_crate(p, &re, "ABE");
+        // negatives: char outside class
+        assert_matches_regex_crate(p, &re, "aee");
+        assert_matches_regex_crate(p, &re, "axe");
+        assert_matches_regex_crate(p, &re, "aae");
+        assert_matches_regex_crate(p, &re, "");
+    }
+
+    /// `(?i)a(?-i)b(?i)c(?-i)d` — alternating CI on/off four times.
+    #[test]
+    fn test_partial_ci_four_toggles() {
+        let p = "^(?i)a(?-i)b(?i)c(?-i)d$";
+        let re = build_regex_unchecked(p);
+        // a: CI, b: exact, c: CI, d: exact
+        assert_matches_regex_crate(p, &re, "abcd");
+        assert_matches_regex_crate(p, &re, "AbCd");
+        assert_matches_regex_crate(p, &re, "Abcd");
+        assert_matches_regex_crate(p, &re, "abCd");
+        // negatives: b or d changed case
+        assert_matches_regex_crate(p, &re, "aBcd");
+        assert_matches_regex_crate(p, &re, "abcD");
+        assert_matches_regex_crate(p, &re, "aBcD");
+        assert_matches_regex_crate(p, &re, "ABCD");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "abc");
+        assert_matches_regex_crate(p, &re, "abcde");
+    }
+
+    /// `(?i:a)1(?i:b)2` — CI letters separated by case-invariant digits.
+    #[test]
+    fn test_partial_ci_interleaved_digits() {
+        let p = "^(?i:a)1(?i:b)2$";
+        let re = build_regex_unchecked(p);
+        // positives: a and b are CI, digits must be exact
+        assert_matches_regex_crate(p, &re, "a1b2");
+        assert_matches_regex_crate(p, &re, "A1b2");
+        assert_matches_regex_crate(p, &re, "a1B2");
+        assert_matches_regex_crate(p, &re, "A1B2");
+        // negatives: wrong digit
+        assert_matches_regex_crate(p, &re, "a2b2");
+        assert_matches_regex_crate(p, &re, "a1b1");
+        assert_matches_regex_crate(p, &re, "A2B2");
+        // negatives
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "a1b");
+        assert_matches_regex_crate(p, &re, "1b2");
+    }
+
+    /// Verify structural: partial CI emits ByteCI only for CI letters.
+    #[test]
+    fn test_partial_ci_byteci_selective() {
+        // a(?i:b)c ��� only b should be ByteCI, a and c should be Byte
+        let re = build_regex_unchecked("^a(?i:b)c$");
+        let byte_count = re
+            .states
+            .iter()
+            .filter(|s| matches!(s, State::Byte { .. }))
+            .count();
+        let byteci_count = re
+            .states
+            .iter()
+            .filter(|s| matches!(s, State::ByteCI { .. }))
+            .count();
+        assert_eq!(byte_count, 2, "a and c should be plain Byte states");
+        assert_eq!(byteci_count, 1, "only b should be ByteCI");
+    }
+
+    /// `(?i)abc(?-i)def` — verify byte equivalence classes differ by region.
+    /// Letters in the CI region should share classes with their upper counterparts;
+    /// letters in the non-CI region should not.
+    #[test]
+    fn test_partial_ci_byte_classes_selective() {
+        let re = build_regex_unchecked("^(?i)abc(?-i)def$");
+        // In the CI region: a/A should share a class
+        assert_eq!(
+            re.byte_classes[b'a' as usize], re.byte_classes[b'A' as usize],
+            "a and A should be in the same byte equivalence class (CI region)"
+        );
+        // In the non-CI region: d/D should be in different classes because
+        // d matches a consuming state that D does not.
+        assert_ne!(
+            re.byte_classes[b'd' as usize], re.byte_classes[b'D' as usize],
+            "d and D should be in different byte equivalence classes (non-CI region)"
+        );
     }
 }
