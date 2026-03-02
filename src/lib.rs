@@ -245,7 +245,7 @@ pub(crate) enum AssertKind {
 
 /// Result of evaluating an assertion at a given position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AssertEval {
+pub(crate) enum AssertEval {
     /// Assertion is satisfied — follow the `out` transition.
     Pass,
     /// Assertion is not satisfied — skip.
@@ -258,7 +258,7 @@ enum AssertEval {
 
 /// Returns `true` if `b` is an ASCII word byte: `[0-9A-Za-z_]`.
 #[inline]
-fn is_word_byte(b: u8) -> bool {
+pub(crate) fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
@@ -769,10 +769,33 @@ impl Regex {
             }
         }
 
+        // -- Deferred assertions --
+        let n_deferred = self
+            .states
+            .iter()
+            .filter(|s| {
+                matches!(s,
+                    State::Assert { kind, .. } if matches!(kind,
+                        AssertKind::WordAscii
+                        | AssertKind::WordAsciiNegate
+                        | AssertKind::EndLF
+                    )
+                )
+            })
+            .count();
+        if n_deferred > 0 {
+            writeln!(out).unwrap();
+            writeln!(
+                out,
+                "Deferred assertions: {n_deferred} (resolved at DFA transition time)"
+            )
+            .unwrap();
+        }
+
         // -- Execution tier --
         writeln!(out).unwrap();
         let tier = if self.dfa_eligible {
-            "Tier 1: Lazy DFA (flat table, no counters)"
+            "Tier 1: Lazy DFA (flat table, no counters, deferred assertions)"
         } else if self.counting_dfa_eligible {
             "Tier 3: Counting DFA (flat table + counter programs)"
         } else {
@@ -1280,7 +1303,20 @@ impl RegexBuilder {
 
         // DFA eligibility: no counters and no deferred-assertion types.
         let has_counters = !self.counters.is_empty();
-        let has_complex_assert = self.states.iter().any(|s| {
+        // Tier 1 DFA handles deferred assertions (WordAscii, WordAsciiNegate,
+        // EndLF) natively.  Only StartCRLF and EndCRLF remain ineligible.
+        let has_crlf_assert = self.states.iter().any(|s| {
+            matches!(s,
+                State::Assert { kind, .. } if matches!(kind,
+                    AssertKind::EndCRLF
+                    | AssertKind::StartCRLF
+                )
+            )
+        });
+        let dfa_eligible = !has_counters && !has_crlf_assert;
+
+        // Tier 3 counting DFA does NOT handle deferred assertions yet.
+        let has_deferred_assert = self.states.iter().any(|s| {
             matches!(s,
                 State::Assert { kind, .. } if matches!(kind,
                     AssertKind::EndLF
@@ -1291,7 +1327,6 @@ impl RegexBuilder {
                 )
             )
         });
-        let dfa_eligible = !has_counters && !has_complex_assert;
 
         // The counting DFA cannot handle zero-width counter bodies
         // (where the body can match empty, creating epsilon-only loops
@@ -1338,7 +1373,7 @@ impl RegexBuilder {
             })
         };
         let counting_dfa_eligible =
-            has_counters && !has_complex_assert && !has_zero_width_counter_body;
+            has_counters && !has_deferred_assert && !has_zero_width_counter_body;
 
         Ok(Regex {
             id: NEXT_REGEX_ID.fetch_add(1, Ordering::Relaxed),
@@ -5046,6 +5081,193 @@ mod tests {
         assert_matches_regex_crate(p, &re, ".test.");
         assert_matches_regex_crate(p, &re, "\ttest\n");
         assert_matches_regex_crate(p, &re, "/test/");
+    }
+
+    // ===================================================================
+    // Deferred assertion DFA tests: verify , \B, EndLF work via Tier 1 DFA
+    // ===================================================================
+
+    /// Verify that patterns with  are DFA-eligible (no counters).
+    #[test]
+    fn test_word_boundary_dfa_eligible() {
+        let re = build_regex_unchecked(r"foo");
+        assert!(re.dfa_eligible, "\\bfoo\\b should be DFA-eligible");
+        assert!(!re.counting_dfa_eligible);
+    }
+
+    /// Verify that patterns with \B are DFA-eligible.
+    #[test]
+    fn test_non_word_boundary_dfa_eligible() {
+        let re = build_regex_unchecked(r"\Bfoo\B");
+        assert!(re.dfa_eligible, "\\Bfoo\\B should be DFA-eligible");
+    }
+
+    /// Verify that patterns with EndLF (multiline $) are DFA-eligible.
+    #[test]
+    fn test_endlf_dfa_eligible() {
+        let re = build_regex_unchecked(r"(?m)foo$");
+        assert!(re.dfa_eligible, "(?m)foo$ should be DFA-eligible");
+    }
+
+    ///  at start of input — word follows non-word (input boundary).
+    #[test]
+    fn test_word_boundary_dfa_at_start() {
+        let p = r"foo";
+        let re = build_regex_unchecked(p);
+        assert!(re.dfa_eligible);
+        assert_matches_regex_crate(p, &re, "foo");
+        assert_matches_regex_crate(p, &re, "foobar");
+        assert_matches_regex_crate(p, &re, "afoo");
+        assert_matches_regex_crate(p, &re, " foo");
+    }
+
+    ///  at end of input — word at end.
+    #[test]
+    fn test_word_boundary_dfa_at_end() {
+        let p = r"foo";
+        let re = build_regex_unchecked(p);
+        assert!(re.dfa_eligible);
+        assert_matches_regex_crate(p, &re, "foo");
+        assert_matches_regex_crate(p, &re, "foo ");
+        assert_matches_regex_crate(p, &re, "foo.");
+        assert_matches_regex_crate(p, &re, "foob");
+        assert_matches_regex_crate(p, &re, "barfoo");
+    }
+
+    ///  with various transitions: word-to-nonword and nonword-to-word.
+    #[test]
+    fn test_word_boundary_dfa_transitions() {
+        let p = r"\w+";
+        let re = build_regex_unchecked(p);
+        assert!(re.dfa_eligible);
+        assert_matches_regex_crate(p, &re, "hello");
+        assert_matches_regex_crate(p, &re, "hello world");
+        assert_matches_regex_crate(p, &re, "  hello  ");
+        assert_matches_regex_crate(p, &re, "");
+        assert_matches_regex_crate(p, &re, "   ");
+        assert_matches_regex_crate(p, &re, "a");
+    }
+
+    /// \B (non-boundary) DFA test — match inside words only.
+    #[test]
+    fn test_non_word_boundary_dfa_inside_word() {
+        let p = r"\Boo\B";
+        let re = build_regex_unchecked(p);
+        assert!(re.dfa_eligible);
+        assert_matches_regex_crate(p, &re, "foobar");
+        assert_matches_regex_crate(p, &re, "oo");
+        assert_matches_regex_crate(p, &re, " oo ");
+        assert_matches_regex_crate(p, &re, "xoox");
+    }
+
+    /// EndLF (multiline $) DFA test — match before newline.
+    #[test]
+    fn test_endlf_dfa_before_newline() {
+        let p = r"(?m)foo$";
+        let re = build_regex_unchecked(p);
+        assert!(re.dfa_eligible);
+        assert_matches_regex_crate(p, &re, "foo");
+        assert_matches_regex_crate(
+            p, &re, "foo
+bar",
+        );
+        assert_matches_regex_crate(
+            p, &re, "bar
+foo",
+        );
+        assert_matches_regex_crate(
+            p,
+            &re,
+            "bar
+foo
+baz",
+        );
+        assert_matches_regex_crate(p, &re, "foobar");
+        assert_matches_regex_crate(
+            p, &re, "barfoo
+",
+        );
+    }
+
+    /// EndLF at end-of-input (no trailing newline).
+    #[test]
+    fn test_endlf_dfa_at_eof() {
+        let p = r"(?m)bar$";
+        let re = build_regex_unchecked(p);
+        assert!(re.dfa_eligible);
+        assert_matches_regex_crate(p, &re, "bar");
+        assert_matches_regex_crate(p, &re, "foobar");
+        assert_matches_regex_crate(
+            p, &re, "foo
+bar",
+        );
+        assert_matches_regex_crate(
+            p, &re, "bar
+foo",
+        );
+    }
+
+    /// Mixed deferred assertions in the same pattern.
+    #[test]
+    fn test_word_boundary_with_endlf() {
+        let p = r"(?m)foo$";
+        let re = build_regex_unchecked(p);
+        assert!(re.dfa_eligible);
+        assert_matches_regex_crate(p, &re, "foo");
+        assert_matches_regex_crate(
+            p, &re, "foo
+bar",
+        );
+        assert_matches_regex_crate(
+            p, &re, "bar
+foo",
+        );
+        assert_matches_regex_crate(
+            p,
+            &re,
+            "bar
+foo
+baz",
+        );
+        assert_matches_regex_crate(p, &re, "barfoo");
+        assert_matches_regex_crate(p, &re, "foobar");
+    }
+
+    /// Chunk-boundary test: deferred assertions across chunk boundaries.
+    #[test]
+    fn test_word_boundary_dfa_chunk_boundary() {
+        let p = r"\btest\b";
+        let re = build_regex_unchecked(p);
+        assert!(re.dfa_eligible);
+        let mut mem = MatcherMemory::default();
+        // Feed "hel" then "lo test bye"
+        let mut m = mem.matcher(&re);
+        m.chunk(b"hel");
+        m.chunk(b"lo test bye");
+        assert!(m.finish());
+        // Feed "test" alone
+        let mut m = mem.matcher(&re);
+        m.chunk(b"test");
+        assert!(m.finish());
+        // Feed "tes" then "ting" - no boundary at end.
+        let mut m = mem.matcher(&re);
+        m.chunk(b"tes");
+        m.chunk(b"ting");
+        assert!(!m.finish());
+    }
+
+    /// SQL-injection-style alternation with  (simplified).
+    #[test]
+    fn test_word_boundary_dfa_alternation() {
+        let p = r"(?:select|insert|update|delete)";
+        let re = build_regex_unchecked(p);
+        assert!(re.dfa_eligible);
+        assert_matches_regex_crate(p, &re, "select");
+        assert_matches_regex_crate(p, &re, "run select now");
+        assert_matches_regex_crate(p, &re, "selected");
+        assert_matches_regex_crate(p, &re, "preselect");
+        assert_matches_regex_crate(p, &re, "delete from");
+        assert_matches_regex_crate(p, &re, "undelete");
     }
 
     // ===================================================================
