@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::{AssertEval, AssertKind, Regex, State, StateIdx, byte_match_ci, is_word_byte};
+use crate::{
+    AssertEval, AssertKind, Prefilter, Regex, State, StateIdx, byte_match_ci, is_word_byte,
+};
 
 use super::{DfaState, DfaStateId};
 
@@ -562,6 +564,7 @@ pub struct DfaMatcher<'a> {
     regex: &'a Regex,
     current: DfaStateId,
     ever_matched: bool,
+    prefilter: Prefilter,
 }
 
 impl<'a> DfaMatcher<'a> {
@@ -571,6 +574,7 @@ impl<'a> DfaMatcher<'a> {
             ever_matched: cache.start_is_match,
             cache,
             regex,
+            prefilter: regex.prefilter,
         }
     }
 
@@ -582,7 +586,40 @@ impl<'a> DfaMatcher<'a> {
         }
     }
 
+    #[inline(always)]
     pub fn chunk(&mut self, input: &[u8]) {
+        if self.ever_matched {
+            return;
+        }
+
+        let input = match self.prefilter {
+            Prefilter::None => input,
+            Prefilter::Memchr1(b) => {
+                if let Some(idx) = memchr::memchr(b, input) {
+                    self.prefilter = Prefilter::None;
+                    &input[idx..]
+                } else {
+                    return;
+                }
+            }
+            Prefilter::Memchr2(b1, b2) => {
+                if let Some(idx) = memchr::memchr2(b1, b2, input) {
+                    self.prefilter = Prefilter::None;
+                    &input[idx..]
+                } else {
+                    return;
+                }
+            }
+            Prefilter::Memchr3(b1, b2, b3) => {
+                if let Some(idx) = memchr::memchr3(b1, b2, b3, input) {
+                    self.prefilter = Prefilter::None;
+                    &input[idx..]
+                } else {
+                    return;
+                }
+            }
+        };
+
         for &b in input {
             if self.ever_matched {
                 return;

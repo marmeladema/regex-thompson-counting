@@ -11,11 +11,11 @@ path = "src/main.rs"
 [dev-dependencies]
 gungraun = "0.17.2"
 itertools = "0.10"
-memchr = "2.8.0"
 regex = "1"
 
 [dependencies]
 indexmap = "2"
+memchr = "2.8.0"
 regex-syntax = "0.8.9"
 
 [profile.release]
