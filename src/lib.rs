@@ -721,9 +721,24 @@ pub struct Regex {
     /// `state * num_byte_classes + byte_classes[byte]` instead of
     /// `state * 256 + byte`, giving a ~6-7× compression for typical
     /// case-insensitive patterns.
+    ///
+    /// **Tradeoff**: the indirection adds ~2-3 instructions per byte in the
+    /// DFA hot loop (an extra array load + a real multiply instead of a
+    /// shift for the slot computation).  For simple patterns with few DFA
+    /// states the full stride=256 table fits comfortably in L1/L2 cache,
+    /// so the compression is not needed and the indirection is pure
+    /// overhead.  For complex patterns (many NFA states → many DFA states)
+    /// the table compression keeps the working set small enough to stay in
+    /// cache.
+    ///
+    /// We therefore only enable byte-class compression when the NFA has more
+    /// than [`BYTE_CLASSES_NFA_THRESHOLD`] states.  Below that threshold,
+    /// `byte_classes` is the identity mapping and `num_byte_classes` is 256.
     pub(crate) byte_classes: [u8; 256],
     /// Number of distinct byte equivalence classes (the "stride" of
-    /// each DFA state row in the flat transition table).
+    /// each DFA state row in the flat transition table).  Either 256
+    /// (identity, no compression) or the actual class count when byte-class
+    /// compression is enabled.
     pub(crate) num_byte_classes: usize,
     /// Prefilter for skipping non-starting bytes in the DFA hot loop.
     pub(crate) prefilter: Prefilter,
@@ -864,12 +879,16 @@ impl Regex {
 
         // -- Byte equivalence classes --
         writeln!(out).unwrap();
-        writeln!(
-            out,
-            "Byte equivalence classes: {} (DFA stride, vs 256 raw)",
-            self.num_byte_classes
-        )
-        .unwrap();
+        if self.num_byte_classes < 256 {
+            writeln!(
+                out,
+                "Byte equivalence classes: {} (DFA stride, vs 256 raw)",
+                self.num_byte_classes
+            )
+            .unwrap();
+        } else {
+            writeln!(out, "Byte equivalence classes: disabled (stride=256)").unwrap();
+        }
 
         // -- Execution tier --
         writeln!(out).unwrap();
@@ -1127,6 +1146,13 @@ impl RegexBuilder {
     /// they produce the same match outcome (both match to the same target,
     /// or both fail).  Additionally, when deferred assertions are present,
     /// bytes with different word-ness are always in different classes.
+    ///
+    /// The purpose is to reduce the DFA transition table stride from 256 to
+    /// the number of classes, shrinking each state row and allowing more
+    /// states to fit in cache.  This does **not** speed up per-byte
+    /// transitions — it adds ~2-3 instructions of indirection overhead per
+    /// byte.  The win comes from keeping the table small enough to stay in
+    /// L1/L2 cache when the DFA has many states.
     ///
     /// Returns `(mapping, num_classes)` where `mapping[byte]` is the class
     /// index for that byte and `num_classes` is the total count.
@@ -1543,6 +1569,13 @@ impl RegexBuilder {
         }
     }
 
+    /// Minimum NFA state count to enable byte equivalence class compression.
+    ///
+    /// Below this threshold the DFA uses stride=256 (identity mapping) to
+    /// avoid the ~2-3 insn/byte indirection overhead.  Above it, byte
+    /// classes compress the transition table so more DFA states fit in cache.
+    const BYTE_CLASSES_NFA_THRESHOLD: usize = 128;
+
     /// Compile a `regex-syntax` HIR into a ready-to-match [`Regex`].
     pub fn build(&mut self, hir: &Hir) -> Result<Regex, Error> {
         self.states.clear();
@@ -1663,12 +1696,22 @@ impl RegexBuilder {
                 )
             )
         });
-        let (byte_classes, num_byte_classes) = Self::compute_byte_classes(
-            self.states.as_slice(),
-            &classes_slice,
-            &byte_tables_slice,
-            has_any_deferred,
-        );
+        let (byte_classes, num_byte_classes) =
+            if self.states.len() >= Self::BYTE_CLASSES_NFA_THRESHOLD {
+                Self::compute_byte_classes(
+                    self.states.as_slice(),
+                    &classes_slice,
+                    &byte_tables_slice,
+                    has_any_deferred,
+                )
+            } else {
+                // Identity mapping: stride=256, no indirection overhead.
+                let mut identity = [0u8; 256];
+                for (i, slot) in identity.iter_mut().enumerate() {
+                    *slot = i as u8;
+                }
+                (identity, 256)
+            };
 
         let prefilter = Self::compute_prefilter(
             &start_closure,
@@ -6924,24 +6967,40 @@ baz",
         assert!(!has_byteci2, "plain \"a\" should not use ByteCI");
     }
 
-    /// Byte equivalence classes compress under (?i).
-    /// A simple (?i)abc should have fewer than 256 classes since
-    /// a/A, b/B, c/C are equivalent pairs.
+    /// Byte equivalence classes are only enabled for complex patterns
+    /// (>= BYTE_CLASSES_NFA_THRESHOLD NFA states).  A simple (?i)abc
+    /// stays at stride=256 to avoid per-byte indirection overhead.
+    /// A sufficiently large CI pattern gets compression.
     #[test]
     fn test_ci_byte_classes_compress() {
-        let re = build_regex_unchecked("^(?i)abc$");
-        assert!(
-            re.num_byte_classes < 256,
-            "expected byte class compression under (?i), got {} classes",
-            re.num_byte_classes
-        );
-        // Verify a and A map to the same class
+        // Small pattern: should use identity mapping (stride=256).
+        let small = build_regex_unchecked("^(?i)abc$");
         assert_eq!(
-            re.byte_classes[b'a' as usize], re.byte_classes[b'A' as usize],
+            small.num_byte_classes, 256,
+            "small pattern should use identity mapping, got {} classes",
+            small.num_byte_classes
+        );
+
+        // Large pattern: use a WAF-style keyword alternation that exceeds
+        // the NFA threshold.  This should get byte class compression.
+        let large = build_regex_unchecked(
+            "(?i)\\b(?:select|insert|update|delete|drop|alter|create|grant|\
+             revoke|union|where|having|order|group|limit|offset|from|into|\
+             table|index|exec|execute|declare|set|cast|convert|char|concat|\
+             substring|ascii|benchmark|sleep|waitfor|delay|load_file|outfile)\\b",
+        );
+        assert!(
+            large.num_byte_classes < 256,
+            "large pattern should use byte class compression, got {} classes",
+            large.num_byte_classes
+        );
+        // Verify a and A map to the same class in the compressed pattern
+        assert_eq!(
+            large.byte_classes[b'a' as usize], large.byte_classes[b'A' as usize],
             "a and A should be in the same byte equivalence class"
         );
         assert_eq!(
-            re.byte_classes[b'b' as usize], re.byte_classes[b'B' as usize],
+            large.byte_classes[b'b' as usize], large.byte_classes[b'B' as usize],
             "b and B should be in the same byte equivalence class"
         );
     }
@@ -7461,9 +7520,23 @@ baz",
     /// `(?i)abc(?-i)def` — verify byte equivalence classes differ by region.
     /// Letters in the CI region should share classes with their upper counterparts;
     /// letters in the non-CI region should not.
+    ///
+    /// Uses a large enough pattern to trigger byte class compression, by
+    /// padding with additional alternations.
     #[test]
     fn test_partial_ci_byte_classes_selective() {
-        let re = build_regex_unchecked("^(?i)abc(?-i)def$");
+        // Build a pattern large enough to exceed BYTE_CLASSES_NFA_THRESHOLD
+        // while preserving the CI/non-CI split we want to test.
+        let re = build_regex_unchecked(
+            "(?i)(?:abc|ghi|jkl|mno|pqr|stu|vwx|yz0|123|456|789|\
+             aaa|bbb|ccc|ddd|eee|fff|ggg|hhh|iii|jjj|kkk|lll|mmm|\
+             nnn|ooo|ppp|qqq|rrr|sss|ttt|uuu|vvv|www|xxx|yyy|zzz)(?-i)def",
+        );
+        assert!(
+            re.num_byte_classes < 256,
+            "pattern should use byte class compression, got {} classes",
+            re.num_byte_classes
+        );
         // In the CI region: a/A should share a class
         assert_eq!(
             re.byte_classes[b'a' as usize], re.byte_classes[b'A' as usize],

@@ -288,7 +288,8 @@ impl DfaCache {
         false
     }
 
-    /// Compute the DFA transition for `(from_state, byte)`.
+    /// Compute the DFA transition for `(from_state, byte)`, using byte-class
+    /// compression (stride < 256).
     #[inline(always)]
     fn transition(&mut self, from: DfaStateId, byte: u8, regex: &Regex) -> DfaStateId {
         if from == DfaStateId::DEAD {
@@ -296,6 +297,23 @@ impl DfaCache {
         }
         let class = regex.byte_classes[byte as usize] as usize;
         let slot = from.idx() * self.stride + class;
+        let cached = self.transitions[slot];
+        if cached != DfaStateId::UNPOPULATED {
+            return cached;
+        }
+        let to = self.populate(from, byte, regex);
+        self.transitions[slot] = to;
+        to
+    }
+
+    /// Compute the DFA transition for `(from_state, byte)`, using the
+    /// identity mapping (stride=256, no byte-class indirection).
+    #[inline(always)]
+    fn transition_direct(&mut self, from: DfaStateId, byte: u8, regex: &Regex) -> DfaStateId {
+        if from == DfaStateId::DEAD {
+            return self.transition_from_dead(byte, regex);
+        }
+        let slot = from.idx() * 256 + byte as usize;
         let cached = self.transitions[slot];
         if cached != DfaStateId::UNPOPULATED {
             return cached;
@@ -580,7 +598,11 @@ impl<'a> DfaMatcher<'a> {
 
     #[inline(always)]
     pub fn step(&mut self, byte: u8) {
-        self.current = self.cache.transition(self.current, byte, self.regex);
+        if self.cache.stride == 256 {
+            self.current = self.cache.transition_direct(self.current, byte, self.regex);
+        } else {
+            self.current = self.cache.transition(self.current, byte, self.regex);
+        }
         if self.current != DfaStateId::DEAD && self.cache.states[self.current.idx()].is_match {
             self.ever_matched = true;
         }
@@ -620,11 +642,30 @@ impl<'a> DfaMatcher<'a> {
             }
         };
 
-        for &b in input {
-            if self.ever_matched {
-                return;
+        if self.cache.stride == 256 {
+            for &b in input {
+                if self.ever_matched {
+                    return;
+                }
+                self.current = self.cache.transition_direct(self.current, b, self.regex);
+                if self.current != DfaStateId::DEAD
+                    && self.cache.states[self.current.idx()].is_match
+                {
+                    self.ever_matched = true;
+                }
             }
-            self.step(b);
+        } else {
+            for &b in input {
+                if self.ever_matched {
+                    return;
+                }
+                self.current = self.cache.transition(self.current, b, self.regex);
+                if self.current != DfaStateId::DEAD
+                    && self.cache.states[self.current.idx()].is_match
+                {
+                    self.ever_matched = true;
+                }
+            }
         }
     }
 

@@ -711,14 +711,38 @@ impl CountingDfaCache {
         }
     }
 
-    /// Compute a counting transition for `(from_state, byte)`.
-    #[inline]
+    /// Compute a counting transition for `(from_state, byte)`, using
+    /// byte-class compression (stride < 256).
+    #[inline(always)]
     fn transition(&mut self, from: DfaStateId, byte: u8, regex: &Regex) -> CountingTransition {
         if from == DfaStateId::DEAD {
             let t = self.populate(from, byte, regex);
             return t;
         }
         let slot = from.0 as usize * self.stride + regex.byte_classes[byte as usize] as usize;
+        let t = self.transitions[slot];
+        if !t.is_unpopulated() {
+            return t;
+        }
+        let t = self.populate(from, byte, regex);
+        self.transitions[slot] = t;
+        t
+    }
+
+    /// Compute a counting transition for `(from_state, byte)`, using the
+    /// identity mapping (stride=256, no byte-class indirection).
+    #[inline(always)]
+    fn transition_direct(
+        &mut self,
+        from: DfaStateId,
+        byte: u8,
+        regex: &Regex,
+    ) -> CountingTransition {
+        if from == DfaStateId::DEAD {
+            let t = self.populate(from, byte, regex);
+            return t;
+        }
+        let slot = from.0 as usize * 256 + byte as usize;
         let t = self.transitions[slot];
         if !t.is_unpopulated() {
             return t;
@@ -972,7 +996,11 @@ impl<'a> CountingDfaMatcher<'a> {
     /// Advance by one byte.
     #[inline]
     pub fn step(&mut self, byte: u8) {
-        let trans = self.cache.transition(self.current, byte, self.regex);
+        let trans = if self.cache.stride == 256 {
+            self.cache.transition_direct(self.current, byte, self.regex)
+        } else {
+            self.cache.transition(self.current, byte, self.regex)
+        };
         self.current = trans.next;
 
         let origin_table = &self.cache.origin_program_tables[trans.origin_table.0 as usize];
