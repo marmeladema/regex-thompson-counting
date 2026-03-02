@@ -15,7 +15,6 @@ memchr = "2.8.0"
 regex = "1"
 
 [dependencies]
-clru = "0.6.3"
 indexmap = "2"
 regex-syntax = "0.8.9"
 

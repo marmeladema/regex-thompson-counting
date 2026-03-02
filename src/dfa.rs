@@ -14,9 +14,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::num::NonZeroUsize;
-
-use clru::CLruCache;
 
 use crate::{AssertKind, CounterCtx, CounterIdx, CounterPool, Regex, State, StateIdx};
 
@@ -31,6 +28,8 @@ pub(crate) struct DfaStateId(u32);
 impl DfaStateId {
     /// Sentinel: the "dead" state (no NFA states, no match possible).
     pub(crate) const DEAD: Self = Self(u32::MAX);
+    /// Sentinel for unpopulated flat-table slots.
+    const UNPOPULATED: Self = Self(u32::MAX - 1);
 
     #[inline]
     fn idx(self) -> usize {
@@ -57,15 +56,17 @@ struct DfaState {
 // DFA cache (Tier 1)
 // ---------------------------------------------------------------------------
 
-/// Default DFA transition cache capacity (number of (state, byte) entries).
-const DFA_CACHE_CAPACITY: usize = 16_384;
+/// Maximum number of DFA states before the flat transition table stops
+/// growing.  2048 states × 256 entries × 4 bytes = 2 MB.
+const DFA_MAX_STATES: usize = 2048;
 
-/// Lazy DFA cache: append-only state table + LRU transition cache.
+/// Lazy DFA cache: append-only state table + flat transition table.
 ///
-/// The state table never evicts entries (DFA states are canonical and
-/// referenced by `DfaStateId`).  The transition cache uses LRU eviction
-/// via `CLruCache`; evicting a transition is always safe — it just
-/// causes a cache miss that triggers re-population.
+/// The transition table is a flat `Vec<DfaStateId>` indexed by
+/// `state.0 * 256 + byte`.  Unpopulated slots contain
+/// `DfaStateId::UNPOPULATED`.  When the state count reaches
+/// [`DFA_MAX_STATES`], new states are no longer interned — the
+/// transition falls back to recomputing without caching.
 ///
 /// The cache is **persisted across `matcher()` calls** for the same
 /// `Regex`.  A unique regex ID detects when a different regex is used
@@ -75,8 +76,9 @@ pub(crate) struct DfaCache {
     states: Vec<DfaState>,
     /// Reverse lookup: canonical `DfaState → DfaStateId`.
     state_map: HashMap<DfaState, DfaStateId>,
-    /// LRU transition cache: `(from_state, byte) -> to_state`.
-    transitions: CLruCache<(DfaStateId, u8), DfaStateId>,
+    /// Flat transition table: `transitions[state.0 * 256 + byte] -> to_state`.
+    /// Unpopulated slots contain `DfaStateId::UNPOPULATED`.
+    transitions: Vec<DfaStateId>,
     /// Scratch space for epsilon closure (avoids allocation per populate).
     closure_stack: Vec<StateIdx>,
     /// Scratch space for collecting NFA states during closure.
@@ -104,7 +106,7 @@ impl DfaCache {
         Self {
             states: Vec::new(),
             state_map: HashMap::new(),
-            transitions: CLruCache::new(NonZeroUsize::new(DFA_CACHE_CAPACITY).unwrap()),
+            transitions: Vec::new(),
             closure_stack: Vec::new(),
             closure_result: Vec::new(),
             closure_visited: vec![false; num_nfa_states],
@@ -115,24 +117,32 @@ impl DfaCache {
     }
 
     /// Look up or insert a DFA state for the given sorted NFA state set.
+    /// Returns `None` if the state cap ([`DFA_MAX_STATES`]) has been reached
+    /// and the state is not already interned.
     fn intern_state(
         &mut self,
         nfa_states: Box<[StateIdx]>,
         is_match: bool,
         is_match_at_end: bool,
-    ) -> DfaStateId {
+    ) -> Option<DfaStateId> {
         let state = DfaState {
             nfa_states,
             is_match,
             is_match_at_end,
         };
         if let Some(&id) = self.state_map.get(&state) {
-            return id;
+            return Some(id);
+        }
+        if self.states.len() >= DFA_MAX_STATES {
+            return None;
         }
         let id = DfaStateId(self.states.len() as u32);
         self.state_map.insert(state.clone(), id);
         self.states.push(state);
-        id
+        // Extend the flat transition table with 256 UNPOPULATED slots.
+        self.transitions
+            .extend(std::iter::repeat_n(DfaStateId::UNPOPULATED, 256));
+        Some(id)
     }
 
     /// Compute the epsilon closure from a set of NFA seed states.
@@ -240,13 +250,26 @@ impl DfaCache {
     }
 
     /// Compute the DFA transition for `(from_state, byte)`.
+    #[inline(always)]
     fn transition(&mut self, from: DfaStateId, byte: u8, regex: &Regex) -> DfaStateId {
-        if let Some(&to) = self.transitions.get(&(from, byte)) {
-            return to;
+        if from == DfaStateId::DEAD {
+            return self.transition_from_dead(byte, regex);
+        }
+        let slot = from.idx() * 256 + byte as usize;
+        let cached = self.transitions[slot];
+        if cached != DfaStateId::UNPOPULATED {
+            return cached;
         }
         let to = self.populate(from, byte, regex);
-        let _ = self.transitions.put((from, byte), to);
+        self.transitions[slot] = to;
         to
+    }
+
+    /// Transition from the DEAD state (re-seed from start).
+    /// Separated to keep the hot path of `transition()` small.
+    #[inline(never)]
+    fn transition_from_dead(&mut self, byte: u8, regex: &Regex) -> DfaStateId {
+        self.populate(DfaStateId::DEAD, byte, regex)
     }
 
     /// On cache miss: compute the next DFA state.
@@ -281,7 +304,11 @@ impl DfaCache {
             if nfa_set.is_empty() && !is_match && !is_match_at_end {
                 return DfaStateId::DEAD;
             }
-            return self.intern_state(nfa_set, is_match, is_match_at_end);
+            // If the state cap is reached, return DEAD — the state cannot
+            // be cached but we avoid growing the flat table unboundedly.
+            return self
+                .intern_state(nfa_set, is_match, is_match_at_end)
+                .unwrap_or(DfaStateId::DEAD);
         }
 
         let seeds = targets.into_iter().chain(std::iter::once(regex.start));
@@ -293,6 +320,7 @@ impl DfaCache {
         }
 
         self.intern_state(nfa_set, is_match, is_match_at_end)
+            .unwrap_or(DfaStateId::DEAD)
     }
 
     /// Reset the cache for reuse with a new regex.
@@ -307,6 +335,12 @@ impl DfaCache {
         self.start_is_match = false;
     }
 
+    /// Number of interned DFA states (for diagnostics / testing).
+    #[allow(dead_code)]
+    pub(crate) fn num_states(&self) -> usize {
+        self.states.len()
+    }
+
     /// Prepare the cache for use with `regex`.
     pub(crate) fn prepare(&mut self, regex: &Regex) {
         let id = regex.id;
@@ -318,7 +352,9 @@ impl DfaCache {
 
         let (nfa_set, is_match, is_match_at_end) =
             self.epsilon_closure(std::iter::once(regex.start), &regex.states, true, None);
-        self.start_id = self.intern_state(nfa_set, is_match, is_match_at_end);
+        self.start_id = self
+            .intern_state(nfa_set, is_match, is_match_at_end)
+            .expect("start state exceeds DFA_MAX_STATES");
         self.start_is_match = self.states[self.start_id.idx()].is_match;
     }
 }
