@@ -243,6 +243,16 @@ pub(crate) enum AssertKind {
     /// Matches at a position where both sides are word characters or
     /// both sides are non-word characters.
     WordAsciiNegate,
+    /// `\b{start}` — ASCII word-start boundary.
+    ///
+    /// Matches where the previous byte is NOT a word character (or
+    /// start-of-input) and the next byte IS a word character.
+    WordStartAscii,
+    /// `\b{end}` — ASCII word-end boundary.
+    ///
+    /// Matches where the previous byte IS a word character and the
+    /// next byte is NOT a word character (or end-of-input).
+    WordEndAscii,
 }
 
 /// Result of evaluating an assertion at a given position.
@@ -417,6 +427,52 @@ impl AssertKind {
                     }
                 }
             }
+            AssertKind::WordStartAscii => {
+                // prev must NOT be word, next must be word.
+                let prev_w = prev.is_some_and(is_word_byte);
+                if prev_w {
+                    return Fail;
+                }
+                match next {
+                    Some(b) => {
+                        if is_word_byte(b) {
+                            Pass
+                        } else {
+                            Fail
+                        }
+                    }
+                    None => {
+                        if at_end {
+                            Fail
+                        } else {
+                            Defer
+                        }
+                    }
+                }
+            }
+            AssertKind::WordEndAscii => {
+                // prev must be word, next must NOT be word.
+                let prev_w = prev.is_some_and(is_word_byte);
+                if !prev_w {
+                    return Fail;
+                }
+                match next {
+                    Some(b) => {
+                        if is_word_byte(b) {
+                            Fail
+                        } else {
+                            Pass
+                        }
+                    }
+                    None => {
+                        if at_end {
+                            Pass
+                        } else {
+                            Defer
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -431,6 +487,8 @@ impl AssertKind {
             AssertKind::EndCRLF => "$CRLF",
             AssertKind::WordAscii => "\\b",
             AssertKind::WordAsciiNegate => "\\B",
+            AssertKind::WordStartAscii => "\\b{start}",
+            AssertKind::WordEndAscii => "\\b{end}",
         }
     }
 }
@@ -891,6 +949,8 @@ impl Regex {
                     State::Assert { kind, .. } if matches!(kind,
                         AssertKind::WordAscii
                         | AssertKind::WordAsciiNegate
+                        | AssertKind::WordStartAscii
+                        | AssertKind::WordEndAscii
                         | AssertKind::EndLF
                     )
                 )
@@ -1372,6 +1432,8 @@ impl RegexBuilder {
                     hir::Look::EndCRLF => AssertKind::EndCRLF,
                     hir::Look::WordAscii => AssertKind::WordAscii,
                     hir::Look::WordAsciiNegate => AssertKind::WordAsciiNegate,
+                    hir::Look::WordStartAscii => AssertKind::WordStartAscii,
+                    hir::Look::WordEndAscii => AssertKind::WordEndAscii,
                     _ => return Err(Error::UnsupportedLook(*look)),
                 };
                 self.postfix.push(RegexHirNode::Assert(kind));
@@ -1660,6 +1722,8 @@ impl RegexBuilder {
                     | AssertKind::StartCRLF
                     | AssertKind::WordAscii
                     | AssertKind::WordAsciiNegate
+                    | AssertKind::WordStartAscii
+                    | AssertKind::WordEndAscii
                 )
             )
         });
@@ -1744,6 +1808,8 @@ impl RegexBuilder {
                                     | AssertKind::StartCRLF
                                     | AssertKind::WordAscii
                                     | AssertKind::WordAsciiNegate
+                                    | AssertKind::WordStartAscii
+                                    | AssertKind::WordEndAscii
                             ) {
                                 return true;
                             }
@@ -5764,6 +5830,92 @@ mod tests {
                 ("preselect", false),
                 ("delete from", true),
                 ("undelete", false),
+            ],
+        }
+        // Word-start and word-end boundary assertions
+        test_word_start_basic {
+            pattern: r#"\b{start}\w+\b{end}"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("hello", true),
+                ("hello world", true),
+                ("  hello  ", true),
+                ("", false),
+                ("   ", false),
+                ("a", true),
+            ],
+        }
+        test_word_start_only {
+            pattern: r#"\b{start}foo"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("foo", true),
+                ("foobar", true),
+                (" foo", true),
+                ("xfoo", false),
+                ("", false),
+            ],
+        }
+        test_word_end_only {
+            pattern: r#"foo\b{end}"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("foo", true),
+                ("barfoo", true),
+                ("foo ", true),
+                ("foobar", false),
+                ("", false),
+            ],
+        }
+        test_word_start_alternation {
+            pattern: r#"\b{start}(?:cat|dog)\b{end}"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("cat", true),
+                ("dog", true),
+                ("the cat sat", true),
+                ("hotdog", false),
+                ("concatenate", false),
+            ],
+        }
+        test_word_start_with_counter {
+            pattern: r#"\b{start}\w{3,5}\b{end}"#,
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("abc", true),
+                ("abcde", true),
+                ("ab", false),
+                ("abcdef", false),
+                (" abc ", true),
+                (" ab ", false),
+                ("hello world", true),
+            ],
+        }
+        test_word_end_at_eof {
+            pattern: r#"test\b{end}"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("test", true),
+                ("a test", true),
+                ("testing", false),
+                ("test!", true),
+            ],
+        }
+        test_word_start_at_start {
+            pattern: r#"\b{start}test"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("test", true),
+                ("test case", true),
+                ("attest", false),
+                ("!test", true),
             ],
         }
         test_multiline_abc {
