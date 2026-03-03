@@ -71,7 +71,9 @@ use regex_syntax::hir::{self, HirKind};
 static NEXT_REGEX_ID: AtomicU64 = AtomicU64::new(1);
 
 mod dfa;
-use dfa::{CountingDfaCache, CountingDfaMatcher, DfaCache, DfaMatcher};
+use dfa::{
+    CountingDfaCache, CountingDfaMatcher, DfaCache, DfaMatcher, Tier2DfaCache, Tier2DfaMatcher,
+};
 
 /// Re-export so users do not need a direct `regex-syntax` dependency.
 pub use regex_syntax::hir::Hir;
@@ -706,6 +708,9 @@ pub struct Regex {
     /// (Tier 1: no counters, no deferred-assertion types like \b/\B
     /// /EndLF/EndCRLF/StartCRLF).
     dfa_eligible: bool,
+    /// `true` when this pattern has non-nested counters and can use the
+    /// Tier 2 conditional-transition DFA.
+    tier2_eligible: bool,
     /// `true` when this pattern has counters but can use the counting DFA
     /// (Tier 3: no complex assertions).
     counting_dfa_eligible: bool,
@@ -894,6 +899,8 @@ impl Regex {
         writeln!(out).unwrap();
         let tier = if self.dfa_eligible {
             "Tier 1: Lazy DFA (flat table, no counters, deferred assertions)"
+        } else if self.tier2_eligible {
+            "Tier 2: Conditional DFA (non-nested counters, per-counter instances)"
         } else if self.counting_dfa_eligible {
             "Tier 3: Counting DFA (flat table + counter programs)"
         } else {
@@ -1681,6 +1688,73 @@ impl RegexBuilder {
         let counting_dfa_eligible =
             has_counters && !has_deferred_assert && !has_zero_width_counter_body;
 
+        // Tier 2 eligibility: non-nested counters.  A counter is "nested"
+        // if its body (the path from CI.out to its CInc) passes through
+        // another counter's CI or CInc state.
+        let tier2_eligible = counting_dfa_eligible && {
+            let states = &self.states;
+            fn has_nesting(states: &[State]) -> bool {
+                for s in states.iter() {
+                    if let State::CounterInstance { counter, out } = s {
+                        // Walk from CI.out to CInc(counter) through epsilon
+                        // states.  If we encounter another counter's CI or
+                        // CInc on the way, it's nested.
+                        if body_crosses_other_counter(*out, *counter, states) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            fn body_crosses_other_counter(
+                start: StateIdx,
+                own_counter: CounterIdx,
+                states: &[State],
+            ) -> bool {
+                let mut stack = vec![start];
+                let mut visited = vec![false; states.len()];
+                while let Some(idx) = stack.pop() {
+                    let i = idx.idx();
+                    if visited[i] {
+                        continue;
+                    }
+                    visited[i] = true;
+                    match states[idx] {
+                        State::CounterInstance { counter, out } => {
+                            if counter != own_counter {
+                                return true; // nested: another CI in body
+                            }
+                            stack.push(out);
+                        }
+                        State::CounterIncrement {
+                            counter,
+                            out: _,
+                            out1: _,
+                            ..
+                        } => {
+                            if counter == own_counter {
+                                // Reached our own CInc — don't follow further
+                                // (we only check the body, not past the break).
+                                continue;
+                            }
+                            return true; // nested: another CInc in body
+                        }
+                        State::Split { out, out1 } => {
+                            stack.push(out1);
+                            stack.push(out);
+                        }
+                        State::Assert { out, .. } => {
+                            stack.push(out);
+                        }
+                        // Consuming states and Match terminate the walk.
+                        _ => {}
+                    }
+                }
+                false
+            }
+            !has_nesting(states)
+        };
+
         // Compute byte equivalence classes before moving data out.
         let classes_slice: Vec<ByteClass> = self.classes.iter().copied().collect();
         let byte_tables_slice: Vec<ByteMap> = self.byte_tables.to_vec();
@@ -1731,6 +1805,7 @@ impl RegexBuilder {
             start_closure,
             start_closure_matches,
             dfa_eligible,
+            tier2_eligible,
             counting_dfa_eligible,
             byte_classes,
             num_byte_classes,
@@ -2116,6 +2191,8 @@ pub struct MatcherMemory {
     counter_pool: CounterPool,
     /// Lazy DFA cache (allocated on first use with a DFA-eligible regex).
     dfa_cache: Option<DfaCache>,
+    /// Tier 2 DFA cache (non-nested counters, conditional transitions).
+    tier2_cache: Option<Tier2DfaCache>,
     /// Counting DFA cache (Tier 3: patterns with counters).
     counting_dfa_cache: Option<CountingDfaCache>,
     /// Counter pool for the counting DFA (separate from NFA's pool).
@@ -2136,6 +2213,14 @@ impl MatcherMemory {
             cache.prepare(regex);
             let dfa = DfaMatcher::new(cache, regex);
             AnyMatcher::Dfa(dfa)
+        } else if regex.tier2_eligible {
+            // Tier 2: DFA + conditional transitions (non-nested counters).
+            let cache = self
+                .tier2_cache
+                .get_or_insert_with(|| Tier2DfaCache::new(regex.states.len()));
+            cache.prepare(regex);
+            let dfa = Tier2DfaMatcher::new(cache, regex);
+            AnyMatcher::Tier2Dfa(dfa)
         } else if regex.counting_dfa_eligible {
             // Tier 3: DFA + explicit counter contexts.
             let cache = self
@@ -2192,6 +2277,8 @@ impl MatcherMemory {
 pub enum AnyMatcher<'a> {
     /// Lazy DFA path (Tier 1: counter-free, simple-assertion patterns).
     Dfa(DfaMatcher<'a>),
+    /// Tier 2 DFA path (non-nested counters, conditional transitions).
+    Tier2Dfa(Tier2DfaMatcher<'a>),
     /// Counting DFA path (Tier 3: DFA + explicit counter contexts).
     CountingDfa(CountingDfaMatcher<'a>),
     /// NFA simulator path (general case).
@@ -2203,6 +2290,7 @@ impl<'a> AnyMatcher<'a> {
     pub fn chunk(&mut self, input: &[u8]) {
         match self {
             Self::Dfa(d) => d.chunk(input),
+            Self::Tier2Dfa(d) => d.chunk(input),
             Self::CountingDfa(d) => d.chunk(input),
             Self::Nfa(n) => n.chunk(input),
         }
@@ -2212,6 +2300,7 @@ impl<'a> AnyMatcher<'a> {
     pub fn step(&mut self, b: u8) {
         match self {
             Self::Dfa(d) => d.step(b),
+            Self::Tier2Dfa(d) => d.step(b),
             Self::CountingDfa(d) => d.step(b),
             Self::Nfa(n) => n.step(b),
         }
@@ -2221,6 +2310,7 @@ impl<'a> AnyMatcher<'a> {
     pub fn finish(self) -> bool {
         match self {
             Self::Dfa(d) => d.finish(),
+            Self::Tier2Dfa(d) => d.finish(),
             Self::CountingDfa(d) => d.finish(),
             Self::Nfa(n) => n.finish(),
         }
@@ -2231,6 +2321,7 @@ impl<'a> AnyMatcher<'a> {
     pub fn ismatch(&self) -> bool {
         match self {
             Self::Dfa(d) => d.ismatch(),
+            Self::Tier2Dfa(d) => d.ismatch(),
             Self::CountingDfa(d) => d.ismatch(),
             Self::Nfa(n) => n.ismatch(),
         }
@@ -2241,6 +2332,7 @@ impl<'a> fmt::Debug for AnyMatcher<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Dfa(d) => f.debug_tuple("AnyMatcher::Dfa").field(d).finish(),
+            Self::Tier2Dfa(d) => f.debug_tuple("AnyMatcher::Tier2Dfa").field(d).finish(),
             Self::CountingDfa(d) => f.debug_tuple("AnyMatcher::CountingDfa").field(d).finish(),
             Self::Nfa(n) => f.debug_tuple("AnyMatcher::Nfa").field(n).finish(),
         }

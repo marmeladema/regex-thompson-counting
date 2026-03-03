@@ -1,4 +1,4 @@
-//! Lazy DFA (Tier 1 and Tier 3).
+//! Lazy DFA (Tier 1, Tier 2, and Tier 3).
 //!
 //! **Tier 1** (counter-free patterns): standard lazy subset construction.
 //! DFA-eligible patterns may include deferred assertions (`\b`, `\B`,
@@ -8,7 +8,11 @@
 //!
 //! Only `StartCRLF` and `EndCRLF` remain DFA-ineligible.
 //!
-//! **Tier 3** (counted repetitions): DFA + explicit counter contexts.
+//! **Tier 2** (non-nested counted repetitions): DFA + conditional transitions.
+//! Precomputes separate DFA successor states per counter condition instead
+//! of using runtime counter programs.  Each counter tracked independently.
+//!
+//! **Tier 3** (nested counted repetitions): DFA + explicit counter contexts.
 //! The DFA state (set of NFA consuming states) is separated from the
 //! counter state (a set of `CounterCtx` values).  DFA transitions are
 //! cached normally; each transition also stores a compiled *counter
@@ -16,9 +20,11 @@
 //! hit the program is replayed against each active counter context.
 
 mod tier1;
+mod tier2;
 mod tier3;
 
 pub(crate) use tier1::{DfaCache, DfaMatcher};
+pub(crate) use tier2::{Tier2DfaCache, Tier2DfaMatcher};
 pub(crate) use tier3::{CountingDfaCache, CountingDfaMatcher};
 
 use crate::StateIdx;
