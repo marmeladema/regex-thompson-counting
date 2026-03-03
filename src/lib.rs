@@ -764,6 +764,23 @@ impl Regex {
         let byte_tables_alloc = self.byte_tables.len() * std::mem::size_of::<ByteMap>();
         inline + states_alloc + classes_alloc + byte_tables_alloc
     }
+    /// Return the minimum DFA tier that can handle this regex.
+    ///
+    /// - `0` = NFA only (e.g. CRLF assertions, zero-width counter bodies)
+    /// - `1` = Tier 1+ (counter-free, no deferred assertions)
+    /// - `2` = Tier 2+ (non-nested counters, conditional DFA)
+    /// - `3` = Tier 3 (nested counters, counting DFA with counter programs)
+    pub fn min_tier(&self) -> u8 {
+        if self.dfa_eligible {
+            1
+        } else if self.tier2_eligible {
+            2
+        } else if self.counting_dfa_eligible {
+            3
+        } else {
+            0
+        }
+    }
     /// Print diagnostic information about this compiled regex.
     pub fn info(&self, mut out: impl Write) {
         // -- Memory --
@@ -3175,19 +3192,6 @@ mod tests {
             assert_matches_regex_crate(p, &re, input);
         }
     }
-
-    #[test]
-    fn test_byte_table_cross_validate_unanchored() {
-        let p = "(ab|cd|ef)";
-        let re = build_regex_unchecked(p);
-        for input in &[
-            "ab", "cd", "ef", "xxab", "cdyy", "xxefyy", // positives
-            "ac", "xyz", "", "a", "f", // negatives
-        ] {
-            assert_matches_regex_crate(p, &re, input);
-        }
-    }
-
     // -- ByteTable: streaming / multi-chunk ----------------------------------
 
     /// Feed a ByteTable pattern across multiple chunks.  The ByteTable
@@ -3253,51 +3257,6 @@ mod tests {
     }
 
     // -- ByteTable + counters ------------------------------------------------
-
-    /// ByteTable inside a bounded repetition with real counting.
-    #[test]
-    fn test_byte_table_with_bounded_repetition_cross_validate() {
-        let p = "^(ab|cd|ef){2,4}$";
-        let re = build_regex_unchecked(p);
-        for input in &[
-            "abcd",
-            "efab",
-            "cdef",
-            "ababab",
-            "abcdef",
-            "abcdefab", // positives (2,3,4 reps)
-            "ab",
-            "ef",
-            "",
-            "abcdefabcd",
-            "abcdefef", // negatives (1, 0, 5 reps)
-        ] {
-            assert_matches_regex_crate(p, &re, input);
-        }
-    }
-
-    /// ByteTable inside a counted repetition with a non-trivial suffix.
-    #[test]
-    fn test_byte_table_counted_with_suffix() {
-        let p = "^(ab|cd|ef){1,3}x$";
-        let re = build_regex_unchecked(p);
-        for input in &[
-            "abx",
-            "cdx",
-            "efx", // 1 rep + suffix
-            "abcdx",
-            "efabx",   // 2 reps + suffix
-            "abcdefx", // 3 reps + suffix
-            "x",
-            "ab",
-            "abcdefabx",
-            "",
-            "abcdefxx", // negatives
-        ] {
-            assert_matches_regex_crate(p, &re, input);
-        }
-    }
-
     // -- ByteTable: mixed-length branches ------------------------------------
 
     /// Alternation branches of different lengths with distinct first bytes.
@@ -3314,20 +3273,6 @@ mod tests {
             assert_matches_regex_crate(p, &re, input);
         }
     }
-
-    /// Mixed-length unanchored — ByteTable in a substring context.
-    #[test]
-    fn test_byte_table_mixed_length_unanchored() {
-        let p = "(a|bc|def)";
-        let re = build_regex_unchecked(p);
-        for input in &[
-            "a", "bc", "def", "xxa", "xxbcyy", "xxdefyy", // positives
-            "xx", "", "bd", // negatives
-        ] {
-            assert_matches_regex_crate(p, &re, input);
-        }
-    }
-
     // -- ByteTable: large alternation ----------------------------------------
 
     /// 10-way alternation — well above threshold.
@@ -3392,39 +3337,6 @@ mod tests {
     }
 
     // -- ByteTable: surrounding literal context ------------------------------
-
-    /// Literal prefix and suffix around a ByteTable alternation.
-    #[test]
-    fn test_byte_table_with_prefix_and_suffix() {
-        let p = "^xx(ab|cd|ef)yy$";
-        let re = build_regex_unchecked(p);
-        for input in &[
-            "xxabyy", "xxcdyy", "xxefyy", // positives
-            "xxabyyz", "xabyy", "xxaby", "xxyy", "abyy", "", // negatives
-        ] {
-            assert_matches_regex_crate(p, &re, input);
-        }
-    }
-
-    /// ByteTable preceded by a wildcard.
-    #[test]
-    fn test_byte_table_after_wildcard() {
-        let p = "^..(ab|cd|ef)$";
-        let re = build_regex_unchecked(p);
-        for input in &[
-            "xxab",
-            "zzcd",
-            "qqef",
-            "\x00\x7fab", // positives
-            "xab",
-            "xxxab",
-            "xxac",
-            "", // negatives
-        ] {
-            assert_matches_regex_crate(p, &re, input);
-        }
-    }
-
     // -- ByteTable: single-char branches → ByteClass (no optimisation) -------
 
     /// `(a|b|c)` is collapsed to `[abc]` by regex-syntax, so no ByteTable.
@@ -3459,41 +3371,6 @@ mod tests {
     }
 
     // -- ByteTable: with wildcard / complex suffix ---------------------------
-
-    /// ByteTable followed by `.*` wildcard and a literal.
-    #[test]
-    fn test_byte_table_followed_by_wildcard() {
-        let p = "^(ab|cd|ef).*x$";
-        let re = build_regex_unchecked(p);
-        for input in &[
-            "abx", "cdx", "efx", "ab123x", "cdxxxxxx", // positives
-            "abX", "cd", "ef123", "x", "", // negatives
-        ] {
-            assert_matches_regex_crate(p, &re, input);
-        }
-    }
-
-    /// ByteTable inside a complex pattern with wildcards on both sides.
-    #[test]
-    fn test_byte_table_sandwiched_by_wildcards() {
-        let p = "^.*(ab|cd|ef).*$";
-        let re = build_regex_unchecked(p);
-        for input in &[
-            "ab",
-            "cd",
-            "ef",
-            "xxxab",
-            "cdyyy",
-            "xxxefyyy",
-            "xxabyycdzzef", // positives
-            "",
-            "x",
-            "ac", // negatives
-        ] {
-            assert_matches_regex_crate(p, &re, input);
-        }
-    }
-
     // -- ByteTable: memory_size accounts for tables --------------------------
 
     /// Verify memory_size() grows by ~1024 bytes per ByteTable entry.
@@ -3596,1137 +3473,6 @@ mod tests {
             pattern, input, actual_step, expected
         );
     }
-
-    /// `.*a.{3}bc` — counting constraint on a wildcard.
-    #[test]
-    fn test_counting() {
-        let p = "^.*a.{3}bc$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "aybzbc");
-        assert_matches_regex_crate(p, &re, "axaybzbc");
-        assert_matches_regex_crate(p, &re, "a123bc");
-        assert_matches_regex_crate(p, &re, "za999bc");
-        // negatives: too few wildcard chars
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "a12bc");
-        // negatives: wrong trailing literal
-        assert_matches_regex_crate(p, &re, "a123bd");
-        assert_matches_regex_crate(p, &re, "a123xc");
-        // negatives: empty, no 'a' at all, missing suffix
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "bc");
-        assert_matches_regex_crate(p, &re, "a123b");
-        assert_matches_regex_crate(p, &re, "a123");
-        assert_memory_size(p, &re, 1056);
-    }
-
-    /// `(a|bc){1,2}` — flat range repetition with all combos up to 3.
-    #[test]
-    fn test_range() {
-        use itertools::Itertools;
-
-        let p = "^(a|bc){1,2}$";
-        let re = build_regex_unchecked(p);
-
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "bc");
-        // negatives: empty, wrong chars, partial match
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "x");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "c");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "ca");
-        assert_matches_regex_crate(p, &re, "bca");
-
-        // Two repetitions (all combos)
-        for v in std::iter::repeat_n(["a", "bc"], 2)
-            .map(|a| a.into_iter())
-            .multi_cartesian_product()
-        {
-            let input = v.into_iter().collect::<String>();
-            assert_matches_regex_crate(p, &re, &input);
-        }
-
-        // Three repetitions — should not match (max is 2)
-        for v in std::iter::repeat_n(["a", "bc"], 3)
-            .map(|a| a.into_iter())
-            .multi_cartesian_product()
-        {
-            let input = v.into_iter().collect::<String>();
-            assert_matches_regex_crate(p, &re, &input);
-        }
-        assert_memory_size(p, &re, 720);
-    }
-
-    /// `((a|bc){1,2}){2,3}` — nested counting constraints.
-    #[test]
-    fn test_nested_counting() {
-        use itertools::Itertools;
-
-        let p = "^((a|bc){1,2}){2,3}$";
-        let re = build_regex_unchecked(p);
-
-        // negatives: below outer min, wrong chars
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "bc");
-        assert_matches_regex_crate(p, &re, "x");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "c");
-        assert_matches_regex_crate(p, &re, "aax");
-
-        for i in 2..=6 {
-            for v in std::iter::repeat_n(["a", "bc"], i)
-                .map(|a| a.into_iter())
-                .multi_cartesian_product()
-            {
-                let input = v.into_iter().collect::<String>();
-                assert_matches_regex_crate(p, &re, &input);
-            }
-        }
-
-        for v in std::iter::repeat_n(["a", "bc"], 7)
-            .map(|a| a.into_iter())
-            .multi_cartesian_product()
-        {
-            let input = v.into_iter().collect::<String>();
-            assert_matches_regex_crate(p, &re, &input);
-        }
-        assert_memory_size(p, &re, 800);
-    }
-
-    /// `(a|a?){2,3}` — epsilon-matchable body (the `a?` branch can match
-    /// empty).  Exercises the epsilon-body detection logic in `addstate`.
-    #[test]
-    fn test_aaaaa() {
-        let p = "^(a|a?){2,3}$";
-        let re = build_regex_unchecked(p);
-
-        // positives (epsilon branches make all lengths 0..=3 matchable)
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        // negatives: too many a's
-        assert_matches_regex_crate(p, &re, "aaaa");
-        assert_matches_regex_crate(p, &re, "aaaaa");
-        // negatives: wrong characters
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_memory_size(p, &re, 720);
-    }
-
-    /// `a+` — basic one-or-more repetition.
-    #[test]
-    fn test_one_plus_basic() {
-        let p = "^a+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_memory_size(p, &re, 560);
-    }
-
-    /// `.+` — one-or-more wildcard.
-    #[test]
-    fn test_one_plus_wildcard() {
-        let p = "^.+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 816);
-    }
-
-    /// `a+b+` — consecutive one-or-more repetitions.
-    #[test]
-    fn test_one_plus_catenation() {
-        let p = "^a+b+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_matches_regex_crate(p, &re, "abb");
-        assert_matches_regex_crate(p, &re, "aabb");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_memory_size(p, &re, 640);
-    }
-
-    /// `(ab)+` — one-or-more of a multi-byte sequence.
-    #[test]
-    fn test_one_plus_group() {
-        let p = "^(ab)+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abab");
-        assert_matches_regex_crate(p, &re, "ababab");
-        assert_matches_regex_crate(p, &re, "aba");
-        assert_memory_size(p, &re, 600);
-    }
-
-    /// `(a|b)+` — one-or-more alternation.
-    #[test]
-    fn test_one_plus_alternate() {
-        let p = "^(a|b)+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_matches_regex_crate(p, &re, "bba");
-        assert_matches_regex_crate(p, &re, "abab");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "c");
-        assert_matches_regex_crate(p, &re, "ac");
-        assert_matches_regex_crate(p, &re, "ca");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 816);
-    }
-
-    /// `.*a.{3}b+c` — one-or-more mixed with counting constraints.
-    #[test]
-    fn test_one_plus_with_counting() {
-        let p = "^.*a.{3}b+c$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "a123bc");
-        assert_matches_regex_crate(p, &re, "a123bbc");
-        assert_matches_regex_crate(p, &re, "a123bbbc");
-        assert_matches_regex_crate(p, &re, "xa123bc");
-        assert_matches_regex_crate(p, &re, "xxxa999bc");
-        // negatives: missing b+ section
-        assert_matches_regex_crate(p, &re, "a123c");
-        // negatives: too few wildcard chars
-        assert_matches_regex_crate(p, &re, "a12bc");
-        // negatives: wrong trailing literal
-        assert_matches_regex_crate(p, &re, "a123bd");
-        assert_matches_regex_crate(p, &re, "a123bx");
-        // negatives: empty, no 'a', missing 'c'
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "x123bc");
-        assert_matches_regex_crate(p, &re, "a123b");
-        assert_memory_size(p, &re, 1096);
-    }
-
-    /// `(a{2,3})+` — inner repetition, outer one-or-more.
-    /// The body of `+` is itself a counted repetition.
-    #[test]
-    fn test_repetition_inside_one_plus() {
-        let p = "^(a{2,3})+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "aaaa");
-        assert_matches_regex_crate(p, &re, "aaaaa");
-        assert_matches_regex_crate(p, &re, "aaaaaa");
-        assert_matches_regex_crate(p, &re, "aaaaaaa");
-        assert_matches_regex_crate(p, &re, "aaaaaaaa");
-        assert_matches_regex_crate(p, &re, "aaaaaaaaa");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 640);
-    }
-
-    /// `((a|bc){1,2})+` — inner range repetition of alternation, outer `+`.
-    #[test]
-    fn test_range_alternation_inside_one_plus() {
-        use itertools::Itertools;
-
-        let p = "^((a|bc){1,2})+$";
-        let re = build_regex_unchecked(p);
-
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "bc");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "c");
-
-        // 2 through 6 atoms — exercises multiple iterations of the outer `+`
-        for i in 2..=6 {
-            for v in std::iter::repeat_n(["a", "bc"], i)
-                .map(|a| a.into_iter())
-                .multi_cartesian_product()
-            {
-                let input = v.into_iter().collect::<String>();
-                assert_matches_regex_crate(p, &re, &input);
-            }
-        }
-        assert_memory_size(p, &re, 760);
-    }
-
-    /// `(a+){2,3}` — inner one-or-more, outer counted repetition.
-    #[test]
-    fn test_one_plus_inside_repetition() {
-        let p = "^(a+){2,3}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "aaaa");
-        assert_matches_regex_crate(p, &re, "aaaaa");
-        assert_matches_regex_crate(p, &re, "aaaaaa");
-        assert_matches_regex_crate(p, &re, "aaaaaaa");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 640);
-    }
-
-    /// `((a|b)+){2,4}` — inner `+` of alternation, outer counted repetition.
-    #[test]
-    fn test_one_plus_alternation_inside_repetition() {
-        use itertools::Itertools;
-
-        let p = "^((a|b)+){2,4}$";
-        let re = build_regex_unchecked(p);
-
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "c");
-
-        for i in 2..=8 {
-            for v in std::iter::repeat_n(["a", "b"], i)
-                .map(|a| a.into_iter())
-                .multi_cartesian_product()
-            {
-                let input = v.into_iter().collect::<String>();
-                assert_matches_regex_crate(p, &re, &input);
-            }
-        }
-        assert_memory_size(p, &re, 896);
-    }
-
-    /// `(a+b{2,3})+` — inner `+` and inner repetition side-by-side,
-    /// wrapped in outer `+`.
-    #[test]
-    fn test_mixed_plus_and_repetition_inside_one_plus() {
-        let p = "^(a+b{2,3})+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abb");
-        assert_matches_regex_crate(p, &re, "abbb");
-        assert_matches_regex_crate(p, &re, "abbbb");
-        assert_matches_regex_crate(p, &re, "aabb");
-        assert_matches_regex_crate(p, &re, "aabbb");
-        assert_matches_regex_crate(p, &re, "abbabb");
-        assert_matches_regex_crate(p, &re, "abbaabb");
-        assert_matches_regex_crate(p, &re, "abbabbbabb");
-        assert_matches_regex_crate(p, &re, "aabbaabbb");
-        assert_matches_regex_crate(p, &re, "aabbbaabbb");
-        assert_memory_size(p, &re, 720);
-    }
-
-    // -- min=0 repetition tests ---------------------------------------------
-
-    /// `a{0,2}` — zero to two occurrences of a single byte.
-    #[test]
-    fn test_min_zero_basic() {
-        let p = "^a{0,2}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 640);
-    }
-
-    /// `a{0,1}` — equivalent to `a?`.
-    #[test]
-    fn test_min_zero_max_one() {
-        let p = "^a{0,1}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 560);
-    }
-
-    /// `(a|bc){0,3}` — zero to three of an alternation.
-    #[test]
-    fn test_min_zero_alternation() {
-        use itertools::Itertools;
-
-        let p = "^(a|bc){0,3}$";
-        let re = build_regex_unchecked(p);
-
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "bc");
-        assert_matches_regex_crate(p, &re, "b");
-
-        for i in 2..=4 {
-            for v in std::iter::repeat_n(["a", "bc"], i)
-                .map(|a| a.into_iter())
-                .multi_cartesian_product()
-            {
-                let input = v.into_iter().collect::<String>();
-                assert_matches_regex_crate(p, &re, &input);
-            }
-        }
-        assert_memory_size(p, &re, 760);
-    }
-
-    /// `a{0,}` — zero or more, lowered to `a*` (no counter overhead).
-    #[test]
-    fn test_min_zero_unbounded() {
-        let p = "^a{0,}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "aaaa");
-        // negatives
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_matches_regex_crate(p, &re, "baa");
-        assert_memory_size(p, &re, 560);
-    }
-
-    /// `(ab){0,}` — zero or more of a group, lowered to `(ab)*`.
-    #[test]
-    fn test_min_zero_unbounded_group() {
-        let p = "^(ab){0,}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abab");
-        assert_matches_regex_crate(p, &re, "ababab");
-        assert_matches_regex_crate(p, &re, "aba");
-        assert_memory_size(p, &re, 600);
-    }
-
-    /// `x(a{0,2})+y` — min=0 repetition nested inside `+`.
-    #[test]
-    fn test_min_zero_inside_one_plus() {
-        let p = "^x(a{0,2})+y$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "xy");
-        assert_matches_regex_crate(p, &re, "xay");
-        assert_matches_regex_crate(p, &re, "xaay");
-        assert_matches_regex_crate(p, &re, "xaaay");
-        assert_matches_regex_crate(p, &re, "xaaaay");
-        // negatives: missing suffix/prefix
-        assert_matches_regex_crate(p, &re, "x");
-        assert_matches_regex_crate(p, &re, "y");
-        assert_matches_regex_crate(p, &re, "");
-        // negatives: wrong characters in middle
-        assert_matches_regex_crate(p, &re, "xby");
-        assert_matches_regex_crate(p, &re, "xaby");
-        // negatives: wrong delimiters
-        assert_matches_regex_crate(p, &re, "ay");
-        assert_matches_regex_crate(p, &re, "xa");
-        assert_matches_regex_crate(p, &re, "aay");
-        assert_memory_size(p, &re, 760);
-    }
-
-    /// `(a{0,2}){2,3}` — min=0 inner, counted outer.
-    #[test]
-    fn test_min_zero_inside_repetition() {
-        let p = "^(a{0,2}){2,3}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "aaaa");
-        assert_matches_regex_crate(p, &re, "aaaaa");
-        assert_matches_regex_crate(p, &re, "aaaaaa");
-        assert_matches_regex_crate(p, &re, "aaaaaaa");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 720);
-    }
-
-    /// `(a+){0,3}` — `+` inside a min=0 counted repetition.
-    #[test]
-    fn test_one_plus_inside_min_zero_repetition() {
-        let p = "^(a+){0,3}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "aaaa");
-        assert_matches_regex_crate(p, &re, "aaaaa");
-        assert_matches_regex_crate(p, &re, "aaaaaa");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_memory_size(p, &re, 680);
-    }
-
-    /// `.{0,3}` — min=0 repetition on wildcard.
-    #[test]
-    fn test_min_zero_wildcard() {
-        let p = "^.{0,3}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abcd");
-        assert_memory_size(p, &re, 896);
-    }
-
-    /// `a{0,3}` — same as `a{0,3}` (the old test used `min: None`).
-    #[test]
-    fn test_none_min_repetition() {
-        let p = "^a{0,3}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        // negatives: above max
-        assert_matches_regex_crate(p, &re, "aaaa");
-        // negatives: wrong characters
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_memory_size(p, &re, 640);
-    }
-
-    // -- Standalone primitive tests ------------------------------------------
-
-    /// `a` — single literal byte.
-    #[test]
-    fn test_literal_single() {
-        let p = "^a$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "a");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_memory_size(p, &re, 520);
-    }
-
-    /// `abc` — multi-byte literal concatenation.
-    #[test]
-    fn test_literal_multi() {
-        let p = "^abc$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abd");
-        assert_matches_regex_crate(p, &re, "abcd");
-        assert_matches_regex_crate(p, &re, "xabc");
-        assert_matches_regex_crate(p, &re, "abcx");
-        assert_matches_regex_crate(p, &re, "xabcx");
-        assert_matches_regex_crate(p, &re, "cba");
-        assert_matches_regex_crate(p, &re, "bac");
-        assert_memory_size(p, &re, 600);
-    }
-
-    /// `.` — bare wildcard (matches exactly one byte).
-    #[test]
-    fn test_dot_single() {
-        let p = "^.$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "z");
-        assert_matches_regex_crate(p, &re, "0");
-        assert_matches_regex_crate(p, &re, " ");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 776);
-    }
-
-    /// `a|bc` — bare alternation (no repetition).
-    #[test]
-    fn test_alternation_bare() {
-        let p = "^(a|bc)$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "bc");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "c");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "x");
-        assert_matches_regex_crate(p, &re, "bca");
-        assert_memory_size(p, &re, 640);
-    }
-
-    /// `a|b|c` — three-way alternation.
-    #[test]
-    fn test_alternation_three_way() {
-        let p = "^(a|b|c)$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "c");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "d");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 776);
-    }
-
-    /// `a?` — standalone zero-or-one.
-    #[test]
-    fn test_question_mark_single() {
-        let p = "^a?$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        // negatives
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_memory_size(p, &re, 560);
-    }
-
-    /// `(ab)?` — zero-or-one of a group.
-    #[test]
-    fn test_question_mark_group() {
-        let p = "^(ab)?$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "ab");
-        // negatives
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "abab");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 600);
-    }
-
-    /// `a?b` — optional prefix followed by a literal.
-    #[test]
-    fn test_question_mark_prefix() {
-        let p = "^a?b$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ab");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_matches_regex_crate(p, &re, "bb");
-        assert_matches_regex_crate(p, &re, "cb");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 600);
-    }
-
-    /// `a*` — standalone zero-or-more.
-    #[test]
-    fn test_star_single() {
-        let p = "^a*$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "aaaa");
-        // negatives
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_matches_regex_crate(p, &re, "baa");
-        assert_memory_size(p, &re, 560);
-    }
-
-    /// `(ab)*` — zero-or-more of a group.
-    #[test]
-    fn test_star_group() {
-        let p = "^(ab)*$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abab");
-        assert_matches_regex_crate(p, &re, "ababab");
-        // negatives
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "aba");
-        assert_matches_regex_crate(p, &re, "abba");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_memory_size(p, &re, 600);
-    }
-
-    /// `a*b` — star followed by a literal.
-    #[test]
-    fn test_star_then_literal() {
-        let p = "^a*b$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_matches_regex_crate(p, &re, "aaab");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "bb");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "aabb");
-        assert_memory_size(p, &re, 600);
-    }
-
-    /// `a{2,}` — unbounded min with n>0.
-    #[test]
-    fn test_min_n_unbounded() {
-        let p = "^a{2,}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "aaaa");
-        assert_matches_regex_crate(p, &re, "aaaaa");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_matches_regex_crate(p, &re, "baa");
-        assert_memory_size(p, &re, 600);
-    }
-
-    /// `(ab){2,}` — unbounded min of a group.
-    #[test]
-    fn test_min_n_unbounded_group() {
-        let p = "^(ab){2,}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abab");
-        assert_matches_regex_crate(p, &re, "ababab");
-        assert_matches_regex_crate(p, &re, "abababab");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aba");
-        assert_matches_regex_crate(p, &re, "abba");
-        assert_matches_regex_crate(p, &re, "ababc");
-        assert_matches_regex_crate(p, &re, "xabab");
-        assert_memory_size(p, &re, 640);
-    }
-
-    /// `a{3,5}` — bounded min>0 range.
-    #[test]
-    fn test_bounded_range() {
-        let p = "^a{3,5}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "aaaa");
-        assert_matches_regex_crate(p, &re, "aaaaa");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaaaaa");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "aaab");
-        assert_matches_regex_crate(p, &re, "baaa");
-        assert_memory_size(p, &re, 600);
-    }
-
-    /// `a{3,3}` — exact repetition.
-    #[test]
-    fn test_exact_repetition() {
-        let p = "^a{3,3}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "aaa");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaaa");
-        assert_matches_regex_crate(p, &re, "aaaaa");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "bbb");
-        assert_memory_size(p, &re, 600);
-    }
-
-    // -- Byte class tests ---------------------------------------------------
-
-    /// `[a-c]` — a small contiguous byte range (Class::Bytes).
-    #[test]
-    fn test_byte_class_range() {
-        let p = "^[a-c]$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "c");
-        assert_matches_regex_crate(p, &re, "d");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_memory_size(p, &re, 776);
-    }
-
-    /// `[a-c]+` — one-or-more of a byte class.
-    #[test]
-    fn test_byte_class_one_plus() {
-        let p = "^[a-c]+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "cba");
-        assert_matches_regex_crate(p, &re, "abcd");
-        assert_matches_regex_crate(p, &re, "d");
-        assert_memory_size(p, &re, 816);
-    }
-
-    /// `[a-c]{2,3}` — counted repetition of a byte class.
-    #[test]
-    fn test_byte_class_counted() {
-        let p = "^[a-c]{2,3}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abca");
-        assert_matches_regex_crate(p, &re, "cc");
-        assert_matches_regex_crate(p, &re, "dd");
-        assert_memory_size(p, &re, 856);
-    }
-
-    /// `[ax]` — disjoint single bytes (multi-range Class::Bytes).
-    #[test]
-    fn test_byte_class_disjoint() {
-        let p = "^[ax]$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "x");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ax");
-        assert_memory_size(p, &re, 776);
-    }
-
-    /// `[a-cx-z]+` — multiple disjoint ranges in a byte class.
-    #[test]
-    fn test_byte_class_multi_range() {
-        let p = "^[a-cx-z]+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "x");
-        assert_matches_regex_crate(p, &re, "axbycz");
-        assert_matches_regex_crate(p, &re, "d");
-        assert_matches_regex_crate(p, &re, "w");
-        assert_matches_regex_crate(p, &re, "abcxyz");
-        assert_memory_size(p, &re, 816);
-    }
-
-    /// `[a-c].*[x-z]` — byte classes mixed with wildcard.
-    #[test]
-    fn test_byte_class_with_wildcard() {
-        let p = "^[a-c].*[x-z]$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "ax");
-        assert_matches_regex_crate(p, &re, "a123z");
-        assert_matches_regex_crate(p, &re, "bx");
-        assert_matches_regex_crate(p, &re, "dx");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_memory_size(p, &re, 1408);
-    }
-
-    // -- Predefined character class tests -----------------------------------
-
-    /// `\d` — matches a single ASCII digit.
-    #[test]
-    fn test_digit() {
-        let p = r"^\d$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "0");
-        assert_matches_regex_crate(p, &re, "5");
-        assert_matches_regex_crate(p, &re, "9");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "z");
-        assert_matches_regex_crate(p, &re, " ");
-        assert_matches_regex_crate(p, &re, "00");
-        assert_matches_regex_crate(p, &re, "12");
-        assert_memory_size(p, &re, 776);
-    }
-
-    /// `\d+` — one-or-more digits.
-    #[test]
-    fn test_digit_plus() {
-        let p = r"^\d+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "0");
-        assert_matches_regex_crate(p, &re, "42");
-        assert_matches_regex_crate(p, &re, "999");
-        assert_matches_regex_crate(p, &re, "0123456789");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "12a");
-        assert_matches_regex_crate(p, &re, "a12");
-        assert_matches_regex_crate(p, &re, "1 2");
-        assert_memory_size(p, &re, 816);
-    }
-
-    /// `\d{3,5}` — counted digit repetition.
-    #[test]
-    fn test_digit_counted() {
-        let p = r"^\d{3,5}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "123");
-        assert_matches_regex_crate(p, &re, "1234");
-        assert_matches_regex_crate(p, &re, "12345");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "1");
-        assert_matches_regex_crate(p, &re, "12");
-        assert_matches_regex_crate(p, &re, "123456");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "12a");
-        assert_memory_size(p, &re, 856);
-    }
-
-    /// `\D` — matches a single non-digit byte.
-    #[test]
-    fn test_non_digit() {
-        let p = r"^\D$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "z");
-        assert_matches_regex_crate(p, &re, " ");
-        assert_matches_regex_crate(p, &re, "!");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "0");
-        assert_matches_regex_crate(p, &re, "5");
-        assert_matches_regex_crate(p, &re, "9");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_memory_size(p, &re, 776);
-    }
-
-    /// `\D+` — one-or-more non-digits.
-    #[test]
-    fn test_non_digit_plus() {
-        let p = r"^\D+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "hello world");
-        assert_matches_regex_crate(p, &re, "!@#");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "0");
-        assert_matches_regex_crate(p, &re, "abc1");
-        assert_matches_regex_crate(p, &re, "1abc");
-        assert_memory_size(p, &re, 816);
-    }
-
-    /// `\s` — matches a single ASCII whitespace byte.
-    #[test]
-    fn test_space() {
-        let p = r"^\s$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, " ");
-        assert_matches_regex_crate(p, &re, "\t");
-        assert_matches_regex_crate(p, &re, "\n");
-        assert_matches_regex_crate(p, &re, "\r");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "0");
-        assert_matches_regex_crate(p, &re, "  ");
-        assert_memory_size(p, &re, 776);
-    }
-
-    /// `\s+` — one-or-more whitespace.
-    #[test]
-    fn test_space_plus() {
-        let p = r"^\s+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, " ");
-        assert_matches_regex_crate(p, &re, "   ");
-        assert_matches_regex_crate(p, &re, " \t\n\r");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, " a");
-        assert_matches_regex_crate(p, &re, "a ");
-        assert_memory_size(p, &re, 816);
-    }
-
-    /// `\S` — matches a single non-whitespace byte.
-    #[test]
-    fn test_non_space() {
-        let p = r"^\S$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "0");
-        assert_matches_regex_crate(p, &re, "!");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, " ");
-        assert_matches_regex_crate(p, &re, "\t");
-        assert_matches_regex_crate(p, &re, "\n");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_memory_size(p, &re, 776);
-    }
-
-    /// `\S+` — one-or-more non-whitespace.
-    #[test]
-    fn test_non_space_plus() {
-        let p = r"^\S+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "123");
-        assert_matches_regex_crate(p, &re, "a1!");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, " ");
-        assert_matches_regex_crate(p, &re, "a b");
-        assert_matches_regex_crate(p, &re, " abc");
-        assert_memory_size(p, &re, 816);
-    }
-
-    /// `\w` — matches a single ASCII word byte (`[0-9A-Za-z_]`).
-    #[test]
-    fn test_word() {
-        let p = r"^\w$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "Z");
-        assert_matches_regex_crate(p, &re, "0");
-        assert_matches_regex_crate(p, &re, "9");
-        assert_matches_regex_crate(p, &re, "_");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, " ");
-        assert_matches_regex_crate(p, &re, "!");
-        assert_matches_regex_crate(p, &re, "-");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_memory_size(p, &re, 776);
-    }
-
-    /// `\w+` — one-or-more word bytes.
-    #[test]
-    fn test_word_plus() {
-        let p = r"^\w+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "hello");
-        assert_matches_regex_crate(p, &re, "foo_bar");
-        assert_matches_regex_crate(p, &re, "x123");
-        assert_matches_regex_crate(p, &re, "___");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, " ");
-        assert_matches_regex_crate(p, &re, "hello world");
-        assert_matches_regex_crate(p, &re, "foo-bar");
-        assert_memory_size(p, &re, 816);
-    }
-
-    /// `\w{2,4}` — counted word repetition.
-    #[test]
-    fn test_word_counted() {
-        let p = r"^\w{2,4}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "a1_Z");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "abcde");
-        assert_matches_regex_crate(p, &re, "!!");
-        assert_matches_regex_crate(p, &re, "a b");
-        assert_memory_size(p, &re, 856);
-    }
-
-    /// `\W` — matches a single non-word byte.
-    #[test]
-    fn test_non_word() {
-        let p = r"^\W$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, " ");
-        assert_matches_regex_crate(p, &re, "!");
-        assert_matches_regex_crate(p, &re, "-");
-        assert_matches_regex_crate(p, &re, ".");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "0");
-        assert_matches_regex_crate(p, &re, "_");
-        assert_matches_regex_crate(p, &re, "  ");
-        assert_memory_size(p, &re, 776);
-    }
-
-    /// `\W+` — one-or-more non-word bytes.
-    #[test]
-    fn test_non_word_plus() {
-        let p = r"^\W+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, " ");
-        assert_matches_regex_crate(p, &re, "!@#");
-        assert_matches_regex_crate(p, &re, " - ");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "0");
-        assert_matches_regex_crate(p, &re, " a ");
-        assert_matches_regex_crate(p, &re, "!a!");
-        assert_memory_size(p, &re, 816);
-    }
-
-    /// `\d+\s+\w+` — mixed predefined classes in concatenation.
-    #[test]
-    fn test_predefined_mixed() {
-        let p = r"^\d+\s+\w+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "42 hello");
-        assert_matches_regex_crate(p, &re, "0\tfoo");
-        assert_matches_regex_crate(p, &re, "123  x");
-        assert_matches_regex_crate(p, &re, "7 _");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "42");
-        assert_matches_regex_crate(p, &re, "42 ");
-        assert_matches_regex_crate(p, &re, " hello");
-        assert_matches_regex_crate(p, &re, "hello 42");
-        assert_matches_regex_crate(p, &re, "42hello");
-        assert_memory_size(p, &re, 1488);
-    }
-
-    // -- Byte-class deduplication tests --------------------------------------
-
     /// Build a compiled [`Regex`] from a pattern string *without*
     /// asserting a specific memory size.  Used by dedup tests that
     /// compare sizes relatively rather than absolutely.
@@ -4736,6 +3482,3271 @@ mod tests {
         builder
             .build(&hir)
             .expect("our builder should accept the HIR")
+    }
+    // -----------------------------------------------------------------------
+    // Data-driven test infrastructure
+    // -----------------------------------------------------------------------
+
+    /// Compute the minimum DFA tier that can handle this regex.
+    /// 0 = NFA only, 1 = Tier 1+, 2 = Tier 2+, 3 = Tier 3 only.
+    fn compute_min_tier(re: &Regex) -> u8 {
+        if re.dfa_eligible {
+            1
+        } else if re.tier2_eligible {
+            2
+        } else if re.counting_dfa_eligible {
+            3
+        } else {
+            0
+        }
+    }
+
+    /// Test a pattern+input via the NFA simulator (full-chunk + byte-at-a-time).
+    fn test_nfa(pattern: &str, re: &Regex, input: &str, expected: bool) {
+        let mut memory = MatcherMemory::default();
+        let mut m = memory.nfa_matcher(re);
+        m.chunk(input.as_bytes());
+        let actual = m.finish();
+        assert_eq!(
+            actual, expected,
+            "NFA chunk mismatch for `{}` on {:?}: got={}, expected={}",
+            pattern, input, actual, expected
+        );
+        let mut m = memory.nfa_matcher(re);
+        for &b in input.as_bytes() {
+            m.chunk(&[b]);
+        }
+        let actual = m.finish();
+        assert_eq!(
+            actual, expected,
+            "NFA single-byte mismatch for `{}` on {:?}: got={}, expected={}",
+            pattern, input, actual, expected
+        );
+    }
+
+    /// Test a pattern+input via Tier 1 DFA (full-chunk + byte-at-a-time).
+    fn test_tier1(pattern: &str, re: &Regex, input: &str, expected: bool) {
+        use crate::dfa::{DfaCache, DfaMatcher};
+        let mut cache = DfaCache::new(re.states.len());
+        cache.prepare(re);
+        let mut d = DfaMatcher::new(&mut cache, re);
+        d.chunk(input.as_bytes());
+        let actual = d.finish();
+        assert_eq!(
+            actual, expected,
+            "Tier1 chunk mismatch for `{}` on {:?}: got={}, expected={}",
+            pattern, input, actual, expected
+        );
+        let mut d = DfaMatcher::new(&mut cache, re);
+        for &b in input.as_bytes() {
+            d.chunk(&[b]);
+        }
+        let actual = d.finish();
+        assert_eq!(
+            actual, expected,
+            "Tier1 single-byte mismatch for `{}` on {:?}: got={}, expected={}",
+            pattern, input, actual, expected
+        );
+    }
+
+    /// Test a pattern+input via Tier 2 DFA (full-chunk + byte-at-a-time).
+    fn test_tier2(pattern: &str, re: &Regex, input: &str, expected: bool) {
+        use crate::dfa::{Tier2DfaCache, Tier2DfaMatcher};
+        let mut cache = Tier2DfaCache::new(re.states.len());
+        cache.prepare(re);
+        let mut d = Tier2DfaMatcher::new(&mut cache, re);
+        d.chunk(input.as_bytes());
+        let actual = d.finish();
+        assert_eq!(
+            actual, expected,
+            "Tier2 chunk mismatch for `{}` on {:?}: got={}, expected={}",
+            pattern, input, actual, expected
+        );
+        let mut d = Tier2DfaMatcher::new(&mut cache, re);
+        for &b in input.as_bytes() {
+            d.chunk(&[b]);
+        }
+        let actual = d.finish();
+        assert_eq!(
+            actual, expected,
+            "Tier2 single-byte mismatch for `{}` on {:?}: got={}, expected={}",
+            pattern, input, actual, expected
+        );
+    }
+
+    /// Test a pattern+input via Tier 3 DFA (full-chunk + byte-at-a-time).
+    fn test_tier3(pattern: &str, re: &Regex, input: &str, expected: bool) {
+        use crate::dfa::{CountingDfaCache, CountingDfaMatcher};
+        let mut cache = CountingDfaCache::new(re.states.len());
+        cache.prepare(re);
+        let mut pool = CounterPool {
+            arena: Vec::new(),
+            free: Vec::new(),
+            num_counters: re.num_counters,
+        };
+        let mut d = CountingDfaMatcher::new(&mut cache, re, &mut pool);
+        d.chunk(input.as_bytes());
+        let actual = d.finish();
+        assert_eq!(
+            actual, expected,
+            "Tier3 chunk mismatch for `{}` on {:?}: got={}, expected={}",
+            pattern, input, actual, expected
+        );
+        pool.clear();
+        pool.num_counters = re.num_counters;
+        let mut d = CountingDfaMatcher::new(&mut cache, re, &mut pool);
+        for &b in input.as_bytes() {
+            d.chunk(&[b]);
+        }
+        let actual = d.finish();
+        assert_eq!(
+            actual, expected,
+            "Tier3 single-byte mismatch for `{}` on {:?}: got={}, expected={}",
+            pattern, input, actual, expected
+        );
+    }
+
+    /// Central test runner for data-driven match tests.
+    ///
+    /// For each input, queries the regex crate oracle for the expected
+    /// result, then tests NFA and all compatible DFA tiers.
+    fn run_match_test(pattern: &str, memory: usize, min_tier: u8, inputs: &[(&str, bool)]) {
+        let re = build_regex_unchecked(pattern);
+
+        // Verify declared min_tier matches the compiled regex.
+        let actual_tier = compute_min_tier(&re);
+        assert_eq!(
+            actual_tier, min_tier,
+            "min_tier mismatch for `{}`: declared={}, actual={}",
+            pattern, min_tier, actual_tier
+        );
+
+        // Assert memory size if specified (0 = skip).
+        if memory > 0 {
+            assert_memory_size(pattern, &re, memory);
+        }
+
+        // Oracle: regex crate is the source of truth.
+        let full = format!("(?s-u){}", pattern);
+        let oracle = regex::bytes::Regex::new(&full).expect("regex crate should parse pattern");
+
+        for &(input, expected_hint) in inputs {
+            let expected = oracle.is_match(input.as_bytes());
+
+            // Sanity-check the hint against the oracle.
+            assert_eq!(
+                expected, expected_hint,
+                "Oracle/hint mismatch for `{}` on {:?}: oracle={}, hint={}",
+                pattern, input, expected, expected_hint
+            );
+
+            // Always test NFA.
+            test_nfa(pattern, &re, input, expected);
+
+            // Test each DFA tier the regex is actually eligible for.
+            if re.dfa_eligible {
+                test_tier1(pattern, &re, input, expected);
+            }
+            if re.tier2_eligible {
+                test_tier2(pattern, &re, input, expected);
+            }
+            if re.counting_dfa_eligible {
+                test_tier3(pattern, &re, input, expected);
+            }
+        }
+    }
+
+    /// Generate one `#[test]` function per entry in the table.
+    macro_rules! match_tests {
+        ($(
+            $name:ident {
+                pattern: $pattern:literal,
+                memory: $memory:literal,
+                min_tier: $tier:literal,
+                inputs: [$(($input:literal, $expected:literal)),* $(,)?],
+            }
+        )*) => {
+            $(
+                #[test]
+                fn $name() {
+                    run_match_test(
+                        $pattern,
+                        $memory,
+                        $tier,
+                        &[$(($input, $expected)),*],
+                    );
+                }
+            )*
+        };
+    }
+
+    match_tests! {
+        test_counting {
+            pattern: "^.*a.{3}bc$",
+            memory: 1056,
+            min_tier: 2,
+            inputs: [
+                ("aybzbc", true),
+                ("axaybzbc", true),
+                ("a123bc", true),
+                ("za999bc", true),
+                ("abc", false),
+                ("a12bc", false),
+                ("a123bd", false),
+                ("a123xc", false),
+                ("", false),
+                ("bc", false),
+                ("a123b", false),
+                ("a123", false),
+            ],
+        }
+        test_range {
+            pattern: "^(a|bc){1,2}$",
+            memory: 720,
+            min_tier: 2,
+            inputs: [
+                ("a", true),
+                ("bc", true),
+                ("", false),
+                ("x", false),
+                ("b", false),
+                ("c", false),
+                ("ab", false),
+                ("ca", false),
+                ("bca", true),
+            ],
+        }
+        test_nested_counting {
+            pattern: "^((a|bc){1,2}){2,3}$",
+            memory: 800,
+            min_tier: 3,
+            inputs: [
+                ("", false),
+                ("a", false),
+                ("bc", false),
+                ("x", false),
+                ("b", false),
+                ("c", false),
+                ("aax", false),
+            ],
+        }
+        test_aaaaa {
+            pattern: "^(a|a?){2,3}$",
+            memory: 720,
+            min_tier: 0,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("aa", true),
+                ("aaa", true),
+                ("aaaa", false),
+                ("aaaaa", false),
+                ("b", false),
+                ("ab", false),
+                ("ba", false),
+                ("aab", false),
+            ],
+        }
+        test_one_plus_basic {
+            pattern: "^a+$",
+            memory: 560,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("aa", true),
+                ("aaa", true),
+                ("", false),
+                ("b", false),
+                ("ab", false),
+                ("ba", false),
+                ("aab", false),
+            ],
+        }
+        test_one_plus_wildcard {
+            pattern: "^.+$",
+            memory: 816,
+            min_tier: 1,
+            inputs: [
+                ("", false),
+                ("a", true),
+                ("ab", true),
+                ("abc", true),
+            ],
+        }
+        test_one_plus_catenation {
+            pattern: "^a+b+$",
+            memory: 640,
+            min_tier: 1,
+            inputs: [
+                ("", false),
+                ("a", false),
+                ("b", false),
+                ("ab", true),
+                ("aab", true),
+                ("abb", true),
+                ("aabb", true),
+                ("ba", false),
+            ],
+        }
+        test_one_plus_group {
+            pattern: "^(ab)+$",
+            memory: 600,
+            min_tier: 1,
+            inputs: [
+                ("", false),
+                ("a", false),
+                ("ab", true),
+                ("abab", true),
+                ("ababab", true),
+                ("aba", false),
+            ],
+        }
+        test_one_plus_alternate {
+            pattern: "^(a|b)+$",
+            memory: 816,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("b", true),
+                ("ab", true),
+                ("ba", true),
+                ("aab", true),
+                ("bba", true),
+                ("abab", true),
+                ("", false),
+                ("c", false),
+                ("ac", false),
+                ("ca", false),
+                ("abc", false),
+            ],
+        }
+        test_one_plus_with_counting {
+            pattern: "^.*a.{3}b+c$",
+            memory: 1096,
+            min_tier: 2,
+            inputs: [
+                ("a123bc", true),
+                ("a123bbc", true),
+                ("a123bbbc", true),
+                ("xa123bc", true),
+                ("xxxa999bc", true),
+                ("a123c", false),
+                ("a12bc", false),
+                ("a123bd", false),
+                ("a123bx", false),
+                ("", false),
+                ("x123bc", false),
+                ("a123b", false),
+            ],
+        }
+        test_repetition_inside_one_plus {
+            pattern: "^(a{2,3})+$",
+            memory: 640,
+            min_tier: 2,
+            inputs: [
+                ("", false),
+                ("a", false),
+                ("aa", true),
+                ("aaa", true),
+                ("aaaa", true),
+                ("aaaaa", true),
+                ("aaaaaa", true),
+                ("aaaaaaa", true),
+                ("aaaaaaaa", true),
+                ("aaaaaaaaa", true),
+                ("b", false),
+            ],
+        }
+        test_range_alternation_inside_one_plus {
+            pattern: "^((a|bc){1,2})+$",
+            memory: 760,
+            min_tier: 2,
+            inputs: [
+                ("", false),
+                ("a", true),
+                ("bc", true),
+                ("b", false),
+                ("c", false),
+            ],
+        }
+        test_one_plus_inside_repetition {
+            pattern: "^(a+){2,3}$",
+            memory: 640,
+            min_tier: 2,
+            inputs: [
+                ("", false),
+                ("a", false),
+                ("aa", true),
+                ("aaa", true),
+                ("aaaa", true),
+                ("aaaaa", true),
+                ("aaaaaa", true),
+                ("aaaaaaa", true),
+                ("b", false),
+            ],
+        }
+        test_one_plus_alternation_inside_repetition {
+            pattern: "^((a|b)+){2,4}$",
+            memory: 896,
+            min_tier: 2,
+            inputs: [
+                ("", false),
+                ("a", false),
+                ("b", false),
+                ("c", false),
+            ],
+        }
+        test_mixed_plus_and_repetition_inside_one_plus {
+            pattern: "^(a+b{2,3})+$",
+            memory: 720,
+            min_tier: 2,
+            inputs: [
+                ("", false),
+                ("a", false),
+                ("ab", false),
+                ("abb", true),
+                ("abbb", true),
+                ("abbbb", false),
+                ("aabb", true),
+                ("aabbb", true),
+                ("abbabb", true),
+                ("abbaabb", true),
+                ("abbabbbabb", true),
+                ("aabbaabbb", true),
+                ("aabbbaabbb", true),
+            ],
+        }
+        test_min_zero_basic {
+            pattern: "^a{0,2}$",
+            memory: 640,
+            min_tier: 2,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("aa", true),
+                ("aaa", false),
+                ("b", false),
+            ],
+        }
+        test_min_zero_max_one {
+            pattern: "^a{0,1}$",
+            memory: 560,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("aa", false),
+                ("b", false),
+            ],
+        }
+        test_min_zero_alternation {
+            pattern: "^(a|bc){0,3}$",
+            memory: 760,
+            min_tier: 2,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("bc", true),
+                ("b", false),
+            ],
+        }
+        test_min_zero_unbounded {
+            pattern: "^a{0,}$",
+            memory: 560,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("aa", true),
+                ("aaa", true),
+                ("aaaa", true),
+                ("b", false),
+                ("ab", false),
+                ("ba", false),
+                ("aab", false),
+                ("baa", false),
+            ],
+        }
+        test_min_zero_unbounded_group {
+            pattern: "^(ab){0,}$",
+            memory: 600,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("a", false),
+                ("ab", true),
+                ("abab", true),
+                ("ababab", true),
+                ("aba", false),
+            ],
+        }
+        test_min_zero_inside_one_plus {
+            pattern: "^x(a{0,2})+y$",
+            memory: 760,
+            min_tier: 2,
+            inputs: [
+                ("xy", true),
+                ("xay", true),
+                ("xaay", true),
+                ("xaaay", true),
+                ("xaaaay", true),
+                ("x", false),
+                ("y", false),
+                ("", false),
+                ("xby", false),
+                ("xaby", false),
+                ("ay", false),
+                ("xa", false),
+                ("aay", false),
+            ],
+        }
+        test_min_zero_inside_repetition {
+            pattern: "^(a{0,2}){2,3}$",
+            memory: 720,
+            min_tier: 0,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("aa", true),
+                ("aaa", true),
+                ("aaaa", true),
+                ("aaaaa", true),
+                ("aaaaaa", true),
+                ("aaaaaaa", false),
+                ("b", false),
+            ],
+        }
+        test_one_plus_inside_min_zero_repetition {
+            pattern: "^(a+){0,3}$",
+            memory: 680,
+            min_tier: 2,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("aa", true),
+                ("aaa", true),
+                ("aaaa", true),
+                ("aaaaa", true),
+                ("aaaaaa", true),
+                ("b", false),
+            ],
+        }
+        test_min_zero_wildcard {
+            pattern: "^.{0,3}$",
+            memory: 896,
+            min_tier: 2,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("ab", true),
+                ("abc", true),
+                ("abcd", false),
+            ],
+        }
+        test_none_min_repetition {
+            pattern: "^a{0,3}$",
+            memory: 640,
+            min_tier: 2,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("aa", true),
+                ("aaa", true),
+                ("aaaa", false),
+                ("b", false),
+                ("ab", false),
+                ("aab", false),
+            ],
+        }
+        test_literal_single {
+            pattern: "^a$",
+            memory: 520,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("", false),
+                ("b", false),
+                ("aa", false),
+                ("ab", false),
+                ("ba", false),
+            ],
+        }
+        test_literal_multi {
+            pattern: "^abc$",
+            memory: 600,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("", false),
+                ("a", false),
+                ("ab", false),
+                ("abd", false),
+                ("abcd", false),
+                ("xabc", false),
+                ("abcx", false),
+                ("xabcx", false),
+                ("cba", false),
+                ("bac", false),
+            ],
+        }
+        test_dot_single {
+            pattern: "^.$",
+            memory: 776,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("z", true),
+                ("0", true),
+                (" ", true),
+                ("", false),
+                ("ab", false),
+                ("abc", false),
+            ],
+        }
+        test_alternation_bare {
+            pattern: "^(a|bc)$",
+            memory: 640,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("bc", true),
+                ("", false),
+                ("b", false),
+                ("c", false),
+                ("ab", false),
+                ("abc", false),
+                ("x", false),
+                ("bca", false),
+            ],
+        }
+        test_alternation_three_way {
+            pattern: "^(a|b|c)$",
+            memory: 776,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("b", true),
+                ("c", true),
+                ("", false),
+                ("d", false),
+                ("ab", false),
+                ("abc", false),
+            ],
+        }
+        test_question_mark_single {
+            pattern: "^a?$",
+            memory: 560,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("aa", false),
+                ("b", false),
+                ("ab", false),
+            ],
+        }
+        test_question_mark_group {
+            pattern: "^(ab)?$",
+            memory: 600,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("ab", true),
+                ("a", false),
+                ("b", false),
+                ("ba", false),
+                ("abab", false),
+                ("abc", false),
+            ],
+        }
+        test_question_mark_prefix {
+            pattern: "^a?b$",
+            memory: 600,
+            min_tier: 1,
+            inputs: [
+                ("b", true),
+                ("ab", true),
+                ("", false),
+                ("a", false),
+                ("aab", false),
+                ("bb", false),
+                ("cb", false),
+                ("abc", false),
+            ],
+        }
+        test_star_single {
+            pattern: "^a*$",
+            memory: 560,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("aa", true),
+                ("aaa", true),
+                ("aaaa", true),
+                ("b", false),
+                ("ab", false),
+                ("ba", false),
+                ("aab", false),
+                ("baa", false),
+            ],
+        }
+        test_star_group {
+            pattern: "^(ab)*$",
+            memory: 600,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("ab", true),
+                ("abab", true),
+                ("ababab", true),
+                ("a", false),
+                ("b", false),
+                ("ba", false),
+                ("aba", false),
+                ("abba", false),
+                ("abc", false),
+            ],
+        }
+        test_star_then_literal {
+            pattern: "^a*b$",
+            memory: 600,
+            min_tier: 1,
+            inputs: [
+                ("b", true),
+                ("ab", true),
+                ("aab", true),
+                ("aaab", true),
+                ("", false),
+                ("a", false),
+                ("aa", false),
+                ("bb", false),
+                ("ba", false),
+                ("abc", false),
+                ("aabb", false),
+            ],
+        }
+        test_min_n_unbounded {
+            pattern: "^a{2,}$",
+            memory: 600,
+            min_tier: 2,
+            inputs: [
+                ("aa", true),
+                ("aaa", true),
+                ("aaaa", true),
+                ("aaaaa", true),
+                ("", false),
+                ("a", false),
+                ("b", false),
+                ("ab", false),
+                ("aab", false),
+                ("baa", false),
+            ],
+        }
+        test_min_n_unbounded_group {
+            pattern: "^(ab){2,}$",
+            memory: 640,
+            min_tier: 2,
+            inputs: [
+                ("abab", true),
+                ("ababab", true),
+                ("abababab", true),
+                ("", false),
+                ("ab", false),
+                ("a", false),
+                ("aba", false),
+                ("abba", false),
+                ("ababc", false),
+                ("xabab", false),
+            ],
+        }
+        test_bounded_range {
+            pattern: "^a{3,5}$",
+            memory: 600,
+            min_tier: 2,
+            inputs: [
+                ("aaa", true),
+                ("aaaa", true),
+                ("aaaaa", true),
+                ("", false),
+                ("a", false),
+                ("aa", false),
+                ("aaaaaa", false),
+                ("b", false),
+                ("aaab", false),
+                ("baaa", false),
+            ],
+        }
+        test_exact_repetition {
+            pattern: "^a{3,3}$",
+            memory: 600,
+            min_tier: 2,
+            inputs: [
+                ("aaa", true),
+                ("", false),
+                ("a", false),
+                ("aa", false),
+                ("aaaa", false),
+                ("aaaaa", false),
+                ("b", false),
+                ("bbb", false),
+            ],
+        }
+        test_byte_class_range {
+            pattern: "^[a-c]$",
+            memory: 776,
+            min_tier: 1,
+            inputs: [
+                ("", false),
+                ("a", true),
+                ("b", true),
+                ("c", true),
+                ("d", false),
+                ("ab", false),
+            ],
+        }
+        test_byte_class_one_plus {
+            pattern: "^[a-c]+$",
+            memory: 816,
+            min_tier: 1,
+            inputs: [
+                ("", false),
+                ("a", true),
+                ("abc", true),
+                ("cba", true),
+                ("abcd", false),
+                ("d", false),
+            ],
+        }
+        test_byte_class_counted {
+            pattern: "^[a-c]{2,3}$",
+            memory: 856,
+            min_tier: 2,
+            inputs: [
+                ("", false),
+                ("a", false),
+                ("ab", true),
+                ("abc", true),
+                ("abca", false),
+                ("cc", true),
+                ("dd", false),
+            ],
+        }
+        test_byte_class_disjoint {
+            pattern: "^[ax]$",
+            memory: 776,
+            min_tier: 1,
+            inputs: [
+                ("", false),
+                ("a", true),
+                ("x", true),
+                ("b", false),
+                ("ax", false),
+            ],
+        }
+        test_byte_class_multi_range {
+            pattern: "^[a-cx-z]+$",
+            memory: 816,
+            min_tier: 1,
+            inputs: [
+                ("", false),
+                ("a", true),
+                ("x", true),
+                ("axbycz", true),
+                ("d", false),
+                ("w", false),
+                ("abcxyz", true),
+            ],
+        }
+        test_byte_class_with_wildcard {
+            pattern: "^[a-c].*[x-z]$",
+            memory: 1408,
+            min_tier: 1,
+            inputs: [
+                ("ax", true),
+                ("a123z", true),
+                ("bx", true),
+                ("dx", false),
+                ("", false),
+                ("a", false),
+            ],
+        }
+        test_digit {
+            pattern: r#"^\d$"#,
+            memory: 776,
+            min_tier: 1,
+            inputs: [
+                ("0", true),
+                ("5", true),
+                ("9", true),
+                ("", false),
+                ("a", false),
+                ("z", false),
+                (" ", false),
+                ("00", false),
+                ("12", false),
+            ],
+        }
+        test_digit_plus {
+            pattern: r#"^\d+$"#,
+            memory: 816,
+            min_tier: 1,
+            inputs: [
+                ("0", true),
+                ("42", true),
+                ("999", true),
+                ("0123456789", true),
+                ("", false),
+                ("a", false),
+                ("12a", false),
+                ("a12", false),
+                ("1 2", false),
+            ],
+        }
+        test_digit_counted {
+            pattern: r#"^\d{3,5}$"#,
+            memory: 856,
+            min_tier: 2,
+            inputs: [
+                ("123", true),
+                ("1234", true),
+                ("12345", true),
+                ("", false),
+                ("1", false),
+                ("12", false),
+                ("123456", false),
+                ("abc", false),
+                ("12a", false),
+            ],
+        }
+        test_non_digit {
+            pattern: r#"^\D$"#,
+            memory: 776,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("z", true),
+                (" ", true),
+                ("!", true),
+                ("", false),
+                ("0", false),
+                ("5", false),
+                ("9", false),
+                ("aa", false),
+            ],
+        }
+        test_non_digit_plus {
+            pattern: r#"^\D+$"#,
+            memory: 816,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("hello world", true),
+                ("!@#", true),
+                ("", false),
+                ("0", false),
+                ("abc1", false),
+                ("1abc", false),
+            ],
+        }
+        test_space {
+            pattern: r#"^\s$"#,
+            memory: 776,
+            min_tier: 1,
+            inputs: [
+                (" ", true),
+                ("\t", true),
+                ("\n", true),
+                ("\r", true),
+                ("", false),
+                ("a", false),
+                ("0", false),
+                ("  ", false),
+            ],
+        }
+        test_space_plus {
+            pattern: r#"^\s+$"#,
+            memory: 816,
+            min_tier: 1,
+            inputs: [
+                (" ", true),
+                ("   ", true),
+                (" \t\n\r", true),
+                ("", false),
+                ("a", false),
+                (" a", false),
+                ("a ", false),
+            ],
+        }
+        test_non_space {
+            pattern: r#"^\S$"#,
+            memory: 776,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("0", true),
+                ("!", true),
+                ("", false),
+                (" ", false),
+                ("\t", false),
+                ("\n", false),
+                ("aa", false),
+            ],
+        }
+        test_non_space_plus {
+            pattern: r#"^\S+$"#,
+            memory: 816,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("123", true),
+                ("a1!", true),
+                ("", false),
+                (" ", false),
+                ("a b", false),
+                (" abc", false),
+            ],
+        }
+        test_word {
+            pattern: r#"^\w$"#,
+            memory: 776,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("Z", true),
+                ("0", true),
+                ("9", true),
+                ("_", true),
+                ("", false),
+                (" ", false),
+                ("!", false),
+                ("-", false),
+                ("ab", false),
+            ],
+        }
+        test_word_plus {
+            pattern: r#"^\w+$"#,
+            memory: 816,
+            min_tier: 1,
+            inputs: [
+                ("hello", true),
+                ("foo_bar", true),
+                ("x123", true),
+                ("___", true),
+                ("", false),
+                (" ", false),
+                ("hello world", false),
+                ("foo-bar", false),
+            ],
+        }
+        test_word_counted {
+            pattern: r#"^\w{2,4}$"#,
+            memory: 856,
+            min_tier: 2,
+            inputs: [
+                ("ab", true),
+                ("abc", true),
+                ("a1_Z", true),
+                ("", false),
+                ("a", false),
+                ("abcde", false),
+                ("!!", false),
+                ("a b", false),
+            ],
+        }
+        test_non_word {
+            pattern: r#"^\W$"#,
+            memory: 776,
+            min_tier: 1,
+            inputs: [
+                (" ", true),
+                ("!", true),
+                ("-", true),
+                (".", true),
+                ("", false),
+                ("a", false),
+                ("0", false),
+                ("_", false),
+                ("  ", false),
+            ],
+        }
+        test_non_word_plus {
+            pattern: r#"^\W+$"#,
+            memory: 816,
+            min_tier: 1,
+            inputs: [
+                (" ", true),
+                ("!@#", true),
+                (" - ", true),
+                ("", false),
+                ("a", false),
+                ("0", false),
+                (" a ", false),
+                ("!a!", false),
+            ],
+        }
+        test_predefined_mixed {
+            pattern: r#"^\d+\s+\w+$"#,
+            memory: 1488,
+            min_tier: 1,
+            inputs: [
+                ("42 hello", true),
+                ("0\tfoo", true),
+                ("123  x", true),
+                ("7 _", true),
+                ("", false),
+                ("42", false),
+                ("42 ", false),
+                (" hello", false),
+                ("hello 42", false),
+                ("42hello", false),
+            ],
+        }
+        test_anchor_start_only {
+            pattern: "^abc",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("abcdef", true),
+                ("abc123", true),
+                ("", false),
+                ("xabc", false),
+                ("ab", false),
+                ("abd", false),
+                ("zabc", false),
+            ],
+        }
+        test_anchor_end_only {
+            pattern: "abc$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("xabc", true),
+                ("123abc", true),
+                ("xxabc", true),
+                ("", false),
+                ("abcx", false),
+                ("ab", false),
+                ("abcabd", false),
+            ],
+        }
+        test_unanchored_literal {
+            pattern: "abc",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("xabc", true),
+                ("abcx", true),
+                ("xabcx", true),
+                ("xxabcxx", true),
+                ("", false),
+                ("ab", false),
+                ("abd", false),
+                ("axbc", false),
+                ("bca", false),
+            ],
+        }
+        test_anchor_start_wildcard {
+            pattern: "^a.b",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("axb", true),
+                ("axbyyy", true),
+                ("a1b", true),
+                ("ab", false),
+                ("yaxb", false),
+                ("", false),
+            ],
+        }
+        test_anchor_end_wildcard {
+            pattern: "a.b$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("axb", true),
+                ("yyyaxb", true),
+                ("a1b", true),
+                ("ab", false),
+                ("axby", false),
+                ("", false),
+            ],
+        }
+        test_both_anchors_quantifiers {
+            pattern: "^a+b+$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("ab", true),
+                ("aab", true),
+                ("abb", true),
+                ("aabb", true),
+                ("", false),
+                ("a", false),
+                ("b", false),
+                ("ba", false),
+                ("xab", false),
+                ("abx", false),
+            ],
+        }
+        test_unanchored_quantifiers {
+            pattern: "a+b+",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("ab", true),
+                ("aab", true),
+                ("abb", true),
+                ("xab", true),
+                ("xaabb", true),
+                ("abx", true),
+                ("xabx", true),
+                ("", false),
+                ("a", false),
+                ("b", false),
+                ("ba", false),
+                ("xyz", false),
+            ],
+        }
+        test_anchor_start_one_plus {
+            pattern: "^a+",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("aa", true),
+                ("aab", true),
+                ("abc", true),
+                ("", false),
+                ("b", false),
+                ("ba", false),
+                ("baa", false),
+            ],
+        }
+        test_anchor_end_one_plus {
+            pattern: "a+$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("aa", true),
+                ("ba", true),
+                ("baa", true),
+                ("xxa", true),
+                ("", false),
+                ("b", false),
+                ("ab", false),
+                ("aab", false),
+            ],
+        }
+        test_anchors_empty {
+            pattern: "^$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [("", true), ("a", false), ("ab", false)],
+        }
+        test_anchor_start_bare {
+            pattern: "^",
+            memory: 0,
+            min_tier: 1,
+            inputs: [("", true), ("a", true), ("abc", true)],
+        }
+        test_anchor_end_bare {
+            pattern: "$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [("", true), ("a", true), ("abc", true)],
+        }
+        test_unanchored_alternation {
+            pattern: "(a|b)",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("b", true),
+                ("xa", true),
+                ("bx", true),
+                ("xax", true),
+                ("", false),
+                ("c", false),
+                ("xyz", false),
+            ],
+        }
+        test_unanchored_star_literal {
+            pattern: "a*b",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("b", true),
+                ("ab", true),
+                ("aab", true),
+                ("xb", true),
+                ("xab", true),
+                ("bx", true),
+                ("", false),
+                ("a", false),
+                ("aa", false),
+                ("xyz", false),
+            ],
+        }
+        test_anchor_in_alternation_start {
+            pattern: "a|^b",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("xa", true),
+                ("ax", true),
+                ("xax", true),
+                ("b", true),
+                ("bx", true),
+                ("bxx", true),
+                ("ba", true),
+                ("ab", true),
+                ("", false),
+                ("c", false),
+                ("xb", false),
+                ("xbx", false),
+                ("xyz", false),
+            ],
+        }
+        test_anchor_in_alternation_end {
+            pattern: "a$|b",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("xa", true),
+                ("xxa", true),
+                ("b", true),
+                ("xb", true),
+                ("bx", true),
+                ("xbx", true),
+                ("ba", true),
+                ("ab", true),
+                ("", false),
+                ("c", false),
+                ("ax", false),
+                ("xax", false),
+                ("xyz", false),
+            ],
+        }
+        test_multiline_start_basic {
+            pattern: "(?m)^abc",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("abc\ndef", true),
+                ("xxx\nabc", true),
+                ("xxx\nabc\nyyy", true),
+                ("\nabc", true),
+                ("xabc", false),
+                ("", false),
+                ("\n", false),
+            ],
+        }
+        test_multiline_end_basic {
+            pattern: "(?m)abc$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("abc\ndef", true),
+                ("xxx\nabc", true),
+                ("xxxabc\nyyy", true),
+                ("abc\n", true),
+                ("abcx", false),
+                ("", false),
+                ("\n", false),
+            ],
+        }
+        test_multiline_both_anchors {
+            pattern: "(?m)^abc$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("abc\ndef", true),
+                ("def\nabc", true),
+                ("xxx\nabc\nyyy", true),
+                ("\nabc\n", true),
+                ("abc\n", true),
+                ("\nabc", true),
+                ("xabc", false),
+                ("abcx", false),
+                ("xabcx", false),
+                ("", false),
+                ("\n", false),
+                ("\n\n", false),
+            ],
+        }
+        test_multiline_multi_lines {
+            pattern: "(?m)^abc$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc\ndef\nghi", true),
+                ("def\nabc\nghi", true),
+                ("def\nghi\nabc", true),
+                ("def\nghi\njkl", false),
+            ],
+        }
+        test_multiline_catenation_across_newline {
+            pattern: r#"(?m)abc$\n^def"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc\ndef", true),
+                ("xxx\nabc\ndef\nyyy", true),
+                ("abc\nxef", false),
+                ("abcdef", false),
+            ],
+        }
+        test_multiline_with_dot_plus {
+            pattern: "(?m)^.+$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("abc\ndef", true),
+                ("\nabc", true),
+                ("abc\n", true),
+                ("", false),
+                ("\n", true),
+                ("\n\n", true),
+            ],
+        }
+        test_multiline_with_counting {
+            pattern: r#"(?m)^\d{2,4}$"#,
+            memory: 0,
+            min_tier: 0,
+            inputs: [
+                ("12", true),
+                ("123", true),
+                ("1234", true),
+                ("1", false),
+                ("12345", false),
+                ("xx\n12\nyy", true),
+                ("xx\n12345\nyy", false),
+                ("xx\n1\nyy", false),
+                ("12\n1234\n12345", true),
+            ],
+        }
+        test_multiline_edge_cases_empty {
+            pattern: "(?m)^$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("\n", true),
+                ("\n\n", true),
+                ("abc", false),
+                ("abc\n", true),
+                ("\nabc", true),
+                ("abc\n\ndef", true),
+            ],
+        }
+        test_multiline_start_only_empty_lines {
+            pattern: "(?m)^",
+            memory: 0,
+            min_tier: 1,
+            inputs: [("", true), ("a", true), ("\n", true)],
+        }
+        test_multiline_end_only {
+            pattern: "(?m)$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [("", true), ("a", true), ("\n", true)],
+        }
+        test_multiline_alternation {
+            pattern: "(?m)^(abc|def)$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("def", true),
+                ("abc\ndef", true),
+                ("ghi\nabc\njkl", true),
+                ("ghi\njkl", false),
+                ("abcdef", false),
+            ],
+        }
+        test_multiline_mixed_with_nonmultiline {
+            pattern: "^abc(?m:$)",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("abc\ndef", true),
+                ("xabc", false),
+                ("\nabc", false),
+            ],
+        }
+        test_crlf_start_basic {
+            pattern: "(?Rm)^abc",
+            memory: 0,
+            min_tier: 0,
+            inputs: [
+                ("abc", true),
+                ("\nabc", true),
+                ("\rabc", true),
+                ("\r\nabc", true),
+                ("xxx\nabc", true),
+                ("xxx\rabc", true),
+                ("xxx\r\nabc", true),
+                ("xabc", false),
+            ],
+        }
+        test_crlf_end_basic {
+            pattern: "(?Rm)abc$",
+            memory: 0,
+            min_tier: 0,
+            inputs: [
+                ("abc", true),
+                ("abc\n", true),
+                ("abc\r", true),
+                ("abc\r\n", true),
+                ("abc\nxxx", true),
+                ("abc\rxxx", true),
+                ("abc\r\nxxx", true),
+                ("abcx", false),
+            ],
+        }
+        test_crlf_both_anchors {
+            pattern: "(?Rm)^abc$",
+            memory: 0,
+            min_tier: 0,
+            inputs: [
+                ("abc", true),
+                ("abc\r\n", true),
+                ("\r\nabc", true),
+                ("\r\nabc\r\n", true),
+                ("xxx\r\nabc\r\nyyy", true),
+                ("abc\n", true),
+                ("\nabc\n", true),
+                ("abc\r", true),
+                ("\rabc\r", true),
+                ("xabc", false),
+                ("abcx", false),
+            ],
+        }
+        test_crlf_empty_lines {
+            pattern: "(?Rm)^$",
+            memory: 0,
+            min_tier: 0,
+            inputs: [
+                ("", true),
+                ("\n", true),
+                ("\r\n", true),
+                ("\r", true),
+                ("\r\n\r\n", true),
+                ("abc\r\n\r\ndef", true),
+                ("abc", false),
+            ],
+        }
+        test_crlf_multiline_vs_lf_1 {
+            pattern: "(?Rm)^abc$",
+            memory: 0,
+            min_tier: 0,
+            inputs: [("\r\nabc\r\n", true)],
+        }
+        test_crlf_multiline_vs_lf_2 {
+            pattern: "(?m)^abc$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [("\r\nabc\r\n", false)],
+        }
+        test_crlf_with_dot_plus {
+            pattern: "(?Rm)^.+$",
+            memory: 0,
+            min_tier: 0,
+            inputs: [
+                ("abc", true),
+                ("abc\r\ndef", true),
+                ("\r\nabc", true),
+                ("abc\r\n", true),
+                ("", false),
+                ("\r\n", true),
+                ("\r\n\r\n", true),
+            ],
+        }
+        test_crlf_with_counting {
+            pattern: r#"(?Rm)^\d{2,4}$"#,
+            memory: 0,
+            min_tier: 0,
+            inputs: [
+                ("12", true),
+                ("1234", true),
+                ("12345", false),
+                ("xx\r\n12\r\nyy", true),
+                ("xx\r\n1\r\nyy", false),
+            ],
+        }
+        test_crlf_bare_cr_as_line_terminator {
+            pattern: "(?Rm)^abc$",
+            memory: 0,
+            min_tier: 0,
+            inputs: [("xxx\rabc\ryyy", true), ("xxx\rabc", true), ("abc\ryyy", true)],
+        }
+        test_crlf_end_before_cr {
+            pattern: "(?Rm)abc$",
+            memory: 0,
+            min_tier: 0,
+            inputs: [("abc\r", true), ("abc\r\n", true), ("abc\rxxx", true)],
+        }
+        test_crlf_start_after_lf_not_crlf_middle {
+            pattern: "(?Rm)^x",
+            memory: 0,
+            min_tier: 0,
+            inputs: [("\nx", true), ("\r\nx", true), ("\rx", true)],
+        }
+        test_crlf_mixed_terminators {
+            pattern: "(?Rm)^abc$",
+            memory: 0,
+            min_tier: 0,
+            inputs: [
+                ("xxx\nabc\ryyy", true),
+                ("xxx\rabc\nyyy", true),
+                ("xxx\r\nabc\r\nyyy", true),
+                ("xxx\nabc\r\nyyy", true),
+                ("xxx\r\nabc\nyyy", true),
+            ],
+        }
+        test_crlf_end_only {
+            pattern: "(?Rm)$",
+            memory: 0,
+            min_tier: 0,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("\r\n", true),
+                ("\r", true),
+                ("\n", true),
+            ],
+        }
+        test_crlf_start_only {
+            pattern: "(?Rm)^",
+            memory: 0,
+            min_tier: 0,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("\r\n", true),
+                ("\r", true),
+                ("\n", true),
+            ],
+        }
+        test_word_boundary_literal {
+            pattern: r#"\bfoo\b"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("foo", true),
+                (" foo ", true),
+                ("foo bar", true),
+                ("bar foo", true),
+                ("bar foo baz", true),
+                ("(foo)", true),
+                ("foobar", false),
+                ("barfoo", false),
+                ("xfooy", false),
+                ("", false),
+            ],
+        }
+        test_word_boundary_start_end_1 {
+            pattern: r#"\bx"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [("x", true), (" x", true), ("ax", false)],
+        }
+        test_word_boundary_start_end_2 {
+            pattern: r#"x\b"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [("x", true), ("x ", true), ("xa", false)],
+        }
+        test_word_boundary_quantifiers {
+            pattern: r#"\b\w+\b"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("hello", true),
+                ("hello world", true),
+                ("  hello  ", true),
+                ("", false),
+                ("   ", false),
+            ],
+        }
+        test_word_boundary_counter {
+            pattern: r#"\b\w{3,5}\b"#,
+            memory: 0,
+            min_tier: 0,
+            inputs: [
+                ("abc", true),
+                ("abcde", true),
+                ("ab", false),
+                ("abcdef", false),
+                (" abc ", true),
+                (" ab ", false),
+                ("hello world", true),
+            ],
+        }
+        test_non_word_boundary {
+            pattern: r#"\Bfoo\B"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("xfooy", true),
+                ("afoobar", true),
+                ("foo", false),
+                (" foo ", false),
+                ("xfoo", false),
+                ("fooy", false),
+            ],
+        }
+        test_word_boundary_digits_underscore_1 {
+            pattern: r#"\b\d+\b"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [("123", true), (" 456 ", true), ("abc123def", false)],
+        }
+        test_word_boundary_digits_underscore_2 {
+            pattern: r#"\b_test_\b"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [("_test_", true), (" _test_ ", true), ("x_test_y", false)],
+        }
+        test_word_boundary_bare {
+            pattern: r#"\b"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [("a", true), (" ", false), ("", false)],
+        }
+        test_non_word_boundary_bare {
+            pattern: r#"\B"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [("", true), (" ", true), ("a", false)],
+        }
+        test_word_boundary_mixed {
+            pattern: r#"\bfoo\B"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("foobar", true),
+                (" foobar", true),
+                ("foo", false),
+                ("foo ", false),
+                ("xfoobar", false),
+            ],
+        }
+        test_word_boundary_alternation {
+            pattern: r#"\b(cat|dog)\b"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("cat", true),
+                ("dog", true),
+                ("the cat sat", true),
+                ("hotdog", false),
+                ("concatenate", false),
+            ],
+        }
+        test_word_boundary_special_chars {
+            pattern: r#"\btest\b"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("\0test\0", true),
+                (".test.", true),
+                ("\ttest\n", true),
+                ("/test/", true),
+            ],
+        }
+        test_unanchored_counter_simple_1 {
+            pattern: r#"\w{3,5}"#,
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("abc", true),
+                ("abcde", true),
+                ("ab", false),
+                ("a b c", false),
+                (" abc ", true),
+                ("x y z", false),
+                ("", false),
+                ("a", false),
+                ("abcdef", true),
+                ("ab cde fg", true),
+            ],
+        }
+        test_unanchored_counter_simple_2 {
+            pattern: "a{3}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("aaa", true),
+                ("aa", false),
+                ("xaaax", true),
+                ("a a a", false),
+                ("", false),
+                ("aaaa", true),
+                ("baaab", true),
+            ],
+        }
+        test_unanchored_counter_simple_3 {
+            pattern: "[0-9]{4}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("1234", true),
+                ("123", false),
+                ("a1234b", true),
+                ("1 2 3 4", false),
+                ("12345", true),
+                ("", false),
+            ],
+        }
+        test_unanchored_counter_alternation_body {
+            pattern: "(a|bc){2,4}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("aa", true),
+                ("abc", true),
+                ("bca", true),
+                ("bcbc", true),
+                ("a", false),
+                ("bc", false),
+                ("", false),
+                ("xaay", true),
+                ("xbcay", true),
+                ("a bc a", false),
+                ("abcbca", true),
+                ("abcbcbc", true),
+            ],
+        }
+        test_unanchored_counter_multi_byte_body {
+            pattern: "(ab){2,3}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("abab", true),
+                ("ababab", true),
+                ("ab", false),
+                ("", false),
+                ("xababx", true),
+                ("ab ab ab", false),
+                ("aab", false),
+                ("abb", false),
+                ("abababab", true),
+            ],
+        }
+        test_unanchored_counter_nested {
+            pattern: "((a|b){1,2}){2,3}",
+            memory: 0,
+            min_tier: 3,
+            inputs: [
+                ("ab", true),
+                ("aabb", true),
+                ("ababab", true),
+                ("a", false),
+                ("", false),
+                ("xaby", true),
+                ("a b", false),
+                ("abba", true),
+            ],
+        }
+        test_unanchored_counter_min_zero {
+            pattern: "a{0,3}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("aa", true),
+                ("aaa", true),
+                ("aaaa", true),
+                ("b", true),
+                ("xaaax", true),
+            ],
+        }
+        test_unanchored_counter_unbounded {
+            pattern: "a{2,}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("aa", true),
+                ("aaa", true),
+                ("a", false),
+                ("", false),
+                ("xaay", true),
+                ("a a", false),
+                ("baaaab", true),
+            ],
+        }
+        test_unanchored_counter_wildcard_body {
+            pattern: ".{3,5}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("abc", true),
+                ("abcde", true),
+                ("ab", false),
+                ("a", false),
+                ("", false),
+                ("abcdef", true),
+            ],
+        }
+        test_partial_anchor_start_counter_1 {
+            pattern: "^a{2,3}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("aa", true),
+                ("aaa", true),
+                ("a", false),
+                ("aaax", true),
+                ("", false),
+                ("xaa", false),
+            ],
+        }
+        test_partial_anchor_start_counter_2 {
+            pattern: r#"^\d{2,4}"#,
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("12", true),
+                ("1234", true),
+                ("1", false),
+                ("12345", true),
+                ("", false),
+                ("a12", false),
+            ],
+        }
+        test_partial_anchor_end_counter_1 {
+            pattern: "a{2,3}$",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("aa", true),
+                ("aaa", true),
+                ("a", false),
+                ("xaa", true),
+                ("", false),
+                ("aax", false),
+            ],
+        }
+        test_partial_anchor_end_counter_2 {
+            pattern: r#"\d{2,4}$"#,
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("12", true),
+                ("1234", true),
+                ("1", false),
+                ("x1234", true),
+                ("", false),
+                ("12x", false),
+            ],
+        }
+        test_unanchored_byte_class_1 {
+            pattern: r#"\d+"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("123", true),
+                ("abc", false),
+                ("a1b2c3", true),
+                ("", false),
+            ],
+        }
+        test_unanchored_byte_class_2 {
+            pattern: r#"\w+"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("hello", true),
+                (" ", false),
+                ("a b c", true),
+                ("", false),
+            ],
+        }
+        test_unanchored_byte_class_3 {
+            pattern: "[a-c]+",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("abcabc", true),
+                ("xyz", false),
+                ("xabcy", true),
+                ("", false),
+            ],
+        }
+        test_unanchored_byte_table_counter {
+            pattern: "(ab|cd|ef){2,3}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("abcd", true),
+                ("abcdef", true),
+                ("ab", false),
+                ("", false),
+                ("xabcdy", true),
+                ("ab cd ef", false),
+                ("ababab", true),
+                ("efef", true),
+                ("abefcd", true),
+            ],
+        }
+        test_unanchored_question_mark {
+            pattern: "a?b",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("ab", true),
+                ("b", true),
+                ("xaby", true),
+                ("xby", true),
+                ("a", false),
+                ("", false),
+                ("aab", true),
+            ],
+        }
+        test_counter_exact_one {
+            pattern: "a{1,1}",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("", false),
+                ("xax", true),
+                ("aa", true),
+                ("b", false),
+            ],
+        }
+        test_multiline_alternation_counter {
+            pattern: "(?m:^)(a|bc){2,3}(?m:$)",
+            memory: 0,
+            min_tier: 0,
+            inputs: [
+                ("aa", true),
+                ("abc", true),
+                ("bcbc", true),
+                ("a", false),
+                ("", false),
+                ("xxx\naa\nyyy", true),
+                ("xxx\nabc\nyyy", true),
+                ("xxx\na\nyyy", false),
+            ],
+        }
+        test_empty_input_unanchored_counter {
+            pattern: "a{0,3}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [("", true)],
+        }
+        test_unanchored_byte_class_counter {
+            pattern: r#"\d{2,4}"#,
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("12", true),
+                ("1234", true),
+                ("1", false),
+                ("", false),
+                ("a12b", true),
+                ("a1b2c", false),
+                ("12345", true),
+                ("a1234b", true),
+            ],
+        }
+        test_counter_body_with_assertion_1 {
+            pattern: "(?m:^a){2,3}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("a\na", false),
+                ("a\na\na", false),
+                ("a", false),
+                ("", false),
+                ("a\nb\na", false),
+                ("ba\na", false),
+                ("a\na\na\na", false),
+            ],
+        }
+        test_counter_body_with_assertion_2 {
+            pattern: "(?m:a$){2,3}",
+            memory: 0,
+            min_tier: 0,
+            inputs: [
+                ("a\na", false),
+                ("a\na\na", false),
+                ("a", false),
+                ("", false),
+                ("a\nb\na", false),
+                ("xa\nxa", false),
+            ],
+        }
+        test_counter_body_with_assertion_3 {
+            pattern: "(?m:^a$){2,3}",
+            memory: 0,
+            min_tier: 0,
+            inputs: [
+                ("a\na", false),
+                ("a\na\na", false),
+                ("a", false),
+                ("", false),
+                ("a\nab\na", false),
+                ("x\na\na\nx", false),
+            ],
+        }
+        test_byte_table_cross_validate_unanchored {
+            pattern: "(ab|cd|ef)",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("ab", true),
+                ("cd", true),
+                ("ef", true),
+                ("xxab", true),
+                ("cdyy", true),
+                ("xxefyy", true),
+                ("ac", false),
+                ("xyz", false),
+                ("", false),
+                ("a", false),
+                ("f", false),
+            ],
+        }
+        test_byte_table_with_bounded_repetition_cross_validate {
+            pattern: "^(ab|cd|ef){2,4}$",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("abcd", true),
+                ("efab", true),
+                ("cdef", true),
+                ("ababab", true),
+                ("abcdef", true),
+                ("abcdefab", true),
+                ("ab", false),
+                ("ef", false),
+                ("", false),
+                ("abcdefabcd", false),
+                ("abcdefef", true),
+            ],
+        }
+        test_byte_table_counted_with_suffix {
+            pattern: "^(ab|cd|ef){1,3}x$",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("abx", true),
+                ("cdx", true),
+                ("efx", true),
+                ("abcdx", true),
+                ("efabx", true),
+                ("abcdefx", true),
+                ("x", false),
+                ("ab", false),
+                ("abcdefabx", false),
+                ("", false),
+                ("abcdefxx", false),
+            ],
+        }
+        test_byte_table_mixed_length_unanchored {
+            pattern: "(a|bc|def)",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("bc", true),
+                ("def", true),
+                ("xxa", true),
+                ("xxbcyy", true),
+                ("xxdefyy", true),
+                ("xx", false),
+                ("", false),
+                ("bd", false),
+            ],
+        }
+        test_byte_table_with_prefix_and_suffix {
+            pattern: "^xx(ab|cd|ef)yy$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("xxabyy", true),
+                ("xxcdyy", true),
+                ("xxefyy", true),
+                ("xxabyyz", false),
+                ("xabyy", false),
+                ("xxaby", false),
+                ("xxyy", false),
+                ("abyy", false),
+                ("", false),
+            ],
+        }
+        test_byte_table_after_wildcard {
+            pattern: "^..(ab|cd|ef)$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("xxab", true),
+                ("zzcd", true),
+                ("qqef", true),
+                ("\0\x7fab", true),
+                ("xab", false),
+                ("xxxab", false),
+                ("xxac", false),
+                ("", false),
+            ],
+        }
+        test_byte_table_followed_by_wildcard {
+            pattern: "^(ab|cd|ef).*x$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abx", true),
+                ("cdx", true),
+                ("efx", true),
+                ("ab123x", true),
+                ("cdxxxxxx", true),
+                ("abX", false),
+                ("cd", false),
+                ("ef123", false),
+                ("x", false),
+                ("", false),
+            ],
+        }
+        test_byte_table_sandwiched_by_wildcards {
+            pattern: "^.*(ab|cd|ef).*$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("ab", true),
+                ("cd", true),
+                ("ef", true),
+                ("xxxab", true),
+                ("cdyyy", true),
+                ("xxxefyyy", true),
+                ("xxabyycdzzef", true),
+                ("", false),
+                ("x", false),
+                ("ac", false),
+            ],
+        }
+        test_step_fused_multi_counter_same_byte {
+            pattern: "a{2}.*a{3}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("aaaaa", true),
+                ("aabaa", false),
+                ("aaxaaa", true),
+                ("aa aaa", true),
+                ("a", false),
+                ("aaaa", false),
+                ("aaa", false),
+                ("", false),
+            ],
+        }
+        test_step_fused_alternation_overlap {
+            pattern: "(a|a){2,3}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("aa", true),
+                ("aaa", true),
+                ("a", false),
+                ("aaaa", true),
+                ("", false),
+                ("xaax", true),
+                ("xaaax", true),
+            ],
+        }
+        test_step_fused_byteclass_and_literal {
+            pattern: "[a-z]{2}a{2}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("xyaa", true),
+                ("aaaa", true),
+                ("aa", false),
+                ("aaa", false),
+                ("abaa", true),
+                ("a", false),
+                ("", false),
+                ("xyzaa", true),
+                (" aaaa ", true),
+            ],
+        }
+        test_step_fused_reseed_with_counter {
+            pattern: "(a{2}){2}",
+            memory: 0,
+            min_tier: 3,
+            inputs: [
+                ("aaaa", true),
+                ("aaa", false),
+                ("aaaaa", true),
+                ("aa", false),
+                ("a", false),
+                ("", false),
+                ("xaaaax", true),
+                ("aa aa", false),
+                ("aaxaa", false),
+            ],
+        }
+        test_ci_literal_single {
+            pattern: "^(?i)a$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("A", true),
+                ("", false),
+                ("b", false),
+                ("B", false),
+                ("aa", false),
+                ("AA", false),
+                ("aA", false),
+                ("1", false),
+            ],
+        }
+        test_ci_literal_multi {
+            pattern: "^(?i)abc$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("ABC", true),
+                ("Abc", true),
+                ("aBc", true),
+                ("abC", true),
+                ("ABc", true),
+                ("AbC", true),
+                ("aBC", true),
+                ("", false),
+                ("ab", false),
+                ("AB", false),
+                ("abcd", false),
+                ("ABCD", false),
+                ("xabc", false),
+                ("abd", false),
+                ("cba", false),
+                ("CBA", false),
+            ],
+        }
+        test_ci_one_plus {
+            pattern: "^(?i)a+$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("A", true),
+                ("aa", true),
+                ("AA", true),
+                ("aAaA", true),
+                ("AaAa", true),
+                ("aaAAAAaa", true),
+                ("", false),
+                ("b", false),
+                ("ab", false),
+                ("ba", false),
+                ("aab", false),
+                ("bAA", false),
+            ],
+        }
+        test_ci_star {
+            pattern: "^(?i)a*$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("A", true),
+                ("aA", true),
+                ("AaA", true),
+                ("b", false),
+                ("ab", false),
+                ("Ba", false),
+            ],
+        }
+        test_ci_question {
+            pattern: "^(?i)a?$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("A", true),
+                ("b", false),
+                ("aa", false),
+                ("AA", false),
+                ("aA", false),
+            ],
+        }
+        test_ci_counted {
+            pattern: "^(?i)a{2,4}$",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("aa", true),
+                ("AA", true),
+                ("aA", true),
+                ("Aa", true),
+                ("aaa", true),
+                ("AAA", true),
+                ("aAa", true),
+                ("aaaa", true),
+                ("AAAA", true),
+                ("aAaA", true),
+                ("AaAa", true),
+                ("", false),
+                ("a", false),
+                ("A", false),
+                ("aaaaa", false),
+                ("AAAAA", false),
+                ("b", false),
+                ("bb", false),
+                ("aab", false),
+                ("baa", false),
+            ],
+        }
+        test_ci_counted_min_zero {
+            pattern: "^(?i)a{0,3}$",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("A", true),
+                ("aA", true),
+                ("AaA", true),
+                ("aAa", true),
+                ("aaaa", false),
+                ("AAAA", false),
+                ("b", false),
+                ("aab", false),
+            ],
+        }
+        test_ci_alternation {
+            pattern: "^(?i)(a|bc)$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("A", true),
+                ("bc", true),
+                ("BC", true),
+                ("Bc", true),
+                ("bC", true),
+                ("", false),
+                ("b", false),
+                ("B", false),
+                ("c", false),
+                ("C", false),
+                ("ab", false),
+                ("abc", false),
+                ("cb", false),
+                ("CB", false),
+            ],
+        }
+        test_ci_alternation_three_way {
+            pattern: "^(?i)(abc|def|ghi)$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("ABC", true),
+                ("AbC", true),
+                ("def", true),
+                ("DEF", true),
+                ("DeF", true),
+                ("ghi", true),
+                ("GHI", true),
+                ("gHi", true),
+                ("", false),
+                ("ab", false),
+                ("abcd", false),
+                ("abcdef", false),
+                ("xyz", false),
+                ("aef", false),
+                ("abi", false),
+            ],
+        }
+        test_ci_mixed_letter_nonletter {
+            pattern: "^(?i)hello world$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("hello world", true),
+                ("HELLO WORLD", true),
+                ("Hello World", true),
+                ("hElLo WoRlD", true),
+                ("", false),
+                ("hello", false),
+                ("helloworld", false),
+                ("hello  world", false),
+                ("hello world!", false),
+                ("xhello world", false),
+            ],
+        }
+        test_ci_with_digits {
+            pattern: "^(?i)a1b2c$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("a1b2c", true),
+                ("A1B2C", true),
+                ("A1b2C", true),
+                ("a1B2c", true),
+                ("a2b2c", false),
+                ("a1b1c", false),
+                ("a1b2", false),
+                ("1b2c", false),
+                ("", false),
+            ],
+        }
+        test_ci_byte_class {
+            pattern: "^(?i)[abc]$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("A", true),
+                ("b", true),
+                ("B", true),
+                ("c", true),
+                ("C", true),
+                ("", false),
+                ("d", false),
+                ("D", false),
+                ("z", false),
+                ("Z", false),
+                ("ab", false),
+                ("1", false),
+            ],
+        }
+        test_ci_byte_class_full_alpha {
+            pattern: "^(?i)[a-z]$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("A", true),
+                ("m", true),
+                ("M", true),
+                ("z", true),
+                ("Z", true),
+                ("", false),
+                ("0", false),
+                ("9", false),
+                ("!", false),
+                ("ab", false),
+            ],
+        }
+        test_ci_byte_class_alpha_digit {
+            pattern: "^(?i)[a-z0-9]+$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc123", true),
+                ("ABC123", true),
+                ("AbC789", true),
+                ("0", true),
+                ("Z", true),
+                ("", false),
+                ("!", false),
+                ("abc!", false),
+                (" ", false),
+            ],
+        }
+        test_ci_word_boundary {
+            pattern: "(?i)foo",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("foo", false),
+                ("FOO", false),
+                ("Foo", false),
+                ("fOo", false),
+                (" foo ", false),
+                (" FOO ", false),
+                ("!foo!", false),
+                ("x foo y", false),
+                ("x FOO y", false),
+                ("foobar", false),
+                ("FOOBAR", false),
+                ("barfoo1", false),
+                ("afoo", false),
+                ("foob", false),
+                ("", false),
+                ("bar", false),
+                ("BAR", false),
+                ("fo", false),
+                ("oo", false),
+            ],
+        }
+        test_ci_unanchored {
+            pattern: "(?i)select",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("SELECT", true),
+                ("select", true),
+                ("Select", true),
+                ("sElEcT", true),
+                ("xxx SELECT yyy", true),
+                ("beforeSELECTafter", true),
+                ("123select456", true),
+                ("", false),
+                ("selec", false),
+                ("elect", false),
+                ("SELCT", false),
+                ("slect", false),
+            ],
+        }
+        test_ci_counted_group {
+            pattern: "^(?i)(ab){2,3}$",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("abab", true),
+                ("ABAB", true),
+                ("AbAb", true),
+                ("aBaB", true),
+                ("ababab", true),
+                ("ABABAB", true),
+                ("AbAbAb", true),
+                ("aBAbab", true),
+                ("ab", false),
+                ("AB", false),
+                ("abababab", false),
+                ("ABABABAB", false),
+                ("", false),
+                ("ba", false),
+                ("aabb", false),
+            ],
+        }
+        test_ci_catenation_one_plus {
+            pattern: "^(?i)a+b+c+$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("ABC", true),
+                ("aaBBcc", true),
+                ("AaaBbCcc", true),
+                ("aaaBBBccc", true),
+                ("", false),
+                ("a", false),
+                ("ab", false),
+                ("bc", false),
+                ("ac", false),
+                ("cba", false),
+                ("CBA", false),
+                ("abca", false),
+                ("aabbc1", false),
+            ],
+        }
+        test_ci_wildcard {
+            pattern: "^(?i).*foo.*$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("foo", true),
+                ("FOO", true),
+                ("Foo", true),
+                ("xxxfooyyy", true),
+                ("XXXFOOYYY", true),
+                ("123Foo456", true),
+                ("foobar", true),
+                ("barFOO", true),
+                ("", false),
+                ("fo", false),
+                ("oo", false),
+                ("bar", false),
+                ("fxoo", false),
+            ],
+        }
+        test_ci_digit_then_hex {
+            pattern: r#"^(?i)\d+[a-f]+$"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("1a", true),
+                ("1A", true),
+                ("99ff", true),
+                ("99FF", true),
+                ("123abcDEF", true),
+                ("0fF", true),
+                ("", false),
+                ("a1", false),
+                ("123", false),
+                ("abc", false),
+                ("12g", false),
+                ("12G", false),
+            ],
+        }
+        test_ci_word_class {
+            pattern: r#"^(?i)\w+$"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("ABC", true),
+                ("Hello123", true),
+                ("_underscore", true),
+                ("MiXeD_CaSe_123", true),
+                ("", false),
+                (" ", false),
+                ("hello world", false),
+                ("!", false),
+            ],
+        }
+        test_ci_waf_sql_keywords {
+            pattern: "(?i)(?:select|insert|update|delete)",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("SELECT", false),
+                ("select", false),
+                ("Select", false),
+                ("INSERT", false),
+                ("insert", false),
+                ("Insert", false),
+                ("UPDATE", false),
+                ("update", false),
+                ("UpDaTe", false),
+                ("DELETE", false),
+                ("delete", false),
+                ("DeLeTe", false),
+                ("please SELECT * from", false),
+                ("do INSERT into", false),
+                ("run UPDATE set", false),
+                ("run delete from t", false),
+                ("selected", false),
+                ("SELECTED", false),
+                ("inserts", false),
+                ("updated", false),
+                ("deletes", false),
+                ("preselect", false),
+                ("", false),
+                ("hello world", false),
+                ("CREATE TABLE", false),
+            ],
+        }
+        test_ci_function_call {
+            pattern: r#"(?i)foo\("#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("foo(", false),
+                ("FOO(", false),
+                ("Foo(", false),
+                ("x foo(", false),
+                ("x FOO( y", false),
+                ("!Foo(1)", false),
+                ("foo", false),
+                ("FOO", false),
+                ("barfoo(", false),
+                ("afoo(", false),
+                ("", false),
+                ("bar(", false),
+            ],
+        }
+        test_ci_counted_alternation {
+            pattern: "^(?i)(a|b){1,2}$",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("a", true),
+                ("A", true),
+                ("b", true),
+                ("B", true),
+                ("aa", true),
+                ("AA", true),
+                ("ab", true),
+                ("AB", true),
+                ("aB", true),
+                ("Ab", true),
+                ("ba", true),
+                ("BA", true),
+                ("bA", true),
+                ("Ba", true),
+                ("bb", true),
+                ("BB", true),
+                ("", false),
+                ("aab", false),
+                ("AAB", false),
+                ("c", false),
+                ("C", false),
+            ],
+        }
+        test_ci_dot_in_middle {
+            pattern: "^(?i)x.y$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("xay", true),
+                ("XAY", true),
+                ("xAy", true),
+                ("X1Y", true),
+                ("x y", true),
+                ("X!Y", true),
+                ("", false),
+                ("xy", false),
+                ("XY", false),
+                ("xaby", false),
+                ("axy", false),
+            ],
+        }
+        test_ci_negated_class {
+            pattern: "^(?i)[^a-z]$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("0", true),
+                ("9", true),
+                ("!", true),
+                (" ", true),
+                ("@", true),
+                ("a", false),
+                ("A", false),
+                ("z", false),
+                ("Z", false),
+                ("m", false),
+                ("M", false),
+                ("", false),
+                ("12", false),
+            ],
+        }
+        test_ci_counted_wildcard {
+            pattern: "^(?i).{2,4}$",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("ab", true),
+                ("AB", true),
+                ("12", true),
+                ("abc", true),
+                ("abcd", true),
+                ("!@#", true),
+                ("", false),
+                ("a", false),
+                ("abcde", false),
+            ],
+        }
+        test_ci_repeated_alternation {
+            pattern: "^(?i)(foo|bar)+$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("foo", true),
+                ("FOO", true),
+                ("bar", true),
+                ("BAR", true),
+                ("foobar", true),
+                ("FOOBAR", true),
+                ("FooBar", true),
+                ("barfoo", true),
+                ("BARFOO", true),
+                ("foofoofoo", true),
+                ("FOOBARFOO", true),
+                ("barBARbar", true),
+                ("", false),
+                ("fo", false),
+                ("ba", false),
+                ("baz", false),
+                ("foobaz", false),
+                ("foobarx", false),
+            ],
+        }
+        test_ci_non_word_class {
+            pattern: r#"^(?i)a\Wb$"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("a b", true),
+                ("A B", true),
+                ("a!b", true),
+                ("A!B", true),
+                ("a.B", true),
+                ("A-b", true),
+                ("aab", false),
+                ("a1b", false),
+                ("a_b", false),
+                ("ab", false),
+                ("", false),
+                ("c d", false),
+            ],
+        }
+        test_partial_ci_middle {
+            pattern: "^a(?i:b)c$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("aBc", true),
+                ("Abc", false),
+                ("abC", false),
+                ("ABC", false),
+                ("aBC", false),
+                ("AbC", false),
+                ("", false),
+                ("ac", false),
+                ("axc", false),
+                ("abbc", false),
+                ("abcx", false),
+            ],
+        }
+        test_partial_ci_prefix {
+            pattern: "^(?i:a)b$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("ab", true),
+                ("Ab", true),
+                ("aB", false),
+                ("AB", false),
+                ("", false),
+                ("b", false),
+                ("cb", false),
+                ("abc", false),
+            ],
+        }
+        test_partial_ci_suffix {
+            pattern: "^a(?i:b)$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("ab", true),
+                ("aB", true),
+                ("Ab", false),
+                ("AB", false),
+                ("", false),
+                ("a", false),
+                ("ac", false),
+            ],
+        }
+        test_partial_ci_toggle_on_off {
+            pattern: "^(?i)a(?-i)b$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("ab", true),
+                ("Ab", true),
+                ("aB", false),
+                ("AB", false),
+                ("", false),
+                ("a", false),
+                ("b", false),
+                ("abc", false),
+            ],
+        }
+        test_partial_ci_toggle_off_then_on {
+            pattern: "^a(?-i)b(?i)c$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("abC", true),
+                ("Abc", false),
+                ("aBc", false),
+                ("ABC", false),
+                ("ABc", false),
+                ("", false),
+                ("ab", false),
+                ("abx", false),
+            ],
+        }
+        test_partial_ci_quantified_group {
+            pattern: "^a(?i:b)+c$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("aBc", true),
+                ("abbc", true),
+                ("aBBc", true),
+                ("aBbBc", true),
+                ("abBbc", true),
+                ("Abc", false),
+                ("abC", false),
+                ("ABC", false),
+                ("ac", false),
+                ("axc", false),
+                ("", false),
+            ],
+        }
+        test_partial_ci_star_group {
+            pattern: "^a(?i:b)*c$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("ac", true),
+                ("abc", true),
+                ("aBc", true),
+                ("aBBBc", true),
+                ("Ac", false),
+                ("aC", false),
+                ("ABc", false),
+                ("", false),
+                ("a", false),
+                ("axc", false),
+            ],
+        }
+        test_partial_ci_counted_group {
+            pattern: "^a(?i:b){2,4}c$",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("abbc", true),
+                ("aBBc", true),
+                ("aBbc", true),
+                ("abbbc", true),
+                ("aBBBc", true),
+                ("abBBc", true),
+                ("abbbbc", true),
+                ("aBBBBc", true),
+                ("abc", false),
+                ("aBc", false),
+                ("abbbbbc", false),
+                ("aBBBBBc", false),
+                ("ABBc", false),
+                ("abbC", false),
+                ("axxc", false),
+                ("", false),
+            ],
+        }
+        test_partial_ci_multi_letter_group {
+            pattern: "^a(?i:bc)d$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abcd", true),
+                ("aBCd", true),
+                ("aBcd", true),
+                ("abCd", true),
+                ("Abcd", false),
+                ("abcD", false),
+                ("ABCD", false),
+                ("", false),
+                ("abc", false),
+                ("abxd", false),
+                ("axcd", false),
+            ],
+        }
+        test_partial_ci_adjacent_groups {
+            pattern: "^(?i:a)(?i:b)c$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("Abc", true),
+                ("aBc", true),
+                ("ABc", true),
+                ("abC", false),
+                ("ABC", false),
+                ("AbC", false),
+                ("", false),
+                ("ab", false),
+                ("xbc", false),
+            ],
+        }
+        test_partial_ci_alternation_then_literal {
+            pattern: "^(?i:a|bc)d$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("ad", true),
+                ("Ad", true),
+                ("bcd", true),
+                ("BCd", true),
+                ("Bcd", true),
+                ("bCd", true),
+                ("aD", false),
+                ("AD", false),
+                ("bcD", false),
+                ("BCD", false),
+                ("", false),
+                ("d", false),
+                ("bd", false),
+                ("cd", false),
+            ],
+        }
+        test_partial_ci_word_in_middle {
+            pattern: "^x(?i:foo)y$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("xfooy", true),
+                ("xFOOy", true),
+                ("xFooy", true),
+                ("xfOoy", true),
+                ("xfoOy", true),
+                ("Xfooy", false),
+                ("xfooY", false),
+                ("XFOOY", false),
+                ("xbary", false),
+                ("xfoy", false),
+                ("", false),
+            ],
+        }
+        test_partial_ci_three_segments {
+            pattern: "^(?i)abc(?-i)def(?i)ghi$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abcdefghi", true),
+                ("ABCdefGHI", true),
+                ("AbcdefGhi", true),
+                ("aBcdefgHi", true),
+                ("ABCdefghi", true),
+                ("abcdefGHI", true),
+                ("abcDEFghi", false),
+                ("ABCDEFghi", false),
+                ("abcDefghi", false),
+                ("abcdEfghi", false),
+                ("abcdeF ghi", false),
+                ("ABCDEFGHI", false),
+                ("", false),
+                ("abcdef", false),
+                ("defghi", false),
+            ],
+        }
+        test_partial_ci_waf_keyword_prefix {
+            pattern: r#"(?i:select)\s+\w+"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("select foo", true),
+                ("SELECT foo", true),
+                ("Select foo", true),
+                ("sElEcT bar", true),
+                ("xxx SELECT users yyy", true),
+                ("SELECT  a", true),
+                ("selectfoo", false),
+                ("SELECT", false),
+                ("SELECT ", false),
+                ("", false),
+                ("insert foo", false),
+            ],
+        }
+        test_partial_ci_optional_group {
+            pattern: "^a(?i:b)?c$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("ac", true),
+                ("abc", true),
+                ("aBc", true),
+                ("Ac", false),
+                ("aC", false),
+                ("Abc", false),
+                ("abC", false),
+                ("axc", false),
+                ("abbc", false),
+                ("", false),
+            ],
+        }
+        test_partial_ci_unanchored_key_value {
+            pattern: "x(?i:key)=",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("xkey=val", true),
+                ("xKEY=val", true),
+                ("xKey=123", true),
+                ("pre xkEy=v post", true),
+                ("Xkey=val", false),
+                ("xkey:val", false),
+                ("", false),
+                ("xkey", false),
+                ("ykey=val", false),
+            ],
+        }
+        test_partial_ci_counted_group_then_literal {
+            pattern: "^(?i:ab){2,3}c$",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("ababc", true),
+                ("ABABc", true),
+                ("AbAbc", true),
+                ("aBaBc", true),
+                ("abababc", true),
+                ("ABABABc", true),
+                ("AbAbAbc", true),
+                ("ababC", false),
+                ("ABABC", false),
+                ("abc", false),
+                ("ababababc", false),
+                ("", false),
+                ("xyzc", false),
+            ],
+        }
+        test_partial_ci_class_in_group {
+            pattern: "^a(?i:[b-d])e$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abe", true),
+                ("aBe", true),
+                ("ace", true),
+                ("aCe", true),
+                ("ade", true),
+                ("aDe", true),
+                ("Abe", false),
+                ("abE", false),
+                ("ABE", false),
+                ("aee", false),
+                ("axe", false),
+                ("aae", false),
+                ("", false),
+            ],
+        }
+        test_partial_ci_four_toggles {
+            pattern: "^(?i)a(?-i)b(?i)c(?-i)d$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abcd", true),
+                ("AbCd", true),
+                ("Abcd", true),
+                ("abCd", true),
+                ("aBcd", false),
+                ("abcD", false),
+                ("aBcD", false),
+                ("ABCD", false),
+                ("", false),
+                ("abc", false),
+                ("abcde", false),
+            ],
+        }
+        test_partial_ci_interleaved_digits {
+            pattern: "^(?i:a)1(?i:b)2$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("a1b2", true),
+                ("A1b2", true),
+                ("a1B2", true),
+                ("A1B2", true),
+                ("a2b2", false),
+                ("a1b1", false),
+                ("A2B2", false),
+                ("", false),
+                ("a1b", false),
+                ("1b2", false),
+            ],
+        }
     }
 
     /// `\d\d` — two identical predefined classes share one lookup table.
@@ -4865,764 +6876,15 @@ mod tests {
     }
 
     // -- Partial anchor tests -----------------------------------------------
-
-    /// `^abc` — start-anchored only.  Matches strings that start with
-    /// "abc", regardless of what follows.
-    #[test]
-    fn test_anchor_start_only() {
-        let p = "^abc";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abcdef");
-        assert_matches_regex_crate(p, &re, "abc123");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "xabc");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abd");
-        assert_matches_regex_crate(p, &re, "zabc");
-    }
-
-    /// `abc$` — end-anchored only.  Matches strings that end with "abc",
-    /// regardless of what precedes.
-    #[test]
-    fn test_anchor_end_only() {
-        let p = "abc$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "xabc");
-        assert_matches_regex_crate(p, &re, "123abc");
-        assert_matches_regex_crate(p, &re, "xxabc");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "abcx");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abcabd");
-    }
-
-    /// `abc` — fully unanchored.  Matches any string containing "abc".
-    #[test]
-    fn test_unanchored_literal() {
-        let p = "abc";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "xabc");
-        assert_matches_regex_crate(p, &re, "abcx");
-        assert_matches_regex_crate(p, &re, "xabcx");
-        assert_matches_regex_crate(p, &re, "xxabcxx");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abd");
-        assert_matches_regex_crate(p, &re, "axbc");
-        assert_matches_regex_crate(p, &re, "bca");
-    }
-
-    /// `^a.b` — start-anchored with wildcard.
-    #[test]
-    fn test_anchor_start_wildcard() {
-        let p = "^a.b";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "axb");
-        assert_matches_regex_crate(p, &re, "axbyyy");
-        assert_matches_regex_crate(p, &re, "a1b");
-        // negatives
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "yaxb");
-        assert_matches_regex_crate(p, &re, "");
-    }
-
-    /// `a.b$` — end-anchored with wildcard.
-    #[test]
-    fn test_anchor_end_wildcard() {
-        let p = "a.b$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "axb");
-        assert_matches_regex_crate(p, &re, "yyyaxb");
-        assert_matches_regex_crate(p, &re, "a1b");
-        // negatives
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "axby");
-        assert_matches_regex_crate(p, &re, "");
-    }
-
-    /// `^a+b+$` — anchored with quantifiers (non-counter).
-    #[test]
-    fn test_both_anchors_quantifiers() {
-        let p = "^a+b+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_matches_regex_crate(p, &re, "abb");
-        assert_matches_regex_crate(p, &re, "aabb");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "xab");
-        assert_matches_regex_crate(p, &re, "abx");
-    }
-
-    /// `a+b+` — unanchored with quantifiers (non-counter).
-    #[test]
-    fn test_unanchored_quantifiers() {
-        let p = "a+b+";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_matches_regex_crate(p, &re, "abb");
-        assert_matches_regex_crate(p, &re, "xab");
-        assert_matches_regex_crate(p, &re, "xaabb");
-        assert_matches_regex_crate(p, &re, "abx");
-        assert_matches_regex_crate(p, &re, "xabx");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "xyz");
-    }
-
-    /// `^a+` — start-anchored with one-or-more.
-    #[test]
-    fn test_anchor_start_one_plus() {
-        let p = "^a+";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_matches_regex_crate(p, &re, "abc");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "baa");
-    }
-
-    /// `a+$` — end-anchored with one-or-more.
-    #[test]
-    fn test_anchor_end_one_plus() {
-        let p = "a+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "baa");
-        assert_matches_regex_crate(p, &re, "xxa");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "aab");
-    }
-
-    /// `^$` — empty string, both anchors.
-    #[test]
-    fn test_anchors_empty() {
-        let p = "^$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        // negatives
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "ab");
-    }
-
-    /// `^` — start anchor only, matches any string.
-    #[test]
-    fn test_anchor_start_bare() {
-        let p = "^";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "abc");
-    }
-
-    /// `$` — end anchor only, matches any string.
-    #[test]
-    fn test_anchor_end_bare() {
-        let p = "$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "abc");
-    }
-
-    /// `(a|b)` — unanchored alternation, matches any string containing
-    /// 'a' or 'b'.
-    #[test]
-    fn test_unanchored_alternation() {
-        let p = "(a|b)";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "xa");
-        assert_matches_regex_crate(p, &re, "bx");
-        assert_matches_regex_crate(p, &re, "xax");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "c");
-        assert_matches_regex_crate(p, &re, "xyz");
-    }
-
-    /// `a*b` — unanchored star-then-literal.
-    #[test]
-    fn test_unanchored_star_literal() {
-        let p = "a*b";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_matches_regex_crate(p, &re, "xb");
-        assert_matches_regex_crate(p, &re, "xab");
-        assert_matches_regex_crate(p, &re, "bx");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "xyz");
-    }
-
-    /// `a|^b` — anchor inside an alternation arm.  Matches any string
-    /// containing `a` (unanchored), OR any string starting with `b`.
-    #[test]
-    fn test_anchor_in_alternation_start() {
-        let p = "a|^b";
-        let re = build_regex_unchecked(p);
-        // positives via the `a` arm (unanchored)
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "xa");
-        assert_matches_regex_crate(p, &re, "ax");
-        assert_matches_regex_crate(p, &re, "xax");
-        // positives via the `^b` arm
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "bx");
-        assert_matches_regex_crate(p, &re, "bxx");
-        // positives via both arms
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "ab");
-        // negatives: no `a` and doesn't start with `b`
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "c");
-        assert_matches_regex_crate(p, &re, "xb");
-        assert_matches_regex_crate(p, &re, "xbx");
-        assert_matches_regex_crate(p, &re, "xyz");
-    }
-
-    /// `a$|b` — anchor inside an alternation arm.  Matches any string
-    /// ending with `a`, OR any string containing `b` (unanchored).
-    #[test]
-    fn test_anchor_in_alternation_end() {
-        let p = "a$|b";
-        let re = build_regex_unchecked(p);
-        // positives via the `a$` arm
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "xa");
-        assert_matches_regex_crate(p, &re, "xxa");
-        // positives via the `b` arm (unanchored)
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "xb");
-        assert_matches_regex_crate(p, &re, "bx");
-        assert_matches_regex_crate(p, &re, "xbx");
-        // positives via both arms
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "ab");
-        // negatives: doesn't end with `a` and no `b`
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "c");
-        assert_matches_regex_crate(p, &re, "ax");
-        assert_matches_regex_crate(p, &re, "xax");
-        assert_matches_regex_crate(p, &re, "xyz");
-    }
-
     // -------------------------------------------------------------------
     // Multiline assertions: (?m:^) = StartLF, (?m:$) = EndLF
     // -------------------------------------------------------------------
-
-    #[test]
-    fn test_multiline_start_basic() {
-        let p = "(?m)^abc";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abc\ndef");
-        assert_matches_regex_crate(p, &re, "xxx\nabc");
-        assert_matches_regex_crate(p, &re, "xxx\nabc\nyyy");
-        assert_matches_regex_crate(p, &re, "\nabc");
-        assert_matches_regex_crate(p, &re, "xabc"); // no match: not at line start
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "\n");
-    }
-
-    #[test]
-    fn test_multiline_end_basic() {
-        let p = "(?m)abc$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abc\ndef");
-        assert_matches_regex_crate(p, &re, "xxx\nabc");
-        assert_matches_regex_crate(p, &re, "xxxabc\nyyy");
-        assert_matches_regex_crate(p, &re, "abc\n");
-        assert_matches_regex_crate(p, &re, "abcx"); // no match: not at line end
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "\n");
-    }
-
-    #[test]
-    fn test_multiline_both_anchors() {
-        let p = "(?m)^abc$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abc\ndef");
-        assert_matches_regex_crate(p, &re, "def\nabc");
-        assert_matches_regex_crate(p, &re, "xxx\nabc\nyyy");
-        assert_matches_regex_crate(p, &re, "\nabc\n");
-        assert_matches_regex_crate(p, &re, "abc\n");
-        assert_matches_regex_crate(p, &re, "\nabc");
-        assert_matches_regex_crate(p, &re, "xabc"); // no match
-        assert_matches_regex_crate(p, &re, "abcx"); // no match
-        assert_matches_regex_crate(p, &re, "xabcx"); // no match
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "\n");
-        assert_matches_regex_crate(p, &re, "\n\n");
-    }
-
-    #[test]
-    fn test_multiline_multi_lines() {
-        // Pattern that matches "abc" on its own line somewhere in the input.
-        let p = "(?m)^abc$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc\ndef\nghi");
-        assert_matches_regex_crate(p, &re, "def\nabc\nghi");
-        assert_matches_regex_crate(p, &re, "def\nghi\nabc");
-        assert_matches_regex_crate(p, &re, "def\nghi\njkl"); // no match
-    }
-
-    #[test]
-    fn test_multiline_catenation_across_newline() {
-        // Pattern: line ending with abc, newline, line starting with def
-        let p = r"(?m)abc$\n^def";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc\ndef");
-        assert_matches_regex_crate(p, &re, "xxx\nabc\ndef\nyyy");
-        assert_matches_regex_crate(p, &re, "abc\nxef"); // no match
-        assert_matches_regex_crate(p, &re, "abcdef"); // no match
-    }
-
-    #[test]
-    fn test_multiline_with_dot_plus() {
-        let p = "(?m)^.+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abc\ndef");
-        assert_matches_regex_crate(p, &re, "\nabc");
-        assert_matches_regex_crate(p, &re, "abc\n");
-        assert_matches_regex_crate(p, &re, ""); // no match: .+ needs >=1 char
-        assert_matches_regex_crate(p, &re, "\n"); // no match: each line is empty
-        assert_matches_regex_crate(p, &re, "\n\n");
-    }
-
-    #[test]
-    fn test_multiline_with_counting() {
-        let p = r"(?m)^\d{2,4}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "12");
-        assert_matches_regex_crate(p, &re, "123");
-        assert_matches_regex_crate(p, &re, "1234");
-        assert_matches_regex_crate(p, &re, "1"); // too short
-        assert_matches_regex_crate(p, &re, "12345"); // too long
-        assert_matches_regex_crate(p, &re, "xx\n12\nyy");
-        assert_matches_regex_crate(p, &re, "xx\n12345\nyy"); // no match on that line
-        assert_matches_regex_crate(p, &re, "xx\n1\nyy"); // too short
-        assert_matches_regex_crate(p, &re, "12\n1234\n12345");
-    }
-
-    #[test]
-    fn test_multiline_edge_cases_empty() {
-        // (?m)^$ matches any empty line (including empty input).
-        let p = "(?m)^$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "\n");
-        assert_matches_regex_crate(p, &re, "\n\n");
-        assert_matches_regex_crate(p, &re, "abc"); // no empty line
-        assert_matches_regex_crate(p, &re, "abc\n"); // empty line after trailing \n
-        assert_matches_regex_crate(p, &re, "\nabc"); // empty line before \n
-        assert_matches_regex_crate(p, &re, "abc\n\ndef"); // empty line between
-    }
-
-    #[test]
-    fn test_multiline_start_only_empty_lines() {
-        let p = "(?m)^";
-        let re = build_regex_unchecked(p);
-        // ^ in multiline always matches (every input has at least position 0).
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "\n");
-    }
-
-    #[test]
-    fn test_multiline_end_only() {
-        let p = "(?m)$";
-        let re = build_regex_unchecked(p);
-        // $ in multiline always matches.
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "\n");
-    }
-
-    #[test]
-    fn test_multiline_alternation() {
-        let p = "(?m)^(abc|def)$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "def");
-        assert_matches_regex_crate(p, &re, "abc\ndef");
-        assert_matches_regex_crate(p, &re, "ghi\nabc\njkl");
-        assert_matches_regex_crate(p, &re, "ghi\njkl"); // no match
-        assert_matches_regex_crate(p, &re, "abcdef"); // no match
-    }
-
-    #[test]
-    fn test_multiline_mixed_with_nonmultiline() {
-        // Non-multiline ^ and multiline $ in the same pattern.
-        // regex-syntax: ^ without (?m) = Look::Start, $ with (?m) = Look::EndLF
-        let p = "^abc(?m:$)";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abc\ndef");
-        assert_matches_regex_crate(p, &re, "xabc"); // no match: ^ is not multiline
-        assert_matches_regex_crate(p, &re, "\nabc"); // no match: ^ is not multiline
-    }
-
     // -------------------------------------------------------------------
     // CRLF multiline tests  ((?Rm) → StartCRLF / EndCRLF)
     // -------------------------------------------------------------------
-
-    #[test]
-    fn test_crlf_start_basic() {
-        // (?Rm:^) matches at start of input, after \n, and after bare \r
-        // (but NOT between \r and \n — \r\n is a single line terminator).
-        let p = r"(?Rm)^abc";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "\nabc");
-        assert_matches_regex_crate(p, &re, "\rabc");
-        assert_matches_regex_crate(p, &re, "\r\nabc");
-        assert_matches_regex_crate(p, &re, "xxx\nabc");
-        assert_matches_regex_crate(p, &re, "xxx\rabc");
-        assert_matches_regex_crate(p, &re, "xxx\r\nabc");
-        assert_matches_regex_crate(p, &re, "xabc"); // no match
-    }
-
-    #[test]
-    fn test_crlf_end_basic() {
-        // (?Rm:$) matches at end of input, before \r, and before \n
-        // (but NOT between \r and \n).
-        let p = r"(?Rm)abc$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abc\n");
-        assert_matches_regex_crate(p, &re, "abc\r");
-        assert_matches_regex_crate(p, &re, "abc\r\n");
-        assert_matches_regex_crate(p, &re, "abc\nxxx");
-        assert_matches_regex_crate(p, &re, "abc\rxxx");
-        assert_matches_regex_crate(p, &re, "abc\r\nxxx");
-        assert_matches_regex_crate(p, &re, "abcx"); // no match
-    }
-
-    #[test]
-    fn test_crlf_both_anchors() {
-        let p = r"(?Rm)^abc$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abc\r\n");
-        assert_matches_regex_crate(p, &re, "\r\nabc");
-        assert_matches_regex_crate(p, &re, "\r\nabc\r\n");
-        assert_matches_regex_crate(p, &re, "xxx\r\nabc\r\nyyy");
-        assert_matches_regex_crate(p, &re, "abc\n");
-        assert_matches_regex_crate(p, &re, "\nabc\n");
-        assert_matches_regex_crate(p, &re, "abc\r");
-        assert_matches_regex_crate(p, &re, "\rabc\r");
-        assert_matches_regex_crate(p, &re, "xabc"); // no match
-        assert_matches_regex_crate(p, &re, "abcx"); // no match
-    }
-
-    #[test]
-    fn test_crlf_empty_lines() {
-        // (?Rm)^$ matches any empty line, including empty input and
-        // positions between \r\n line terminators.
-        let p = r"(?Rm)^$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "\n");
-        assert_matches_regex_crate(p, &re, "\r\n");
-        assert_matches_regex_crate(p, &re, "\r");
-        assert_matches_regex_crate(p, &re, "\r\n\r\n");
-        assert_matches_regex_crate(p, &re, "abc\r\n\r\ndef");
-        assert_matches_regex_crate(p, &re, "abc"); // no empty line
-    }
-
-    #[test]
-    fn test_crlf_multiline_vs_lf() {
-        // Demonstrate difference between LF-mode and CRLF-mode.
-        // In CRLF mode, \r\n is a single terminator, so ^ after \r
-        // does NOT match between \r and \n.
-        let p_crlf = r"(?Rm)^abc$";
-        let re_crlf = build_regex_unchecked(p_crlf);
-
-        // \r\nabc\r\n — should match in CRLF mode
-        assert_matches_regex_crate(p_crlf, &re_crlf, "\r\nabc\r\n");
-
-        let p_lf = r"(?m)^abc$";
-        let re_lf = build_regex_unchecked(p_lf);
-
-        // In LF mode, \r is NOT a line terminator:
-        // \r\nabc\r\n — the "line" is "\rabc\r" which doesn't match "abc"
-        assert_matches_regex_crate(p_lf, &re_lf, "\r\nabc\r\n");
-    }
-
-    #[test]
-    fn test_crlf_with_dot_plus() {
-        let p = r"(?Rm)^.+$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abc\r\ndef");
-        assert_matches_regex_crate(p, &re, "\r\nabc");
-        assert_matches_regex_crate(p, &re, "abc\r\n");
-        assert_matches_regex_crate(p, &re, ""); // no match
-        assert_matches_regex_crate(p, &re, "\r\n"); // no match: lines are empty
-        assert_matches_regex_crate(p, &re, "\r\n\r\n");
-    }
-
-    #[test]
-    fn test_crlf_with_counting() {
-        let p = r"(?Rm)^\d{2,4}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "12");
-        assert_matches_regex_crate(p, &re, "1234");
-        assert_matches_regex_crate(p, &re, "12345"); // too long
-        assert_matches_regex_crate(p, &re, "xx\r\n12\r\nyy");
-        assert_matches_regex_crate(p, &re, "xx\r\n1\r\nyy"); // too short
-    }
-
-    #[test]
-    fn test_crlf_bare_cr_as_line_terminator() {
-        // Bare \r (without following \n) acts as a line terminator in
-        // CRLF mode.
-        let p = r"(?Rm)^abc$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "xxx\rabc\ryyy");
-        assert_matches_regex_crate(p, &re, "xxx\rabc");
-        assert_matches_regex_crate(p, &re, "abc\ryyy");
-    }
-
-    #[test]
-    fn test_crlf_end_before_cr() {
-        // EndCRLF fires before \r.
-        let p = r"(?Rm)abc$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc\r");
-        assert_matches_regex_crate(p, &re, "abc\r\n");
-        assert_matches_regex_crate(p, &re, "abc\rxxx");
-    }
-
-    #[test]
-    fn test_crlf_start_after_lf_not_crlf_middle() {
-        // StartCRLF after \n: matches. Between \r and \n: does NOT match.
-        let p = r"(?Rm)^x";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "\nx"); // match: after \n
-        assert_matches_regex_crate(p, &re, "\r\nx"); // match: after \r\n
-        assert_matches_regex_crate(p, &re, "\rx"); // match: after bare \r
-    }
-
-    #[test]
-    fn test_crlf_mixed_terminators() {
-        // Input with mixed \n, \r, and \r\n terminators.
-        let p = r"(?Rm)^abc$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "xxx\nabc\ryyy");
-        assert_matches_regex_crate(p, &re, "xxx\rabc\nyyy");
-        assert_matches_regex_crate(p, &re, "xxx\r\nabc\r\nyyy");
-        assert_matches_regex_crate(p, &re, "xxx\nabc\r\nyyy");
-        assert_matches_regex_crate(p, &re, "xxx\r\nabc\nyyy");
-    }
-
-    #[test]
-    fn test_crlf_end_only() {
-        let p = r"(?Rm)$";
-        let re = build_regex_unchecked(p);
-        // EndCRLF always matches (every input has end-of-input).
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "\r\n");
-        assert_matches_regex_crate(p, &re, "\r");
-        assert_matches_regex_crate(p, &re, "\n");
-    }
-
-    #[test]
-    fn test_crlf_start_only() {
-        let p = r"(?Rm)^";
-        let re = build_regex_unchecked(p);
-        // StartCRLF always matches (every input has position 0).
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "\r\n");
-        assert_matches_regex_crate(p, &re, "\r");
-        assert_matches_regex_crate(p, &re, "\n");
-    }
-
     // ===================================================================
     // Word boundary assertions: \b (WordAscii) and \B (WordAsciiNegate)
     // ===================================================================
-
-    /// `\b` — basic word boundary around a literal.
-    #[test]
-    fn test_word_boundary_literal() {
-        let p = r"\bfoo\b";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "foo");
-        assert_matches_regex_crate(p, &re, " foo ");
-        assert_matches_regex_crate(p, &re, "foo bar");
-        assert_matches_regex_crate(p, &re, "bar foo");
-        assert_matches_regex_crate(p, &re, "bar foo baz");
-        assert_matches_regex_crate(p, &re, "(foo)");
-        assert_matches_regex_crate(p, &re, "foobar"); // no match
-        assert_matches_regex_crate(p, &re, "barfoo"); // no match (trailing)
-        assert_matches_regex_crate(p, &re, "xfooy"); // no match
-        assert_matches_regex_crate(p, &re, ""); // no match
-    }
-
-    /// `\b` at start/end of input.
-    #[test]
-    fn test_word_boundary_start_end() {
-        let p = r"\bx";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "x"); // boundary at start
-        assert_matches_regex_crate(p, &re, " x"); // boundary after space
-        assert_matches_regex_crate(p, &re, "ax"); // no boundary: a is word char
-
-        let p = r"x\b";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "x"); // boundary at end
-        assert_matches_regex_crate(p, &re, "x "); // boundary before space
-        assert_matches_regex_crate(p, &re, "xa"); // no boundary: a is word char
-    }
-
-    /// `\b` with quantifiers.
-    #[test]
-    fn test_word_boundary_quantifiers() {
-        let p = r"\b\w+\b";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "hello");
-        assert_matches_regex_crate(p, &re, "hello world");
-        assert_matches_regex_crate(p, &re, "  hello  ");
-        assert_matches_regex_crate(p, &re, ""); // no match
-        assert_matches_regex_crate(p, &re, "   "); // no match
-    }
-
-    /// `\b` with counted repetitions.
-    #[test]
-    fn test_word_boundary_counter() {
-        let p = r"\b\w{3,5}\b";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abcde");
-        assert_matches_regex_crate(p, &re, "ab"); // too short
-        assert_matches_regex_crate(p, &re, "abcdef"); // 6 chars, but \b\w{3,5}\b matches "abcde"
-        assert_matches_regex_crate(p, &re, " abc ");
-        assert_matches_regex_crate(p, &re, " ab "); // too short
-        assert_matches_regex_crate(p, &re, "hello world");
-    }
-
-    /// `\B` — non-word boundary.
-    #[test]
-    fn test_non_word_boundary() {
-        let p = r"\Bfoo\B";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "xfooy"); // match: word chars on both sides
-        assert_matches_regex_crate(p, &re, "afoobar");
-        assert_matches_regex_crate(p, &re, "foo"); // no match: start/end are non-word
-        assert_matches_regex_crate(p, &re, " foo "); // no match: spaces are non-word
-        assert_matches_regex_crate(p, &re, "xfoo"); // no match: end is non-word
-        assert_matches_regex_crate(p, &re, "fooy"); // no match: start is non-word
-    }
-
-    /// `\b` with digits and underscores (word chars).
-    #[test]
-    fn test_word_boundary_digits_underscore() {
-        let p = r"\b\d+\b";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "123");
-        assert_matches_regex_crate(p, &re, " 456 ");
-        assert_matches_regex_crate(p, &re, "abc123def"); // no boundary match; digits bordered by word chars
-
-        let p = r"\b_test_\b";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "_test_");
-        assert_matches_regex_crate(p, &re, " _test_ ");
-        assert_matches_regex_crate(p, &re, "x_test_y"); // no match: bordered by word chars
-    }
-
-    /// `\b` bare — matches at every word boundary position.
-    #[test]
-    fn test_word_boundary_bare() {
-        let p = r"\b";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "a"); // match: boundary at start
-        assert_matches_regex_crate(p, &re, " "); // no match: no word chars, no boundary
-        assert_matches_regex_crate(p, &re, ""); // no match: empty input, no boundary
-    }
-
-    /// `\B` bare — matches at every non-word boundary position.
-    #[test]
-    fn test_non_word_boundary_bare() {
-        let p = r"\B";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, ""); // match: empty input is non-word/non-word
-        assert_matches_regex_crate(p, &re, " "); // match: between non-word boundaries
-        assert_matches_regex_crate(p, &re, "a"); // no match: start-of-input vs word char is a word boundary
-    }
-
-    /// Mixed `\b` and `\B` in the same pattern.
-    #[test]
-    fn test_word_boundary_mixed() {
-        // Match a word that starts at a word boundary but whose end
-        // is NOT at a word boundary (i.e., followed by another word char).
-        let p = r"\bfoo\B";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "foobar"); // match
-        assert_matches_regex_crate(p, &re, " foobar"); // match
-        assert_matches_regex_crate(p, &re, "foo"); // no match: end is at boundary
-        assert_matches_regex_crate(p, &re, "foo "); // no match: space after
-        assert_matches_regex_crate(p, &re, "xfoobar"); // no match: x before foo
-    }
-
-    /// `\b` with alternation.
-    #[test]
-    fn test_word_boundary_alternation() {
-        let p = r"\b(cat|dog)\b";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "cat");
-        assert_matches_regex_crate(p, &re, "dog");
-        assert_matches_regex_crate(p, &re, "the cat sat");
-        assert_matches_regex_crate(p, &re, "hotdog"); // no match
-        assert_matches_regex_crate(p, &re, "concatenate"); // no match
-    }
-
-    /// `\b` with special ASCII boundary characters.
-    #[test]
-    fn test_word_boundary_special_chars() {
-        let p = r"\btest\b";
-        let re = build_regex_unchecked(p);
-        // Punctuation and control chars are not word characters, so
-        // they act as boundaries.
-        assert_matches_regex_crate(p, &re, "\x00test\x00");
-        assert_matches_regex_crate(p, &re, ".test.");
-        assert_matches_regex_crate(p, &re, "\ttest\n");
-        assert_matches_regex_crate(p, &re, "/test/");
-    }
-
     // ===================================================================
     // Deferred assertion DFA tests: verify , \B, EndLF work via Tier 1 DFA
     // ===================================================================
@@ -5707,26 +6969,11 @@ mod tests {
         let re = build_regex_unchecked(p);
         assert!(re.dfa_eligible);
         assert_matches_regex_crate(p, &re, "foo");
-        assert_matches_regex_crate(
-            p, &re, "foo
-bar",
-        );
-        assert_matches_regex_crate(
-            p, &re, "bar
-foo",
-        );
-        assert_matches_regex_crate(
-            p,
-            &re,
-            "bar
-foo
-baz",
-        );
+        assert_matches_regex_crate(p, &re, "foo\nbar");
+        assert_matches_regex_crate(p, &re, "bar\nfoo");
+        assert_matches_regex_crate(p, &re, "bar\nfoo\nbaz");
         assert_matches_regex_crate(p, &re, "foobar");
-        assert_matches_regex_crate(
-            p, &re, "barfoo
-",
-        );
+        assert_matches_regex_crate(p, &re, "barfoo\n");
     }
 
     /// EndLF at end-of-input (no trailing newline).
@@ -5737,14 +6984,8 @@ baz",
         assert!(re.dfa_eligible);
         assert_matches_regex_crate(p, &re, "bar");
         assert_matches_regex_crate(p, &re, "foobar");
-        assert_matches_regex_crate(
-            p, &re, "foo
-bar",
-        );
-        assert_matches_regex_crate(
-            p, &re, "bar
-foo",
-        );
+        assert_matches_regex_crate(p, &re, "foo\nbar");
+        assert_matches_regex_crate(p, &re, "bar\nfoo");
     }
 
     /// Mixed deferred assertions in the same pattern.
@@ -5754,21 +6995,9 @@ foo",
         let re = build_regex_unchecked(p);
         assert!(re.dfa_eligible);
         assert_matches_regex_crate(p, &re, "foo");
-        assert_matches_regex_crate(
-            p, &re, "foo
-bar",
-        );
-        assert_matches_regex_crate(
-            p, &re, "bar
-foo",
-        );
-        assert_matches_regex_crate(
-            p,
-            &re,
-            "bar
-foo
-baz",
-        );
+        assert_matches_regex_crate(p, &re, "foo\nbar");
+        assert_matches_regex_crate(p, &re, "bar\nfoo");
+        assert_matches_regex_crate(p, &re, "bar\nfoo\nbaz");
         assert_matches_regex_crate(p, &re, "barfoo");
         assert_matches_regex_crate(p, &re, "foobar");
     }
@@ -5817,225 +7046,6 @@ baz",
     // multi-chunk scenarios that were previously untested and would
     // have triggered phantom counter accumulation before the fix.
     // ===================================================================
-
-    /// Simple unanchored counters: `\w{3,5}`, `a{3}`, `[0-9]{4}`.
-    /// Before the fix, gap-separated inputs would accumulate phantom
-    /// counts across non-matching positions.
-    #[test]
-    fn test_unanchored_counter_simple() {
-        // \w{3,5}
-        let p = r"\w{3,5}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abcde");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "a b c");
-        assert_matches_regex_crate(p, &re, " abc ");
-        assert_matches_regex_crate(p, &re, "x y z");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "abcdef");
-        assert_matches_regex_crate(p, &re, "ab cde fg");
-
-        // a{3} — exact count
-        let p = "a{3}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "xaaax");
-        assert_matches_regex_crate(p, &re, "a a a");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "aaaa");
-        assert_matches_regex_crate(p, &re, "baaab");
-
-        // [0-9]{4} — digit run
-        let p = "[0-9]{4}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "1234");
-        assert_matches_regex_crate(p, &re, "123");
-        assert_matches_regex_crate(p, &re, "a1234b");
-        assert_matches_regex_crate(p, &re, "1 2 3 4");
-        assert_matches_regex_crate(p, &re, "12345");
-        assert_matches_regex_crate(p, &re, "");
-    }
-
-    /// Unanchored counter with alternation body: `(a|bc){2,4}`.
-    #[test]
-    fn test_unanchored_counter_alternation_body() {
-        let p = "(a|bc){2,4}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "bca");
-        assert_matches_regex_crate(p, &re, "bcbc");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "bc");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "xaay");
-        assert_matches_regex_crate(p, &re, "xbcay");
-        assert_matches_regex_crate(p, &re, "a bc a");
-        assert_matches_regex_crate(p, &re, "abcbca");
-        assert_matches_regex_crate(p, &re, "abcbcbc");
-    }
-
-    /// Unanchored counter with multi-byte body: `(ab){2,3}`.
-    #[test]
-    fn test_unanchored_counter_multi_byte_body() {
-        let p = "(ab){2,3}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abab");
-        assert_matches_regex_crate(p, &re, "ababab");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "xababx");
-        assert_matches_regex_crate(p, &re, "ab ab ab");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_matches_regex_crate(p, &re, "abb");
-        assert_matches_regex_crate(p, &re, "abababab");
-    }
-
-    /// Unanchored nested counting: `((a|b){1,2}){2,3}`.
-    #[test]
-    fn test_unanchored_counter_nested() {
-        let p = "((a|b){1,2}){2,3}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "aabb");
-        assert_matches_regex_crate(p, &re, "ababab");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "xaby");
-        assert_matches_regex_crate(p, &re, "a b");
-        assert_matches_regex_crate(p, &re, "abba");
-    }
-
-    /// Unanchored counter with min=0: `a{0,3}`.
-    #[test]
-    fn test_unanchored_counter_min_zero() {
-        let p = "a{0,3}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "aaaa");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "xaaax");
-    }
-
-    /// Unanchored unbounded counter: `a{2,}`.
-    #[test]
-    fn test_unanchored_counter_unbounded() {
-        let p = "a{2,}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "xaay");
-        assert_matches_regex_crate(p, &re, "a a");
-        assert_matches_regex_crate(p, &re, "baaaab");
-    }
-
-    /// Unanchored counter with wildcard body: `.{3,5}`.
-    #[test]
-    fn test_unanchored_counter_wildcard_body() {
-        let p = ".{3,5}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abcde");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "abcdef");
-    }
-
-    /// Start-anchored counter: `^a{2,3}`, `^\d{2,4}`.
-    #[test]
-    fn test_partial_anchor_start_counter() {
-        let p = r"^a{2,3}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aaax");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "xaa");
-
-        let p = r"^\d{2,4}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "12");
-        assert_matches_regex_crate(p, &re, "1234");
-        assert_matches_regex_crate(p, &re, "1");
-        assert_matches_regex_crate(p, &re, "12345");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a12");
-    }
-
-    /// End-anchored counter: `a{2,3}$`, `\d{2,4}$`.
-    #[test]
-    fn test_partial_anchor_end_counter() {
-        let p = r"a{2,3}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "xaa");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "aax");
-
-        let p = r"\d{2,4}$";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "12");
-        assert_matches_regex_crate(p, &re, "1234");
-        assert_matches_regex_crate(p, &re, "1");
-        assert_matches_regex_crate(p, &re, "x1234");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "12x");
-    }
-
-    /// Unanchored byte-class patterns: `\d+`, `\w+`, `[a-c]+`.
-    #[test]
-    fn test_unanchored_byte_class() {
-        let p = r"\d+";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "123");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "a1b2c3");
-        assert_matches_regex_crate(p, &re, "");
-
-        let p = r"\w+";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "hello");
-        assert_matches_regex_crate(p, &re, " ");
-        assert_matches_regex_crate(p, &re, "a b c");
-        assert_matches_regex_crate(p, &re, "");
-
-        let p = "[a-c]+";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abcabc");
-        assert_matches_regex_crate(p, &re, "xyz");
-        assert_matches_regex_crate(p, &re, "xabcy");
-        assert_matches_regex_crate(p, &re, "");
-    }
-
-    /// Unanchored ByteTable with counter: `(ab|cd|ef){2,3}`.
-    #[test]
-    fn test_unanchored_byte_table_counter() {
-        let p = "(ab|cd|ef){2,3}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "abcd");
-        assert_matches_regex_crate(p, &re, "abcdef");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "xabcdy");
-        assert_matches_regex_crate(p, &re, "ab cd ef");
-        assert_matches_regex_crate(p, &re, "ababab");
-        assert_matches_regex_crate(p, &re, "efef");
-        assert_matches_regex_crate(p, &re, "abefcd");
-    }
-
     /// Counter pattern split across chunk boundaries.
     #[test]
     fn test_chunk_boundary_counter() {
@@ -6122,114 +7132,6 @@ baz",
         m.chunk(b"d");
         assert!(!m.finish(), "ab+d should not match ^abc$");
     }
-
-    /// Unanchored `?` quantifier: `a?b`.
-    #[test]
-    fn test_unanchored_question_mark() {
-        let p = "a?b";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "xaby");
-        assert_matches_regex_crate(p, &re, "xby");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "aab");
-    }
-
-    /// Degenerate counter `{1,1}`: `a{1,1}`.
-    #[test]
-    fn test_counter_exact_one() {
-        let p = "a{1,1}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "xax");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "b");
-    }
-
-    /// Multiline + alternation + counter: `(?m:^)(a|bc){2,3}(?m:$)`.
-    #[test]
-    fn test_multiline_alternation_counter() {
-        let p = r"(?m:^)(a|bc){2,3}(?m:$)";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "bcbc");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "xxx\naa\nyyy");
-        assert_matches_regex_crate(p, &re, "xxx\nabc\nyyy");
-        assert_matches_regex_crate(p, &re, "xxx\na\nyyy");
-    }
-
-    /// Empty input with unanchored counter `a{0,3}`.
-    #[test]
-    fn test_empty_input_unanchored_counter() {
-        let p = "a{0,3}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "");
-    }
-
-    /// Unanchored byte-class + counter: `\d{2,4}`.
-    #[test]
-    fn test_unanchored_byte_class_counter() {
-        let p = r"\d{2,4}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "12");
-        assert_matches_regex_crate(p, &re, "1234");
-        assert_matches_regex_crate(p, &re, "1");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a12b");
-        assert_matches_regex_crate(p, &re, "a1b2c");
-        assert_matches_regex_crate(p, &re, "12345");
-        assert_matches_regex_crate(p, &re, "a1234b");
-    }
-
-    /// Counter body containing assertions.
-    ///
-    /// The counted group includes a multiline start-of-line anchor,
-    /// so the assertion must be evaluated inside the loop body on
-    /// each iteration.  This exercises the interaction between the
-    /// pre-consumption assertion expansion and the counter machinery.
-    #[test]
-    fn test_counter_body_with_assertion() {
-        // Each iteration must start at the beginning of a line.
-        // `(?m:^a){2,3}` — "a" at start of line, repeated 2–3 times.
-        let p = r"(?m:^a){2,3}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "a\na");
-        assert_matches_regex_crate(p, &re, "a\na\na");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a\nb\na");
-        assert_matches_regex_crate(p, &re, "ba\na");
-        assert_matches_regex_crate(p, &re, "a\na\na\na");
-
-        // End-of-line assertion inside counted body.
-        // `(?m:a$){2,3}` — "a" at end of line, repeated 2–3 times.
-        let p = r"(?m:a$){2,3}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "a\na");
-        assert_matches_regex_crate(p, &re, "a\na\na");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a\nb\na");
-        assert_matches_regex_crate(p, &re, "xa\nxa");
-
-        // Both anchors inside counted body.
-        // `(?m:^a$){2,3}` — full-line "a", repeated.
-        let p = r"(?m:^a$){2,3}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "a\na");
-        assert_matches_regex_crate(p, &re, "a\na\na");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a\nab\na");
-        assert_matches_regex_crate(p, &re, "x\na\na\nx");
-    }
-
     /// Deep epsilon-closure chain should not depend on call stack depth.
     #[test]
     fn test_addstate_deep_epsilon_chain() {
@@ -6260,83 +7162,6 @@ baz",
     // consumption loop where multiple clist entries match the same byte
     // in a single step, interacting with counters.
     // ===================================================================
-
-    /// Two counters whose bodies share the same consuming byte class.
-    /// When the input byte matches, both counters' body_alive_gen must
-    /// be stamped before any epsilon closure runs — a single fused pass
-    /// must not interleave marking and closure expansion.
-    #[test]
-    fn test_step_fused_multi_counter_same_byte() {
-        // `a{2}.*a{3}`: two counters both counting 'a', separated by `.*`
-        let p = "a{2}.*a{3}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "aaaaa");
-        assert_matches_regex_crate(p, &re, "aabaa");
-        assert_matches_regex_crate(p, &re, "aaxaaa");
-        assert_matches_regex_crate(p, &re, "aa aaa");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aaaa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "");
-    }
-
-    /// Alternation creates multiple consuming states at different
-    /// positions in clist that all match the same byte.  Verifies that
-    /// the reverse-iteration + LIFO ordering preserves priority.
-    #[test]
-    fn test_step_fused_alternation_overlap() {
-        // `(a|a){2,3}` — both alt branches produce consuming states
-        // for 'a'; counter must still count correctly.
-        let p = "(a|a){2,3}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "aaaa");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "xaax");
-        assert_matches_regex_crate(p, &re, "xaaax");
-    }
-
-    /// ByteClass + exact byte consuming states coexisting in clist,
-    /// both matching the same input byte.  Exercises the fused loop
-    /// handling different State variants in one pass.
-    #[test]
-    fn test_step_fused_byteclass_and_literal() {
-        // `[a-z]{2}a{2}`: [a-z] as ByteClass and 'a' as Byte both
-        // match 'a', and both are wrapped in counters.
-        let p = r"[a-z]{2}a{2}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "xyaa");
-        assert_matches_regex_crate(p, &re, "aaaa");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "abaa");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "xyzaa");
-        assert_matches_regex_crate(p, &re, " aaaa ");
-    }
-
-    /// Unanchored nested counters where the outer body's consuming
-    /// states and the re-seeded start state all compete in the same
-    /// step.  The re-seed (pushed first on the stack, drained last)
-    /// must not interfere with the ongoing counter threads.
-    #[test]
-    fn test_step_fused_reseed_with_counter() {
-        let p = r"(a{2}){2}";
-        let re = build_regex_unchecked(p);
-        assert_matches_regex_crate(p, &re, "aaaa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "aaaaa");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "xaaaax");
-        assert_matches_regex_crate(p, &re, "aa aa");
-        assert_matches_regex_crate(p, &re, "aaxaa");
-    }
-
     #[test]
     fn survey_nested_counter_bugs() {
         let cases: &[(&str, &str)] = &[
@@ -6450,602 +7275,6 @@ baz",
     // -----------------------------------------------------------------------
     // Case-insensitive ((?i)) tests
     // -----------------------------------------------------------------------
-
-    /// `(?i)a` — single case-insensitive letter (ByteCI optimization).
-    #[test]
-    fn test_ci_literal_single() {
-        let p = "^(?i)a$";
-        let re = build_regex_unchecked(p);
-        // positives: both cases
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "A");
-        // negatives: wrong char, empty, multi-char
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "B");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "AA");
-        assert_matches_regex_crate(p, &re, "aA");
-        assert_matches_regex_crate(p, &re, "1");
-    }
-
-    /// `(?i)abc` — multi-byte case-insensitive literal.
-    #[test]
-    fn test_ci_literal_multi() {
-        let p = "^(?i)abc$";
-        let re = build_regex_unchecked(p);
-        // positives: all case combos
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "ABC");
-        assert_matches_regex_crate(p, &re, "Abc");
-        assert_matches_regex_crate(p, &re, "aBc");
-        assert_matches_regex_crate(p, &re, "abC");
-        assert_matches_regex_crate(p, &re, "ABc");
-        assert_matches_regex_crate(p, &re, "AbC");
-        assert_matches_regex_crate(p, &re, "aBC");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "AB");
-        assert_matches_regex_crate(p, &re, "abcd");
-        assert_matches_regex_crate(p, &re, "ABCD");
-        assert_matches_regex_crate(p, &re, "xabc");
-        assert_matches_regex_crate(p, &re, "abd");
-        assert_matches_regex_crate(p, &re, "cba");
-        assert_matches_regex_crate(p, &re, "CBA");
-    }
-
-    /// `(?i)a+` — case-insensitive one-or-more.
-    #[test]
-    fn test_ci_one_plus() {
-        let p = "^(?i)a+$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "A");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "AA");
-        assert_matches_regex_crate(p, &re, "aAaA");
-        assert_matches_regex_crate(p, &re, "AaAa");
-        assert_matches_regex_crate(p, &re, "aaAAAAaa");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_matches_regex_crate(p, &re, "bAA");
-    }
-
-    /// `(?i)a*` — case-insensitive zero-or-more.
-    #[test]
-    fn test_ci_star() {
-        let p = "^(?i)a*$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "A");
-        assert_matches_regex_crate(p, &re, "aA");
-        assert_matches_regex_crate(p, &re, "AaA");
-        // negatives
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "Ba");
-    }
-
-    /// `(?i)a?` — case-insensitive optional.
-    #[test]
-    fn test_ci_question() {
-        let p = "^(?i)a?$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "A");
-        // negatives
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "AA");
-        assert_matches_regex_crate(p, &re, "aA");
-    }
-
-    /// `(?i)a{2,4}` — case-insensitive counted repetition.
-    #[test]
-    fn test_ci_counted() {
-        let p = "^(?i)a{2,4}$";
-        let re = build_regex_unchecked(p);
-        // positives: lengths 2..4, mixed case
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "AA");
-        assert_matches_regex_crate(p, &re, "aA");
-        assert_matches_regex_crate(p, &re, "Aa");
-        assert_matches_regex_crate(p, &re, "aaa");
-        assert_matches_regex_crate(p, &re, "AAA");
-        assert_matches_regex_crate(p, &re, "aAa");
-        assert_matches_regex_crate(p, &re, "aaaa");
-        assert_matches_regex_crate(p, &re, "AAAA");
-        assert_matches_regex_crate(p, &re, "aAaA");
-        assert_matches_regex_crate(p, &re, "AaAa");
-        // negatives: too short, too long, wrong char
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "A");
-        assert_matches_regex_crate(p, &re, "aaaaa");
-        assert_matches_regex_crate(p, &re, "AAAAA");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "bb");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_matches_regex_crate(p, &re, "baa");
-    }
-
-    /// `(?i)a{0,3}` — case-insensitive counted with min zero.
-    #[test]
-    fn test_ci_counted_min_zero() {
-        let p = "^(?i)a{0,3}$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "A");
-        assert_matches_regex_crate(p, &re, "aA");
-        assert_matches_regex_crate(p, &re, "AaA");
-        assert_matches_regex_crate(p, &re, "aAa");
-        // negatives: too long, wrong char
-        assert_matches_regex_crate(p, &re, "aaaa");
-        assert_matches_regex_crate(p, &re, "AAAA");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "aab");
-    }
-
-    /// `(?i)(a|bc)` — case-insensitive alternation.
-    #[test]
-    fn test_ci_alternation() {
-        let p = "^(?i)(a|bc)$";
-        let re = build_regex_unchecked(p);
-        // positives: all case combos
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "A");
-        assert_matches_regex_crate(p, &re, "bc");
-        assert_matches_regex_crate(p, &re, "BC");
-        assert_matches_regex_crate(p, &re, "Bc");
-        assert_matches_regex_crate(p, &re, "bC");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "B");
-        assert_matches_regex_crate(p, &re, "c");
-        assert_matches_regex_crate(p, &re, "C");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "cb");
-        assert_matches_regex_crate(p, &re, "CB");
-    }
-
-    /// `(?i)(abc|def|ghi)` — three-way case-insensitive alternation.
-    #[test]
-    fn test_ci_alternation_three_way() {
-        let p = "^(?i)(abc|def|ghi)$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "ABC");
-        assert_matches_regex_crate(p, &re, "AbC");
-        assert_matches_regex_crate(p, &re, "def");
-        assert_matches_regex_crate(p, &re, "DEF");
-        assert_matches_regex_crate(p, &re, "DeF");
-        assert_matches_regex_crate(p, &re, "ghi");
-        assert_matches_regex_crate(p, &re, "GHI");
-        assert_matches_regex_crate(p, &re, "gHi");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abcd");
-        assert_matches_regex_crate(p, &re, "abcdef");
-        assert_matches_regex_crate(p, &re, "xyz");
-        assert_matches_regex_crate(p, &re, "aef");
-        assert_matches_regex_crate(p, &re, "abi");
-    }
-
-    /// `(?i)hello world` — case-insensitive with non-letter bytes.
-    /// Space and digits are not affected by (?i).
-    #[test]
-    fn test_ci_mixed_letter_nonletter() {
-        let p = "^(?i)hello world$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "hello world");
-        assert_matches_regex_crate(p, &re, "HELLO WORLD");
-        assert_matches_regex_crate(p, &re, "Hello World");
-        assert_matches_regex_crate(p, &re, "hElLo WoRlD");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "hello");
-        assert_matches_regex_crate(p, &re, "helloworld"); // missing space
-        assert_matches_regex_crate(p, &re, "hello  world"); // double space
-        assert_matches_regex_crate(p, &re, "hello world!");
-        assert_matches_regex_crate(p, &re, "xhello world");
-    }
-
-    /// `(?i)a1b2c` — case-insensitive with interleaved digits.
-    /// Digits are invariant under (?i) and must match exactly.
-    #[test]
-    fn test_ci_with_digits() {
-        let p = "^(?i)a1b2c$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "a1b2c");
-        assert_matches_regex_crate(p, &re, "A1B2C");
-        assert_matches_regex_crate(p, &re, "A1b2C");
-        assert_matches_regex_crate(p, &re, "a1B2c");
-        // negatives: wrong digit, wrong letter, length
-        assert_matches_regex_crate(p, &re, "a2b2c");
-        assert_matches_regex_crate(p, &re, "a1b1c");
-        assert_matches_regex_crate(p, &re, "a1b2");
-        assert_matches_regex_crate(p, &re, "1b2c");
-        assert_matches_regex_crate(p, &re, "");
-    }
-
-    /// `(?i)[abc]` — case-insensitive character class (single letters).
-    /// Under (?i), [abc] should match a-c and A-C.
-    #[test]
-    fn test_ci_byte_class() {
-        let p = "^(?i)[abc]$";
-        let re = build_regex_unchecked(p);
-        // positives: lower and upper
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "A");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "B");
-        assert_matches_regex_crate(p, &re, "c");
-        assert_matches_regex_crate(p, &re, "C");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "d");
-        assert_matches_regex_crate(p, &re, "D");
-        assert_matches_regex_crate(p, &re, "z");
-        assert_matches_regex_crate(p, &re, "Z");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "1");
-    }
-
-    /// `(?i)[a-z]` — case-insensitive full alpha range.
-    /// Under (?i), [a-z] already matches A-Z.
-    #[test]
-    fn test_ci_byte_class_full_alpha() {
-        let p = "^(?i)[a-z]$";
-        let re = build_regex_unchecked(p);
-        // positives: lower, upper, boundaries
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "A");
-        assert_matches_regex_crate(p, &re, "m");
-        assert_matches_regex_crate(p, &re, "M");
-        assert_matches_regex_crate(p, &re, "z");
-        assert_matches_regex_crate(p, &re, "Z");
-        // negatives: digits, specials, multi
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "0");
-        assert_matches_regex_crate(p, &re, "9");
-        assert_matches_regex_crate(p, &re, "!");
-        assert_matches_regex_crate(p, &re, "ab");
-    }
-
-    /// `(?i)[a-z0-9]` — case-insensitive class with digit range.
-    #[test]
-    fn test_ci_byte_class_alpha_digit() {
-        let p = "^(?i)[a-z0-9]+$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "abc123");
-        assert_matches_regex_crate(p, &re, "ABC123");
-        assert_matches_regex_crate(p, &re, "AbC789");
-        assert_matches_regex_crate(p, &re, "0");
-        assert_matches_regex_crate(p, &re, "Z");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "!");
-        assert_matches_regex_crate(p, &re, "abc!");
-        assert_matches_regex_crate(p, &re, " ");
-    }
-
-    /// `(?i)foo` — case-insensitive word boundary.
-    #[test]
-    fn test_ci_word_boundary() {
-        let p = r"(?i)foo";
-        let re = build_regex_unchecked(p);
-        // positives: unanchored, various cases
-        assert_matches_regex_crate(p, &re, "foo");
-        assert_matches_regex_crate(p, &re, "FOO");
-        assert_matches_regex_crate(p, &re, "Foo");
-        assert_matches_regex_crate(p, &re, "fOo");
-        assert_matches_regex_crate(p, &re, " foo ");
-        assert_matches_regex_crate(p, &re, " FOO ");
-        assert_matches_regex_crate(p, &re, "!foo!");
-        assert_matches_regex_crate(p, &re, "x foo y");
-        assert_matches_regex_crate(p, &re, "x FOO y");
-        // negatives: embedded in longer word
-        assert_matches_regex_crate(p, &re, "foobar");
-        assert_matches_regex_crate(p, &re, "FOOBAR");
-        assert_matches_regex_crate(p, &re, "barfoo1");
-        assert_matches_regex_crate(p, &re, "afoo");
-        assert_matches_regex_crate(p, &re, "foob");
-        // negatives: not present at all
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "bar");
-        assert_matches_regex_crate(p, &re, "BAR");
-        assert_matches_regex_crate(p, &re, "fo");
-        assert_matches_regex_crate(p, &re, "oo");
-    }
-
-    /// Unanchored `(?i)select` — finds case-insensitive substring.
-    #[test]
-    fn test_ci_unanchored() {
-        let p = "(?i)select";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "SELECT");
-        assert_matches_regex_crate(p, &re, "select");
-        assert_matches_regex_crate(p, &re, "Select");
-        assert_matches_regex_crate(p, &re, "sElEcT");
-        assert_matches_regex_crate(p, &re, "xxx SELECT yyy");
-        assert_matches_regex_crate(p, &re, "beforeSELECTafter");
-        assert_matches_regex_crate(p, &re, "123select456");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "selec");
-        assert_matches_regex_crate(p, &re, "elect");
-        assert_matches_regex_crate(p, &re, "SELCT"); // missing E
-        assert_matches_regex_crate(p, &re, "slect"); // missing E
-    }
-
-    /// `(?i)(ab){2,3}` — case-insensitive counted group.
-    #[test]
-    fn test_ci_counted_group() {
-        let p = "^(?i)(ab){2,3}$";
-        let re = build_regex_unchecked(p);
-        // positives: 2 reps
-        assert_matches_regex_crate(p, &re, "abab");
-        assert_matches_regex_crate(p, &re, "ABAB");
-        assert_matches_regex_crate(p, &re, "AbAb");
-        assert_matches_regex_crate(p, &re, "aBaB");
-        // positives: 3 reps
-        assert_matches_regex_crate(p, &re, "ababab");
-        assert_matches_regex_crate(p, &re, "ABABAB");
-        assert_matches_regex_crate(p, &re, "AbAbAb");
-        assert_matches_regex_crate(p, &re, "aBAbab");
-        // negatives: 1 rep
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "AB");
-        // negatives: 4 reps
-        assert_matches_regex_crate(p, &re, "abababab");
-        assert_matches_regex_crate(p, &re, "ABABABAB");
-        // negatives: wrong, empty
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "aabb");
-    }
-
-    /// `(?i)a+b+c+` — case-insensitive catenation of one-or-more.
-    #[test]
-    fn test_ci_catenation_one_plus() {
-        let p = "^(?i)a+b+c+$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "ABC");
-        assert_matches_regex_crate(p, &re, "aaBBcc");
-        assert_matches_regex_crate(p, &re, "AaaBbCcc");
-        assert_matches_regex_crate(p, &re, "aaaBBBccc");
-        // negatives: missing segment, wrong order
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "bc");
-        assert_matches_regex_crate(p, &re, "ac");
-        assert_matches_regex_crate(p, &re, "cba");
-        assert_matches_regex_crate(p, &re, "CBA");
-        assert_matches_regex_crate(p, &re, "abca"); // trailing a
-        assert_matches_regex_crate(p, &re, "aabbc1"); // trailing digit
-    }
-
-    /// `(?i).*foo.*` — case-insensitive with wildcards.
-    #[test]
-    fn test_ci_wildcard() {
-        let p = "^(?i).*foo.*$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "foo");
-        assert_matches_regex_crate(p, &re, "FOO");
-        assert_matches_regex_crate(p, &re, "Foo");
-        assert_matches_regex_crate(p, &re, "xxxfooyyy");
-        assert_matches_regex_crate(p, &re, "XXXFOOYYY");
-        assert_matches_regex_crate(p, &re, "123Foo456");
-        assert_matches_regex_crate(p, &re, "foobar");
-        assert_matches_regex_crate(p, &re, "barFOO");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "fo");
-        assert_matches_regex_crate(p, &re, "oo");
-        assert_matches_regex_crate(p, &re, "bar");
-        assert_matches_regex_crate(p, &re, "fxoo");
-    }
-
-    /// `(?i)\d+[a-f]+` — case-insensitive hex-like: digits then hex letters.
-    /// \d is not affected by (?i), but [a-f] becomes [a-fA-F].
-    #[test]
-    fn test_ci_digit_then_hex() {
-        let p = r"^(?i)\d+[a-f]+$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "1a");
-        assert_matches_regex_crate(p, &re, "1A");
-        assert_matches_regex_crate(p, &re, "99ff");
-        assert_matches_regex_crate(p, &re, "99FF");
-        assert_matches_regex_crate(p, &re, "123abcDEF");
-        assert_matches_regex_crate(p, &re, "0fF");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a1"); // wrong order
-        assert_matches_regex_crate(p, &re, "123"); // no hex
-        assert_matches_regex_crate(p, &re, "abc"); // no digits
-        assert_matches_regex_crate(p, &re, "12g"); // g is not hex
-        assert_matches_regex_crate(p, &re, "12G"); // G is not hex
-    }
-
-    /// `(?i)\w+` — case-insensitive word chars (\w is already CI-agnostic).
-    #[test]
-    fn test_ci_word_class() {
-        let p = r"^(?i)\w+$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "ABC");
-        assert_matches_regex_crate(p, &re, "Hello123");
-        assert_matches_regex_crate(p, &re, "_underscore");
-        assert_matches_regex_crate(p, &re, "MiXeD_CaSe_123");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, " ");
-        assert_matches_regex_crate(p, &re, "hello world");
-        assert_matches_regex_crate(p, &re, "!");
-    }
-
-    /// WAF-like pattern: `(?i)\b(?:select|insert|update|delete)\b`.
-    /// Tests the kind of pattern common in SQL injection rules.
-    #[test]
-    fn test_ci_waf_sql_keywords() {
-        let p = r"(?i)(?:select|insert|update|delete)";
-        let re = build_regex_unchecked(p);
-        // positives: each keyword, various cases
-        assert_matches_regex_crate(p, &re, "SELECT");
-        assert_matches_regex_crate(p, &re, "select");
-        assert_matches_regex_crate(p, &re, "Select");
-        assert_matches_regex_crate(p, &re, "INSERT");
-        assert_matches_regex_crate(p, &re, "insert");
-        assert_matches_regex_crate(p, &re, "Insert");
-        assert_matches_regex_crate(p, &re, "UPDATE");
-        assert_matches_regex_crate(p, &re, "update");
-        assert_matches_regex_crate(p, &re, "UpDaTe");
-        assert_matches_regex_crate(p, &re, "DELETE");
-        assert_matches_regex_crate(p, &re, "delete");
-        assert_matches_regex_crate(p, &re, "DeLeTe");
-        // positives: embedded in sentence (unanchored with word boundary)
-        assert_matches_regex_crate(p, &re, "please SELECT * from");
-        assert_matches_regex_crate(p, &re, "do INSERT into");
-        assert_matches_regex_crate(p, &re, "run UPDATE set");
-        assert_matches_regex_crate(p, &re, "run delete from t");
-        // negatives: not a whole word
-        assert_matches_regex_crate(p, &re, "selected");
-        assert_matches_regex_crate(p, &re, "SELECTED");
-        assert_matches_regex_crate(p, &re, "inserts");
-        assert_matches_regex_crate(p, &re, "updated");
-        assert_matches_regex_crate(p, &re, "deletes");
-        assert_matches_regex_crate(p, &re, "preselect");
-        // negatives: not present
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "hello world");
-        assert_matches_regex_crate(p, &re, "CREATE TABLE");
-    }
-
-    /// `(?i)\bfoo\(\)` — case-insensitive function call pattern.
-    /// Parentheses are literal (escaped), only letters are CI.
-    #[test]
-    fn test_ci_function_call() {
-        let p = r"(?i)foo\(";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "foo(");
-        assert_matches_regex_crate(p, &re, "FOO(");
-        assert_matches_regex_crate(p, &re, "Foo(");
-        assert_matches_regex_crate(p, &re, "x foo(");
-        assert_matches_regex_crate(p, &re, "x FOO( y");
-        assert_matches_regex_crate(p, &re, "!Foo(1)");
-        // negatives: no paren, embedded in word, wrong
-        assert_matches_regex_crate(p, &re, "foo");
-        assert_matches_regex_crate(p, &re, "FOO");
-        assert_matches_regex_crate(p, &re, "barfoo("); // \b fails
-        assert_matches_regex_crate(p, &re, "afoo("); // \b fails
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "bar(");
-    }
-
-    /// `(?i)(a|b){1,2}` — case-insensitive counted alternation.
-    /// Exercises counter + ByteCI interaction.
-    #[test]
-    fn test_ci_counted_alternation() {
-        let p = "^(?i)(a|b){1,2}$";
-        let re = build_regex_unchecked(p);
-        // positives: 1 rep
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "A");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "B");
-        // positives: 2 reps, all case combos
-        assert_matches_regex_crate(p, &re, "aa");
-        assert_matches_regex_crate(p, &re, "AA");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "AB");
-        assert_matches_regex_crate(p, &re, "aB");
-        assert_matches_regex_crate(p, &re, "Ab");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "BA");
-        assert_matches_regex_crate(p, &re, "bA");
-        assert_matches_regex_crate(p, &re, "Ba");
-        assert_matches_regex_crate(p, &re, "bb");
-        assert_matches_regex_crate(p, &re, "BB");
-        // negatives: 0 reps, 3 reps, wrong char
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_matches_regex_crate(p, &re, "AAB");
-        assert_matches_regex_crate(p, &re, "c");
-        assert_matches_regex_crate(p, &re, "C");
-    }
-
-    /// `(?i)x.y` — case-insensitive with wildcard in middle.
-    /// The dot is not affected by (?i); x and y are.
-    #[test]
-    fn test_ci_dot_in_middle() {
-        let p = "^(?i)x.y$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "xay");
-        assert_matches_regex_crate(p, &re, "XAY");
-        assert_matches_regex_crate(p, &re, "xAy");
-        assert_matches_regex_crate(p, &re, "X1Y");
-        assert_matches_regex_crate(p, &re, "x y");
-        assert_matches_regex_crate(p, &re, "X!Y");
-        // negatives: wrong length, missing
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "xy");
-        assert_matches_regex_crate(p, &re, "XY");
-        assert_matches_regex_crate(p, &re, "xaby");
-        assert_matches_regex_crate(p, &re, "axy");
-    }
-
-    /// `(?i)[^a-z]` — case-insensitive negated class.
-    /// Under (?i), [^a-z] excludes both a-z AND A-Z.
-    #[test]
-    fn test_ci_negated_class() {
-        let p = "^(?i)[^a-z]$";
-        let re = build_regex_unchecked(p);
-        // positives: digits, specials
-        assert_matches_regex_crate(p, &re, "0");
-        assert_matches_regex_crate(p, &re, "9");
-        assert_matches_regex_crate(p, &re, "!");
-        assert_matches_regex_crate(p, &re, " ");
-        assert_matches_regex_crate(p, &re, "@");
-        // negatives: any letter
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "A");
-        assert_matches_regex_crate(p, &re, "z");
-        assert_matches_regex_crate(p, &re, "Z");
-        assert_matches_regex_crate(p, &re, "m");
-        assert_matches_regex_crate(p, &re, "M");
-        // negatives: multi-char, empty
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "12");
-    }
-
     /// Verify ByteCI state is actually emitted for simple (?i) patterns.
     #[test]
     fn test_ci_byteci_state_emitted() {
@@ -7096,500 +7325,9 @@ baz",
             "b and B should be in the same byte equivalence class"
         );
     }
-
-    /// `(?i).{2,4}` — case-insensitive counted wildcard.
-    /// (?i) does not change dot behavior, but tests interaction.
-    #[test]
-    fn test_ci_counted_wildcard() {
-        let p = "^(?i).{2,4}$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "AB");
-        assert_matches_regex_crate(p, &re, "12");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abcd");
-        assert_matches_regex_crate(p, &re, "!@#");
-        // negatives: too short, too long
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "abcde");
-    }
-
-    /// `(?i)(foo|bar)+` — repeated CI alternation of multi-byte branches.
-    #[test]
-    fn test_ci_repeated_alternation() {
-        let p = "^(?i)(foo|bar)+$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "foo");
-        assert_matches_regex_crate(p, &re, "FOO");
-        assert_matches_regex_crate(p, &re, "bar");
-        assert_matches_regex_crate(p, &re, "BAR");
-        assert_matches_regex_crate(p, &re, "foobar");
-        assert_matches_regex_crate(p, &re, "FOOBAR");
-        assert_matches_regex_crate(p, &re, "FooBar");
-        assert_matches_regex_crate(p, &re, "barfoo");
-        assert_matches_regex_crate(p, &re, "BARFOO");
-        assert_matches_regex_crate(p, &re, "foofoofoo");
-        assert_matches_regex_crate(p, &re, "FOOBARFOO");
-        assert_matches_regex_crate(p, &re, "barBARbar");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "fo");
-        assert_matches_regex_crate(p, &re, "ba");
-        assert_matches_regex_crate(p, &re, "baz");
-        assert_matches_regex_crate(p, &re, "foobaz");
-        assert_matches_regex_crate(p, &re, "foobarx");
-    }
-
-    /// `(?i)a\Wb` — CI letters around non-word char.
-    #[test]
-    fn test_ci_non_word_class() {
-        let p = r"^(?i)a\Wb$";
-        let re = build_regex_unchecked(p);
-        // positives: various non-word separators
-        assert_matches_regex_crate(p, &re, "a b");
-        assert_matches_regex_crate(p, &re, "A B");
-        assert_matches_regex_crate(p, &re, "a!b");
-        assert_matches_regex_crate(p, &re, "A!B");
-        assert_matches_regex_crate(p, &re, "a.B");
-        assert_matches_regex_crate(p, &re, "A-b");
-        // negatives: word char in middle, wrong letters
-        assert_matches_regex_crate(p, &re, "aab");
-        assert_matches_regex_crate(p, &re, "a1b");
-        assert_matches_regex_crate(p, &re, "a_b");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "c d");
-    }
-
     // -----------------------------------------------------------------------
     // Partial case-insensitive tests (mixed CI / case-sensitive regions)
     // -----------------------------------------------------------------------
-
-    /// `a(?i:b)c` — only the middle letter is case-insensitive.
-    #[test]
-    fn test_partial_ci_middle() {
-        let p = "^a(?i:b)c$";
-        let re = build_regex_unchecked(p);
-        // positives: b/B in the middle, a and c must be lowercase
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "aBc");
-        // negatives: a or c changed case
-        assert_matches_regex_crate(p, &re, "Abc");
-        assert_matches_regex_crate(p, &re, "abC");
-        assert_matches_regex_crate(p, &re, "ABC");
-        assert_matches_regex_crate(p, &re, "aBC");
-        assert_matches_regex_crate(p, &re, "AbC");
-        // negatives: wrong char, length
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "ac");
-        assert_matches_regex_crate(p, &re, "axc");
-        assert_matches_regex_crate(p, &re, "abbc");
-        assert_matches_regex_crate(p, &re, "abcx");
-    }
-
-    /// `(?i:a)b` — first letter CI, second case-sensitive.
-    #[test]
-    fn test_partial_ci_prefix() {
-        let p = "^(?i:a)b$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "Ab");
-        // negatives: b changed case
-        assert_matches_regex_crate(p, &re, "aB");
-        assert_matches_regex_crate(p, &re, "AB");
-        // negatives: wrong, length
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "cb");
-        assert_matches_regex_crate(p, &re, "abc");
-    }
-
-    /// `a(?i:b)` — first letter case-sensitive, second CI.
-    #[test]
-    fn test_partial_ci_suffix() {
-        let p = "^a(?i:b)$";
-        let re = build_regex_unchecked(p);
-        // positives
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "aB");
-        // negatives: a changed case
-        assert_matches_regex_crate(p, &re, "Ab");
-        assert_matches_regex_crate(p, &re, "AB");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "ac");
-    }
-
-    /// `(?i)a(?-i)b` — toggle on then off.
-    #[test]
-    fn test_partial_ci_toggle_on_off() {
-        let p = "^(?i)a(?-i)b$";
-        let re = build_regex_unchecked(p);
-        // positives: a is CI, b is not
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "Ab");
-        // negatives: b must be lowercase
-        assert_matches_regex_crate(p, &re, "aB");
-        assert_matches_regex_crate(p, &re, "AB");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "b");
-        assert_matches_regex_crate(p, &re, "abc");
-    }
-
-    /// `a(?-i)b(?i)c` — explicit toggle in a non-CI context (no-op, then on).
-    /// Default is case-sensitive, so (?-i) is redundant but legal.
-    #[test]
-    fn test_partial_ci_toggle_off_then_on() {
-        let p = "^a(?-i)b(?i)c$";
-        let re = build_regex_unchecked(p);
-        // a: case-sensitive (default), b: case-sensitive (explicit), c: CI
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abC");
-        // negatives: a or b changed case
-        assert_matches_regex_crate(p, &re, "Abc");
-        assert_matches_regex_crate(p, &re, "aBc");
-        assert_matches_regex_crate(p, &re, "ABC");
-        assert_matches_regex_crate(p, &re, "ABc");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "abx");
-    }
-
-    /// `a(?i:b)+c` — CI quantified group between case-sensitive letters.
-    #[test]
-    fn test_partial_ci_quantified_group() {
-        let p = "^a(?i:b)+c$";
-        let re = build_regex_unchecked(p);
-        // positives: one or more b/B
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "aBc");
-        assert_matches_regex_crate(p, &re, "abbc");
-        assert_matches_regex_crate(p, &re, "aBBc");
-        assert_matches_regex_crate(p, &re, "aBbBc");
-        assert_matches_regex_crate(p, &re, "abBbc");
-        // negatives: a or c changed case
-        assert_matches_regex_crate(p, &re, "Abc");
-        assert_matches_regex_crate(p, &re, "abC");
-        assert_matches_regex_crate(p, &re, "ABC");
-        // negatives: zero b's, wrong char
-        assert_matches_regex_crate(p, &re, "ac");
-        assert_matches_regex_crate(p, &re, "axc");
-        assert_matches_regex_crate(p, &re, "");
-    }
-
-    /// `a(?i:b)*c` — CI zero-or-more group.
-    #[test]
-    fn test_partial_ci_star_group() {
-        let p = "^a(?i:b)*c$";
-        let re = build_regex_unchecked(p);
-        // positives: zero or more b/B
-        assert_matches_regex_crate(p, &re, "ac");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "aBc");
-        assert_matches_regex_crate(p, &re, "aBBBc");
-        // negatives: a or c changed case
-        assert_matches_regex_crate(p, &re, "Ac");
-        assert_matches_regex_crate(p, &re, "aC");
-        assert_matches_regex_crate(p, &re, "ABc");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a");
-        assert_matches_regex_crate(p, &re, "axc");
-    }
-
-    /// `a(?i:b){2,4}c` — CI counted group.
-    #[test]
-    fn test_partial_ci_counted_group() {
-        let p = "^a(?i:b){2,4}c$";
-        let re = build_regex_unchecked(p);
-        // positives: 2..4 b/B
-        assert_matches_regex_crate(p, &re, "abbc");
-        assert_matches_regex_crate(p, &re, "aBBc");
-        assert_matches_regex_crate(p, &re, "aBbc");
-        assert_matches_regex_crate(p, &re, "abbbc");
-        assert_matches_regex_crate(p, &re, "aBBBc");
-        assert_matches_regex_crate(p, &re, "abBBc");
-        assert_matches_regex_crate(p, &re, "abbbbc");
-        assert_matches_regex_crate(p, &re, "aBBBBc");
-        // negatives: 1 or 5 b's
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "aBc");
-        assert_matches_regex_crate(p, &re, "abbbbbc");
-        assert_matches_regex_crate(p, &re, "aBBBBBc");
-        // negatives: a or c wrong case
-        assert_matches_regex_crate(p, &re, "ABBc");
-        assert_matches_regex_crate(p, &re, "abbC");
-        // negatives: wrong char
-        assert_matches_regex_crate(p, &re, "axxc");
-        assert_matches_regex_crate(p, &re, "");
-    }
-
-    /// `a(?i:bc)d` — CI group spanning multiple letters.
-    #[test]
-    fn test_partial_ci_multi_letter_group() {
-        let p = "^a(?i:bc)d$";
-        let re = build_regex_unchecked(p);
-        // positives: b and c are CI
-        assert_matches_regex_crate(p, &re, "abcd");
-        assert_matches_regex_crate(p, &re, "aBCd");
-        assert_matches_regex_crate(p, &re, "aBcd");
-        assert_matches_regex_crate(p, &re, "abCd");
-        // negatives: a or d changed case
-        assert_matches_regex_crate(p, &re, "Abcd");
-        assert_matches_regex_crate(p, &re, "abcD");
-        assert_matches_regex_crate(p, &re, "ABCD");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abxd");
-        assert_matches_regex_crate(p, &re, "axcd");
-    }
-
-    /// `(?i:a)(?i:b)c` — two adjacent CI groups, then case-sensitive.
-    #[test]
-    fn test_partial_ci_adjacent_groups() {
-        let p = "^(?i:a)(?i:b)c$";
-        let re = build_regex_unchecked(p);
-        // positives: a and b CI, c must be lowercase
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "Abc");
-        assert_matches_regex_crate(p, &re, "aBc");
-        assert_matches_regex_crate(p, &re, "ABc");
-        // negatives: c changed case
-        assert_matches_regex_crate(p, &re, "abC");
-        assert_matches_regex_crate(p, &re, "ABC");
-        assert_matches_regex_crate(p, &re, "AbC");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "ab");
-        assert_matches_regex_crate(p, &re, "xbc");
-    }
-
-    /// `(?i:a|bc)d` — CI alternation followed by case-sensitive.
-    #[test]
-    fn test_partial_ci_alternation_then_literal() {
-        let p = "^(?i:a|bc)d$";
-        let re = build_regex_unchecked(p);
-        // positives: alternation is CI, d is not
-        assert_matches_regex_crate(p, &re, "ad");
-        assert_matches_regex_crate(p, &re, "Ad");
-        assert_matches_regex_crate(p, &re, "bcd");
-        assert_matches_regex_crate(p, &re, "BCd");
-        assert_matches_regex_crate(p, &re, "Bcd");
-        assert_matches_regex_crate(p, &re, "bCd");
-        // negatives: d must be lowercase
-        assert_matches_regex_crate(p, &re, "aD");
-        assert_matches_regex_crate(p, &re, "AD");
-        assert_matches_regex_crate(p, &re, "bcD");
-        assert_matches_regex_crate(p, &re, "BCD");
-        // negatives: wrong, partial
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "d");
-        assert_matches_regex_crate(p, &re, "bd");
-        assert_matches_regex_crate(p, &re, "cd");
-    }
-
-    /// `x(?i:foo)y` — case-sensitive x/y wrapping a CI word.
-    #[test]
-    fn test_partial_ci_word_in_middle() {
-        let p = "^x(?i:foo)y$";
-        let re = build_regex_unchecked(p);
-        // positives: foo is CI
-        assert_matches_regex_crate(p, &re, "xfooy");
-        assert_matches_regex_crate(p, &re, "xFOOy");
-        assert_matches_regex_crate(p, &re, "xFooy");
-        assert_matches_regex_crate(p, &re, "xfOoy");
-        assert_matches_regex_crate(p, &re, "xfoOy");
-        // negatives: x or y changed case
-        assert_matches_regex_crate(p, &re, "Xfooy");
-        assert_matches_regex_crate(p, &re, "xfooY");
-        assert_matches_regex_crate(p, &re, "XFOOY");
-        // negatives: wrong inner word
-        assert_matches_regex_crate(p, &re, "xbary");
-        assert_matches_regex_crate(p, &re, "xfoy");
-        assert_matches_regex_crate(p, &re, "");
-    }
-
-    /// `(?i)abc(?-i)def(?i)ghi` — toggle on/off/on across three segments.
-    #[test]
-    fn test_partial_ci_three_segments() {
-        let p = "^(?i)abc(?-i)def(?i)ghi$";
-        let re = build_regex_unchecked(p);
-        // positives: abc CI, def exact, ghi CI
-        assert_matches_regex_crate(p, &re, "abcdefghi");
-        assert_matches_regex_crate(p, &re, "ABCdefGHI");
-        assert_matches_regex_crate(p, &re, "AbcdefGhi");
-        assert_matches_regex_crate(p, &re, "aBcdefgHi");
-        assert_matches_regex_crate(p, &re, "ABCdefghi");
-        assert_matches_regex_crate(p, &re, "abcdefGHI");
-        // negatives: middle segment must be exact lowercase
-        assert_matches_regex_crate(p, &re, "abcDEFghi");
-        assert_matches_regex_crate(p, &re, "ABCDEFghi");
-        assert_matches_regex_crate(p, &re, "abcDefghi");
-        assert_matches_regex_crate(p, &re, "abcdEfghi");
-        assert_matches_regex_crate(p, &re, "abcdeF ghi");
-        assert_matches_regex_crate(p, &re, "ABCDEFGHI");
-        // negatives: length, wrong
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "abcdef");
-        assert_matches_regex_crate(p, &re, "defghi");
-    }
-
-    /// `(?i:select)\s+\w+` — CI keyword then case-sensitive rest (WAF-like).
-    #[test]
-    fn test_partial_ci_waf_keyword_prefix() {
-        let p = r"(?i:select)\s+\w+";
-        let re = build_regex_unchecked(p);
-        // positives: SELECT is CI, rest must match as-is
-        assert_matches_regex_crate(p, &re, "select foo");
-        assert_matches_regex_crate(p, &re, "SELECT foo");
-        assert_matches_regex_crate(p, &re, "Select foo");
-        assert_matches_regex_crate(p, &re, "sElEcT bar");
-        assert_matches_regex_crate(p, &re, "xxx SELECT users yyy");
-        assert_matches_regex_crate(p, &re, "SELECT  a");
-        // negatives: no space, no word after
-        assert_matches_regex_crate(p, &re, "selectfoo");
-        assert_matches_regex_crate(p, &re, "SELECT");
-        assert_matches_regex_crate(p, &re, "SELECT ");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "insert foo");
-    }
-
-    /// `a(?i:b)?c` — CI optional group.
-    #[test]
-    fn test_partial_ci_optional_group() {
-        let p = "^a(?i:b)?c$";
-        let re = build_regex_unchecked(p);
-        // positives: with or without b
-        assert_matches_regex_crate(p, &re, "ac");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "aBc");
-        // negatives: a or c wrong case
-        assert_matches_regex_crate(p, &re, "Ac");
-        assert_matches_regex_crate(p, &re, "aC");
-        assert_matches_regex_crate(p, &re, "Abc");
-        assert_matches_regex_crate(p, &re, "abC");
-        // negatives: wrong char
-        assert_matches_regex_crate(p, &re, "axc");
-        assert_matches_regex_crate(p, &re, "abbc");
-        assert_matches_regex_crate(p, &re, "");
-    }
-
-    /// Unanchored `x(?i:key)=` — CI key name in a key=value pattern.
-    #[test]
-    fn test_partial_ci_unanchored_key_value() {
-        let p = r"x(?i:key)=";
-        let re = build_regex_unchecked(p);
-        // positives: x must be lowercase, key is CI, = is literal
-        assert_matches_regex_crate(p, &re, "xkey=val");
-        assert_matches_regex_crate(p, &re, "xKEY=val");
-        assert_matches_regex_crate(p, &re, "xKey=123");
-        assert_matches_regex_crate(p, &re, "pre xkEy=v post");
-        // negatives: x or = wrong
-        assert_matches_regex_crate(p, &re, "Xkey=val");
-        assert_matches_regex_crate(p, &re, "xkey:val");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "xkey");
-        assert_matches_regex_crate(p, &re, "ykey=val");
-    }
-
-    /// `(?i:ab){2,3}c` — CI counted group then case-sensitive tail.
-    #[test]
-    fn test_partial_ci_counted_group_then_literal() {
-        let p = "^(?i:ab){2,3}c$";
-        let re = build_regex_unchecked(p);
-        // positives: 2 reps
-        assert_matches_regex_crate(p, &re, "ababc");
-        assert_matches_regex_crate(p, &re, "ABABc");
-        assert_matches_regex_crate(p, &re, "AbAbc");
-        assert_matches_regex_crate(p, &re, "aBaBc");
-        // positives: 3 reps
-        assert_matches_regex_crate(p, &re, "abababc");
-        assert_matches_regex_crate(p, &re, "ABABABc");
-        assert_matches_regex_crate(p, &re, "AbAbAbc");
-        // negatives: c must be lowercase
-        assert_matches_regex_crate(p, &re, "ababC");
-        assert_matches_regex_crate(p, &re, "ABABC");
-        // negatives: 1 rep, 4 reps
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "ababababc");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "xyzc");
-    }
-
-    /// `a(?i:[b-d])e` — CI character class in a partial-CI context.
-    #[test]
-    fn test_partial_ci_class_in_group() {
-        let p = "^a(?i:[b-d])e$";
-        let re = build_regex_unchecked(p);
-        // positives: [b-d] becomes [b-dB-D] under (?i)
-        assert_matches_regex_crate(p, &re, "abe");
-        assert_matches_regex_crate(p, &re, "aBe");
-        assert_matches_regex_crate(p, &re, "ace");
-        assert_matches_regex_crate(p, &re, "aCe");
-        assert_matches_regex_crate(p, &re, "ade");
-        assert_matches_regex_crate(p, &re, "aDe");
-        // negatives: a or e changed case
-        assert_matches_regex_crate(p, &re, "Abe");
-        assert_matches_regex_crate(p, &re, "abE");
-        assert_matches_regex_crate(p, &re, "ABE");
-        // negatives: char outside class
-        assert_matches_regex_crate(p, &re, "aee");
-        assert_matches_regex_crate(p, &re, "axe");
-        assert_matches_regex_crate(p, &re, "aae");
-        assert_matches_regex_crate(p, &re, "");
-    }
-
-    /// `(?i)a(?-i)b(?i)c(?-i)d` — alternating CI on/off four times.
-    #[test]
-    fn test_partial_ci_four_toggles() {
-        let p = "^(?i)a(?-i)b(?i)c(?-i)d$";
-        let re = build_regex_unchecked(p);
-        // a: CI, b: exact, c: CI, d: exact
-        assert_matches_regex_crate(p, &re, "abcd");
-        assert_matches_regex_crate(p, &re, "AbCd");
-        assert_matches_regex_crate(p, &re, "Abcd");
-        assert_matches_regex_crate(p, &re, "abCd");
-        // negatives: b or d changed case
-        assert_matches_regex_crate(p, &re, "aBcd");
-        assert_matches_regex_crate(p, &re, "abcD");
-        assert_matches_regex_crate(p, &re, "aBcD");
-        assert_matches_regex_crate(p, &re, "ABCD");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "abc");
-        assert_matches_regex_crate(p, &re, "abcde");
-    }
-
-    /// `(?i:a)1(?i:b)2` — CI letters separated by case-invariant digits.
-    #[test]
-    fn test_partial_ci_interleaved_digits() {
-        let p = "^(?i:a)1(?i:b)2$";
-        let re = build_regex_unchecked(p);
-        // positives: a and b are CI, digits must be exact
-        assert_matches_regex_crate(p, &re, "a1b2");
-        assert_matches_regex_crate(p, &re, "A1b2");
-        assert_matches_regex_crate(p, &re, "a1B2");
-        assert_matches_regex_crate(p, &re, "A1B2");
-        // negatives: wrong digit
-        assert_matches_regex_crate(p, &re, "a2b2");
-        assert_matches_regex_crate(p, &re, "a1b1");
-        assert_matches_regex_crate(p, &re, "A2B2");
-        // negatives
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "a1b");
-        assert_matches_regex_crate(p, &re, "1b2");
-    }
-
     /// Verify structural: partial CI emits ByteCI only for CI letters.
     #[test]
     fn test_partial_ci_byteci_selective() {
