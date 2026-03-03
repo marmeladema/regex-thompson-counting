@@ -767,9 +767,9 @@ impl Regex {
     /// Return the minimum DFA tier that can handle this regex.
     ///
     /// - `0` = NFA only (e.g. CRLF assertions, zero-width counter bodies)
-    /// - `1` = Tier 1+ (counter-free, no deferred assertions)
-    /// - `2` = Tier 2+ (non-nested counters, conditional DFA)
-    /// - `3` = Tier 3 (nested counters, counting DFA with counter programs)
+    /// - `1` = Tier 1+ (counter-free, deferred assertions supported)
+    /// - `2` = Tier 2+ (non-nested counters, deferred assertions supported)
+    /// - `3` = Tier 3 (nested counters, no deferred assertions)
     pub fn min_tier(&self) -> u8 {
         if self.dfa_eligible {
             1
@@ -1705,28 +1705,18 @@ impl RegexBuilder {
         let counting_dfa_eligible =
             has_counters && !has_deferred_assert && !has_zero_width_counter_body;
 
-        // Tier 2 eligibility: non-nested counters.  A counter is "nested"
-        // if its body (the path from CI.out to its CInc) passes through
-        // another counter's CI or CInc state.
-        let tier2_eligible = counting_dfa_eligible && {
+        // Check for deferred assertions inside a counter body.  Tier 2
+        // cannot handle these because the CInc increment is separated from
+        // byte consumption by a deferred assertion, breaking the origin-
+        // action model.  Tier 2 only supports deferred assertions that are
+        // OUTSIDE the counter body (before CI or after CInc break).
+        let has_deferred_in_counter_body = has_counters && {
             let states = &self.states;
-            fn has_nesting(states: &[State]) -> bool {
-                for s in states.iter() {
-                    if let State::CounterInstance { counter, out } = s {
-                        // Walk from CI.out to CInc(counter) through epsilon
-                        // states.  If we encounter another counter's CI or
-                        // CInc on the way, it's nested.
-                        if body_crosses_other_counter(*out, *counter, states) {
-                            return true;
-                        }
-                    }
-                }
-                false
-            }
-            fn body_crosses_other_counter(
+            fn body_has_deferred(
                 start: StateIdx,
                 own_counter: CounterIdx,
                 states: &[State],
+                byte_tables: &[ByteMap],
             ) -> bool {
                 let mut stack = vec![start];
                 let mut visited = vec![false; states.len()];
@@ -1737,40 +1727,125 @@ impl RegexBuilder {
                     }
                     visited[i] = true;
                     match states[idx] {
-                        State::CounterInstance { counter, out } => {
-                            if counter != own_counter {
-                                return true; // nested: another CI in body
+                        State::CounterIncrement { counter, .. } if counter == own_counter => {
+                            continue;
+                        }
+                        State::Assert { kind, out } => {
+                            if matches!(
+                                kind,
+                                AssertKind::EndLF
+                                    | AssertKind::EndCRLF
+                                    | AssertKind::StartCRLF
+                                    | AssertKind::WordAscii
+                                    | AssertKind::WordAsciiNegate
+                            ) {
+                                return true;
                             }
                             stack.push(out);
-                        }
-                        State::CounterIncrement {
-                            counter,
-                            out: _,
-                            out1: _,
-                            ..
-                        } => {
-                            if counter == own_counter {
-                                // Reached our own CInc — don't follow further
-                                // (we only check the body, not past the break).
-                                continue;
-                            }
-                            return true; // nested: another CInc in body
                         }
                         State::Split { out, out1 } => {
                             stack.push(out1);
                             stack.push(out);
                         }
-                        State::Assert { out, .. } => {
-                            stack.push(out);
+                        State::CounterInstance { out, .. } => stack.push(out),
+                        // Follow through consuming states — deferred
+                        // assertions may appear after a byte match within
+                        // the counter body (e.g. `(?m:a$){2,3}`).
+                        State::Byte { out, .. }
+                        | State::ByteCI { out, .. }
+                        | State::ByteClass { out, .. } => stack.push(out),
+                        State::ByteTable { table } => {
+                            for &succ in byte_tables[table.idx()].0.iter() {
+                                if succ != StateIdx::NONE {
+                                    stack.push(succ);
+                                }
+                            }
                         }
-                        // Consuming states and Match terminate the walk.
                         _ => {}
                     }
                 }
                 false
             }
-            !has_nesting(states)
+            let byte_tables = &self.byte_tables;
+            states.iter().any(|s| {
+                if let State::CounterInstance { counter, out } = s {
+                    body_has_deferred(*out, *counter, states, byte_tables)
+                } else {
+                    false
+                }
+            })
         };
+
+        // Tier 2 eligibility: non-nested counters.  Tier 2 supports
+        // deferred assertions (\b, \B, EndLF) unlike Tier 3, but only
+        // when they are outside the counter body.
+        let tier2_eligible = has_counters
+            && !has_crlf_assert
+            && !has_zero_width_counter_body
+            && !has_deferred_in_counter_body
+            && {
+                let states = &self.states;
+                fn has_nesting(states: &[State]) -> bool {
+                    for s in states.iter() {
+                        if let State::CounterInstance { counter, out } = s {
+                            // Walk from CI.out to CInc(counter) through epsilon
+                            // states.  If we encounter another counter's CI or
+                            // CInc on the way, it's nested.
+                            if body_crosses_other_counter(*out, *counter, states) {
+                                return true;
+                            }
+                        }
+                    }
+                    false
+                }
+                fn body_crosses_other_counter(
+                    start: StateIdx,
+                    own_counter: CounterIdx,
+                    states: &[State],
+                ) -> bool {
+                    let mut stack = vec![start];
+                    let mut visited = vec![false; states.len()];
+                    while let Some(idx) = stack.pop() {
+                        let i = idx.idx();
+                        if visited[i] {
+                            continue;
+                        }
+                        visited[i] = true;
+                        match states[idx] {
+                            State::CounterInstance { counter, out } => {
+                                if counter != own_counter {
+                                    return true; // nested: another CI in body
+                                }
+                                stack.push(out);
+                            }
+                            State::CounterIncrement {
+                                counter,
+                                out: _,
+                                out1: _,
+                                ..
+                            } => {
+                                if counter == own_counter {
+                                    // Reached our own CInc — don't follow further
+                                    // (we only check the body, not past the break).
+                                    continue;
+                                }
+                                return true; // nested: another CInc in body
+                            }
+                            State::Split { out, out1 } => {
+                                stack.push(out1);
+                                stack.push(out);
+                            }
+                            State::Assert { out, .. } => {
+                                stack.push(out);
+                            }
+                            // Consuming states and Match terminate the walk.
+                            _ => {}
+                        }
+                    }
+                    false
+                }
+                !has_nesting(states)
+            };
 
         // Compute byte equivalence classes before moving data out.
         let classes_slice: Vec<ByteClass> = self.classes.iter().copied().collect();
@@ -4923,7 +4998,7 @@ mod tests {
         test_multiline_with_counting {
             pattern: r#"(?m)^\d{2,4}$"#,
             memory: 0,
-            min_tier: 0,
+            min_tier: 2,
             inputs: [
                 ("12", true),
                 ("123", true),
@@ -5184,7 +5259,7 @@ mod tests {
         test_word_boundary_counter {
             pattern: r#"\b\w{3,5}\b"#,
             memory: 0,
-            min_tier: 0,
+            min_tier: 2,
             inputs: [
                 ("abc", true),
                 ("abcde", true),
@@ -5533,7 +5608,7 @@ mod tests {
         test_multiline_alternation_counter {
             pattern: "(?m:^)(a|bc){2,3}(?m:$)",
             memory: 0,
-            min_tier: 0,
+            min_tier: 2,
             inputs: [
                 ("aa", true),
                 ("abc", true),

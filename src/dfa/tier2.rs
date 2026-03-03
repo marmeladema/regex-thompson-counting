@@ -66,7 +66,10 @@ struct Transition {
     /// True if this transition crosses a CInc node.
     is_counting: bool,
     /// New counter instances from CI nodes in the successor closure.
-    seeds: Box<[(CounterIdx, StateIdx)]>,
+    /// The third element is the initial counter value (0 for fresh seeds,
+    /// 1 for seeds from resolved deferred assertions whose origin already
+    /// consumed the resolving byte through a CInc increment).
+    seeds: Box<[(CounterIdx, StateIdx, u32)]>,
     /// Parallel arrays: `origin_keys[i]` → `origin_actions[i]`.
     origin_keys: Box<[StateIdx]>,
     origin_actions: Box<[OriginAction]>,
@@ -157,7 +160,7 @@ pub(crate) struct Tier2DfaCache {
     start_id: DfaStateId,
     start_is_match: bool,
     start_is_match_at_end: bool,
-    start_seeds: Box<[(CounterIdx, StateIdx)]>,
+    start_seeds: Box<[(CounterIdx, StateIdx, u32)]>,
 }
 
 impl fmt::Debug for Tier2DfaCache {
@@ -234,6 +237,7 @@ impl Tier2DfaCache {
         states: &[State],
         at_start: bool,
         prev_byte: Option<u8>,
+        next_byte: Option<u8>,
         follow_break: bool,
     ) -> ClosureResult {
         self.closure_stack.clear();
@@ -268,7 +272,7 @@ impl Tier2DfaCache {
                         }
                         continue;
                     }
-                    let result = kind.eval(at_start, false, prev_byte, None);
+                    let result = kind.eval(at_start, false, prev_byte, next_byte);
                     match result {
                         AssertEval::Pass => self.closure_stack.push(out),
                         AssertEval::Fail => {}
@@ -343,8 +347,12 @@ impl Tier2DfaCache {
                 }
                 State::Assert { out, .. } => stack.push(out),
                 State::CounterInstance { out, .. } => stack.push(out),
-                State::CounterIncrement { out, out1, .. } => {
-                    stack.push(out1);
+                State::CounterIncrement { out, .. } => {
+                    // Only follow the continue path (out).  The break path
+                    // (out1) requires a counter instance with value >= min,
+                    // which we cannot verify structurally.  Counter-aware
+                    // break matching is handled by instance tracking in
+                    // step_slow / finish.
                     stack.push(out);
                 }
                 _ => {}
@@ -402,19 +410,38 @@ impl Tier2DfaCache {
         // Phase 1: collect targets — NFA states reached after consuming `byte`.
         let mut targets_per_origin: Vec<(StateIdx, Vec<StateIdx>)> = Vec::new();
 
+        let mut resolved_seeds: Vec<(CounterIdx, StateIdx, u32)> = Vec::new();
+        let mut resolved_cinc = false;
+        let mut resolved_is_match = false;
+        let mut resolved_is_match_at_end = false;
+
         if from != DfaStateId::DEAD {
             let from_state = &self.states[from.idx()];
 
             // Resolve deferred assertions.
             let extra = self.resolve_deferred(from_state, byte, regex);
             if !extra.is_empty() {
+                let resolved_prev = if self.states[from.idx()].prev_was_word {
+                    Some(b'a')
+                } else {
+                    Some(b' ')
+                };
                 let cr = self.epsilon_closure(
                     extra.into_iter(),
                     &regex.states,
                     false,
+                    resolved_prev,
                     Some(byte),
                     true, // follow_break=true for resolved assert closure
                 );
+                resolved_seeds = cr
+                    .seed_instances
+                    .iter()
+                    .map(|&(c, s)| (c, s, 0u32))
+                    .collect();
+                resolved_cinc = cr.encountered_cinc;
+                resolved_is_match = cr.is_match;
+                resolved_is_match_at_end = cr.is_match_at_end;
                 for &idx in cr.nfa_states.iter() {
                     if let Some(t) = consume_byte(idx, byte, regex) {
                         targets_per_origin.push((idx, vec![t]));
@@ -445,11 +472,11 @@ impl Tier2DfaCache {
             &regex.states,
             false,
             Some(byte),
+            None,
             true, // follow_break=true
         );
 
-        let is_counting = probe.encountered_cinc;
-        let seed_instances = probe.seed_instances.clone();
+        let is_counting = probe.encountered_cinc || resolved_cinc;
 
         // Build per-origin actions.
         let mut origin_keys = Vec::new();
@@ -459,6 +486,32 @@ impl Tier2DfaCache {
             origin_keys.push(origin);
             origin_actions.push(action);
         }
+
+        // Compute seed initial values.  Resolved deferred seeds whose
+        // origin consumed the byte and had an Increment action start at
+        // value 1 (the resolving byte already counted as one iteration).
+        for rs in &mut resolved_seeds {
+            if let Some(pos) = origin_keys.iter().position(|&k| k == rs.1)
+                && matches!(origin_actions[pos], OriginAction::Increment { .. })
+            {
+                rs.2 = 1;
+            }
+        }
+
+        let mut seed_instances: Vec<(CounterIdx, StateIdx, u32)> = probe
+            .seed_instances
+            .iter()
+            .map(|&(c, s)| (c, s, 0u32))
+            .collect();
+        for s in &resolved_seeds {
+            if !seed_instances
+                .iter()
+                .any(|e| e.0 == s.0 && e.1 == s.1 && e.2 == s.2)
+            {
+                seed_instances.push(*s);
+            }
+        }
+        let seed_instances: Box<[(CounterIdx, StateIdx, u32)]> = seed_instances.into();
 
         // Compute DFA successors: no_break and with_break.
         if is_counting {
@@ -471,6 +524,7 @@ impl Tier2DfaCache {
                 &regex.states,
                 false,
                 Some(byte),
+                None,
                 false, // follow_break=false → no_break
             );
             let nb_id = self.intern_closure_result(&cr_nb, byte);
@@ -481,13 +535,17 @@ impl Tier2DfaCache {
             let (nb_m, nb_mae) = self.match_flags(nb_id);
             let (wb_m, wb_mae) = self.match_flags(wb_id);
 
+            // Fold resolved deferred assertion matches into both
+            // successors' flags.  `resolved_is_match` applies
+            // unconditionally (the DFA state that was transitioned FROM
+            // already encodes the correct counter-aware path).
             Transition {
                 no_break: nb_id,
-                no_break_is_match: nb_m,
-                no_break_is_match_at_end: nb_mae,
+                no_break_is_match: nb_m || resolved_is_match,
+                no_break_is_match_at_end: nb_mae || resolved_is_match_at_end,
                 with_break: wb_id,
-                with_break_is_match: wb_m,
-                with_break_is_match_at_end: wb_mae,
+                with_break_is_match: wb_m || resolved_is_match,
+                with_break_is_match_at_end: wb_mae || resolved_is_match_at_end,
                 is_counting: true,
                 seeds: seed_instances,
                 origin_keys: origin_keys.into_boxed_slice(),
@@ -500,11 +558,11 @@ impl Tier2DfaCache {
 
             Transition {
                 no_break: id,
-                no_break_is_match: m,
-                no_break_is_match_at_end: mae,
+                no_break_is_match: m || resolved_is_match,
+                no_break_is_match_at_end: mae || resolved_is_match_at_end,
                 with_break: id,
-                with_break_is_match: m,
-                with_break_is_match_at_end: mae,
+                with_break_is_match: m || resolved_is_match,
+                with_break_is_match_at_end: mae || resolved_is_match_at_end,
                 is_counting: false,
                 seeds: seed_instances,
                 origin_keys: origin_keys.into_boxed_slice(),
@@ -568,6 +626,7 @@ impl Tier2DfaCache {
                 &regex.states,
                 false,
                 None,
+                None,
                 false, // follow_break=false → continue only
             );
             let cr_break_only = self.epsilon_closure_break_only(targets, &regex.states);
@@ -582,8 +641,14 @@ impl Tier2DfaCache {
             }
         } else {
             // No CInc ��� just advance.
-            let cr =
-                self.epsilon_closure(targets.iter().copied(), &regex.states, false, None, true);
+            let cr = self.epsilon_closure(
+                targets.iter().copied(),
+                &regex.states,
+                false,
+                None,
+                None,
+                true,
+            );
             if cr.nfa_states.is_empty() {
                 OriginAction::Dead
             } else {
@@ -639,13 +704,14 @@ impl Tier2DfaCache {
                     stack.push(out);
                 }
                 State::Assert { kind, out } => {
-                    if kind == AssertKind::End {
-                        if self.can_reach_match(out, states) {
-                            is_match_at_end = true;
-                        }
-                    } else {
-                        stack.push(out);
+                    if kind == AssertKind::End && self.can_reach_match(out, states) {
+                        is_match_at_end = true;
                     }
+                    // Do NOT follow other assertions.  Deferred assertions
+                    // (\b, EndLF, etc.) are resolved at DFA transition time
+                    // via the with_break state's deferred_asserts.  Start/
+                    // StartLF cannot pass in break context (past the start
+                    // of input).
                 }
                 State::Match => {
                     is_match = true;
@@ -692,6 +758,7 @@ impl Tier2DfaCache {
             &regex.states,
             true,
             None,
+            None,
             true, // follow_break=true for start closure
         );
         self.start_id = self
@@ -705,7 +772,11 @@ impl Tier2DfaCache {
             .expect("start state exceeds DFA_MAX_STATES");
         self.start_is_match = self.states[self.start_id.idx()].is_match;
         self.start_is_match_at_end = self.states[self.start_id.idx()].is_match_at_end;
-        self.start_seeds = cr.seed_instances;
+        self.start_seeds = cr
+            .seed_instances
+            .iter()
+            .map(|&(c, s)| (c, s, 0u32))
+            .collect();
     }
 }
 
@@ -856,8 +927,8 @@ impl<'a> Tier2DfaMatcher<'a> {
         let next_instances: Vec<Vec<Instance>> =
             (0..regex.num_counters).map(|_| Vec::new()).collect();
 
-        for &(counter, origin) in cache.start_seeds.iter() {
-            counters[counter.idx()].push(Instance { value: 0, origin });
+        for &(counter, origin, value) in cache.start_seeds.iter() {
+            counters[counter.idx()].push(Instance { value, origin });
         }
 
         let ever_matched = cache.start_is_match;
@@ -1018,13 +1089,13 @@ impl<'a> Tier2DfaMatcher<'a> {
         std::mem::swap(&mut self.counters, &mut self.next_instances);
 
         // Seed new instances.
-        for &(counter, origin) in t.seeds.iter() {
+        for &(counter, origin, value) in t.seeds.iter() {
             let c_idx = counter.idx();
             let already = self.counters[c_idx]
                 .iter()
-                .any(|inst| inst.value == 0 && inst.origin == origin);
+                .any(|inst| inst.value == value && inst.origin == origin);
             if !already {
-                self.counters[c_idx].push(Instance { value: 0, origin });
+                self.counters[c_idx].push(Instance { value, origin });
             }
         }
 
@@ -1056,8 +1127,8 @@ impl<'a> Tier2DfaMatcher<'a> {
         }
 
         // Seed instances.
-        for &(counter, origin) in trans.seeds.iter() {
-            self.counters[counter.idx()].push(Instance { value: 0, origin });
+        for &(counter, origin, value) in trans.seeds.iter() {
+            self.counters[counter.idx()].push(Instance { value, origin });
         }
         if !trans.seeds.is_empty() {
             self.has_live_instances = true;
