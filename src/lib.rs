@@ -6068,19 +6068,19 @@ mod tests {
             ],
         }
         test_ci_word_boundary {
-            pattern: "(?i)foo",
+            pattern: r"(?i)\bfoo\b",
             memory: 0,
             min_tier: 1,
             inputs: [
-                ("foo", false),
-                ("FOO", false),
-                ("Foo", false),
-                ("fOo", false),
-                (" foo ", false),
-                (" FOO ", false),
-                ("!foo!", false),
-                ("x foo y", false),
-                ("x FOO y", false),
+                ("foo", true),
+                ("FOO", true),
+                ("Foo", true),
+                ("fOo", true),
+                (" foo ", true),
+                (" FOO ", true),
+                ("!foo!", true),
+                ("x foo y", true),
+                ("x FOO y", true),
                 ("foobar", false),
                 ("FOOBAR", false),
                 ("barfoo1", false),
@@ -6211,26 +6211,26 @@ mod tests {
             ],
         }
         test_ci_waf_sql_keywords {
-            pattern: "(?i)(?:select|insert|update|delete)",
+            pattern: r"(?i)\b(?:select|insert|update|delete)\b",
             memory: 0,
             min_tier: 1,
             inputs: [
-                ("SELECT", false),
-                ("select", false),
-                ("Select", false),
-                ("INSERT", false),
-                ("insert", false),
-                ("Insert", false),
-                ("UPDATE", false),
-                ("update", false),
-                ("UpDaTe", false),
-                ("DELETE", false),
-                ("delete", false),
-                ("DeLeTe", false),
-                ("please SELECT * from", false),
-                ("do INSERT into", false),
-                ("run UPDATE set", false),
-                ("run delete from t", false),
+                ("SELECT", true),
+                ("select", true),
+                ("Select", true),
+                ("INSERT", true),
+                ("insert", true),
+                ("Insert", true),
+                ("UPDATE", true),
+                ("update", true),
+                ("UpDaTe", true),
+                ("DELETE", true),
+                ("delete", true),
+                ("DeLeTe", true),
+                ("please SELECT * from", true),
+                ("do INSERT into", true),
+                ("run UPDATE set", true),
+                ("run delete from t", true),
                 ("selected", false),
                 ("SELECTED", false),
                 ("inserts", false),
@@ -6243,16 +6243,16 @@ mod tests {
             ],
         }
         test_ci_function_call {
-            pattern: r#"(?i)foo\("#,
+            pattern: r#"(?i)\bfoo\("#,
             memory: 0,
             min_tier: 1,
             inputs: [
-                ("foo(", false),
-                ("FOO(", false),
-                ("Foo(", false),
-                ("x foo(", false),
-                ("x FOO( y", false),
-                ("!Foo(1)", false),
+                ("foo(", true),
+                ("FOO(", true),
+                ("Foo(", true),
+                ("x foo(", true),
+                ("x FOO( y", true),
+                ("!Foo(1)", true),
                 ("foo", false),
                 ("FOO", false),
                 ("barfoo(", false),
@@ -6886,13 +6886,13 @@ mod tests {
     // Word boundary assertions: \b (WordAscii) and \B (WordAsciiNegate)
     // ===================================================================
     // ===================================================================
-    // Deferred assertion DFA tests: verify , \B, EndLF work via Tier 1 DFA
+    // Deferred assertion DFA tests: verify \b, \B, EndLF work via Tier 1 DFA
     // ===================================================================
 
-    /// Verify that patterns with  are DFA-eligible (no counters).
+    /// Verify that patterns with \b are DFA-eligible (no counters).
     #[test]
     fn test_word_boundary_dfa_eligible() {
-        let re = build_regex_unchecked(r"foo");
+        let re = build_regex_unchecked(r"\bfoo\b");
         assert!(re.dfa_eligible, "\\bfoo\\b should be DFA-eligible");
         assert!(!re.counting_dfa_eligible);
     }
@@ -6911,10 +6911,10 @@ mod tests {
         assert!(re.dfa_eligible, "(?m)foo$ should be DFA-eligible");
     }
 
-    ///  at start of input — word follows non-word (input boundary).
+    /// \b at start of input — word follows non-word (input boundary).
     #[test]
     fn test_word_boundary_dfa_at_start() {
-        let p = r"foo";
+        let p = r"\bfoo";
         let re = build_regex_unchecked(p);
         assert!(re.dfa_eligible);
         assert_matches_regex_crate(p, &re, "foo");
@@ -6923,10 +6923,10 @@ mod tests {
         assert_matches_regex_crate(p, &re, " foo");
     }
 
-    ///  at end of input — word at end.
+    /// \b at end of input — word at end.
     #[test]
     fn test_word_boundary_dfa_at_end() {
-        let p = r"foo";
+        let p = r"foo\b";
         let re = build_regex_unchecked(p);
         assert!(re.dfa_eligible);
         assert_matches_regex_crate(p, &re, "foo");
@@ -6936,10 +6936,10 @@ mod tests {
         assert_matches_regex_crate(p, &re, "barfoo");
     }
 
-    ///  with various transitions: word-to-nonword and nonword-to-word.
+    /// \b with various transitions: word-to-nonword and nonword-to-word.
     #[test]
     fn test_word_boundary_dfa_transitions() {
-        let p = r"\w+";
+        let p = r"\b\w+\b";
         let re = build_regex_unchecked(p);
         assert!(re.dfa_eligible);
         assert_matches_regex_crate(p, &re, "hello");
@@ -6991,7 +6991,7 @@ mod tests {
     /// Mixed deferred assertions in the same pattern.
     #[test]
     fn test_word_boundary_with_endlf() {
-        let p = r"(?m)foo$";
+        let p = r"(?m)\bfoo\b$";
         let re = build_regex_unchecked(p);
         assert!(re.dfa_eligible);
         assert_matches_regex_crate(p, &re, "foo");
@@ -7025,10 +7025,10 @@ mod tests {
         assert!(!m.finish());
     }
 
-    /// SQL-injection-style alternation with  (simplified).
+    /// SQL-injection-style alternation with \b (simplified).
     #[test]
     fn test_word_boundary_dfa_alternation() {
-        let p = r"(?:select|insert|update|delete)";
+        let p = r"\b(?:select|insert|update|delete)\b";
         let re = build_regex_unchecked(p);
         assert!(re.dfa_eligible);
         assert_matches_regex_crate(p, &re, "select");

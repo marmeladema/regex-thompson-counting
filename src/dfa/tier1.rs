@@ -133,6 +133,7 @@ impl DfaCache {
         at_start: bool,
         at_end: bool,
         prev_byte: Option<u8>,
+        next_byte: Option<u8>,
     ) -> (Box<[StateIdx]>, Box<[StateIdx]>, bool, bool) {
         self.closure_stack.clear();
         self.closure_result.clear();
@@ -169,7 +170,7 @@ impl DfaCache {
                         }
                         continue;
                     }
-                    let result = kind.eval(at_start, at_end, prev_byte, None);
+                    let result = kind.eval(at_start, at_end, prev_byte, next_byte);
                     match result {
                         AssertEval::Pass => {
                             self.closure_stack.push(out);
@@ -357,13 +358,21 @@ impl DfaCache {
             if !extra.is_empty() {
                 // Mini epsilon closure: find consuming states reachable
                 // from the resolved assertion outputs.
+                // Reconstruct prev_byte for the resolved chain: assertions
+                // were deferred with from_state.prev_was_word context.
+                let resolved_prev = if self.states[from.idx()].prev_was_word {
+                    Some(b'a')
+                } else {
+                    Some(b' ')
+                };
                 let (resolved_consumers, _resolved_deferred, resolved_match, resolved_match_at_end) =
                     self.epsilon_closure(
                         extra.into_iter(),
                         &regex.states,
                         false,
                         false,
-                        Some(byte), // prev_byte = byte for the assertion context
+                        resolved_prev,
+                        Some(byte), // next_byte: assertions in chain can see the current byte
                     );
                 // These resolved consumers can now consume `byte`.
                 // NOTE: We must re-read from_state after epsilon_closure
@@ -434,6 +443,7 @@ impl DfaCache {
                         false,
                         false,
                         Some(byte),
+                        None,
                     );
                     m |= resolved_match;
                     mae |= resolved_match_at_end;
@@ -452,7 +462,7 @@ impl DfaCache {
 
                 let seeds = targets.into_iter().chain(std::iter::once(regex.start));
                 let (nfa_set, deferred, mut m, mut mae) =
-                    self.epsilon_closure(seeds, &regex.states, false, false, Some(byte));
+                    self.epsilon_closure(seeds, &regex.states, false, false, Some(byte), None);
                 m |= resolved_match;
                 mae |= resolved_match_at_end;
                 if nfa_set.is_empty() && deferred.is_empty() && !m && !mae {
@@ -494,6 +504,7 @@ impl DfaCache {
                 false,
                 false,
                 Some(byte),
+                None,
             );
             if nfa_set.is_empty() && deferred.is_empty() && !is_match && !is_match_at_end {
                 return DfaStateId::DEAD;
@@ -510,7 +521,7 @@ impl DfaCache {
 
         let seeds = targets.into_iter().chain(std::iter::once(regex.start));
         let (nfa_set, deferred, is_match, is_match_at_end) =
-            self.epsilon_closure(seeds, &regex.states, false, false, Some(byte));
+            self.epsilon_closure(seeds, &regex.states, false, false, Some(byte), None);
 
         if nfa_set.is_empty() && deferred.is_empty() && !is_match && !is_match_at_end {
             return DfaStateId::DEAD;
@@ -562,6 +573,7 @@ impl DfaCache {
             &regex.states,
             true,
             false,
+            None,
             None,
         );
         let pw = false; // At start, prev is always non-word.
