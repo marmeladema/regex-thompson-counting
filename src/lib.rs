@@ -870,7 +870,13 @@ impl Regex {
         }
         if !assert_kinds.is_empty() {
             writeln!(out).unwrap();
-            writeln!(out, "Assertions: {}", assert_kinds.len()).unwrap();
+            writeln!(
+                out,
+                "Assertion kinds: {} (across {n_assert} state{})",
+                assert_kinds.len(),
+                if n_assert == 1 { "" } else { "s" }
+            )
+            .unwrap();
             for k in &assert_kinds {
                 writeln!(out, "  {k}").unwrap();
             }
