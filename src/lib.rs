@@ -2509,7 +2509,7 @@ impl<'a> NfaMatcher<'a> {
                 self.lastlist[idx.idx()] = self.listid;
             }
         } else {
-            self.addstate(start, CounterCtx::new());
+            self.addstate(start, CounterCtx::new(), None);
         }
         std::mem::swap(self.clist, self.nlist);
         self.has_assert = self.nlist_has_assert;
@@ -2520,19 +2520,24 @@ impl<'a> NfaMatcher<'a> {
     /// Follow epsilon transitions from state `idx` with counter context
     /// `ctx`, adding all reachable states to `nlist`.
     ///
+    /// `next_byte`: when known (e.g. during pre-consumption assertion
+    /// resolution), passing `Some(b)` lets chained deferred assertions
+    /// (like `\b` → `EndLF`) resolve immediately instead of being
+    /// deferred again and lost.
+    ///
     /// Dedup strategy:
     /// - Empty context: fast path via `lastlist`/`listid` (O(1) per state).
     /// - Non-empty context: linear scan of `ctx_visited` with value
     ///   comparison through the counter pool.
     #[inline]
-    fn addstate(&mut self, idx: StateIdx, ctx: CounterCtx) {
+    fn addstate(&mut self, idx: StateIdx, ctx: CounterCtx, next_byte: Option<u8>) {
         self.addstack.clear();
         self.addstack.push(AddStateOp::Visit(idx, ctx));
-        self.drain_addstack();
+        self.drain_addstack(next_byte);
     }
 
     /// Process all operations on the work stack until empty.
-    fn drain_addstack(&mut self) {
+    fn drain_addstack(&mut self, next_byte: Option<u8>) {
         while let Some(op) = self.addstack.pop() {
             match op {
                 AddStateOp::Visit(idx, ctx) => {
@@ -2572,12 +2577,15 @@ impl<'a> NfaMatcher<'a> {
                         }
 
                         State::Assert { kind, out } => {
-                            // PostPush so the Assert is in nlist for
-                            // deferred resolution in step()/finish().
+                            // Always PostPush — the assertion must be in
+                            // nlist for deferred resolution in step()/finish().
                             self.nlist_has_assert = true;
                             let post_ctx = ctx.clone(self.counter_pool);
                             self.addstack.push(AddStateOp::PostPush(idx, post_ctx));
-                            if kind.eval(self.at_start, self.at_end, self.prev_byte, None)
+                            // Evaluate: use next_byte when available (during
+                            // pre-consumption resolution) so chained deferred
+                            // assertions like \b → EndLF can resolve.
+                            if kind.eval(self.at_start, self.at_end, self.prev_byte, next_byte)
                                 == AssertEval::Pass
                             {
                                 self.addstack.push(AddStateOp::Visit(out, ctx));
@@ -2692,7 +2700,9 @@ impl<'a> NfaMatcher<'a> {
                     // A shallow clone() would alias the clist entry's range,
                     // causing use-after-free when addstate frees dead contexts.
                     let ctx_clone = ctx.clone(self.counter_pool);
-                    self.addstate(out, ctx_clone);
+                    // Pass Some(b) so chained deferred assertions (e.g.
+                    // \b → EndLF) can resolve immediately.
+                    self.addstate(out, ctx_clone, Some(b));
                 }
             }
             if any_expanded {
@@ -2746,7 +2756,7 @@ impl<'a> NfaMatcher<'a> {
             self.addstack.push(AddStateOp::Visit(target, ctx));
         }
 
-        self.drain_addstack();
+        self.drain_addstack(None);
 
         // Fast-path re-seed: directly insert precomputed start closure
         // leaves into nlist.  Done after drain_addstack so continuing
@@ -2857,7 +2867,7 @@ impl<'a> NfaMatcher<'a> {
                 if let State::Assert { kind, out } = self.states[idx]
                     && kind.eval(self.at_start, true, self.prev_byte, None) == AssertEval::Pass
                 {
-                    self.addstate(out, ctx);
+                    self.addstate(out, ctx, None);
                 } else {
                     self.counter_pool.free(ctx.range);
                 }
@@ -3803,6 +3813,9 @@ mod tests {
                 ("b", false),
                 ("c", false),
                 ("aax", false),
+                ("aaaaaa", true),
+                ("abcbc", true),
+                ("bcbca", true),
             ],
         }
         test_aaaaa {
@@ -5254,6 +5267,7 @@ mod tests {
                 ("  hello  ", true),
                 ("", false),
                 ("   ", false),
+                ("a", true),
             ],
         }
         test_word_boundary_counter {
@@ -5340,6 +5354,9 @@ mod tests {
                 (".test.", true),
                 ("\ttest\n", true),
                 ("/test/", true),
+                ("hello test bye", true),
+                ("test", true),
+                ("testing", false),
             ],
         }
         test_unanchored_counter_simple_1 {
@@ -5679,6 +5696,229 @@ mod tests {
                 ("", false),
                 ("a\nab\na", false),
                 ("x\na\na\nx", false),
+            ],
+        }
+        // Deferred assertion patterns (migrated from standalone tests)
+        test_non_word_boundary_inside_word {
+            pattern: r#"\Boo\B"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("foobar", true),
+                ("oo", false),
+                (" oo ", false),
+                ("xoox", true),
+            ],
+        }
+        test_endlf_before_newline {
+            pattern: r#"(?m)foo$"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("foo", true),
+                ("foo\nbar", true),
+                ("bar\nfoo", true),
+                ("bar\nfoo\nbaz", true),
+                ("foobar", false),
+                ("barfoo\n", true),
+            ],
+        }
+        test_endlf_at_eof {
+            pattern: r#"(?m)bar$"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("bar", true),
+                ("foobar", true),
+                ("foo\nbar", true),
+                ("bar\nfoo", true),
+            ],
+        }
+        test_word_boundary_with_endlf {
+            pattern: r#"(?m)\bfoo\b$"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("foo", true),
+                ("foo\nbar", true),
+                ("bar\nfoo", true),
+                ("bar\nfoo\nbaz", true),
+                ("barfoo", false),
+                ("foobar", false),
+            ],
+        }
+        test_word_boundary_sql_keywords {
+            pattern: r#"\b(?:select|insert|update|delete)\b"#,
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("select", true),
+                ("run select now", true),
+                ("selected", false),
+                ("preselect", false),
+                ("delete from", true),
+                ("undelete", false),
+            ],
+        }
+        test_multiline_abc {
+            pattern: "(?m:^)abc(?m:$)",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("xxx\nabc\nyyy", true),
+                ("abd", false),
+                ("xabc", false),
+                ("abcx", false),
+                ("xx\nabcx", false),
+            ],
+        }
+        test_unanchored_counter_a35 {
+            pattern: "a{3,5}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("aaa", true),
+                ("aaaa", true),
+                ("aaaaa", true),
+                ("aa", false),
+                ("a", false),
+                ("", false),
+                ("xaaax", true),
+            ],
+        }
+        // Nested counter patterns (migrated from survey_nested_counter_bugs)
+        test_nested_a2_x3 {
+            pattern: "(a{2}){3}",
+            memory: 0,
+            min_tier: 3,
+            inputs: [
+                ("aaaaa", false),
+                ("aaaaaa", true),
+                ("aaaaaaa", true),
+            ],
+        }
+        test_nested_a3_x2 {
+            pattern: "(a{3}){2}",
+            memory: 0,
+            min_tier: 3,
+            inputs: [
+                ("aaaa", false),
+                ("aaaaa", false),
+                ("aaaaaa", true),
+                ("aaaaaaa", true),
+            ],
+        }
+        test_nested_ab_x2 {
+            pattern: "(ab){2}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("aba", false),
+                ("abab", true),
+                ("xababx", true),
+                ("ab", false),
+            ],
+        }
+        test_nested_ab_x3 {
+            pattern: "(ab){3}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("ababa", false),
+                ("ababab", true),
+                ("xabababx", true),
+                ("abab", false),
+            ],
+        }
+        test_nested_a23_x2 {
+            pattern: "(a{2,3}){2}",
+            memory: 0,
+            min_tier: 3,
+            inputs: [
+                ("aaa", false),
+                ("aaaa", true),
+                ("aaaaa", true),
+                ("aaaaaa", true),
+                ("aaaaaaa", true),
+            ],
+        }
+        test_nested_a2_x2_x2 {
+            pattern: "((a{2}){2}){2}",
+            memory: 0,
+            min_tier: 3,
+            inputs: [
+                ("aaaaaaa", false),
+                ("aaaaaaaa", true),
+                ("aaaaaaaaa", true),
+            ],
+        }
+        test_nested_a2_x23 {
+            pattern: "(a{2}){2,3}",
+            memory: 0,
+            min_tier: 3,
+            inputs: [
+                ("aaa", false),
+                ("aaaa", true),
+                ("aaaaa", true),
+                ("aaaaaa", true),
+                ("aaaaaaa", true),
+            ],
+        }
+        test_nested_dotdot_x2 {
+            pattern: "(..){2}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("aaa", false),
+                ("aaaa", true),
+                ("abcde", true),
+                ("ab", false),
+            ],
+        }
+        test_nested_abc_x2 {
+            pattern: "(abc){2}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("abcab", false),
+                ("abcabc", true),
+                ("xabcabcx", true),
+                ("abc", false),
+            ],
+        }
+        test_non_nested_a4 {
+            pattern: "a{4}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("aaa", false),
+                ("aaaa", true),
+                ("aaaaa", true),
+                ("aa", false),
+            ],
+        }
+        test_non_nested_a2 {
+            pattern: "a{2}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("aa", true),
+                ("a", false),
+                ("xaax", true),
+                ("", false),
+            ],
+        }
+        test_nested_a12_x2 {
+            pattern: "^(a{1,2}){2}$",
+            memory: 0,
+            min_tier: 3,
+            inputs: [
+                ("aa", true),
+                ("aaa", true),
+                ("aaaa", true),
+                ("a", false),
+                ("aaaaa", false),
             ],
         }
         test_byte_table_cross_validate_unanchored {
@@ -7011,202 +7251,6 @@ mod tests {
         assert_matches_regex_crate(p, &re, "barfoo");
     }
 
-    /// \b with various transitions: word-to-nonword and nonword-to-word.
-    #[test]
-    fn test_word_boundary_dfa_transitions() {
-        let p = r"\b\w+\b";
-        let re = build_regex_unchecked(p);
-        assert!(re.dfa_eligible);
-        assert_matches_regex_crate(p, &re, "hello");
-        assert_matches_regex_crate(p, &re, "hello world");
-        assert_matches_regex_crate(p, &re, "  hello  ");
-        assert_matches_regex_crate(p, &re, "");
-        assert_matches_regex_crate(p, &re, "   ");
-        assert_matches_regex_crate(p, &re, "a");
-    }
-
-    /// \B (non-boundary) DFA test — match inside words only.
-    #[test]
-    fn test_non_word_boundary_dfa_inside_word() {
-        let p = r"\Boo\B";
-        let re = build_regex_unchecked(p);
-        assert!(re.dfa_eligible);
-        assert_matches_regex_crate(p, &re, "foobar");
-        assert_matches_regex_crate(p, &re, "oo");
-        assert_matches_regex_crate(p, &re, " oo ");
-        assert_matches_regex_crate(p, &re, "xoox");
-    }
-
-    /// EndLF (multiline $) DFA test — match before newline.
-    #[test]
-    fn test_endlf_dfa_before_newline() {
-        let p = r"(?m)foo$";
-        let re = build_regex_unchecked(p);
-        assert!(re.dfa_eligible);
-        assert_matches_regex_crate(p, &re, "foo");
-        assert_matches_regex_crate(p, &re, "foo\nbar");
-        assert_matches_regex_crate(p, &re, "bar\nfoo");
-        assert_matches_regex_crate(p, &re, "bar\nfoo\nbaz");
-        assert_matches_regex_crate(p, &re, "foobar");
-        assert_matches_regex_crate(p, &re, "barfoo\n");
-    }
-
-    /// EndLF at end-of-input (no trailing newline).
-    #[test]
-    fn test_endlf_dfa_at_eof() {
-        let p = r"(?m)bar$";
-        let re = build_regex_unchecked(p);
-        assert!(re.dfa_eligible);
-        assert_matches_regex_crate(p, &re, "bar");
-        assert_matches_regex_crate(p, &re, "foobar");
-        assert_matches_regex_crate(p, &re, "foo\nbar");
-        assert_matches_regex_crate(p, &re, "bar\nfoo");
-    }
-
-    /// Mixed deferred assertions in the same pattern.
-    #[test]
-    fn test_word_boundary_with_endlf() {
-        let p = r"(?m)\bfoo\b$";
-        let re = build_regex_unchecked(p);
-        assert!(re.dfa_eligible);
-        assert_matches_regex_crate(p, &re, "foo");
-        assert_matches_regex_crate(p, &re, "foo\nbar");
-        assert_matches_regex_crate(p, &re, "bar\nfoo");
-        assert_matches_regex_crate(p, &re, "bar\nfoo\nbaz");
-        assert_matches_regex_crate(p, &re, "barfoo");
-        assert_matches_regex_crate(p, &re, "foobar");
-    }
-
-    /// Chunk-boundary test: deferred assertions across chunk boundaries.
-    #[test]
-    fn test_word_boundary_dfa_chunk_boundary() {
-        let p = r"\btest\b";
-        let re = build_regex_unchecked(p);
-        assert!(re.dfa_eligible);
-        let mut mem = MatcherMemory::default();
-        // Feed "hel" then "lo test bye"
-        let mut m = mem.matcher(&re);
-        m.chunk(b"hel");
-        m.chunk(b"lo test bye");
-        assert!(m.finish());
-        // Feed "test" alone
-        let mut m = mem.matcher(&re);
-        m.chunk(b"test");
-        assert!(m.finish());
-        // Feed "tes" then "ting" - no boundary at end.
-        let mut m = mem.matcher(&re);
-        m.chunk(b"tes");
-        m.chunk(b"ting");
-        assert!(!m.finish());
-    }
-
-    /// SQL-injection-style alternation with \b (simplified).
-    #[test]
-    fn test_word_boundary_dfa_alternation() {
-        let p = r"\b(?:select|insert|update|delete)\b";
-        let re = build_regex_unchecked(p);
-        assert!(re.dfa_eligible);
-        assert_matches_regex_crate(p, &re, "select");
-        assert_matches_regex_crate(p, &re, "run select now");
-        assert_matches_regex_crate(p, &re, "selected");
-        assert_matches_regex_crate(p, &re, "preselect");
-        assert_matches_regex_crate(p, &re, "delete from");
-        assert_matches_regex_crate(p, &re, "undelete");
-    }
-
-    // ===================================================================
-    // Stale Becchi counter fix: regression + coverage tests
-    //
-    // These tests exercise unanchored, partially-anchored, and
-    // multi-chunk scenarios that were previously untested and would
-    // have triggered phantom counter accumulation before the fix.
-    // ===================================================================
-    /// Counter pattern split across chunk boundaries.
-    #[test]
-    fn test_chunk_boundary_counter() {
-        let p = r"a{3,5}";
-        let re = build_regex_unchecked(p);
-        let mut mem = MatcherMemory::default();
-
-        // "aaa" in one chunk
-        let mut m = mem.matcher(&re);
-        m.chunk(b"aaa");
-        assert!(m.finish(), "aaa should match a{{3,5}}");
-
-        // "aaa" split as "a" + "aa"
-        let mut m = mem.matcher(&re);
-        m.chunk(b"a");
-        m.chunk(b"aa");
-        assert!(m.finish(), "a+aa should match a{{3,5}}");
-
-        // "aaa" split as "aa" + "a"
-        let mut m = mem.matcher(&re);
-        m.chunk(b"aa");
-        m.chunk(b"a");
-        assert!(m.finish(), "aa+a should match a{{3,5}}");
-
-        // "aaaaa" split as "aa" + "aaa"
-        let mut m = mem.matcher(&re);
-        m.chunk(b"aa");
-        m.chunk(b"aaa");
-        assert!(m.finish(), "aa+aaa should match a{{3,5}}");
-
-        // "aa" — too short
-        let mut m = mem.matcher(&re);
-        m.chunk(b"a");
-        m.chunk(b"a");
-        assert!(!m.finish(), "a+a should not match a{{3,5}}");
-
-        // Multi-byte body across chunks: (ab){2,3}
-        let p = "(ab){2,3}";
-        let re = build_regex_unchecked(p);
-
-        let mut m = mem.matcher(&re);
-        m.chunk(b"ab");
-        m.chunk(b"ab");
-        assert!(m.finish(), "ab+ab should match (ab){{2,3}}");
-
-        let mut m = mem.matcher(&re);
-        m.chunk(b"a");
-        m.chunk(b"bab");
-        assert!(m.finish(), "a+bab should match (ab){{2,3}}");
-
-        let mut m = mem.matcher(&re);
-        m.chunk(b"aba");
-        m.chunk(b"b");
-        assert!(m.finish(), "aba+b should match (ab){{2,3}}");
-    }
-
-    /// Multiline assertions across chunk boundaries.
-    #[test]
-    fn test_chunk_boundary_multiline() {
-        let p = r"(?m:^)abc(?m:$)";
-        let re = build_regex_unchecked(p);
-        let mut mem = MatcherMemory::default();
-
-        // Single chunk
-        let mut m = mem.matcher(&re);
-        m.chunk(b"abc");
-        assert!(m.finish(), "abc should match ^abc$");
-
-        // Split across \n boundary
-        let mut m = mem.matcher(&re);
-        m.chunk(b"xxx\n");
-        m.chunk(b"abc\nyyy");
-        assert!(m.finish(), "xxx\\nabc\\nyyy should match ^abc$ multiline");
-
-        // abc split across chunks
-        let mut m = mem.matcher(&re);
-        m.chunk(b"ab");
-        m.chunk(b"c");
-        assert!(m.finish(), "ab+c should match ^abc$");
-
-        // No match
-        let mut m = mem.matcher(&re);
-        m.chunk(b"ab");
-        m.chunk(b"d");
-        assert!(!m.finish(), "ab+d should not match ^abc$");
-    }
     /// Deep epsilon-closure chain should not depend on call stack depth.
     #[test]
     fn test_addstate_deep_epsilon_chain() {
@@ -7230,81 +7274,6 @@ mod tests {
         let mut m = mem.matcher(&re);
         m.chunk(b"aaa");
         assert!(m.finish());
-    }
-
-    // ===================================================================
-    // Batched step() coverage: tests that exercise the fused pre-mark +
-    // consumption loop where multiple clist entries match the same byte
-    // in a single step, interacting with counters.
-    // ===================================================================
-    #[test]
-    fn survey_nested_counter_bugs() {
-        let cases: &[(&str, &str)] = &[
-            ("(a{2}){2}", "aaa"),
-            ("(a{2}){2}", "aaaa"),
-            ("(a{2}){2}", "aaaaa"),
-            ("(a{2}){3}", "aaaaa"),
-            ("(a{2}){3}", "aaaaaa"),
-            ("(a{3}){2}", "aaaa"),
-            ("(a{3}){2}", "aaaaa"),
-            ("(a{3}){2}", "aaaaaa"),
-            ("(ab){2}", "aba"),
-            ("(ab){2}", "abab"),
-            ("(ab){3}", "ababa"),
-            ("(ab){3}", "ababab"),
-            ("(a{2,3}){2}", "aaa"),
-            ("(a{2,3}){2}", "aaaa"),
-            ("(a{2,3}){2}", "aaaaa"),
-            ("(a{2,3}){2}", "aaaaaa"),
-            ("((a{2}){2}){2}", "aaaaaaa"),
-            ("((a{2}){2}){2}", "aaaaaaaa"),
-            ("(a{2}){2,3}", "aaa"),
-            ("(a{2}){2,3}", "aaaa"),
-            ("(a{2}){2,3}", "aaaaa"),
-            ("(a{2}){2,3}", "aaaaaa"),
-            // multi-byte body (non-nested sub-counter)
-            ("(ab){2}", "aba"),
-            ("(ab){2}", "abab"),
-            ("(ab){3}", "ababab"),
-            ("(..){2}", "aaa"),
-            ("(..){2}", "aaaa"),
-            ("(abc){2}", "abcab"),
-            ("(abc){2}", "abcabc"),
-            // non-nested controls
-            ("a{4}", "aaa"),
-            ("a{4}", "aaaa"),
-            ("a{2}", "aa"),
-            // regression cases (suppression must NOT apply)
-            ("^(a|a?){2,3}$", "aaa"),
-            ("^(a{0,2}){2,3}$", "aaaaa"),
-            ("^((a|bc){1,2}){2,3}$", "aaaaaa"),
-            // variable-inner-length cases
-            ("^(a{1,2}){2}$", "aa"),
-            ("^(a{1,2}){2}$", "aaa"),
-            ("^(a{1,2}){2}$", "aaaa"),
-        ];
-        let mut failures = Vec::new();
-        for &(pat, input) in cases {
-            let re = build_regex_unchecked(pat);
-            let regex_re = regex::Regex::new(pat).unwrap();
-            let mut mem = MatcherMemory::default();
-            let mut m = mem.matcher(&re);
-            m.chunk(input.as_bytes());
-            let ours = m.finish();
-            let theirs = regex_re.is_match(input);
-            if ours != theirs {
-                failures.push((pat, input, ours, theirs));
-            }
-        }
-        if !failures.is_empty() {
-            let mut msg = String::from("Mismatches found:\n");
-            for (pat, input, ours, theirs) in &failures {
-                msg.push_str(&format!(
-                    "  pattern={pat:25} input={input:12} ours={ours:<5} regex={theirs}\n"
-                ));
-            }
-            panic!("{msg}");
-        }
     }
 
     #[test]
