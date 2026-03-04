@@ -394,9 +394,7 @@ impl Tier2DfaCache {
         }
 
         self.closure_result.sort_unstable_by_key(|s| s.0);
-        self.closure_result.dedup();
         self.closure_deferred.sort_unstable_by_key(|s| s.0);
-        self.closure_deferred.dedup();
 
         let mut seed_instances: Vec<(CounterIdx, StateIdx)> = Vec::new();
         for &(counter, ci_out) in &self.closure_seeds {

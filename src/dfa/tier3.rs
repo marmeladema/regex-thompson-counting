@@ -305,9 +305,7 @@ impl Tier3DfaCache {
         }
 
         self.closure_result.sort_unstable_by_key(|s| s.0);
-        self.closure_result.dedup();
         self.closure_deferred.sort_unstable_by_key(|s| s.0);
-        self.closure_deferred.dedup();
 
         // Resolve CI seed pairs to (counter, consuming_state) pairs.
         let mut seed_instances: Vec<(CounterIdx, StateIdx)> = Vec::new();

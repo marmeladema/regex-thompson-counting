@@ -200,9 +200,7 @@ impl DfaCache {
         }
 
         self.closure_result.sort_unstable_by_key(|s| s.0);
-        self.closure_result.dedup();
         self.closure_deferred.sort_unstable_by_key(|s| s.0);
-        self.closure_deferred.dedup();
 
         let nfa_states: Box<[StateIdx]> = self.closure_result.as_slice().into();
         let deferred: Box<[StateIdx]> = self.closure_deferred.as_slice().into();
