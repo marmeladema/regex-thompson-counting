@@ -95,6 +95,9 @@ pub enum Error {
     /// A bounded repetition `{n,m}` where `m` exceeds the configured
     /// `max_repetition` limit.  Contains `(actual_max, limit)`.
     RepetitionTooLarge(usize, usize),
+    /// The pattern requires more than 256 counters (the maximum supported
+    /// by the `CounterIdx(u8)` representation).
+    TooManyCounters,
 }
 
 impl fmt::Display for Error {
@@ -108,6 +111,13 @@ impl fmt::Display for Error {
             }
             Self::RepetitionTooLarge(max, limit) => {
                 write!(f, "repetition max {} exceeds limit {}", max, limit)
+            }
+            Self::TooManyCounters => {
+                write!(
+                    f,
+                    "pattern requires more than {} counters",
+                    MAX_COUNTERS
+                )
             }
         }
     }
@@ -1183,10 +1193,13 @@ impl Default for RegexBuilder {
 }
 impl RegexBuilder {
     /// Allocate a fresh counter index.
-    fn next_counter(&mut self) -> CounterIdx {
+    fn next_counter(&mut self) -> Result<CounterIdx, Error> {
         let counter = self.counters.len();
+        if counter >= MAX_COUNTERS {
+            return Err(Error::TooManyCounters);
+        }
         self.counters.push(counter);
-        CounterIdx(counter)
+        Ok(CounterIdx(counter as u8))
     }
 
     /// Return the index of `table` in `self.classes`, inserting it if it
@@ -1517,14 +1530,14 @@ impl RegexBuilder {
                 }
 
                 if min > 0 {
-                    let counter = self.next_counter();
+                    let counter = self.next_counter()?;
                     self.hir2postfix(&rep.sub)?;
                     self.postfix
                         .push(RegexHirNode::CounterLoop { counter, min, max });
                 } else {
                     // {0,max}: lower to (body{1,max})? — the `?` wrapping
                     // provides the zero-match path.
-                    let counter = self.next_counter();
+                    let counter = self.next_counter()?;
                     self.hir2postfix(&rep.sub)?;
                     self.postfix.push(RegexHirNode::CounterLoop {
                         counter,
@@ -2330,12 +2343,12 @@ impl RegexBuilder {
 
 /// Index into the counter variable array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct CounterIdx(usize);
+pub(crate) struct CounterIdx(u8);
 
 impl CounterIdx {
     #[inline]
     fn idx(self) -> usize {
-        self.0
+        self.0 as usize
     }
 }
 
@@ -2344,6 +2357,9 @@ impl fmt::Display for CounterIdx {
         write!(f, "{}", self.0)
     }
 }
+
+/// Maximum number of counters supported (limited by `CounterIdx(u8)`).
+const MAX_COUNTERS: usize = 256;
 
 /// Sentinel value: this counter slot is inactive (thread is not inside
 /// this counter's repetition body).
@@ -4044,7 +4060,7 @@ mod tests {
     match_tests! {
         test_counting {
             pattern: "^.*a.{3}bc$",
-            memory: 1072,
+            memory: 984,
             min_tier: 2,
             inputs: [
                 ("aybzbc", true),
@@ -4063,7 +4079,7 @@ mod tests {
         }
         test_range {
             pattern: "^(a|bc){1,2}$",
-            memory: 736,
+            memory: 664,
             min_tier: 3,
             inputs: [
                 ("a", true),
@@ -4079,7 +4095,7 @@ mod tests {
         }
         test_nested_counting {
             pattern: "^((a|bc){1,2}){2,3}$",
-            memory: 816,
+            memory: 728,
             min_tier: 4,
             inputs: [
                 ("", false),
@@ -4096,7 +4112,7 @@ mod tests {
         }
         test_aaaaa {
             pattern: "^(a|a?){2,3}$",
-            memory: 736,
+            memory: 664,
             min_tier: 0,
             inputs: [
                 ("", true),
@@ -4113,7 +4129,7 @@ mod tests {
         }
         test_one_plus_basic {
             pattern: "^a+$",
-            memory: 576,
+            memory: 536,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4128,7 +4144,7 @@ mod tests {
         }
         test_one_plus_wildcard {
             pattern: "^.+$",
-            memory: 832,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4139,7 +4155,7 @@ mod tests {
         }
         test_one_plus_catenation {
             pattern: "^a+b+$",
-            memory: 656,
+            memory: 600,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4154,7 +4170,7 @@ mod tests {
         }
         test_one_plus_group {
             pattern: "^(ab)+$",
-            memory: 616,
+            memory: 568,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4167,7 +4183,7 @@ mod tests {
         }
         test_one_plus_alternate {
             pattern: "^(a|b)+$",
-            memory: 832,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4186,7 +4202,7 @@ mod tests {
         }
         test_one_plus_with_counting {
             pattern: "^.*a.{3}b+c$",
-            memory: 1112,
+            memory: 1016,
             min_tier: 2,
             inputs: [
                 ("a123bc", true),
@@ -4205,7 +4221,7 @@ mod tests {
         }
         test_repetition_inside_one_plus {
             pattern: "^(a{2,3})+$",
-            memory: 656,
+            memory: 600,
             min_tier: 2,
             inputs: [
                 ("", false),
@@ -4223,7 +4239,7 @@ mod tests {
         }
         test_range_alternation_inside_one_plus {
             pattern: "^((a|bc){1,2})+$",
-            memory: 776,
+            memory: 696,
             min_tier: 3,
             inputs: [
                 ("", false),
@@ -4235,7 +4251,7 @@ mod tests {
         }
         test_one_plus_inside_repetition {
             pattern: "^(a+){2,3}$",
-            memory: 656,
+            memory: 600,
             min_tier: 3,
             inputs: [
                 ("", false),
@@ -4251,7 +4267,7 @@ mod tests {
         }
         test_one_plus_alternation_inside_repetition {
             pattern: "^((a|b)+){2,4}$",
-            memory: 912,
+            memory: 856,
             min_tier: 3,
             inputs: [
                 ("", false),
@@ -4262,7 +4278,7 @@ mod tests {
         }
         test_mixed_plus_and_repetition_inside_one_plus {
             pattern: "^(a+b{2,3})+$",
-            memory: 736,
+            memory: 664,
             min_tier: 2,
             inputs: [
                 ("", false),
@@ -4282,7 +4298,7 @@ mod tests {
         }
         test_min_zero_basic {
             pattern: "^a{0,2}$",
-            memory: 656,
+            memory: 600,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -4294,7 +4310,7 @@ mod tests {
         }
         test_min_zero_max_one {
             pattern: "^a{0,1}$",
-            memory: 576,
+            memory: 536,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4305,7 +4321,7 @@ mod tests {
         }
         test_min_zero_alternation {
             pattern: "^(a|bc){0,3}$",
-            memory: 776,
+            memory: 696,
             min_tier: 3,
             inputs: [
                 ("", true),
@@ -4316,7 +4332,7 @@ mod tests {
         }
         test_min_zero_unbounded {
             pattern: "^a{0,}$",
-            memory: 576,
+            memory: 536,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4333,7 +4349,7 @@ mod tests {
         }
         test_min_zero_unbounded_group {
             pattern: "^(ab){0,}$",
-            memory: 616,
+            memory: 568,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4346,7 +4362,7 @@ mod tests {
         }
         test_min_zero_inside_one_plus {
             pattern: "^x(a{0,2})+y$",
-            memory: 776,
+            memory: 696,
             min_tier: 2,
             inputs: [
                 ("xy", true),
@@ -4366,7 +4382,7 @@ mod tests {
         }
         test_min_zero_inside_repetition {
             pattern: "^(a{0,2}){2,3}$",
-            memory: 736,
+            memory: 664,
             min_tier: 0,
             inputs: [
                 ("", true),
@@ -4382,7 +4398,7 @@ mod tests {
         }
         test_one_plus_inside_min_zero_repetition {
             pattern: "^(a+){0,3}$",
-            memory: 696,
+            memory: 632,
             min_tier: 3,
             inputs: [
                 ("", true),
@@ -4397,7 +4413,7 @@ mod tests {
         }
         test_min_zero_wildcard {
             pattern: "^.{0,3}$",
-            memory: 912,
+            memory: 856,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -4409,7 +4425,7 @@ mod tests {
         }
         test_none_min_repetition {
             pattern: "^a{0,3}$",
-            memory: 656,
+            memory: 600,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -4424,7 +4440,7 @@ mod tests {
         }
         test_literal_single {
             pattern: "^a$",
-            memory: 536,
+            memory: 504,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4437,7 +4453,7 @@ mod tests {
         }
         test_literal_multi {
             pattern: "^abc$",
-            memory: 616,
+            memory: 568,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -4455,7 +4471,7 @@ mod tests {
         }
         test_dot_single {
             pattern: "^.$",
-            memory: 792,
+            memory: 760,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4469,7 +4485,7 @@ mod tests {
         }
         test_alternation_bare {
             pattern: "^(a|bc)$",
-            memory: 656,
+            memory: 600,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4485,7 +4501,7 @@ mod tests {
         }
         test_alternation_three_way {
             pattern: "^(a|b|c)$",
-            memory: 792,
+            memory: 760,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4499,7 +4515,7 @@ mod tests {
         }
         test_question_mark_single {
             pattern: "^a?$",
-            memory: 576,
+            memory: 536,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4511,7 +4527,7 @@ mod tests {
         }
         test_question_mark_group {
             pattern: "^(ab)?$",
-            memory: 616,
+            memory: 568,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4525,7 +4541,7 @@ mod tests {
         }
         test_question_mark_prefix {
             pattern: "^a?b$",
-            memory: 616,
+            memory: 568,
             min_tier: 1,
             inputs: [
                 ("b", true),
@@ -4540,7 +4556,7 @@ mod tests {
         }
         test_star_single {
             pattern: "^a*$",
-            memory: 576,
+            memory: 536,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4557,7 +4573,7 @@ mod tests {
         }
         test_star_group {
             pattern: "^(ab)*$",
-            memory: 616,
+            memory: 568,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4574,7 +4590,7 @@ mod tests {
         }
         test_star_then_literal {
             pattern: "^a*b$",
-            memory: 616,
+            memory: 568,
             min_tier: 1,
             inputs: [
                 ("b", true),
@@ -4592,7 +4608,7 @@ mod tests {
         }
         test_min_n_unbounded {
             pattern: "^a{2,}$",
-            memory: 616,
+            memory: 568,
             min_tier: 2,
             inputs: [
                 ("aa", true),
@@ -4609,7 +4625,7 @@ mod tests {
         }
         test_min_n_unbounded_group {
             pattern: "^(ab){2,}$",
-            memory: 656,
+            memory: 600,
             min_tier: 2,
             inputs: [
                 ("abab", true),
@@ -4626,7 +4642,7 @@ mod tests {
         }
         test_bounded_range {
             pattern: "^a{3,5}$",
-            memory: 616,
+            memory: 568,
             min_tier: 2,
             inputs: [
                 ("aaa", true),
@@ -4643,7 +4659,7 @@ mod tests {
         }
         test_exact_repetition {
             pattern: "^a{3,3}$",
-            memory: 616,
+            memory: 568,
             min_tier: 2,
             inputs: [
                 ("aaa", true),
@@ -4658,7 +4674,7 @@ mod tests {
         }
         test_byte_class_range {
             pattern: "^[a-c]$",
-            memory: 792,
+            memory: 760,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4671,7 +4687,7 @@ mod tests {
         }
         test_byte_class_one_plus {
             pattern: "^[a-c]+$",
-            memory: 832,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4684,7 +4700,7 @@ mod tests {
         }
         test_byte_class_counted {
             pattern: "^[a-c]{2,3}$",
-            memory: 872,
+            memory: 824,
             min_tier: 2,
             inputs: [
                 ("", false),
@@ -4698,7 +4714,7 @@ mod tests {
         }
         test_byte_class_disjoint {
             pattern: "^[ax]$",
-            memory: 792,
+            memory: 760,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4710,7 +4726,7 @@ mod tests {
         }
         test_byte_class_multi_range {
             pattern: "^[a-cx-z]+$",
-            memory: 832,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4724,7 +4740,7 @@ mod tests {
         }
         test_byte_class_with_wildcard {
             pattern: "^[a-c].*[x-z]$",
-            memory: 1424,
+            memory: 1368,
             min_tier: 1,
             inputs: [
                 ("ax", true),
@@ -4737,7 +4753,7 @@ mod tests {
         }
         test_digit {
             pattern: r#"^\d$"#,
-            memory: 792,
+            memory: 760,
             min_tier: 1,
             inputs: [
                 ("0", true),
@@ -4753,7 +4769,7 @@ mod tests {
         }
         test_digit_plus {
             pattern: r#"^\d+$"#,
-            memory: 832,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 ("0", true),
@@ -4769,7 +4785,7 @@ mod tests {
         }
         test_digit_counted {
             pattern: r#"^\d{3,5}$"#,
-            memory: 872,
+            memory: 824,
             min_tier: 2,
             inputs: [
                 ("123", true),
@@ -4785,7 +4801,7 @@ mod tests {
         }
         test_non_digit {
             pattern: r#"^\D$"#,
-            memory: 792,
+            memory: 760,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4801,7 +4817,7 @@ mod tests {
         }
         test_non_digit_plus {
             pattern: r#"^\D+$"#,
-            memory: 832,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -4815,7 +4831,7 @@ mod tests {
         }
         test_space {
             pattern: r#"^\s$"#,
-            memory: 792,
+            memory: 760,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -4830,7 +4846,7 @@ mod tests {
         }
         test_space_plus {
             pattern: r#"^\s+$"#,
-            memory: 832,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -4844,7 +4860,7 @@ mod tests {
         }
         test_non_space {
             pattern: r#"^\S$"#,
-            memory: 792,
+            memory: 760,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4859,7 +4875,7 @@ mod tests {
         }
         test_non_space_plus {
             pattern: r#"^\S+$"#,
-            memory: 832,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -4873,7 +4889,7 @@ mod tests {
         }
         test_word {
             pattern: r#"^\w$"#,
-            memory: 792,
+            memory: 760,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4890,7 +4906,7 @@ mod tests {
         }
         test_word_plus {
             pattern: r#"^\w+$"#,
-            memory: 832,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 ("hello", true),
@@ -4905,7 +4921,7 @@ mod tests {
         }
         test_word_counted {
             pattern: r#"^\w{2,4}$"#,
-            memory: 872,
+            memory: 824,
             min_tier: 2,
             inputs: [
                 ("ab", true),
@@ -4920,7 +4936,7 @@ mod tests {
         }
         test_non_word {
             pattern: r#"^\W$"#,
-            memory: 792,
+            memory: 760,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -4936,7 +4952,7 @@ mod tests {
         }
         test_non_word_plus {
             pattern: r#"^\W+$"#,
-            memory: 832,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -4951,7 +4967,7 @@ mod tests {
         }
         test_predefined_mixed {
             pattern: r#"^\d+\s+\w+$"#,
-            memory: 1504,
+            memory: 1432,
             min_tier: 1,
             inputs: [
                 ("42 hello", true),
@@ -7783,6 +7799,41 @@ mod tests {
         assert_ne!(
             re.byte_classes[b'd' as usize], re.byte_classes[b'D' as usize],
             "d and D should be in different byte equivalence classes (non-CI region)"
+        );
+    }
+
+    #[test]
+    fn test_too_many_counters() {
+        // Build a pattern with 257 independent counted repetitions,
+        // which requires 257 counters and should exceed the u8 limit.
+        let mut pattern = String::from("^");
+        for _ in 0..257 {
+            pattern.push_str("a{2,3}");
+        }
+        pattern.push('$');
+        let result = RegexBuilder::default().build(
+            &regex_syntax::parse(&pattern).unwrap(),
+        );
+        assert!(
+            matches!(result, Err(Error::TooManyCounters)),
+            "expected TooManyCounters error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_256_counters_ok() {
+        // 256 counters should be fine (indices 0..255 fit in u8).
+        let mut pattern = String::from("^");
+        for _ in 0..256 {
+            pattern.push_str("a{2,3}");
+        }
+        pattern.push('$');
+        let result = RegexBuilder::default().build(
+            &regex_syntax::parse(&pattern).unwrap(),
+        );
+        assert!(
+            result.is_ok(),
+            "256 counters should succeed, got {result:?}"
         );
     }
 }
