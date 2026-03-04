@@ -255,6 +255,10 @@ pub(crate) struct Tier2DfaCache {
     /// should be cleared (only re-seeded first-byte instances remain).
     counter_body_interior: Vec<u32>,
     counter_body_ranges: Vec<(usize, usize)>,
+    /// Per-counter differential state, reused across matcher invocations
+    /// to avoid per-match allocation.  Initialized in `prepare()`,
+    /// cleared and re-seeded in `Tier2DfaMatcher::new()`.
+    counter_states: Vec<CounterState>,
 }
 
 impl fmt::Debug for Tier2DfaCache {
@@ -284,6 +288,7 @@ impl Tier2DfaCache {
             start_seeds: Box::new([]),
             counter_body_interior: Vec::new(),
             counter_body_ranges: Vec::new(),
+            counter_states: Vec::new(),
         }
     }
 
@@ -708,6 +713,7 @@ impl Tier2DfaCache {
         self.start_seeds = Box::new([]);
         self.counter_body_interior.clear();
         self.counter_body_ranges.clear();
+        self.counter_states.clear();
     }
 
     pub(crate) fn prepare(&mut self, regex: &Regex) {
@@ -746,6 +752,15 @@ impl Tier2DfaCache {
         self.start_is_match = self.states[self.start_id.idx()].is_match;
         self.start_is_match_at_end = self.states[self.start_id.idx()].is_match_at_end;
         self.start_seeds = cr.seed_instances.iter().map(|&(c, _s)| (c, 0u32)).collect();
+
+        // Initialize counter_states with the correct sizes.  These are
+        // reused across matcher invocations — only allocated once per regex.
+        self.counter_states.clear();
+        for ci in 0..regex.num_counters {
+            let (min, max, body_len) = regex.counter_info(ci);
+            self.counter_states
+                .push(CounterState::new(body_len.max(1), min as u32, max as u32));
+        }
     }
 }
 
@@ -931,8 +946,6 @@ pub struct Tier2DfaMatcher<'a> {
     cache: &'a mut Tier2DfaCache,
     regex: &'a Regex,
     current: DfaStateId,
-    /// Per-counter differential state.
-    counter_states: Vec<CounterState>,
     ever_matched: bool,
     match_at_end: bool,
     has_live_counters: bool,
@@ -941,24 +954,21 @@ pub struct Tier2DfaMatcher<'a> {
 
 impl<'a> Tier2DfaMatcher<'a> {
     pub(crate) fn new(cache: &'a mut Tier2DfaCache, regex: &'a Regex) -> Self {
-        let counter_states: Vec<CounterState> = (0..regex.num_counters)
-            .map(|ci| {
-                let (min, max, body_len) = regex.counter_info(ci);
-                CounterState::new(body_len.max(1), min as u32, max as u32)
-            })
-            .collect();
+        // Reset counter states — reuse existing allocations.
+        for cs in &mut cache.counter_states {
+            cs.clear();
+        }
 
         // Seed initial counter instances.
         // At the start (before any bytes), active_phase is 0.
         // Seed into the phase that fires CInc when the body completes
         // (after L bytes).  That's phase (0 + L - 1) % L = L - 1.
         let mut has_live = false;
-        let mut cs = counter_states;
         for &(counter, _initial_value) in cache.start_seeds.iter() {
             let c_idx = counter.idx();
-            let nph = cs[c_idx].phases.len();
+            let nph = cache.counter_states[c_idx].phases.len();
             let target_phase = (nph - 1) % nph;
-            cs[c_idx].phases[target_phase].alloc_new();
+            cache.counter_states[c_idx].phases[target_phase].alloc_new();
             has_live = true;
         }
 
@@ -969,7 +979,6 @@ impl<'a> Tier2DfaMatcher<'a> {
             has_live_counters: has_live,
             cache,
             regex,
-            counter_states: cs,
             prefilter: regex.prefilter,
         }
     }
@@ -1033,18 +1042,33 @@ impl<'a> Tier2DfaMatcher<'a> {
             return;
         }
 
+        // Slow path: snapshot scalar transition fields into locals so the
+        // borrow on self.cache.transitions is released before we mutate
+        // self.cache.counter_states.
+        let is_counting = t.is_counting;
+        let counting_mask = t.counting_mask;
+        let no_break = t.no_break;
+        let no_break_is_match = t.no_break_is_match;
+        let no_break_is_match_at_end = t.no_break_is_match_at_end;
+        let with_break = t.with_break;
+        let with_break_is_match = t.with_break_is_match;
+        let with_break_is_match_at_end = t.with_break_is_match_at_end;
+        let counter_reset = t.counter_reset;
+        let num_seeds = t.seeds.len();
+        // `t` borrow ends here (NLL: last use was t.seeds.len()).
+
         self.match_at_end = false;
         let mut any_can_break = false;
 
-        if t.is_counting {
+        if is_counting {
             // Process ALL counters that fire CInc on this transition.
-            let mut mask = t.counting_mask;
+            let mut mask = counting_mask;
             while mask != 0 {
                 let c_idx = mask.trailing_zeros() as usize;
                 mask &= mask - 1; // clear lowest set bit
 
-                if c_idx < self.counter_states.len() {
-                    let cs = &mut self.counter_states[c_idx];
+                if c_idx < self.cache.counter_states.len() {
+                    let cs = &mut self.cache.counter_states[c_idx];
                     let phase_idx = cs.active_phase;
                     let phase = &mut cs.phases[phase_idx];
 
@@ -1067,33 +1091,33 @@ impl<'a> Tier2DfaMatcher<'a> {
 
             // Record match from break path.
             if any_can_break {
-                if t.with_break_is_match {
+                if with_break_is_match {
                     self.ever_matched = true;
                 }
-                if t.with_break_is_match_at_end {
+                if with_break_is_match_at_end {
                     self.match_at_end = true;
                 }
             }
         }
 
         // Select DFA successor.
-        if t.is_counting && any_can_break {
-            self.current = t.with_break;
+        if is_counting && any_can_break {
+            self.current = with_break;
         } else {
-            self.current = t.no_break;
-            if t.no_break_is_match {
+            self.current = no_break;
+            if no_break_is_match {
                 self.ever_matched = true;
             }
-            if t.no_break_is_match_at_end {
+            if no_break_is_match_at_end {
                 self.match_at_end = true;
             }
         }
 
         // Apply counter_reset: clear instances for counters whose body
         // was interrupted (no interior body NFA states in the successor).
-        if t.counter_reset != 0 {
-            for (ci, cs) in self.counter_states.iter_mut().enumerate() {
-                if (t.counter_reset >> ci) & 1 != 0 {
+        if counter_reset != 0 {
+            for (ci, cs) in self.cache.counter_states.iter_mut().enumerate() {
+                if (counter_reset >> ci) & 1 != 0 {
                     cs.clear();
                 }
             }
@@ -1101,16 +1125,20 @@ impl<'a> Tier2DfaMatcher<'a> {
 
         // Advance active_phase for EVERY counter on EVERY byte.
         // This keeps the phase clock synchronized with byte position.
-        for cs in &mut self.counter_states {
+        for cs in &mut self.cache.counter_states {
             let nph = cs.phases.len();
             cs.active_phase = (cs.active_phase + 1) % nph;
         }
 
         // Seed new counter instances.
-        for &(counter, initial_value) in t.seeds.iter() {
+        // Access seeds by index: each index yields a Copy tuple, so the
+        // temporary borrow on self.cache.transitions ends before we
+        // mutate self.cache.counter_states.
+        for si in 0..num_seeds {
+            let (counter, initial_value) = self.cache.transitions[slot].seeds[si];
             let c_idx = counter.idx();
-            if c_idx < self.counter_states.len() {
-                let cs = &mut self.counter_states[c_idx];
+            if c_idx < self.cache.counter_states.len() {
+                let cs = &mut self.cache.counter_states[c_idx];
                 // Seed into the phase that will fire CInc when this
                 // instance completes its first body iteration.  The body
                 // has L bytes.  CInc fires L-1 bytes from now (the phase
@@ -1125,12 +1153,12 @@ impl<'a> Tier2DfaMatcher<'a> {
         }
 
         // Update has_live_counters flag.
-        self.has_live_counters = self.counter_states.iter().any(|cs| !cs.is_empty());
+        self.has_live_counters = self.cache.counter_states.iter().any(|cs| !cs.is_empty());
     }
 
     fn step_from_dead(&mut self, byte: u8) {
         if self.has_live_counters {
-            for cs in &mut self.counter_states {
+            for cs in &mut self.cache.counter_states {
                 cs.clear();
             }
             self.has_live_counters = false;
@@ -1150,7 +1178,7 @@ impl<'a> Tier2DfaMatcher<'a> {
         }
 
         // Advance active_phase for every counter (every byte ticks the clock).
-        for cs in &mut self.counter_states {
+        for cs in &mut self.cache.counter_states {
             let nph = cs.phases.len();
             cs.active_phase = (cs.active_phase + 1) % nph;
         }
@@ -1158,14 +1186,14 @@ impl<'a> Tier2DfaMatcher<'a> {
         // Seed with phase-aware placement.
         for &(counter, initial_value) in trans.seeds.iter() {
             let c_idx = counter.idx();
-            if c_idx < self.counter_states.len() {
-                let cs = &mut self.counter_states[c_idx];
+            if c_idx < self.cache.counter_states.len() {
+                let cs = &mut self.cache.counter_states[c_idx];
                 let nph = cs.phases.len();
                 let target_phase = (cs.active_phase + nph - 1) % nph;
                 cs.phases[target_phase].alloc_new_with_value(initial_value);
             }
         }
-        self.has_live_counters = self.counter_states.iter().any(|cs| !cs.is_empty());
+        self.has_live_counters = self.cache.counter_states.iter().any(|cs| !cs.is_empty());
     }
 
     #[inline(always)]
