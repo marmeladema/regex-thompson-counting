@@ -72,7 +72,7 @@ fn for_each_line(haystack: &[u8], mut f: impl FnMut(&[u8])) {
     }
 }
 
-// ---- aws-keys/quick benchmark (NFA path, has counters) ----
+// ---- aws-keys/quick benchmark (single chunk, 1 MB) ----
 
 #[library_benchmark]
 fn bench_aws_keys_quick() {
@@ -84,6 +84,25 @@ fn bench_aws_keys_quick() {
     matcher.chunk(black_box(&haystack));
     let matched = matcher.finish();
     black_box(matched);
+}
+
+// ---- aws-keys/quick benchmark (per-line grep, like rebar) ----
+
+#[library_benchmark]
+fn bench_aws_keys_grep() {
+    let haystack = aws_haystack();
+    let hir = parse_hir(AWS_PATTERN);
+    let re = RegexBuilder::default().build(&hir).unwrap();
+    let mut mem = MatcherMemory::default();
+    let mut count = 0usize;
+    for_each_line(&haystack, |line| {
+        let mut m = mem.matcher(&re);
+        m.chunk(black_box(line));
+        if m.finish() {
+            count += 1;
+        }
+    });
+    black_box(count);
 }
 
 // ---- grep/every-line benchmark (DFA path, per-line iteration) ----
@@ -124,7 +143,10 @@ fn bench_aws_prefix_tier1() {
     black_box(matched);
 }
 
-library_benchmark_group!(name = aws_keys_group, benchmarks = bench_aws_keys_quick);
+library_benchmark_group!(
+    name = aws_keys_group,
+    benchmarks = [bench_aws_keys_quick, bench_aws_keys_grep]
+);
 library_benchmark_group!(name = aws_prefix_group, benchmarks = bench_aws_prefix_tier1);
 library_benchmark_group!(name = grep_group, benchmarks = bench_grep_every_line);
 

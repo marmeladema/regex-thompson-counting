@@ -716,6 +716,7 @@ impl Tier2DfaCache {
         self.counter_states.clear();
     }
 
+    #[inline]
     pub(crate) fn prepare(&mut self, regex: &Regex) {
         let id = regex.id;
         if self.regex_id == id && self.start_id != DfaStateId::DEAD {
@@ -953,6 +954,7 @@ pub struct Tier2DfaMatcher<'a> {
 }
 
 impl<'a> Tier2DfaMatcher<'a> {
+    #[inline]
     pub(crate) fn new(cache: &'a mut Tier2DfaCache, regex: &'a Regex) -> Self {
         // Reset counter states — reuse existing allocations.
         for cs in &mut cache.counter_states {
@@ -1279,6 +1281,7 @@ impl<'a> Tier2DfaMatcher<'a> {
         }
     }
 
+    #[inline]
     pub fn finish(self) -> bool {
         if self.ever_matched {
             return true;

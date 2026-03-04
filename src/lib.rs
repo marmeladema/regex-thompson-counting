@@ -113,11 +113,7 @@ impl fmt::Display for Error {
                 write!(f, "repetition max {} exceeds limit {}", max, limit)
             }
             Self::TooManyCounters => {
-                write!(
-                    f,
-                    "pattern requires more than {} counters",
-                    MAX_COUNTERS
-                )
+                write!(f, "pattern requires more than {} counters", MAX_COUNTERS)
             }
         }
     }
@@ -2554,6 +2550,7 @@ impl MatcherMemory {
     ///
     /// Returns an [`AnyMatcher`] that transparently dispatches to the
     /// lazy DFA (for DFA-eligible patterns) or the NFA simulator.
+    #[inline]
     pub fn matcher<'a>(&'a mut self, regex: &'a Regex) -> AnyMatcher<'a> {
         if regex.dfa_eligible {
             // Tier 1: pure DFA (no counters, simple assertions).
@@ -2647,6 +2644,7 @@ pub enum AnyMatcher<'a> {
 
 impl<'a> AnyMatcher<'a> {
     /// Feed an entire byte slice through the matcher.
+    #[inline]
     pub fn chunk(&mut self, input: &[u8]) {
         match self {
             Self::Dfa(d) => d.chunk(input),
@@ -2658,6 +2656,7 @@ impl<'a> AnyMatcher<'a> {
     }
 
     /// Signal end-of-input and return the final match result.
+    #[inline]
     pub fn finish(self) -> bool {
         match self {
             Self::Dfa(d) => d.finish(),
@@ -7811,9 +7810,7 @@ mod tests {
             pattern.push_str("a{2,3}");
         }
         pattern.push('$');
-        let result = RegexBuilder::default().build(
-            &regex_syntax::parse(&pattern).unwrap(),
-        );
+        let result = RegexBuilder::default().build(&regex_syntax::parse(&pattern).unwrap());
         assert!(
             matches!(result, Err(Error::TooManyCounters)),
             "expected TooManyCounters error, got {result:?}"
@@ -7828,9 +7825,7 @@ mod tests {
             pattern.push_str("a{2,3}");
         }
         pattern.push('$');
-        let result = RegexBuilder::default().build(
-            &regex_syntax::parse(&pattern).unwrap(),
-        );
+        let result = RegexBuilder::default().build(&regex_syntax::parse(&pattern).unwrap());
         assert!(
             result.is_ok(),
             "256 counters should succeed, got {result:?}"

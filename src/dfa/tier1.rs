@@ -539,6 +539,7 @@ impl DfaCache {
     }
 
     /// Prepare the cache for use with `regex`.
+    #[inline]
     pub(crate) fn prepare(&mut self, regex: &Regex) {
         let id = regex.id;
         if self.regex_id == id && self.start_id != DfaStateId::DEAD {
@@ -580,6 +581,7 @@ pub struct DfaMatcher<'a> {
 }
 
 impl<'a> DfaMatcher<'a> {
+    #[inline]
     pub(crate) fn new(cache: &'a mut DfaCache, regex: &'a Regex) -> Self {
         DfaMatcher {
             current: cache.start_id,
@@ -663,6 +665,7 @@ impl<'a> DfaMatcher<'a> {
         }
     }
 
+    #[inline]
     pub fn finish(self) -> bool {
         if self.ever_matched {
             return true;
