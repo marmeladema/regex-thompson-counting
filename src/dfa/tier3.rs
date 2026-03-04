@@ -366,11 +366,7 @@ impl Tier3DfaCache {
         if from_state.deferred_asserts.is_empty() {
             return extra;
         }
-        let prev = if from_state.prev_was_word {
-            Some(b'a')
-        } else {
-            Some(b' ')
-        };
+        let prev = from_state.prev_byte_representative();
         for &assert_idx in from_state.deferred_asserts.iter() {
             if let State::Assert { kind, out } = regex.states[assert_idx]
                 && kind.eval(false, false, prev, Some(byte)) == AssertEval::Pass
@@ -385,11 +381,7 @@ impl Tier3DfaCache {
         if state.deferred_asserts.is_empty() {
             return false;
         }
-        let prev = if state.prev_was_word {
-            Some(b'a')
-        } else {
-            Some(b' ')
-        };
+        let prev = state.prev_byte_representative();
         for &assert_idx in state.deferred_asserts.iter() {
             if let State::Assert { kind, out } = regex.states[assert_idx]
                 && kind.eval(false, true, prev, None) == AssertEval::Pass
@@ -421,11 +413,7 @@ impl Tier3DfaCache {
             // Resolve deferred assertions.
             let extra = self.resolve_deferred(from_state, byte, regex);
             if !extra.is_empty() {
-                let resolved_prev = if self.states[from.idx()].prev_was_word {
-                    Some(b'a')
-                } else {
-                    Some(b' ')
-                };
+                let resolved_prev = from_state.prev_byte_representative();
                 let cr = self.epsilon_closure(
                     extra.into_iter(),
                     &regex.states,

@@ -249,13 +249,7 @@ impl DfaCache {
         if from_state.deferred_asserts.is_empty() {
             return extra_targets;
         }
-        // Reconstruct prev byte for assertion evaluation.
-        // We only need word-ness, so use synthetic bytes.
-        let prev = if from_state.prev_was_word {
-            Some(b'a')
-        } else {
-            Some(b' ')
-        };
+        let prev = from_state.prev_byte_representative();
         for &assert_idx in from_state.deferred_asserts.iter() {
             if let State::Assert { kind, out } = regex.states[assert_idx] {
                 let result = kind.eval(false, false, prev, Some(byte));
@@ -273,11 +267,7 @@ impl DfaCache {
         if state.deferred_asserts.is_empty() {
             return false;
         }
-        let prev = if state.prev_was_word {
-            Some(b'a')
-        } else {
-            Some(b' ')
-        };
+        let prev = state.prev_byte_representative();
         for &assert_idx in state.deferred_asserts.iter() {
             if let State::Assert { kind, out } = regex.states[assert_idx] {
                 let result = kind.eval(false, true, prev, None);
@@ -358,13 +348,7 @@ impl DfaCache {
             if !extra.is_empty() {
                 // Mini epsilon closure: find consuming states reachable
                 // from the resolved assertion outputs.
-                // Reconstruct prev_byte for the resolved chain: assertions
-                // were deferred with from_state.prev_was_word context.
-                let resolved_prev = if self.states[from.idx()].prev_was_word {
-                    Some(b'a')
-                } else {
-                    Some(b' ')
-                };
+                let resolved_prev = from_state.prev_byte_representative();
                 let (resolved_consumers, _resolved_deferred, resolved_match, resolved_match_at_end) =
                     self.epsilon_closure(
                         extra.into_iter(),

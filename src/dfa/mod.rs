@@ -75,3 +75,22 @@ pub(super) struct DfaState {
     /// splitting.
     pub(super) prev_was_word: bool,
 }
+
+impl DfaState {
+    /// Return a representative previous byte for assertion resolution.
+    ///
+    /// Deferred assertions that depend on the previous byte are exclusively
+    /// from the word-boundary family (`\b`, `\B`, `\b{start}`, `\b{end}`),
+    /// which only inspect `is_word_byte(prev)`.  `StartLF` never defers
+    /// (it resolves immediately since `prev` is always known), and `EndLF`
+    /// does not depend on `prev` at all.  So the bool captures all needed
+    /// information without unnecessary DFA state splitting.
+    #[inline]
+    pub(super) fn prev_byte_representative(&self) -> Option<u8> {
+        if self.prev_was_word {
+            Some(b'a')
+        } else {
+            Some(b' ')
+        }
+    }
+}
