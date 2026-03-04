@@ -1,858 +1,747 @@
-//! Tier 3: Counting DFA for patterns with bounded repetitions.
+//! Tier 3: DFA with conditional transitions for non-nested counters.
 //!
-//! The DFA handles state transitions (cacheable); counter values live
-//! in a side-channel of `CounterCtx` entries updated by compiled
-//! counter programs.  Each context also tracks its NFA "origin"
-//! (the consuming state it is waiting at) so that only the relevant
-//! counter program is applied to it.
+//! Unlike Tier 3 which unions both CInc paths (continue + break) into one
+//! DFA successor and uses runtime counter-program trees, Tier 3 precomputes
+//! **two DFA successor states** per counting transition: one that follows
+//! only the continue path (NoBreak), and one that follows both paths
+//! (WithBreak).  At runtime, the matcher evaluates counter values to pick
+//! the correct successor.
+//!
+//! **Eligibility**: patterns with bounded repetitions where no counter is
+//! nested inside another counter's body.  Body can be any length/structure.
+//!
+//! # Terminology: "origin"
+//!
+//! An **origin** is the NFA consuming state (Byte, ByteCI, ByteClass, or
+//! ByteTable) where a counter instance is currently parked, waiting to
+//! consume the next input byte.
+//!
+//! When an instance is first created at a CI (CounterInstance) node, its
+//! origin is the first consuming state in the counter body.  As input
+//! bytes are consumed, the instance's origin advances through the body's
+//! consuming states.  When the body's last consuming state is consumed,
+//! the epsilon closure reaches CInc and the counter value increments.
+//!
+//! Origins bridge the DFA (which tracks NFA state subsets) and per-counter
+//! instance tracking (which tracks repetition counts).  A cached DFA
+//! transition maps each origin to an [`OriginAction`] that describes what
+//! happens structurally when a byte is consumed there.
 
 use std::collections::HashMap;
 use std::fmt;
 
 use crate::{
-    AssertKind, CounterCtx, CounterIdx, CounterPool, Regex, State, StateIdx, byte_match_ci,
+    AssertEval, AssertKind, CounterIdx, Prefilter, Regex, State, StateIdx, byte_match_ci,
+    is_word_byte,
 };
 
 use super::{DfaState, DfaStateId};
 
-/// Index into [`CountingDfaCache::programs`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CounterProgramIdx(u32);
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
-/// A single node in the counter program tree.
+/// Maximum number of DFA states.
+const DFA_MAX_STATES: usize = 2048;
+
+// ---------------------------------------------------------------------------
+// Transition
+// ---------------------------------------------------------------------------
+
+/// Cached DFA transition for `(state, byte)`.
 ///
-/// Programs are compiled once per DFA transition (on cache miss) by
-/// tracing the NFA epsilon closure and recording counter operations
-/// instead of executing them.  On cache hits the compiled program is
-/// replayed against each active counter context.
-#[derive(Debug)]
-enum CounterOp {
-    /// Initialize counter `counter` to 0 (entering a repetition body).
-    /// Then continue with `then`.
-    Init {
-        counter: CounterIdx,
-        then: Vec<CounterOp>,
-    },
-    /// Increment counter `counter`.  Branch based on the new value:
-    /// - `on_continue` is taken when `new_value < max` (stay in loop).
-    /// - `on_break` is taken when `new_value >= min` (may exit loop).
+/// For non-counting transitions, `no_break` and `with_break` are identical.
+/// For counting transitions, the matcher picks `with_break` when any
+/// incrementing instance has `value+1 >= min`, otherwise `no_break`.
+#[derive(Clone)]
+struct Transition {
+    /// DFA successor when no instance can break (continue-only closure).
+    no_break: DfaStateId,
+    no_break_is_match: bool,
+    no_break_is_match_at_end: bool,
+    /// DFA successor when at least one instance can break (both closure).
+    with_break: DfaStateId,
+    with_break_is_match: bool,
+    with_break_is_match_at_end: bool,
+    /// True if this transition crosses a CInc node.
+    is_counting: bool,
+    /// New counter instances from CI nodes in the successor closure.
+    /// The third element is the initial counter value (0 for fresh seeds,
+    /// 1 for seeds from resolved deferred assertions whose origin already
+    /// consumed the resolving byte through a CInc increment).
+    seeds: Box<[(CounterIdx, StateIdx, u32)]>,
+    /// Parallel arrays: `origin_keys[i]` → `origin_actions[i]`.
+    origin_keys: Box<[StateIdx]>,
+    origin_actions: Box<[OriginAction]>,
+}
+
+impl Transition {
+    fn empty() -> Self {
+        Self {
+            no_break: DfaStateId::UNPOPULATED,
+            no_break_is_match: false,
+            no_break_is_match_at_end: false,
+            with_break: DfaStateId::UNPOPULATED,
+            with_break_is_match: false,
+            with_break_is_match_at_end: false,
+            is_counting: false,
+            seeds: Box::new([]),
+            origin_keys: Box::new([]),
+            origin_actions: Box::new([]),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OriginAction
+// ---------------------------------------------------------------------------
+
+/// What happens to a counter instance at a given origin when the next
+/// byte is consumed and epsilon closure is computed.
+#[derive(Clone, Debug)]
+enum OriginAction {
+    /// The byte did not match — the instance dies.
+    Dead,
+    /// The byte matched and epsilon closure did NOT reach CInc.
+    /// The instance keeps its counter value and moves to `new_origins`.
+    Advance { new_origins: Box<[StateIdx]> },
+    /// The byte matched and epsilon closure reached CInc.  The counter
+    /// value is incremented and the min/max bounds determine whether the
+    /// instance continues or breaks.
     ///
-    /// Both branches can fire when `min <= new_value < max`.
+    /// `advance_origins` handles the `AdvanceOrIncrement` case (e.g.,
+    /// `(a+){2,3}` where a Split before CInc lets the instance stay in
+    /// the inner loop).  Empty when there are no such bypass paths.
     Increment {
-        counter: CounterIdx,
-        min: usize,
-        max: usize,
-        on_continue: Vec<CounterOp>,
-        on_break: Vec<CounterOp>,
+        /// Origins reached WITHOUT going through CInc (same counter value).
+        /// Empty for pure increments; non-empty for AdvanceOrIncrement.
+        advance_origins: Box<[StateIdx]>,
+        min: u32,
+        max: u32,
+        /// Origins the instance moves to when continuing (value+1 < max).
+        continue_origins: Box<[StateIdx]>,
+        /// True if the break path reaches Match directly.
+        break_is_match: bool,
+        /// True if the break path reaches match-at-end ($ → Match).
+        break_is_match_at_end: bool,
     },
-    /// Deactivate counter `counter` (exiting a repetition).
-    /// Then continue with `then`.
-    Remove {
-        counter: CounterIdx,
-        then: Vec<CounterOp>,
-    },
-    /// Emit the current context as a surviving thread.
-    /// `origin` is the NFA consuming state the context will be "at".
-    EmitContinue { origin: StateIdx },
-    /// Signal that a match was found.
-    EmitMatch,
-    /// Signal that a match is reachable at end-of-input (`$` gate).
-    EmitMatchAtEnd,
-}
-
-/// Outcome of applying a counter program to one context.
-enum ProgramResult {
-    /// The context survives with updated counter values at the given
-    /// NFA consuming state.
-    Continue(CounterCtx, StateIdx),
-    /// A match was found (directly reachable).
-    Match,
-    /// A match is reachable at end-of-input (`$`).
-    MatchAtEnd,
-}
-
-/// Execute a counter program against a single context.
-///
-/// The program tree is walked depth-first.  At each `Increment` node the
-/// counter value determines which branches fire.  `EmitContinue` clones
-/// the (possibly modified) context into the output.  `EmitMatch` records
-/// that a match was found.
-///
-/// `ctx` is borrowed; the function clones it as needed.  When only one
-/// branch of an `Increment` fires, the clone is avoided by reusing the
-/// parent context directly.
-fn execute_program(
-    ops: &[CounterOp],
-    ctx: &CounterCtx,
-    pool: &mut CounterPool,
-    results: &mut Vec<ProgramResult>,
-) {
-    for op in ops {
-        match op {
-            CounterOp::EmitContinue { origin } => {
-                results.push(ProgramResult::Continue(ctx.clone(pool), *origin));
-            }
-            CounterOp::EmitMatch => {
-                results.push(ProgramResult::Match);
-            }
-            CounterOp::EmitMatchAtEnd => {
-                results.push(ProgramResult::MatchAtEnd);
-            }
-            CounterOp::Init { counter, then } => {
-                let mut child = ctx.clone(pool);
-                child.set(*counter, 0, pool);
-                execute_program(then, &child, pool, results);
-                pool.free(child.into_range());
-            }
-            CounterOp::Remove { counter, then } => {
-                let mut child = ctx.clone(pool);
-                child.remove(*counter, pool);
-                execute_program(then, &child, pool, results);
-                pool.free(child.into_range());
-            }
-            CounterOp::Increment {
-                counter,
-                min,
-                max,
-                on_continue,
-                on_break,
-            } => {
-                // Skip this Increment if the counter is not active in
-                // this context.  This happens when a DFA state merges
-                // NFA states from different counter loops — a context
-                // in loop A shouldn't process Increment ops from loop B.
-                let cur = match ctx.get(*counter, pool) {
-                    Some(v) => v,
-                    None => continue,
-                };
-                let new_val = cur + 1;
-                let do_continue = new_val < *max;
-                let do_break = new_val >= *min;
-                if do_continue && do_break {
-                    // Both branches fire — need two clones.
-                    let mut child_c = ctx.clone(pool);
-                    child_c.set(*counter, new_val, pool);
-                    execute_program(on_continue, &child_c, pool, results);
-                    pool.free(child_c.into_range());
-                    let mut child_b = ctx.clone(pool);
-                    child_b.set(*counter, new_val, pool);
-                    execute_program(on_break, &child_b, pool, results);
-                    pool.free(child_b.into_range());
-                } else if do_continue {
-                    // Only continue — fast-path when sub-program is a
-                    // single EmitContinue: avoid the intermediate clone by
-                    // building the result context directly.
-                    if let [CounterOp::EmitContinue { origin }] = on_continue.as_slice() {
-                        let mut result = ctx.clone(pool);
-                        result.set(*counter, new_val, pool);
-                        results.push(ProgramResult::Continue(result, *origin));
-                    } else {
-                        let mut child = ctx.clone(pool);
-                        child.set(*counter, new_val, pool);
-                        execute_program(on_continue, &child, pool, results);
-                        pool.free(child.into_range());
-                    }
-                } else if do_break {
-                    // Only break — same fast-path for single EmitContinue.
-                    if let [CounterOp::EmitContinue { origin }] = on_break.as_slice() {
-                        let mut result = ctx.clone(pool);
-                        result.set(*counter, new_val, pool);
-                        results.push(ProgramResult::Continue(result, *origin));
-                    } else if let [CounterOp::EmitMatch] = on_break.as_slice() {
-                        results.push(ProgramResult::Match);
-                    } else if let [CounterOp::EmitMatchAtEnd] = on_break.as_slice() {
-                        results.push(ProgramResult::MatchAtEnd);
-                    } else {
-                        let mut child = ctx.clone(pool);
-                        child.set(*counter, new_val, pool);
-                        execute_program(on_break, &child, pool, results);
-                        pool.free(child.into_range());
-                    }
-                }
-                // Neither fires: context dies silently.
-            }
-        }
-    }
-}
-
-/// Fast-path execution for the common case of a single `Increment` where
-/// only one branch fires and that branch is a single leaf op.
-///
-/// Mutates `ctx` in-place (avoiding allocation) and returns the single
-/// result.  Returns `None` if the program doesn't match this shape, in
-/// which case the caller falls back to `execute_program`.
-#[inline]
-fn try_execute_inplace(
-    prog: &[CounterOp],
-    ctx: &mut CounterCtx,
-    pool: &mut CounterPool,
-) -> Option<ProgramResult> {
-    if let [
-        CounterOp::Increment {
-            counter,
-            min,
-            max,
-            on_continue,
-            on_break,
-        },
-    ] = prog
-    {
-        let cur = ctx.get(*counter, pool)?;
-        let new_val = cur + 1;
-        let do_continue = new_val < *max;
-        let do_break = new_val >= *min;
-        if do_continue && !do_break {
-            // Only continue fires.
-            if let [CounterOp::EmitContinue { origin }] = on_continue.as_slice() {
-                ctx.set(*counter, new_val, pool);
-                return Some(ProgramResult::Continue(CounterCtx::new(), *origin));
-                // ^ dummy ctx — caller will use the mutated `ctx` directly
-            }
-        } else if do_break && !do_continue {
-            // Only break fires.
-            if let [
-                CounterOp::Remove {
-                    then: break_then, ..
-                },
-            ] = on_break.as_slice()
-            {
-                if let [CounterOp::EmitMatch] = break_then.as_slice() {
-                    return Some(ProgramResult::Match);
-                }
-                if let [CounterOp::EmitMatchAtEnd] = break_then.as_slice() {
-                    return Some(ProgramResult::MatchAtEnd);
-                }
-            }
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
-// Counting DFA cache (Tier 3)
+// Instance tracking
 // ---------------------------------------------------------------------------
 
-/// Index into [`CountingDfaCache::origin_program_tables`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct OriginTableIdx(u32);
-
-impl OriginTableIdx {
-    /// Sentinel value indicating an unpopulated transition slot.
-    const NONE: Self = Self(u32::MAX);
+/// A single active counter instance.
+#[derive(Clone, Debug)]
+struct Instance {
+    /// Number of completed iterations (0 when freshly seeded at CI).
+    value: u32,
+    /// The NFA consuming state this instance is waiting at.
+    origin: StateIdx,
 }
 
-/// Cached transition for the counting DFA.  In addition to the next DFA
-/// state, stores per-origin counter programs and a seed program.
-#[derive(Clone, Copy, Debug)]
-struct CountingTransition {
-    next: DfaStateId,
-    /// Index into origin_program_tables: for each NFA consuming state in
-    /// the `from` DFA state, the counter program to apply to contexts at
-    /// that origin.
-    origin_table: OriginTableIdx,
-    /// Counter program for the re-seed context (from regex.start).
-    seed_program: CounterProgramIdx,
-}
+// ---------------------------------------------------------------------------
+// Tier 3 DFA cache
+// ---------------------------------------------------------------------------
 
-impl CountingTransition {
-    /// Sentinel value for an unpopulated transition slot.
-    const UNPOPULATED: Self = Self {
-        next: DfaStateId::DEAD,
-        origin_table: OriginTableIdx::NONE,
-        seed_program: CounterProgramIdx(u32::MAX),
-    };
-
-    /// True if this slot has not been populated yet.
-    #[inline]
-    fn is_unpopulated(self) -> bool {
-        self.origin_table.0 == u32::MAX
-    }
-}
-
-/// Lazy DFA cache for Tier 3 (patterns with counters).
-///
-/// Shares the `DfaState` representation with Tier 1 — the DFA state is
-/// the set of NFA consuming states, ignoring counter values.  Counter
-/// values live in a separate side-channel of `CounterCtx` entries.
-pub(crate) struct CountingDfaCache {
-    /// Append-only table of DFA states.
+/// Lazy DFA cache for Tier 2.
+pub(crate) struct Tier3DfaCache {
     states: Vec<DfaState>,
-    /// Reverse lookup: canonical `DfaState → DfaStateId`.
     state_map: HashMap<DfaState, DfaStateId>,
-    /// Flat transition table: indexed by `state.0 * stride + byte_class`.
-    /// Unpopulated slots have `origin_table == OriginTableIdx::NONE`.
-    transitions: Vec<CountingTransition>,
-    /// Compiled counter programs (append-only).
-    programs: Vec<Vec<CounterOp>>,
-    /// Per-origin program tables (append-only).
-    /// Each entry maps NFA consuming state → counter program index.
-    origin_program_tables: Vec<Vec<(StateIdx, CounterProgramIdx)>>,
-    /// Precomputed seed origin tables for pure-emit seed programs.
-    /// Indexed by `CounterProgramIdx` (same as `programs`).  If the
-    /// seed program at index `i` consists only of `EmitContinue` ops,
-    /// `seed_emit_origins[i]` is `Some(origins)`.  Otherwise `None`.
-    seed_emit_origins: Vec<Option<Box<[StateIdx]>>>,
-    /// Scratch visited set for epsilon closure.
-    closure_visited: Vec<bool>,
-    /// Number of byte equivalence classes — the stride of each DFA state
-    /// row in the transition table.  Copied from [`Regex::num_byte_classes`]
-    /// during [`prepare()`].
+    transitions: Vec<Transition>,
     stride: usize,
-    /// Regex identity for cache reuse.
+    // Scratch space for closure.
+    closure_stack: Vec<StateIdx>,
+    closure_result: Vec<StateIdx>,
+    closure_deferred: Vec<StateIdx>,
+    closure_visited: Vec<bool>,
+    closure_seeds: Vec<(CounterIdx, StateIdx)>,
     regex_id: u64,
-    /// Start DFA state (at_start=true, position 0).
     start_id: DfaStateId,
-    /// Start counter program (applied to the initial seed context).
-    start_program: CounterProgramIdx,
-    /// Whether the start state can match directly.
     start_is_match: bool,
-    /// Whether the start state can match at end-of-input.
     start_is_match_at_end: bool,
+    start_seeds: Box<[(CounterIdx, StateIdx, u32)]>,
 }
 
-impl fmt::Debug for CountingDfaCache {
+impl fmt::Debug for Tier3DfaCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CountingDfaCache")
+        f.debug_struct("Tier3DfaCache")
             .field("num_states", &self.states.len())
-            .field("num_programs", &self.programs.len())
             .finish()
     }
 }
 
-impl CountingDfaCache {
+impl Tier3DfaCache {
     pub(crate) fn new(num_nfa_states: usize) -> Self {
         Self {
             states: Vec::new(),
             state_map: HashMap::new(),
             transitions: Vec::new(),
-            programs: Vec::new(),
-            origin_program_tables: Vec::new(),
-            seed_emit_origins: Vec::new(),
-            closure_visited: vec![false; num_nfa_states],
             stride: 256,
+            closure_stack: Vec::new(),
+            closure_result: Vec::new(),
+            closure_deferred: Vec::new(),
+            closure_visited: vec![false; num_nfa_states],
+            closure_seeds: Vec::new(),
             regex_id: 0,
             start_id: DfaStateId::DEAD,
-            start_program: CounterProgramIdx(0),
             start_is_match: false,
             start_is_match_at_end: false,
+            start_seeds: Box::new([]),
         }
     }
 
-    /// Look up or insert a DFA state.
     fn intern_state(
         &mut self,
         nfa_states: Box<[StateIdx]>,
+        deferred_asserts: Box<[StateIdx]>,
         is_match: bool,
         is_match_at_end: bool,
-    ) -> DfaStateId {
+        prev_was_word: bool,
+    ) -> Option<DfaStateId> {
         let state = DfaState {
             nfa_states,
-            deferred_asserts: Box::new([]),
+            deferred_asserts,
             is_match,
             is_match_at_end,
-            prev_was_word: false,
+            prev_was_word,
         };
         if let Some(&id) = self.state_map.get(&state) {
-            return id;
+            return Some(id);
+        }
+        if self.states.len() >= DFA_MAX_STATES {
+            return None;
         }
         let id = DfaStateId(self.states.len() as u32);
         self.state_map.insert(state.clone(), id);
         self.states.push(state);
-        self.transitions.resize(
-            self.states.len() * self.stride,
-            CountingTransition::UNPOPULATED,
-        );
-        id
+        self.transitions
+            .extend(std::iter::repeat_with(Transition::empty).take(self.stride));
+        Some(id)
     }
 
-    /// Store a counter program and return its index.
-    ///
-    /// Also precomputes whether the program is pure `EmitContinue` ops
-    /// (useful for fast-path seed execution).
-    fn intern_program(&mut self, ops: Vec<CounterOp>) -> CounterProgramIdx {
-        let idx = CounterProgramIdx(self.programs.len() as u32);
-        // Check if the program is pure EmitContinue (no counter ops).
-        let pure_origins: Option<Box<[StateIdx]>> = {
-            let mut origins = Vec::new();
-            let mut pure = true;
-            for op in &ops {
-                match op {
-                    CounterOp::EmitContinue { origin } => origins.push(*origin),
-                    _ => {
-                        pure = false;
-                        break;
-                    }
-                }
-            }
-            if pure {
-                Some(origins.into_boxed_slice())
-            } else {
-                None
-            }
-        };
-        self.seed_emit_origins.push(pure_origins);
-        self.programs.push(ops);
-        idx
-    }
+    // -----------------------------------------------------------------------
+    // Epsilon closure
+    // -----------------------------------------------------------------------
 
-    /// Store a per-origin program table and return its index.
-    fn intern_origin_table(&mut self, table: Vec<(StateIdx, CounterProgramIdx)>) -> OriginTableIdx {
-        let idx = OriginTableIdx(self.origin_program_tables.len() as u32);
-        self.origin_program_tables.push(table);
-        idx
-    }
-
-    /// Epsilon closure that records counter operations into a program tree.
+    /// Compute epsilon closure.
     ///
-    /// Unlike Tier 1's `epsilon_closure` which uses an iterative stack,
-    /// this uses a recursive DFS because the counter program structure
-    /// mirrors the recursion tree (Init → body → Increment with branches).
+    /// `follow_break`: whether to follow the CInc break path (out1).
+    /// The continue path (out) is always followed.
     ///
-    /// Returns: `(sorted NFA consuming states, is_match, is_match_at_end, program ops)`.
-    fn epsilon_closure_with_program(
+    /// Also tracks CI traversals: when a CI is visited, consuming states
+    /// reachable from CI.out are recorded as seed instances.
+    fn epsilon_closure(
         &mut self,
         seeds: impl Iterator<Item = StateIdx>,
         states: &[State],
         at_start: bool,
         prev_byte: Option<u8>,
-    ) -> (Box<[StateIdx]>, bool, bool, Vec<CounterOp>) {
-        // Reset visited.
+        next_byte: Option<u8>,
+        follow_break: bool,
+    ) -> ClosureResult {
+        self.closure_stack.clear();
+        self.closure_result.clear();
+        self.closure_deferred.clear();
+        self.closure_seeds.clear();
         for v in self.closure_visited.iter_mut() {
             *v = false;
         }
 
-        let mut nfa_result: Vec<StateIdx> = Vec::new();
         let mut is_match = false;
         let mut is_match_at_end = false;
-        let mut ops = Vec::new();
+        let mut encountered_cinc = false;
 
-        let seeds: Vec<StateIdx> = seeds.collect();
-        for seed in seeds {
-            Self::trace_epsilon(
-                seed,
-                states,
-                at_start,
-                prev_byte,
-                &mut self.closure_visited,
-                &mut nfa_result,
-                &mut is_match,
-                &mut is_match_at_end,
-                &mut ops,
-            );
-        }
-
-        nfa_result.sort_unstable_by_key(|s| s.0);
-        nfa_result.dedup();
-
-        let nfa_states: Box<[StateIdx]> = nfa_result.into_boxed_slice();
-        (nfa_states, is_match, is_match_at_end, ops)
-    }
-
-    /// Recursive trace through epsilon states, recording counter ops.
-    ///
-    /// Uses **stack-based cycle detection**: a state is marked visited on
-    /// entry and unmarked on exit.  This prevents infinite loops on
-    /// epsilon-only cycles (e.g. `(a?){2}` where `CInc.continue → Split
-    /// → CInc`) while allowing sibling branches of the counter program
-    /// tree to re-traverse shared states.  The `nfa_result` vec may
-    /// contain duplicates; the caller deduplicates it.
-    #[allow(clippy::too_many_arguments)]
-    fn trace_epsilon(
-        idx: StateIdx,
-        states: &[State],
-        at_start: bool,
-        prev_byte: Option<u8>,
-        on_stack: &mut [bool],
-        nfa_result: &mut Vec<StateIdx>,
-        is_match: &mut bool,
-        is_match_at_end: &mut bool,
-        ops: &mut Vec<CounterOp>,
-    ) {
-        let i = idx.idx();
-        if on_stack[i] {
-            return;
-        }
-        on_stack[i] = true;
-
-        match states[idx] {
-            State::Split { out, out1 } => {
-                Self::trace_epsilon(
-                    out,
-                    states,
-                    at_start,
-                    prev_byte,
-                    on_stack,
-                    nfa_result,
-                    is_match,
-                    is_match_at_end,
-                    ops,
-                );
-                Self::trace_epsilon(
-                    out1,
-                    states,
-                    at_start,
-                    prev_byte,
-                    on_stack,
-                    nfa_result,
-                    is_match,
-                    is_match_at_end,
-                    ops,
-                );
+        self.closure_stack.extend(seeds);
+        while let Some(idx) = self.closure_stack.pop() {
+            let i = idx.idx();
+            if self.closure_visited[i] {
+                continue;
             }
-            State::Assert { kind, out } => match kind {
-                AssertKind::Start => {
-                    if at_start {
-                        Self::trace_epsilon(
-                            out,
-                            states,
-                            at_start,
-                            prev_byte,
-                            on_stack,
-                            nfa_result,
-                            is_match,
-                            is_match_at_end,
-                            ops,
-                        );
+            self.closure_visited[i] = true;
+
+            match states[idx] {
+                State::Split { out, out1 } => {
+                    self.closure_stack.push(out1);
+                    self.closure_stack.push(out);
+                }
+                State::Assert { kind, out } => {
+                    if kind == AssertKind::End {
+                        if self.can_reach_match(out, states) {
+                            is_match_at_end = true;
+                        }
+                        continue;
+                    }
+                    let result = kind.eval(at_start, false, prev_byte, next_byte);
+                    match result {
+                        AssertEval::Pass => self.closure_stack.push(out),
+                        AssertEval::Fail => {}
+                        AssertEval::Defer => self.closure_deferred.push(idx),
                     }
                 }
-                AssertKind::End => {
-                    // Check if Match is reachable through this `$` gate.
-                    let mut sub_match = false;
-                    let mut sub_match_at_end = false;
-                    let mut sub_ops = Vec::new();
-                    Self::trace_epsilon_for_end(
-                        out,
-                        states,
-                        &mut sub_match,
-                        &mut sub_match_at_end,
-                        &mut sub_ops,
-                    );
-                    if sub_match {
-                        *is_match_at_end = true;
-                        // Wrap the sub-program ops so they emit
-                        // MatchAtEnd instead of Match.
-                        rewrite_match_to_match_at_end(&mut sub_ops);
-                        ops.extend(sub_ops);
+                State::Match => {
+                    is_match = true;
+                }
+                State::CounterInstance { counter, out } => {
+                    self.closure_stack.push(out);
+                    self.closure_seeds.push((counter, out));
+                }
+                State::CounterIncrement { out, out1, .. } => {
+                    encountered_cinc = true;
+                    // Always follow continue (out).
+                    self.closure_stack.push(out);
+                    // Follow break (out1) only if requested.
+                    if follow_break {
+                        self.closure_stack.push(out1);
                     }
                 }
-                AssertKind::StartLF => {
-                    if at_start || prev_byte == Some(b'\n') {
-                        Self::trace_epsilon(
-                            out,
-                            states,
-                            at_start,
-                            prev_byte,
-                            on_stack,
-                            nfa_result,
-                            is_match,
-                            is_match_at_end,
-                            ops,
-                        );
-                    }
+                State::Byte { .. }
+                | State::ByteCI { .. }
+                | State::ByteClass { .. }
+                | State::ByteTable { .. } => {
+                    self.closure_result.push(idx);
                 }
-                _ => {
-                    debug_assert!(
-                        false,
-                        "complex assertion in counting-DFA pattern: {:?}",
-                        kind
-                    );
+            }
+        }
+
+        self.closure_result.sort_unstable_by_key(|s| s.0);
+        self.closure_result.dedup();
+        self.closure_deferred.sort_unstable_by_key(|s| s.0);
+        self.closure_deferred.dedup();
+
+        // Resolve CI seed pairs to (counter, consuming_state) pairs.
+        let mut seed_instances: Vec<(CounterIdx, StateIdx)> = Vec::new();
+        for &(counter, ci_out) in &self.closure_seeds {
+            let consuming = consuming_states_from(ci_out, states);
+            for c in consuming {
+                seed_instances.push((counter, c));
+            }
+        }
+        seed_instances.sort_by_key(|&(c, s)| (c.idx(), s.0));
+        seed_instances.dedup();
+
+        ClosureResult {
+            nfa_states: self.closure_result.as_slice().into(),
+            deferred_asserts: self.closure_deferred.as_slice().into(),
+            is_match,
+            is_match_at_end,
+            encountered_cinc,
+            seed_instances: seed_instances.into_boxed_slice(),
+        }
+    }
+
+    fn can_reach_match(&self, start: StateIdx, states: &[State]) -> bool {
+        let mut stack = vec![start];
+        let mut visited = vec![false; states.len()];
+        while let Some(idx) = stack.pop() {
+            let i = idx.idx();
+            if visited[i] {
+                continue;
+            }
+            visited[i] = true;
+            match states[idx] {
+                State::Match => return true,
+                State::Split { out, out1 } => {
+                    stack.push(out1);
+                    stack.push(out);
                 }
-            },
-            State::CounterInstance { counter, out } => {
-                let mut sub_ops = Vec::new();
-                Self::trace_epsilon(
-                    out,
-                    states,
-                    at_start,
-                    prev_byte,
-                    on_stack,
-                    nfa_result,
-                    is_match,
-                    is_match_at_end,
-                    &mut sub_ops,
-                );
-                ops.push(CounterOp::Init {
-                    counter,
-                    then: sub_ops,
-                });
-            }
-            State::CounterIncrement {
-                counter,
-                out,
-                out1,
-                min,
-                max,
-            } => {
-                // Continue path (re-enter body).
-                let mut cont_ops = Vec::new();
-                Self::trace_epsilon(
-                    out,
-                    states,
-                    at_start,
-                    prev_byte,
-                    on_stack,
-                    nfa_result,
-                    is_match,
-                    is_match_at_end,
-                    &mut cont_ops,
-                );
-                // Break path (exit repetition).
-                // Wrap in Remove(counter) so that the counter is
-                // deactivated when the context exits this loop.  This
-                // prevents stale counter values from triggering
-                // Increment ops from other positions in the DFA state.
-                let mut raw_break_ops = Vec::new();
-                Self::trace_epsilon(
-                    out1,
-                    states,
-                    at_start,
-                    prev_byte,
-                    on_stack,
-                    nfa_result,
-                    is_match,
-                    is_match_at_end,
-                    &mut raw_break_ops,
-                );
-                let break_ops = vec![CounterOp::Remove {
-                    counter,
-                    then: raw_break_ops,
-                }];
-                ops.push(CounterOp::Increment {
-                    counter,
-                    min,
-                    max,
-                    on_continue: cont_ops,
-                    on_break: break_ops,
-                });
-            }
-            State::Match => {
-                *is_match = true;
-                ops.push(CounterOp::EmitMatch);
-            }
-            State::Byte { .. }
-            | State::ByteCI { .. }
-            | State::ByteClass { .. }
-            | State::ByteTable { .. } => {
-                nfa_result.push(idx);
-                ops.push(CounterOp::EmitContinue { origin: idx });
+                State::Assert { out, .. } => stack.push(out),
+                State::CounterInstance { out, .. } => stack.push(out),
+                State::CounterIncrement { out, .. } => {
+                    // Only follow the continue path (out).  The break path
+                    // (out1) requires a counter instance with value >= min,
+                    // which we cannot verify structurally.  Counter-aware
+                    // break matching is handled by instance tracking in
+                    // step_slow / finish.
+                    stack.push(out);
+                }
+                _ => {}
             }
         }
-
-        on_stack[i] = false;
+        false
     }
 
-    /// Trace epsilon transitions for the `$` (End) path.
-    ///
-    /// This is a separate function because the `$` gate's sub-graph may
-    /// contain counter operations that should only fire at end-of-input.
-    /// We don't use the main `visited` set because these states may also
-    /// appear in the main closure.
-    #[allow(clippy::only_used_in_recursion)]
-    fn trace_epsilon_for_end(
-        idx: StateIdx,
-        states: &[State],
-        is_match: &mut bool,
-        is_match_at_end: &mut bool,
-        ops: &mut Vec<CounterOp>,
-    ) {
-        match states[idx] {
-            State::Match => {
-                *is_match = true;
-                ops.push(CounterOp::EmitMatch);
-            }
-            State::Split { out, out1 } => {
-                Self::trace_epsilon_for_end(out, states, is_match, is_match_at_end, ops);
-                Self::trace_epsilon_for_end(out1, states, is_match, is_match_at_end, ops);
-            }
-            State::Assert {
-                kind: AssertKind::End | AssertKind::Start | AssertKind::StartLF,
-                out,
-            } => {
-                Self::trace_epsilon_for_end(out, states, is_match, is_match_at_end, ops);
-            }
-            State::CounterInstance { counter, out } => {
-                let mut sub_ops = Vec::new();
-                Self::trace_epsilon_for_end(out, states, is_match, is_match_at_end, &mut sub_ops);
-                ops.push(CounterOp::Init {
-                    counter,
-                    then: sub_ops,
-                });
-            }
-            State::CounterIncrement {
-                counter,
-                out,
-                out1,
-                min,
-                max,
-            } => {
-                let mut cont_ops = Vec::new();
-                Self::trace_epsilon_for_end(out, states, is_match, is_match_at_end, &mut cont_ops);
-                let mut raw_break_ops = Vec::new();
-                Self::trace_epsilon_for_end(
-                    out1,
-                    states,
-                    is_match,
-                    is_match_at_end,
-                    &mut raw_break_ops,
-                );
-                let break_ops = vec![CounterOp::Remove {
-                    counter,
-                    then: raw_break_ops,
-                }];
-                ops.push(CounterOp::Increment {
-                    counter,
-                    min,
-                    max,
-                    on_continue: cont_ops,
-                    on_break: break_ops,
-                });
-            }
-            _ => {} // Consuming states block the path at end-of-input.
+    fn resolve_deferred(&self, from_state: &DfaState, byte: u8, regex: &Regex) -> Vec<StateIdx> {
+        let mut extra = Vec::new();
+        if from_state.deferred_asserts.is_empty() {
+            return extra;
         }
+        let prev = if from_state.prev_was_word {
+            Some(b'a')
+        } else {
+            Some(b' ')
+        };
+        for &assert_idx in from_state.deferred_asserts.iter() {
+            if let State::Assert { kind, out } = regex.states[assert_idx]
+                && kind.eval(false, false, prev, Some(byte)) == AssertEval::Pass
+            {
+                extra.push(out);
+            }
+        }
+        extra
     }
 
-    /// Compute a counting transition for `(from_state, byte)`, using
-    /// byte-class compression (stride < 256).
-    #[inline(always)]
-    fn transition(&mut self, from: DfaStateId, byte: u8, regex: &Regex) -> CountingTransition {
-        if from == DfaStateId::DEAD {
-            let t = self.populate(from, byte, regex);
-            return t;
+    fn resolve_deferred_at_end(&self, state: &DfaState, regex: &Regex) -> bool {
+        if state.deferred_asserts.is_empty() {
+            return false;
         }
-        let slot = from.0 as usize * self.stride + regex.byte_classes[byte as usize] as usize;
-        let t = self.transitions[slot];
-        if !t.is_unpopulated() {
-            return t;
+        let prev = if state.prev_was_word {
+            Some(b'a')
+        } else {
+            Some(b' ')
+        };
+        for &assert_idx in state.deferred_asserts.iter() {
+            if let State::Assert { kind, out } = regex.states[assert_idx]
+                && kind.eval(false, true, prev, None) == AssertEval::Pass
+                && self.can_reach_match(out, &regex.states)
+            {
+                return true;
+            }
         }
-        let t = self.populate(from, byte, regex);
-        self.transitions[slot] = t;
-        t
+        false
     }
 
-    /// Compute a counting transition for `(from_state, byte)`, using the
-    /// identity mapping (stride=256, no byte-class indirection).
-    #[inline(always)]
-    fn transition_direct(
-        &mut self,
-        from: DfaStateId,
-        byte: u8,
-        regex: &Regex,
-    ) -> CountingTransition {
-        if from == DfaStateId::DEAD {
-            let t = self.populate(from, byte, regex);
-            return t;
-        }
-        let slot = from.0 as usize * 256 + byte as usize;
-        let t = self.transitions[slot];
-        if !t.is_unpopulated() {
-            return t;
-        }
-        let t = self.populate(from, byte, regex);
-        self.transitions[slot] = t;
-        t
-    }
+    // -----------------------------------------------------------------------
+    // Transition computation
+    // -----------------------------------------------------------------------
 
-    /// On cache miss: compute the next DFA state and per-origin counter
-    /// programs.
-    ///
-    /// For each NFA consuming state in the `from` DFA state, we compute
-    /// the NFA target when consuming `byte`, then run a separate epsilon
-    /// closure to get the counter program for that origin.  This ensures
-    /// that contexts at different NFA positions receive only their own
-    /// counter ops.
-    fn populate(&mut self, from: DfaStateId, byte: u8, regex: &Regex) -> CountingTransition {
-        // Collect (origin_nfa_state, nfa_target) pairs.
-        let mut origin_targets: Vec<(StateIdx, StateIdx)> = Vec::new();
+    /// Compute the transition for `(from_state, byte)`.
+    fn populate(&mut self, from: DfaStateId, byte: u8, regex: &Regex) -> Transition {
+        // Phase 1: collect targets — NFA states reached after consuming `byte`.
+        let mut targets_per_origin: Vec<(StateIdx, Vec<StateIdx>)> = Vec::new();
+
+        let mut resolved_seeds: Vec<(CounterIdx, StateIdx, u32)> = Vec::new();
+        let mut resolved_cinc = false;
+        let mut resolved_is_match = false;
+        let mut resolved_is_match_at_end = false;
 
         if from != DfaStateId::DEAD {
+            let from_state = &self.states[from.idx()];
+
+            // Resolve deferred assertions.
+            let extra = self.resolve_deferred(from_state, byte, regex);
+            if !extra.is_empty() {
+                let resolved_prev = if self.states[from.idx()].prev_was_word {
+                    Some(b'a')
+                } else {
+                    Some(b' ')
+                };
+                let cr = self.epsilon_closure(
+                    extra.into_iter(),
+                    &regex.states,
+                    false,
+                    resolved_prev,
+                    Some(byte),
+                    true, // follow_break=true for resolved assert closure
+                );
+                resolved_seeds = cr
+                    .seed_instances
+                    .iter()
+                    .map(|&(c, s)| (c, s, 0u32))
+                    .collect();
+                resolved_cinc = cr.encountered_cinc;
+                resolved_is_match = cr.is_match;
+                resolved_is_match_at_end = cr.is_match_at_end;
+                for &idx in cr.nfa_states.iter() {
+                    if let Some(t) = consume_byte(idx, byte, regex) {
+                        targets_per_origin.push((idx, vec![t]));
+                    }
+                }
+            }
+
+            // Phase 2: consuming states in `from` consume `byte`.
             let nfa_states = self.states[from.idx()].nfa_states.clone();
             for &idx in nfa_states.iter() {
-                let target = match regex.states[idx] {
-                    State::Byte { byte: b2, out } if byte == b2 => Some(out),
-                    State::ByteCI { byte: b2, out } if byte_match_ci(byte, b2) => Some(out),
-                    State::ByteClass { class, out } if regex.classes[class][byte] => Some(out),
-                    State::ByteTable { table } => {
-                        let t = regex.byte_tables[table][byte];
-                        if t != StateIdx::NONE { Some(t) } else { None }
-                    }
-                    _ => None,
-                };
-                if let Some(t) = target {
-                    origin_targets.push((idx, t));
+                if let Some(t) = consume_byte(idx, byte, regex) {
+                    targets_per_origin.push((idx, vec![t]));
                 }
             }
         }
 
-        let mut merged: Vec<StateIdx> = Vec::new();
-        let mut is_match = false;
-        let mut is_match_at_end = false;
-        let mut origin_table: Vec<(StateIdx, CounterProgramIdx)> = Vec::new();
+        let all_targets: Vec<StateIdx> = targets_per_origin
+            .iter()
+            .flat_map(|(_, ts)| ts.iter().copied())
+            .collect();
 
-        // Per-origin closures.
-        for (origin, target) in &origin_targets {
-            let (nfa, m, mae, ops) = self.epsilon_closure_with_program(
-                std::iter::once(*target),
+        // Probe: full "both" closure to detect CInc and collect seeds.
+        let probe = self.epsilon_closure(
+            all_targets
+                .iter()
+                .copied()
+                .chain(std::iter::once(regex.start)),
+            &regex.states,
+            false,
+            Some(byte),
+            None,
+            true, // follow_break=true
+        );
+
+        let is_counting = probe.encountered_cinc || resolved_cinc;
+
+        // Build per-origin actions.
+        let mut origin_keys = Vec::new();
+        let mut origin_actions = Vec::new();
+        for &(origin, ref targets) in &targets_per_origin {
+            let action = self.compute_origin_action(targets, regex);
+            origin_keys.push(origin);
+            origin_actions.push(action);
+        }
+
+        // Compute seed initial values.  Resolved deferred seeds whose
+        // origin consumed the byte and had an Increment action start at
+        // value 1 (the resolving byte already counted as one iteration).
+        for rs in &mut resolved_seeds {
+            if let Some(pos) = origin_keys.iter().position(|&k| k == rs.1)
+                && matches!(origin_actions[pos], OriginAction::Increment { .. })
+            {
+                rs.2 = 1;
+            }
+        }
+
+        let mut seed_instances: Vec<(CounterIdx, StateIdx, u32)> = probe
+            .seed_instances
+            .iter()
+            .map(|&(c, s)| (c, s, 0u32))
+            .collect();
+        for s in &resolved_seeds {
+            if !seed_instances
+                .iter()
+                .any(|e| e.0 == s.0 && e.1 == s.1 && e.2 == s.2)
+            {
+                seed_instances.push(*s);
+            }
+        }
+        let seed_instances: Box<[(CounterIdx, StateIdx, u32)]> = seed_instances.into();
+
+        // Compute DFA successors: no_break and with_break.
+        if is_counting {
+            // Two separate closures.
+            let cr_nb = self.epsilon_closure(
+                all_targets
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(regex.start)),
                 &regex.states,
                 false,
                 Some(byte),
+                None,
+                false, // follow_break=false → no_break
             );
-            is_match = is_match || m;
-            is_match_at_end = is_match_at_end || mae;
-            merged.extend_from_slice(&nfa);
-            let prog_idx = self.intern_program(ops);
-            origin_table.push((*origin, prog_idx));
-        }
+            let nb_id = self.intern_closure_result(&cr_nb, byte);
 
-        // Seed closure (from regex.start, at_start=false for re-seed).
-        let (seed_nfa, seed_match, seed_match_at_end, seed_ops) = self
-            .epsilon_closure_with_program(
-                std::iter::once(regex.start),
-                &regex.states,
-                false,
-                Some(byte),
-            );
-        let seed_program = self.intern_program(seed_ops);
-        is_match = is_match || seed_match;
-        is_match_at_end = is_match_at_end || seed_match_at_end;
-        merged.extend_from_slice(&seed_nfa);
+            // with_break reuses the probe closure.
+            let wb_id = self.intern_closure_result(&probe, byte);
 
-        // Dedup merged NFA states.
-        merged.sort_unstable_by_key(|s| s.0);
-        merged.dedup();
+            let (nb_m, nb_mae) = self.match_flags(nb_id);
+            let (wb_m, wb_mae) = self.match_flags(wb_id);
 
-        let origin_table_idx = self.intern_origin_table(origin_table);
+            // Fold resolved deferred assertion matches into both
+            // successors' flags.  `resolved_is_match` applies
+            // unconditionally (the DFA state that was transitioned FROM
+            // already encodes the correct counter-aware path).
+            Transition {
+                no_break: nb_id,
+                no_break_is_match: nb_m || resolved_is_match,
+                no_break_is_match_at_end: nb_mae || resolved_is_match_at_end,
+                with_break: wb_id,
+                with_break_is_match: wb_m || resolved_is_match,
+                with_break_is_match_at_end: wb_mae || resolved_is_match_at_end,
+                is_counting: true,
+                seeds: seed_instances,
+                origin_keys: origin_keys.into_boxed_slice(),
+                origin_actions: origin_actions.into_boxed_slice(),
+            }
+        } else {
+            // Non-counting: both successors are the same.
+            let id = self.intern_closure_result(&probe, byte);
+            let (m, mae) = self.match_flags(id);
 
-        if merged.is_empty() && !is_match && !is_match_at_end {
-            return CountingTransition {
-                next: DfaStateId::DEAD,
-                origin_table: origin_table_idx,
-                seed_program,
-            };
-        }
-        let next = self.intern_state(merged.into_boxed_slice(), is_match, is_match_at_end);
-        CountingTransition {
-            next,
-            origin_table: origin_table_idx,
-            seed_program,
+            Transition {
+                no_break: id,
+                no_break_is_match: m || resolved_is_match,
+                no_break_is_match_at_end: mae || resolved_is_match_at_end,
+                with_break: id,
+                with_break_is_match: m || resolved_is_match,
+                with_break_is_match_at_end: mae || resolved_is_match_at_end,
+                is_counting: false,
+                seeds: seed_instances,
+                origin_keys: origin_keys.into_boxed_slice(),
+                origin_actions: origin_actions.into_boxed_slice(),
+            }
         }
     }
 
-    /// Reset the cache.
+    /// Intern a closure result into the state table.  Returns DEAD if
+    /// empty or if the state cap is reached.
+    fn intern_closure_result(&mut self, cr: &ClosureResult, byte: u8) -> DfaStateId {
+        if cr.nfa_states.is_empty()
+            && cr.deferred_asserts.is_empty()
+            && !cr.is_match
+            && !cr.is_match_at_end
+        {
+            return DfaStateId::DEAD;
+        }
+        let pw = if cr.deferred_asserts.is_empty() {
+            false
+        } else {
+            is_word_byte(byte)
+        };
+        self.intern_state(
+            cr.nfa_states.clone(),
+            cr.deferred_asserts.clone(),
+            cr.is_match,
+            cr.is_match_at_end,
+            pw,
+        )
+        .unwrap_or(DfaStateId::DEAD)
+    }
+
+    /// Get match flags for a DFA state ID.
+    fn match_flags(&self, id: DfaStateId) -> (bool, bool) {
+        if id == DfaStateId::DEAD {
+            (false, false)
+        } else {
+            let s = &self.states[id.idx()];
+            (s.is_match, s.is_match_at_end)
+        }
+    }
+
+    /// Compute the origin action for a specific set of targets.
+    fn compute_origin_action(&mut self, targets: &[StateIdx], regex: &Regex) -> OriginAction {
+        // Check if any target leads to CInc through epsilon transitions.
+        let mut found_cinc: Option<(usize, usize)> = None;
+        for &t in targets {
+            if let Some(info) = find_cinc_through_epsilon(t, &regex.states) {
+                found_cinc = Some(info);
+                break;
+            }
+        }
+
+        if let Some((min, max)) = found_cinc {
+            // Check for non-CInc paths (e.g., `+` loop before CInc).
+            let cr_no_cinc = epsilon_closure_stop_at_cinc(targets, &regex.states);
+
+            let cr_continue = self.epsilon_closure(
+                targets.iter().copied(),
+                &regex.states,
+                false,
+                None,
+                None,
+                false, // follow_break=false → continue only
+            );
+            let cr_break_only = self.epsilon_closure_break_only(targets, &regex.states);
+
+            OriginAction::Increment {
+                advance_origins: cr_no_cinc.into_boxed_slice(),
+                min: min as u32,
+                max: max as u32,
+                continue_origins: cr_continue.nfa_states,
+                break_is_match: cr_break_only.0,
+                break_is_match_at_end: cr_break_only.1,
+            }
+        } else {
+            // No CInc ��� just advance.
+            let cr = self.epsilon_closure(
+                targets.iter().copied(),
+                &regex.states,
+                false,
+                None,
+                None,
+                true,
+            );
+            if cr.nfa_states.is_empty() {
+                OriginAction::Dead
+            } else {
+                OriginAction::Advance {
+                    new_origins: cr.nfa_states,
+                }
+            }
+        }
+    }
+
+    /// Epsilon closure that only follows the CInc break path (out1), not
+    /// the continue path (out).  Returns (is_match, is_match_at_end).
+    fn epsilon_closure_break_only(&self, targets: &[StateIdx], states: &[State]) -> (bool, bool) {
+        let mut stack: Vec<StateIdx> = Vec::new();
+        let mut visited = vec![false; states.len()];
+        let mut is_match = false;
+        let mut is_match_at_end = false;
+
+        // First, walk from targets to find CInc nodes, then follow only out1.
+        let mut init_stack: Vec<StateIdx> = targets.to_vec();
+        let mut init_visited = vec![false; states.len()];
+        while let Some(idx) = init_stack.pop() {
+            let i = idx.idx();
+            if init_visited[i] {
+                continue;
+            }
+            init_visited[i] = true;
+            match states[idx] {
+                State::Split { out, out1 } => {
+                    init_stack.push(out1);
+                    init_stack.push(out);
+                }
+                State::Assert { out, .. } => init_stack.push(out),
+                State::CounterInstance { out, .. } => init_stack.push(out),
+                State::CounterIncrement { out1, .. } => {
+                    // Only follow break path.
+                    stack.push(out1);
+                }
+                _ => {}
+            }
+        }
+
+        // Now do a standard epsilon closure from the break targets.
+        while let Some(idx) = stack.pop() {
+            let i = idx.idx();
+            if visited[i] {
+                continue;
+            }
+            visited[i] = true;
+            match states[idx] {
+                State::Split { out, out1 } => {
+                    stack.push(out1);
+                    stack.push(out);
+                }
+                State::Assert { kind, out } => {
+                    if kind == AssertKind::End && self.can_reach_match(out, states) {
+                        is_match_at_end = true;
+                    }
+                    // Do NOT follow other assertions.  Deferred assertions
+                    // (\b, EndLF, etc.) are resolved at DFA transition time
+                    // via the with_break state's deferred_asserts.  Start/
+                    // StartLF cannot pass in break context (past the start
+                    // of input).
+                }
+                State::Match => {
+                    is_match = true;
+                }
+                State::CounterInstance { out, .. } => stack.push(out),
+                _ => {}
+            }
+        }
+
+        (is_match, is_match_at_end)
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache management
+    // -----------------------------------------------------------------------
+
     fn clear(&mut self, num_nfa_states: usize, stride: usize) {
         self.states.clear();
         self.state_map.clear();
         self.transitions.clear();
-        self.programs.clear();
-        self.origin_program_tables.clear();
-        self.seed_emit_origins.clear();
+        self.stride = stride;
+        self.closure_deferred.clear();
+        self.closure_seeds.clear();
         self.closure_visited.clear();
         self.closure_visited.resize(num_nfa_states, false);
-        self.stride = stride;
         self.regex_id = 0;
         self.start_id = DfaStateId::DEAD;
-        self.start_program = CounterProgramIdx(0);
         self.start_is_match = false;
         self.start_is_match_at_end = false;
+        self.start_seeds = Box::new([]);
     }
 
     /// Prepare the cache for `regex`.
@@ -864,373 +753,490 @@ impl CountingDfaCache {
         self.clear(regex.states.len(), regex.num_byte_classes);
         self.regex_id = id;
 
-        let (nfa_set, is_match, is_match_at_end, ops) = self.epsilon_closure_with_program(
+        let cr = self.epsilon_closure(
             std::iter::once(regex.start),
             &regex.states,
             true,
             None,
+            None,
+            true, // follow_break=true for start closure
         );
-        self.start_id = self.intern_state(nfa_set, is_match, is_match_at_end);
-        self.start_program = self.intern_program(ops);
-        self.start_is_match = is_match;
-        self.start_is_match_at_end = is_match_at_end;
+        self.start_id = self
+            .intern_state(
+                cr.nfa_states,
+                cr.deferred_asserts,
+                cr.is_match,
+                cr.is_match_at_end,
+                false,
+            )
+            .expect("start state exceeds DFA_MAX_STATES");
+        self.start_is_match = self.states[self.start_id.idx()].is_match;
+        self.start_is_match_at_end = self.states[self.start_id.idx()].is_match_at_end;
+        self.start_seeds = cr
+            .seed_instances
+            .iter()
+            .map(|&(c, s)| (c, s, 0u32))
+            .collect();
     }
 }
 
-/// Rewrite `EmitMatch` to `EmitMatchAtEnd` in a program tree.
-fn rewrite_match_to_match_at_end(ops: &mut [CounterOp]) {
-    for op in ops.iter_mut() {
-        match op {
-            CounterOp::EmitMatch => {
-                *op = CounterOp::EmitMatchAtEnd;
+// ---------------------------------------------------------------------------
+// ClosureResult
+// ---------------------------------------------------------------------------
+
+struct ClosureResult {
+    nfa_states: Box<[StateIdx]>,
+    deferred_asserts: Box<[StateIdx]>,
+    is_match: bool,
+    is_match_at_end: bool,
+    encountered_cinc: bool,
+    seed_instances: Box<[(CounterIdx, StateIdx)]>,
+}
+
+// ---------------------------------------------------------------------------
+// Free functions
+// ---------------------------------------------------------------------------
+
+/// Try to consume `byte` at NFA state `idx`.
+fn consume_byte(idx: StateIdx, byte: u8, regex: &Regex) -> Option<StateIdx> {
+    match regex.states[idx] {
+        State::Byte { byte: b, out } if byte == b => Some(out),
+        State::ByteCI { byte: b, out } if byte_match_ci(byte, b) => Some(out),
+        State::ByteClass { class, out } if regex.classes[class][byte] => Some(out),
+        State::ByteTable { table } => {
+            let t = regex.byte_tables[table][byte];
+            if t != StateIdx::NONE { Some(t) } else { None }
+        }
+        _ => None,
+    }
+}
+
+/// Find all consuming NFA states reachable from `start` through epsilon
+/// transitions.
+fn consuming_states_from(start: StateIdx, states: &[State]) -> Vec<StateIdx> {
+    let mut result = Vec::new();
+    let mut stack = vec![start];
+    let mut visited = vec![false; states.len()];
+    while let Some(idx) = stack.pop() {
+        let i = idx.idx();
+        if visited[i] {
+            continue;
+        }
+        visited[i] = true;
+        match states[idx] {
+            State::Split { out, out1 } => {
+                stack.push(out1);
+                stack.push(out);
             }
-            CounterOp::Init { then, .. } | CounterOp::Remove { then, .. } => {
-                rewrite_match_to_match_at_end(then);
-            }
-            CounterOp::Increment {
-                on_continue,
-                on_break,
-                ..
-            } => {
-                rewrite_match_to_match_at_end(on_continue);
-                rewrite_match_to_match_at_end(on_break);
+            State::Assert { out, .. } => stack.push(out),
+            State::CounterInstance { out, .. } => stack.push(out),
+            State::Byte { .. }
+            | State::ByteCI { .. }
+            | State::ByteClass { .. }
+            | State::ByteTable { .. } => {
+                result.push(idx);
             }
             _ => {}
         }
     }
+    result
 }
 
-// ---------------------------------------------------------------------------
-// Tier 3 matcher
-// ---------------------------------------------------------------------------
-
-/// Counting DFA matcher for patterns with bounded repetitions.
-///
-/// The DFA handles state transitions (cacheable); counter values live
-/// in a side-channel of `CounterCtx` entries updated by compiled
-/// counter programs.  Each context also tracks its NFA "origin"
-/// (the consuming state it is waiting at) so that only the relevant
-/// counter program is applied to it.
-pub struct CountingDfaMatcher<'a> {
-    cache: &'a mut CountingDfaCache,
-    regex: &'a Regex,
-    pool: &'a mut CounterPool,
-    /// Current DFA state.
-    current: DfaStateId,
-    /// Active counter contexts, each paired with its NFA origin.
-    /// Does NOT include implicit "seed" contexts — those are tracked
-    /// separately via `seed_origins` to avoid redundant alloc/free.
-    contexts: Vec<(CounterCtx, StateIdx)>,
-    /// Scratch space for new contexts during step (avoids realloc).
-    next_contexts: Vec<(CounterCtx, StateIdx)>,
-    /// Scratch space for program execution results (avoids per-step alloc).
-    results: Vec<ProgramResult>,
-    /// Whether a match has been found.
-    ever_matched: bool,
-    /// Whether a match-at-end has been found (current step only).
-    match_at_end: bool,
-    /// When `Some`, the given set of NFA origins has implicit empty
-    /// contexts that are not stored in `contexts`.  This avoids
-    /// allocating and freeing empty contexts every step for unanchored
-    /// patterns where the seed program is pure `EmitContinue`.
-    /// The index points into `cache.seed_emit_origins`.
-    seed_origins_idx: Option<CounterProgramIdx>,
-}
-
-impl<'a> CountingDfaMatcher<'a> {
-    pub(crate) fn new(
-        cache: &'a mut CountingDfaCache,
-        regex: &'a Regex,
-        pool: &'a mut CounterPool,
-    ) -> Self {
-        pool.clear();
-        pool.num_counters = regex.num_counters;
-
-        // Apply the start program to a fresh context to get initial contexts.
-        let mut contexts = Vec::new();
-        let mut ever_matched = false;
-        let mut match_at_end = false;
-        let mut seed_origins_idx = None;
-
-        let start_idx = cache.start_program;
-        if cache.seed_emit_origins[start_idx.0 as usize].is_some() {
-            // Pure-emit start program: track seed origins implicitly.
-            seed_origins_idx = Some(start_idx);
-        } else {
-            let fresh = CounterCtx::new();
-            let start_prog = &cache.programs[start_idx.0 as usize];
-            let mut results = Vec::new();
-            execute_program(start_prog, &fresh, pool, &mut results);
-            for r in results {
-                match r {
-                    ProgramResult::Continue(ctx, origin) => contexts.push((ctx, origin)),
-                    ProgramResult::Match => ever_matched = true,
-                    ProgramResult::MatchAtEnd => match_at_end = true,
-                }
+/// Epsilon closure that stops at CInc (doesn't follow continue or break).
+/// Returns consuming NFA states reachable without passing through CInc.
+fn epsilon_closure_stop_at_cinc(targets: &[StateIdx], states: &[State]) -> Vec<StateIdx> {
+    let mut result = Vec::new();
+    let mut stack: Vec<StateIdx> = targets.to_vec();
+    let mut visited = vec![false; states.len()];
+    while let Some(idx) = stack.pop() {
+        let i = idx.idx();
+        if visited[i] {
+            continue;
+        }
+        visited[i] = true;
+        match states[idx] {
+            State::Split { out, out1 } => {
+                stack.push(out1);
+                stack.push(out);
             }
-            // Dedup initial contexts.
-            dedup_contexts(&mut contexts, pool);
+            State::Assert { out, .. } => stack.push(out),
+            State::CounterInstance { out, .. } => stack.push(out),
+            State::CounterIncrement { .. } => { /* stop */ }
+            State::Match => {}
+            State::Byte { .. }
+            | State::ByteCI { .. }
+            | State::ByteClass { .. }
+            | State::ByteTable { .. } => {
+                result.push(idx);
+            }
+        }
+    }
+    result.sort_unstable_by_key(|s| s.0);
+    result.dedup();
+    result
+}
+
+/// Check if `start` can reach a CInc through epsilon transitions.
+/// Returns (min, max) if found.
+fn find_cinc_through_epsilon(start: StateIdx, states: &[State]) -> Option<(usize, usize)> {
+    let mut stack = vec![start];
+    let mut visited = vec![false; states.len()];
+    while let Some(idx) = stack.pop() {
+        let i = idx.idx();
+        if visited[i] {
+            continue;
+        }
+        visited[i] = true;
+        match states[idx] {
+            State::CounterIncrement { min, max, .. } => {
+                return Some((min, max));
+            }
+            State::Split { out, out1 } => {
+                stack.push(out1);
+                stack.push(out);
+            }
+            State::Assert { out, .. } => stack.push(out),
+            State::CounterInstance { out, .. } => stack.push(out),
+            _ => {}
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3 Matcher
+// ---------------------------------------------------------------------------
+
+/// Tier 3 DFA matcher.
+pub struct Tier3DfaMatcher<'a> {
+    cache: &'a mut Tier3DfaCache,
+    regex: &'a Regex,
+    current: DfaStateId,
+    counters: Vec<Vec<Instance>>,
+    next_instances: Vec<Vec<Instance>>,
+    ever_matched: bool,
+    match_at_end: bool,
+    has_live_instances: bool,
+    prefilter: Prefilter,
+}
+
+impl<'a> Tier3DfaMatcher<'a> {
+    pub(crate) fn new(cache: &'a mut Tier3DfaCache, regex: &'a Regex) -> Self {
+        let mut counters: Vec<Vec<Instance>> =
+            (0..regex.num_counters).map(|_| Vec::new()).collect();
+        let next_instances: Vec<Vec<Instance>> =
+            (0..regex.num_counters).map(|_| Vec::new()).collect();
+
+        for &(counter, origin, value) in cache.start_seeds.iter() {
+            counters[counter.idx()].push(Instance { value, origin });
         }
 
-        if cache.start_is_match {
-            ever_matched = true;
-        }
-        if cache.start_is_match_at_end {
-            match_at_end = true;
-        }
+        let ever_matched = cache.start_is_match;
+        let match_at_end = cache.start_is_match_at_end;
+        let has_live_instances = !cache.start_seeds.is_empty();
 
-        CountingDfaMatcher {
+        Tier3DfaMatcher {
             current: cache.start_id,
             ever_matched,
             match_at_end,
-            seed_origins_idx,
+            has_live_instances,
             cache,
             regex,
-            pool,
-            contexts,
-            next_contexts: Vec::new(),
-            results: Vec::new(),
+            counters,
+            next_instances,
+            prefilter: regex.prefilter,
         }
     }
 
-    /// Advance by one byte.
+    #[inline(always)]
+    fn ensure_transition(&mut self, byte: u8) -> usize {
+        let class = if self.cache.stride == 256 {
+            byte as usize
+        } else {
+            self.regex.byte_classes[byte as usize] as usize
+        };
+        let slot = self.current.idx() * self.cache.stride + class;
+        if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
+            let trans = self.cache.populate(self.current, byte, self.regex);
+            self.cache.transitions[slot] = trans;
+        }
+        slot
+    }
+
     #[inline]
     pub fn step(&mut self, byte: u8) {
-        let trans = if self.cache.stride == 256 {
-            self.cache.transition_direct(self.current, byte, self.regex)
-        } else {
-            self.cache.transition(self.current, byte, self.regex)
-        };
-        self.current = trans.next;
-
-        let origin_table = &self.cache.origin_program_tables[trans.origin_table.0 as usize];
-
-        // ---- Ultra-fast path: seed-only + empty origin table ----
-        // When we only have implicit seed contexts and no NFA consuming
-        // state consumed this byte, the step is a no-op: DFA state
-        // advances, seed resets, done.  This is the overwhelmingly
-        // common case for unanchored patterns on non-matching bytes.
-        if self.seed_origins_idx.is_some() && self.contexts.is_empty() && origin_table.is_empty() {
-            let seed_idx = trans.seed_program;
-            if self.cache.seed_emit_origins[seed_idx.0 as usize].is_some() {
-                self.seed_origins_idx = Some(seed_idx);
-                self.match_at_end = false;
-                return;
-            }
+        if self.current == DfaStateId::DEAD {
+            self.step_from_dead(byte);
+            return;
         }
 
-        // Reset match_at_end: it must reflect only the CURRENT step,
-        // not be accumulated across steps.  The `$` assertion is only
-        // meaningful at the actual end-of-input, evaluated in finish().
-        self.match_at_end = false;
+        let slot = self.ensure_transition(byte);
+        let t = &self.cache.transitions[slot];
 
-        self.next_contexts.clear();
-
-        // --- Phase 1: Process implicit seed contexts ---
-        // When seed_origins_idx is set, we have implicit empty contexts
-        // at those origins.  Check if any of them survive this transition.
-        if let Some(seed_prog_idx) = self.seed_origins_idx
-            && !origin_table.is_empty()
-        {
-            let origins = self.cache.seed_emit_origins[seed_prog_idx.0 as usize]
-                .as_ref()
-                .unwrap();
-            for &seed_origin in origins.iter() {
-                // Look up the program for this seed origin.
-                let prog_idx = origin_table
-                    .iter()
-                    .find(|(o, _)| *o == seed_origin)
-                    .map(|(_, idx)| *idx);
-                if let Some(prog_idx) = prog_idx {
-                    let prog = &self.cache.programs[prog_idx.0 as usize];
-                    // Seed contexts are empty — execute the program
-                    // with a fresh context.
-                    let fresh = CounterCtx::new();
-                    self.results.clear();
-                    execute_program(prog, &fresh, self.pool, &mut self.results);
-                    for r in self.results.drain(..) {
-                        match r {
-                            ProgramResult::Continue(new_ctx, new_origin) => {
-                                self.next_contexts.push((new_ctx, new_origin));
-                            }
-                            ProgramResult::Match => {
-                                self.ever_matched = true;
-                            }
-                            ProgramResult::MatchAtEnd => {
-                                self.match_at_end = true;
-                            }
-                        }
-                    }
-                }
-                // If no program for this seed origin, it dies (no-op).
+        // Fast path: non-counting, no seeds, no live instances.
+        if !t.is_counting && t.seeds.is_empty() && !self.has_live_instances {
+            self.current = t.no_break;
+            self.match_at_end = t.no_break_is_match_at_end;
+            if t.no_break_is_match {
+                self.ever_matched = true;
             }
-            // If origin_table is empty, all implicit seed contexts die (no-op).
+            return;
         }
 
-        // --- Phase 2: Process explicit (non-seed) contexts ---
-        if origin_table.is_empty() {
-            // All contexts die — free them in bulk.
-            for (ctx, _) in self.contexts.drain(..) {
-                self.pool.free(ctx.into_range());
-            }
-        } else {
-            for (mut ctx, ctx_origin) in self.contexts.drain(..) {
-                // Find the program for this context's origin NFA state.
-                let prog_idx = if origin_table.len() == 1 {
-                    let (origin, idx) = origin_table[0];
-                    if origin == ctx_origin {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                } else {
-                    origin_table
-                        .iter()
-                        .find(|(origin, _)| *origin == ctx_origin)
-                        .map(|(_, idx)| *idx)
-                };
-                if let Some(prog_idx) = prog_idx {
-                    let prog = &self.cache.programs[prog_idx.0 as usize];
-                    // Fast path: single Increment with one active branch.
-                    if let Some(result) = try_execute_inplace(prog, &mut ctx, self.pool) {
-                        match result {
-                            ProgramResult::Continue(_, new_origin) => {
-                                self.next_contexts.push((ctx, new_origin));
-                                continue;
-                            }
-                            ProgramResult::Match => {
-                                self.ever_matched = true;
-                            }
-                            ProgramResult::MatchAtEnd => {
-                                self.match_at_end = true;
-                            }
-                        }
-                    } else {
-                        self.results.clear();
-                        execute_program(prog, &ctx, self.pool, &mut self.results);
-                        for r in self.results.drain(..) {
-                            match r {
-                                ProgramResult::Continue(new_ctx, new_origin) => {
-                                    self.next_contexts.push((new_ctx, new_origin));
-                                }
-                                ProgramResult::Match => {
-                                    self.ever_matched = true;
-                                }
-                                ProgramResult::MatchAtEnd => {
-                                    self.match_at_end = true;
-                                }
-                            }
-                        }
-                    }
-                }
-                self.pool.free(ctx.into_range());
-            }
-        }
-
-        // --- Phase 3: Compute new seed ---
-        let seed_idx = trans.seed_program;
-        if self.cache.seed_emit_origins[seed_idx.0 as usize].is_some() {
-            // Pure-emit seed: track implicitly.
-            self.seed_origins_idx = Some(seed_idx);
-        } else {
-            self.seed_origins_idx = None;
-            let seed_prog = &self.cache.programs[seed_idx.0 as usize];
-            if !seed_prog.is_empty() {
-                let fresh = CounterCtx::new();
-                self.results.clear();
-                execute_program(seed_prog, &fresh, self.pool, &mut self.results);
-                for r in self.results.drain(..) {
-                    match r {
-                        ProgramResult::Continue(new_ctx, new_origin) => {
-                            self.next_contexts.push((new_ctx, new_origin));
-                        }
-                        ProgramResult::Match => {
-                            self.ever_matched = true;
-                        }
-                        ProgramResult::MatchAtEnd => {
-                            self.match_at_end = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Dedup explicit contexts (skip when ≤1 or no explicit contexts).
-        if self.next_contexts.len() > 1 {
-            dedup_contexts(&mut self.next_contexts, self.pool);
-        }
-
-        std::mem::swap(&mut self.contexts, &mut self.next_contexts);
+        self.step_slow(slot);
     }
 
-    /// Feed a byte slice.
+    /// Slow path: handles counting transitions and instance processing.
+    #[inline(never)]
+    fn step_slow(&mut self, slot: usize) {
+        let t = &self.cache.transitions[slot];
+
+        // Reset next_instances.
+        for ni in &mut self.next_instances {
+            ni.clear();
+        }
+        self.match_at_end = false;
+
+        // Process each counter's instances against origin actions.
+        let mut any_can_break = false;
+
+        for c_idx in 0..self.counters.len() {
+            for inst in &self.counters[c_idx] {
+                let action = t
+                    .origin_keys
+                    .iter()
+                    .position(|&k| k == inst.origin)
+                    .map(|i| &t.origin_actions[i]);
+
+                match action {
+                    Some(OriginAction::Advance { new_origins }) => {
+                        for &new_o in new_origins.iter() {
+                            self.next_instances[c_idx].push(Instance {
+                                value: inst.value,
+                                origin: new_o,
+                            });
+                        }
+                    }
+                    Some(OriginAction::Dead) | None => {}
+                    Some(OriginAction::Increment {
+                        advance_origins,
+                        min,
+                        max,
+                        continue_origins,
+                        break_is_match,
+                        break_is_match_at_end,
+                    }) => {
+                        // Advance-or-increment: instance always survives
+                        // at advance_origins with same value.
+                        for &new_o in advance_origins.iter() {
+                            self.next_instances[c_idx].push(Instance {
+                                value: inst.value,
+                                origin: new_o,
+                            });
+                        }
+                        // CInc fires.
+                        let new_val = inst.value + 1;
+                        let do_continue = new_val < *max;
+                        let do_break = new_val >= *min;
+
+                        if do_continue {
+                            for &new_o in continue_origins.iter() {
+                                self.next_instances[c_idx].push(Instance {
+                                    value: new_val,
+                                    origin: new_o,
+                                });
+                            }
+                        }
+                        if do_break {
+                            any_can_break = true;
+                            if *break_is_match {
+                                self.ever_matched = true;
+                            }
+                            if *break_is_match_at_end {
+                                self.match_at_end = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Select DFA successor.
+        if t.is_counting && any_can_break {
+            self.current = t.with_break;
+            if !t.is_counting {
+                // unreachable given the outer `if`, but kept for clarity
+                if t.with_break_is_match {
+                    self.ever_matched = true;
+                }
+                if t.with_break_is_match_at_end {
+                    self.match_at_end = true;
+                }
+            }
+        } else {
+            self.current = t.no_break;
+            if !t.is_counting {
+                if t.no_break_is_match {
+                    self.ever_matched = true;
+                }
+                if t.no_break_is_match_at_end {
+                    self.match_at_end = true;
+                }
+            }
+        }
+
+        // Swap instance lists.
+        std::mem::swap(&mut self.counters, &mut self.next_instances);
+
+        // Seed new instances.
+        for &(counter, origin, value) in t.seeds.iter() {
+            let c_idx = counter.idx();
+            let already = self.counters[c_idx]
+                .iter()
+                .any(|inst| inst.value == value && inst.origin == origin);
+            if !already {
+                self.counters[c_idx].push(Instance { value, origin });
+            }
+        }
+
+        // Update has_live_instances flag.
+        self.has_live_instances = self.counters.iter().any(|c| !c.is_empty());
+    }
+
+    fn step_from_dead(&mut self, byte: u8) {
+        if self.has_live_instances {
+            for c in &mut self.counters {
+                c.clear();
+            }
+            self.has_live_instances = false;
+        }
+        self.match_at_end = false;
+
+        let trans = self.cache.populate(DfaStateId::DEAD, byte, self.regex);
+
+        // From DEAD, no instances exist, so use no_break successor.
+        self.current = trans.no_break;
+
+        if !trans.is_counting {
+            if trans.no_break_is_match {
+                self.ever_matched = true;
+            }
+            if trans.no_break_is_match_at_end {
+                self.match_at_end = true;
+            }
+        }
+
+        // Seed instances.
+        for &(counter, origin, value) in trans.seeds.iter() {
+            self.counters[counter.idx()].push(Instance { value, origin });
+        }
+        if !trans.seeds.is_empty() {
+            self.has_live_instances = true;
+        }
+    }
+
+    #[inline(always)]
     pub fn chunk(&mut self, input: &[u8]) {
+        if self.ever_matched {
+            return;
+        }
+
+        let input = match self.prefilter {
+            Prefilter::None => input,
+            Prefilter::Memchr1(b) => {
+                if let Some(idx) = memchr::memchr(b, input) {
+                    self.prefilter = Prefilter::None;
+                    &input[idx..]
+                } else {
+                    return;
+                }
+            }
+            Prefilter::Memchr2(b1, b2) => {
+                if let Some(idx) = memchr::memchr2(b1, b2, input) {
+                    self.prefilter = Prefilter::None;
+                    &input[idx..]
+                } else {
+                    return;
+                }
+            }
+            Prefilter::Memchr3(b1, b2, b3) => {
+                if let Some(idx) = memchr::memchr3(b1, b2, b3, input) {
+                    self.prefilter = Prefilter::None;
+                    &input[idx..]
+                } else {
+                    return;
+                }
+            }
+        };
+
+        let stride = self.cache.stride;
+
         for &b in input {
             if self.ever_matched {
                 return;
             }
-            self.step(b);
+
+            // --- Inline fast path ---
+            if self.current == DfaStateId::DEAD {
+                self.step_from_dead(b);
+                continue;
+            }
+
+            let class = if stride == 256 {
+                b as usize
+            } else {
+                self.regex.byte_classes[b as usize] as usize
+            };
+            let slot = self.current.idx() * stride + class;
+            if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
+                let trans = self.cache.populate(self.current, b, self.regex);
+                self.cache.transitions[slot] = trans;
+            }
+            let t = &self.cache.transitions[slot];
+
+            if !t.is_counting && t.seeds.is_empty() && !self.has_live_instances {
+                self.current = t.no_break;
+                self.match_at_end = t.no_break_is_match_at_end;
+                if t.no_break_is_match {
+                    self.ever_matched = true;
+                }
+                continue;
+            }
+
+            self.step_slow(slot);
         }
     }
 
-    /// Signal end-of-input and return match result.
-    pub fn finish(mut self) -> bool {
+    pub fn finish(self) -> bool {
         if self.ever_matched {
-            // Free remaining contexts.
-            for (ctx, _) in self.contexts.drain(..) {
-                self.pool.free(ctx.into_range());
-            }
             return true;
         }
-
-        // Check if any active context can match at end-of-input.
         if self.match_at_end {
-            for (ctx, _) in self.contexts.drain(..) {
-                self.pool.free(ctx.into_range());
-            }
             return true;
         }
-
-        for (ctx, _) in self.contexts.drain(..) {
-            self.pool.free(ctx.into_range());
+        if self.current != DfaStateId::DEAD {
+            let state = &self.cache.states[self.current.idx()];
+            if state.is_match_at_end {
+                return true;
+            }
+            if self.cache.resolve_deferred_at_end(state, self.regex) {
+                return true;
+            }
         }
         false
     }
 
-    /// Check whether a match has been found so far.
     #[allow(dead_code)]
     pub fn ismatch(&self) -> bool {
         self.ever_matched
     }
 }
 
-impl fmt::Debug for CountingDfaMatcher<'_> {
+impl fmt::Debug for Tier3DfaMatcher<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CountingDfaMatcher")
+        f.debug_struct("Tier3DfaMatcher")
             .field("current", &self.current)
-            .field("num_contexts", &self.contexts.len())
             .field("ever_matched", &self.ever_matched)
             .finish()
-    }
-}
-
-/// Deduplicate counter contexts by (origin, value).  O(n²) linear scan.
-fn dedup_contexts(contexts: &mut Vec<(CounterCtx, StateIdx)>, pool: &mut CounterPool) {
-    let mut i = 0;
-    while i < contexts.len() {
-        let mut dup = false;
-        for j in 0..i {
-            if contexts[i].1 == contexts[j].1 && pool.ctx_eq(&contexts[i].0, &contexts[j].0) {
-                dup = true;
-                break;
-            }
-        }
-        if dup {
-            let (removed, _) = contexts.swap_remove(i);
-            pool.free(removed.into_range());
-            // Don't increment i — the swapped-in element needs checking.
-        } else {
-            i += 1;
-        }
     }
 }

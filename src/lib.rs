@@ -72,7 +72,8 @@ static NEXT_REGEX_ID: AtomicU64 = AtomicU64::new(1);
 
 mod dfa;
 use dfa::{
-    CountingDfaCache, CountingDfaMatcher, DfaCache, DfaMatcher, Tier2DfaCache, Tier2DfaMatcher,
+    DfaCache, DfaMatcher, Tier2DfaCache, Tier2DfaMatcher, Tier3DfaCache, Tier3DfaMatcher,
+    Tier4DfaCache, Tier4DfaMatcher,
 };
 
 /// Re-export so users do not need a direct `regex-syntax` dependency.
@@ -766,12 +767,19 @@ pub struct Regex {
     /// (Tier 1: no counters, no deferred-assertion types like \b/\B
     /// /EndLF/EndCRLF/StartCRLF).
     dfa_eligible: bool,
-    /// `true` when this pattern has non-nested counters and can use the
-    /// Tier 2 conditional-transition DFA.
+    /// `true` when this pattern has non-nested counters with fixed-length
+    /// bodies and can use the Tier 2 differential-counter DFA.
     tier2_eligible: bool,
+    /// `true` when this pattern has non-nested counters and can use the
+    /// Tier 3 conditional-transition DFA.
+    tier3_eligible: bool,
     /// `true` when this pattern has counters but can use the counting DFA
-    /// (Tier 3: no complex assertions).
-    counting_dfa_eligible: bool,
+    /// (Tier 4: no complex assertions).
+    tier4_eligible: bool,
+    /// Per-counter info: `(min, max, body_byte_length)`.
+    /// `body_byte_length` is 0 if the body has variable length.
+    /// Empty if the pattern has no counters.
+    counter_info: Box<[(usize, usize, usize)]>,
     /// Byte equivalence classes for DFA transition table compression.
     ///
     /// Maps each input byte (0..255) to a small equivalence class index.
@@ -822,19 +830,30 @@ impl Regex {
         let byte_tables_alloc = self.byte_tables.len() * std::mem::size_of::<ByteMap>();
         inline + states_alloc + classes_alloc + byte_tables_alloc
     }
+    /// Return per-counter info: `(min, max, body_byte_length)`.
+    ///
+    /// `body_byte_length` is the fixed number of bytes consumed per counter
+    /// iteration (used by the Tier 2 differential-counter DFA).  It is 0
+    /// for variable-length bodies.
+    pub fn counter_info(&self, counter_idx: usize) -> (usize, usize, usize) {
+        self.counter_info[counter_idx]
+    }
     /// Return the minimum DFA tier that can handle this regex.
     ///
     /// - `0` = NFA only (e.g. CRLF assertions, zero-width counter bodies)
     /// - `1` = Tier 1+ (counter-free, deferred assertions supported)
-    /// - `2` = Tier 2+ (non-nested counters, deferred assertions supported)
-    /// - `3` = Tier 3 (nested counters, no deferred assertions)
+    /// - `2` = Tier 2+ (non-nested fixed-length-body counters, differential counters)
+    /// - `3` = Tier 3+ (non-nested counters, deferred assertions supported)
+    /// - `4` = Tier 4 (nested counters, no deferred assertions)
     pub fn min_tier(&self) -> u8 {
         if self.dfa_eligible {
             1
         } else if self.tier2_eligible {
             2
-        } else if self.counting_dfa_eligible {
+        } else if self.tier3_eligible {
             3
+        } else if self.tier4_eligible {
+            4
         } else {
             0
         }
@@ -983,9 +1002,11 @@ impl Regex {
         let tier = if self.dfa_eligible {
             "Tier 1: Lazy DFA (flat table, no counters, deferred assertions)"
         } else if self.tier2_eligible {
-            "Tier 2: Conditional DFA (non-nested counters, per-counter instances)"
-        } else if self.counting_dfa_eligible {
-            "Tier 3: Counting DFA (flat table + counter programs)"
+            "Tier 2: Differential-counter DFA (fixed-length bodies, O(1) counters)"
+        } else if self.tier3_eligible {
+            "Tier 3: Conditional DFA (non-nested counters, per-counter instances)"
+        } else if self.tier4_eligible {
+            "Tier 4: Counting DFA (flat table + counter programs)"
         } else {
             "NFA simulator (general case)"
         };
@@ -1713,7 +1734,7 @@ impl RegexBuilder {
         });
         let dfa_eligible = !has_counters && !has_crlf_assert;
 
-        // Tier 3 counting DFA does NOT handle deferred assertions yet.
+        // Tier 4 counting DFA does NOT handle deferred assertions yet.
         let has_deferred_assert = self.states.iter().any(|s| {
             matches!(s,
                 State::Assert { kind, .. } if matches!(kind,
@@ -1772,8 +1793,7 @@ impl RegexBuilder {
                 }
             })
         };
-        let counting_dfa_eligible =
-            has_counters && !has_deferred_assert && !has_zero_width_counter_body;
+        let tier4_eligible = has_counters && !has_deferred_assert && !has_zero_width_counter_body;
 
         // Check for deferred assertions inside a counter body.  Tier 2
         // cannot handle these because the CInc increment is separated from
@@ -1848,10 +1868,10 @@ impl RegexBuilder {
             })
         };
 
-        // Tier 2 eligibility: non-nested counters.  Tier 2 supports
+        // Tier 3 eligibility: non-nested counters.  Tier 2 supports
         // deferred assertions (\b, \B, EndLF) unlike Tier 3, but only
         // when they are outside the counter body.
-        let tier2_eligible = has_counters
+        let tier3_eligible = has_counters
             && !has_crlf_assert
             && !has_zero_width_counter_body
             && !has_deferred_in_counter_body
@@ -1919,6 +1939,152 @@ impl RegexBuilder {
                 !has_nesting(states)
             };
 
+        // Compute per-counter info: (min, max, body_byte_length).
+        // body_byte_length is the fixed number of bytes consumed per iteration,
+        // or 0 if the body has variable length.
+        let counter_info: Box<[(usize, usize, usize)]> = if has_counters {
+            let states = &self.states;
+            let byte_tables = &self.byte_tables;
+
+            /// Compute the fixed byte-length of a counter body.
+            /// Returns `Some(len)` if all paths through the body consume
+            /// exactly `len` bytes, `None` if variable-length.
+            fn counter_body_length(
+                ci_out: StateIdx,
+                own_counter: CounterIdx,
+                states: &[State],
+                byte_tables: &[ByteMap],
+            ) -> Option<usize> {
+                // DFS from ci_out (the body entry).  Each path counts
+                // consuming states until it reaches CInc(own_counter).
+                // All paths must agree on the count.
+                let mut result: Option<usize> = None;
+                let mut stack: Vec<(StateIdx, usize)> = vec![(ci_out, 0)];
+                let mut visited: Vec<Option<usize>> = vec![None; states.len()];
+                // Use a separate "in_stack" to avoid infinite loops on
+                // cycles that don't pass through CInc.
+                let mut in_stack = vec![false; states.len()];
+                while let Some((idx, depth)) = stack.pop() {
+                    let i = idx.idx();
+                    in_stack[i] = false;
+                    match states[idx] {
+                        State::CounterIncrement { counter, .. } if counter == own_counter => {
+                            // Reached our CInc: this path consumed `depth` bytes.
+                            match result {
+                                None => result = Some(depth),
+                                Some(prev) if prev != depth => return None,
+                                _ => {}
+                            }
+                        }
+                        State::Split { out, out1 } => {
+                            for succ in [out, out1] {
+                                let si = succ.idx();
+                                if !in_stack[si] {
+                                    match visited[si] {
+                                        Some(d) if d == depth => {} // already explored at same depth
+                                        Some(_) => return None,     // different depth = variable
+                                        None => {
+                                            visited[si] = Some(depth);
+                                            in_stack[si] = true;
+                                            stack.push((succ, depth));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        State::Assert { out, .. } | State::CounterInstance { out, .. } => {
+                            let si = out.idx();
+                            if !in_stack[si] {
+                                match visited[si] {
+                                    Some(d) if d == depth => {}
+                                    Some(_) => return None,
+                                    None => {
+                                        visited[si] = Some(depth);
+                                        in_stack[si] = true;
+                                        stack.push((out, depth));
+                                    }
+                                }
+                            }
+                        }
+                        State::Byte { out, .. }
+                        | State::ByteCI { out, .. }
+                        | State::ByteClass { out, .. } => {
+                            let si = out.idx();
+                            let nd = depth + 1;
+                            if !in_stack[si] {
+                                match visited[si] {
+                                    Some(d) if d == nd => {}
+                                    Some(_) => return None,
+                                    None => {
+                                        visited[si] = Some(nd);
+                                        in_stack[si] = true;
+                                        stack.push((out, nd));
+                                    }
+                                }
+                            }
+                        }
+                        State::ByteTable { table } => {
+                            let nd = depth + 1;
+                            for &succ in byte_tables[table.idx()].0.iter() {
+                                if succ != StateIdx::NONE {
+                                    let si = succ.idx();
+                                    if !in_stack[si] {
+                                        match visited[si] {
+                                            Some(d) if d == nd => {}
+                                            Some(_) => return None,
+                                            None => {
+                                                visited[si] = Some(nd);
+                                                in_stack[si] = true;
+                                                stack.push((succ, nd));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Match or other terminal: shouldn't happen in a
+                        // well-formed counter body, but treat as dead end.
+                        _ => {}
+                    }
+                }
+                result
+            }
+
+            let num_counters = self.counters.len();
+            let mut info = vec![(0usize, 0usize, 0usize); num_counters];
+            // First, collect min/max from CInc states.
+            for s in states.iter() {
+                if let State::CounterIncrement {
+                    counter, min, max, ..
+                } = s
+                {
+                    info[counter.idx()] = (*min, *max, 0);
+                }
+            }
+            // Then, compute body lengths from CI states.
+            for s in states.iter() {
+                if let State::CounterInstance { counter, out } = s {
+                    let ci = counter.idx();
+                    let body_len =
+                        counter_body_length(*out, *counter, states, byte_tables).unwrap_or(0);
+                    info[ci].2 = body_len;
+                }
+            }
+            info.into_boxed_slice()
+        } else {
+            Box::new([])
+        };
+
+        // Tier 2 eligibility: single non-nested counter with fixed-length body.
+        // Same structural requirements as tier3 (non-nested, no CRLF, no
+        // zero-width bodies, no deferred asserts inside body), plus the
+        // counter body must have a fixed byte-length.  Currently limited
+        // to single-counter patterns because the with_break/no_break DFA
+        // split assumes one counter fires per transition.
+        let tier2_eligible = tier3_eligible
+            && counter_info.len() == 1
+            && counter_info.iter().all(|&(_, _, body_len)| body_len > 0);
+
         // Compute byte equivalence classes before moving data out.
         let classes_slice: Vec<ByteClass> = self.classes.iter().copied().collect();
         let byte_tables_slice: Vec<ByteMap> = self.byte_tables.to_vec();
@@ -1970,7 +2136,9 @@ impl RegexBuilder {
             start_closure_matches,
             dfa_eligible,
             tier2_eligible,
-            counting_dfa_eligible,
+            tier3_eligible,
+            tier4_eligible,
+            counter_info,
             byte_classes,
             num_byte_classes,
             prefilter,
@@ -2355,10 +2523,12 @@ pub struct MatcherMemory {
     counter_pool: CounterPool,
     /// Lazy DFA cache (allocated on first use with a DFA-eligible regex).
     dfa_cache: Option<DfaCache>,
-    /// Tier 2 DFA cache (non-nested counters, conditional transitions).
+    /// Tier 2 DFA cache (non-nested fixed-length-body counters, differential counters).
     tier2_cache: Option<Tier2DfaCache>,
-    /// Counting DFA cache (Tier 3: patterns with counters).
-    counting_dfa_cache: Option<CountingDfaCache>,
+    /// Tier 3 DFA cache (non-nested counters, conditional transitions).
+    tier3_cache: Option<Tier3DfaCache>,
+    /// Counting DFA cache (Tier 4: patterns with counters).
+    tier4_cache: Option<Tier4DfaCache>,
     /// Counter pool for the counting DFA (separate from NFA's pool).
     counting_pool: CounterPool,
 }
@@ -2378,21 +2548,29 @@ impl MatcherMemory {
             let dfa = DfaMatcher::new(cache, regex);
             AnyMatcher::Dfa(dfa)
         } else if regex.tier2_eligible {
-            // Tier 2: DFA + conditional transitions (non-nested counters).
+            // Tier 2: DFA + differential counters (non-nested, fixed-length bodies).
             let cache = self
                 .tier2_cache
                 .get_or_insert_with(|| Tier2DfaCache::new(regex.states.len()));
             cache.prepare(regex);
             let dfa = Tier2DfaMatcher::new(cache, regex);
             AnyMatcher::Tier2Dfa(dfa)
-        } else if regex.counting_dfa_eligible {
-            // Tier 3: DFA + explicit counter contexts.
+        } else if regex.tier3_eligible {
+            // Tier 3: DFA + conditional transitions (non-nested counters).
             let cache = self
-                .counting_dfa_cache
-                .get_or_insert_with(|| CountingDfaCache::new(regex.states.len()));
+                .tier3_cache
+                .get_or_insert_with(|| Tier3DfaCache::new(regex.states.len()));
             cache.prepare(regex);
-            let dfa = CountingDfaMatcher::new(cache, regex, &mut self.counting_pool);
-            AnyMatcher::CountingDfa(dfa)
+            let dfa = Tier3DfaMatcher::new(cache, regex);
+            AnyMatcher::Tier3Dfa(dfa)
+        } else if regex.tier4_eligible {
+            // Tier 4: DFA + explicit counter contexts.
+            let cache = self
+                .tier4_cache
+                .get_or_insert_with(|| Tier4DfaCache::new(regex.states.len()));
+            cache.prepare(regex);
+            let dfa = Tier4DfaMatcher::new(cache, regex, &mut self.counting_pool);
+            AnyMatcher::Tier4Dfa(dfa)
         } else {
             let nfa = self.nfa_matcher(regex);
             AnyMatcher::Nfa(nfa)
@@ -2441,10 +2619,12 @@ impl MatcherMemory {
 pub enum AnyMatcher<'a> {
     /// Lazy DFA path (Tier 1: counter-free, simple-assertion patterns).
     Dfa(DfaMatcher<'a>),
-    /// Tier 2 DFA path (non-nested counters, conditional transitions).
+    /// Tier 2 DFA path (non-nested fixed-length-body counters, differential counters).
     Tier2Dfa(Tier2DfaMatcher<'a>),
-    /// Counting DFA path (Tier 3: DFA + explicit counter contexts).
-    CountingDfa(CountingDfaMatcher<'a>),
+    /// Tier 3 DFA path (non-nested counters, conditional transitions).
+    Tier3Dfa(Tier3DfaMatcher<'a>),
+    /// Counting DFA path (Tier 4: DFA + explicit counter contexts).
+    Tier4Dfa(Tier4DfaMatcher<'a>),
     /// NFA simulator path (general case).
     Nfa(NfaMatcher<'a>),
 }
@@ -2455,7 +2635,8 @@ impl<'a> AnyMatcher<'a> {
         match self {
             Self::Dfa(d) => d.chunk(input),
             Self::Tier2Dfa(d) => d.chunk(input),
-            Self::CountingDfa(d) => d.chunk(input),
+            Self::Tier3Dfa(d) => d.chunk(input),
+            Self::Tier4Dfa(d) => d.chunk(input),
             Self::Nfa(n) => n.chunk(input),
         }
     }
@@ -2465,7 +2646,8 @@ impl<'a> AnyMatcher<'a> {
         match self {
             Self::Dfa(d) => d.step(b),
             Self::Tier2Dfa(d) => d.step(b),
-            Self::CountingDfa(d) => d.step(b),
+            Self::Tier3Dfa(d) => d.step(b),
+            Self::Tier4Dfa(d) => d.step(b),
             Self::Nfa(n) => n.step(b),
         }
     }
@@ -2475,7 +2657,8 @@ impl<'a> AnyMatcher<'a> {
         match self {
             Self::Dfa(d) => d.finish(),
             Self::Tier2Dfa(d) => d.finish(),
-            Self::CountingDfa(d) => d.finish(),
+            Self::Tier3Dfa(d) => d.finish(),
+            Self::Tier4Dfa(d) => d.finish(),
             Self::Nfa(n) => n.finish(),
         }
     }
@@ -2486,7 +2669,8 @@ impl<'a> AnyMatcher<'a> {
         match self {
             Self::Dfa(d) => d.ismatch(),
             Self::Tier2Dfa(d) => d.ismatch(),
-            Self::CountingDfa(d) => d.ismatch(),
+            Self::Tier3Dfa(d) => d.ismatch(),
+            Self::Tier4Dfa(d) => d.ismatch(),
             Self::Nfa(n) => n.ismatch(),
         }
     }
@@ -2497,7 +2681,8 @@ impl<'a> fmt::Debug for AnyMatcher<'a> {
         match self {
             Self::Dfa(d) => f.debug_tuple("AnyMatcher::Dfa").field(d).finish(),
             Self::Tier2Dfa(d) => f.debug_tuple("AnyMatcher::Tier2Dfa").field(d).finish(),
-            Self::CountingDfa(d) => f.debug_tuple("AnyMatcher::CountingDfa").field(d).finish(),
+            Self::Tier3Dfa(d) => f.debug_tuple("AnyMatcher::Tier3Dfa").field(d).finish(),
+            Self::Tier4Dfa(d) => f.debug_tuple("AnyMatcher::Tier4Dfa").field(d).finish(),
             Self::Nfa(n) => f.debug_tuple("AnyMatcher::Nfa").field(n).finish(),
         }
     }
@@ -3645,14 +3830,16 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Compute the minimum DFA tier that can handle this regex.
-    /// 0 = NFA only, 1 = Tier 1+, 2 = Tier 2+, 3 = Tier 3 only.
+    /// 0 = NFA only, 1 = Tier 1+, 2 = Tier 2+, 3 = Tier 3+, 4 = Tier 4 only.
     fn compute_min_tier(re: &Regex) -> u8 {
         if re.dfa_eligible {
             1
         } else if re.tier2_eligible {
             2
-        } else if re.counting_dfa_eligible {
+        } else if re.tier3_eligible {
             3
+        } else if re.tier4_eligible {
+            4
         } else {
             0
         }
@@ -3733,15 +3920,10 @@ mod tests {
 
     /// Test a pattern+input via Tier 3 DFA (full-chunk + byte-at-a-time).
     fn test_tier3(pattern: &str, re: &Regex, input: &str, expected: bool) {
-        use crate::dfa::{CountingDfaCache, CountingDfaMatcher};
-        let mut cache = CountingDfaCache::new(re.states.len());
+        use crate::dfa::{Tier3DfaCache, Tier3DfaMatcher};
+        let mut cache = Tier3DfaCache::new(re.states.len());
         cache.prepare(re);
-        let mut pool = CounterPool {
-            arena: Vec::new(),
-            free: Vec::new(),
-            num_counters: re.num_counters,
-        };
-        let mut d = CountingDfaMatcher::new(&mut cache, re, &mut pool);
+        let mut d = Tier3DfaMatcher::new(&mut cache, re);
         d.chunk(input.as_bytes());
         let actual = d.finish();
         assert_eq!(
@@ -3749,9 +3931,7 @@ mod tests {
             "Tier3 chunk mismatch for `{}` on {:?}: got={}, expected={}",
             pattern, input, actual, expected
         );
-        pool.clear();
-        pool.num_counters = re.num_counters;
-        let mut d = CountingDfaMatcher::new(&mut cache, re, &mut pool);
+        let mut d = Tier3DfaMatcher::new(&mut cache, re);
         for &b in input.as_bytes() {
             d.chunk(&[b]);
         }
@@ -3759,6 +3939,38 @@ mod tests {
         assert_eq!(
             actual, expected,
             "Tier3 single-byte mismatch for `{}` on {:?}: got={}, expected={}",
+            pattern, input, actual, expected
+        );
+    }
+
+    /// Test a pattern+input via Tier 3 DFA (full-chunk + byte-at-a-time).
+    fn test_tier4(pattern: &str, re: &Regex, input: &str, expected: bool) {
+        use crate::dfa::{Tier4DfaCache, Tier4DfaMatcher};
+        let mut cache = Tier4DfaCache::new(re.states.len());
+        cache.prepare(re);
+        let mut pool = CounterPool {
+            arena: Vec::new(),
+            free: Vec::new(),
+            num_counters: re.num_counters,
+        };
+        let mut d = Tier4DfaMatcher::new(&mut cache, re, &mut pool);
+        d.chunk(input.as_bytes());
+        let actual = d.finish();
+        assert_eq!(
+            actual, expected,
+            "Tier4 chunk mismatch for `{}` on {:?}: got={}, expected={}",
+            pattern, input, actual, expected
+        );
+        pool.clear();
+        pool.num_counters = re.num_counters;
+        let mut d = Tier4DfaMatcher::new(&mut cache, re, &mut pool);
+        for &b in input.as_bytes() {
+            d.chunk(&[b]);
+        }
+        let actual = d.finish();
+        assert_eq!(
+            actual, expected,
+            "Tier4 single-byte mismatch for `{}` on {:?}: got={}, expected={}",
             pattern, input, actual, expected
         );
     }
@@ -3807,8 +4019,11 @@ mod tests {
             if re.tier2_eligible {
                 test_tier2(pattern, &re, input, expected);
             }
-            if re.counting_dfa_eligible {
+            if re.tier3_eligible {
                 test_tier3(pattern, &re, input, expected);
+            }
+            if re.tier4_eligible {
+                test_tier4(pattern, &re, input, expected);
             }
         }
     }
@@ -3840,7 +4055,7 @@ mod tests {
     match_tests! {
         test_counting {
             pattern: "^.*a.{3}bc$",
-            memory: 1056,
+            memory: 1072,
             min_tier: 2,
             inputs: [
                 ("aybzbc", true),
@@ -3859,8 +4074,8 @@ mod tests {
         }
         test_range {
             pattern: "^(a|bc){1,2}$",
-            memory: 720,
-            min_tier: 2,
+            memory: 736,
+            min_tier: 3,
             inputs: [
                 ("a", true),
                 ("bc", true),
@@ -3875,8 +4090,8 @@ mod tests {
         }
         test_nested_counting {
             pattern: "^((a|bc){1,2}){2,3}$",
-            memory: 800,
-            min_tier: 3,
+            memory: 816,
+            min_tier: 4,
             inputs: [
                 ("", false),
                 ("a", false),
@@ -3892,7 +4107,7 @@ mod tests {
         }
         test_aaaaa {
             pattern: "^(a|a?){2,3}$",
-            memory: 720,
+            memory: 736,
             min_tier: 0,
             inputs: [
                 ("", true),
@@ -3909,7 +4124,7 @@ mod tests {
         }
         test_one_plus_basic {
             pattern: "^a+$",
-            memory: 560,
+            memory: 576,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -3924,7 +4139,7 @@ mod tests {
         }
         test_one_plus_wildcard {
             pattern: "^.+$",
-            memory: 816,
+            memory: 832,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -3935,7 +4150,7 @@ mod tests {
         }
         test_one_plus_catenation {
             pattern: "^a+b+$",
-            memory: 640,
+            memory: 656,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -3950,7 +4165,7 @@ mod tests {
         }
         test_one_plus_group {
             pattern: "^(ab)+$",
-            memory: 600,
+            memory: 616,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -3963,7 +4178,7 @@ mod tests {
         }
         test_one_plus_alternate {
             pattern: "^(a|b)+$",
-            memory: 816,
+            memory: 832,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -3982,7 +4197,7 @@ mod tests {
         }
         test_one_plus_with_counting {
             pattern: "^.*a.{3}b+c$",
-            memory: 1096,
+            memory: 1112,
             min_tier: 2,
             inputs: [
                 ("a123bc", true),
@@ -4001,7 +4216,7 @@ mod tests {
         }
         test_repetition_inside_one_plus {
             pattern: "^(a{2,3})+$",
-            memory: 640,
+            memory: 656,
             min_tier: 2,
             inputs: [
                 ("", false),
@@ -4019,8 +4234,8 @@ mod tests {
         }
         test_range_alternation_inside_one_plus {
             pattern: "^((a|bc){1,2})+$",
-            memory: 760,
-            min_tier: 2,
+            memory: 776,
+            min_tier: 3,
             inputs: [
                 ("", false),
                 ("a", true),
@@ -4031,8 +4246,8 @@ mod tests {
         }
         test_one_plus_inside_repetition {
             pattern: "^(a+){2,3}$",
-            memory: 640,
-            min_tier: 2,
+            memory: 656,
+            min_tier: 3,
             inputs: [
                 ("", false),
                 ("a", false),
@@ -4047,8 +4262,8 @@ mod tests {
         }
         test_one_plus_alternation_inside_repetition {
             pattern: "^((a|b)+){2,4}$",
-            memory: 896,
-            min_tier: 2,
+            memory: 912,
+            min_tier: 3,
             inputs: [
                 ("", false),
                 ("a", false),
@@ -4058,7 +4273,7 @@ mod tests {
         }
         test_mixed_plus_and_repetition_inside_one_plus {
             pattern: "^(a+b{2,3})+$",
-            memory: 720,
+            memory: 736,
             min_tier: 2,
             inputs: [
                 ("", false),
@@ -4078,7 +4293,7 @@ mod tests {
         }
         test_min_zero_basic {
             pattern: "^a{0,2}$",
-            memory: 640,
+            memory: 656,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -4090,7 +4305,7 @@ mod tests {
         }
         test_min_zero_max_one {
             pattern: "^a{0,1}$",
-            memory: 560,
+            memory: 576,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4101,8 +4316,8 @@ mod tests {
         }
         test_min_zero_alternation {
             pattern: "^(a|bc){0,3}$",
-            memory: 760,
-            min_tier: 2,
+            memory: 776,
+            min_tier: 3,
             inputs: [
                 ("", true),
                 ("a", true),
@@ -4112,7 +4327,7 @@ mod tests {
         }
         test_min_zero_unbounded {
             pattern: "^a{0,}$",
-            memory: 560,
+            memory: 576,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4129,7 +4344,7 @@ mod tests {
         }
         test_min_zero_unbounded_group {
             pattern: "^(ab){0,}$",
-            memory: 600,
+            memory: 616,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4142,7 +4357,7 @@ mod tests {
         }
         test_min_zero_inside_one_plus {
             pattern: "^x(a{0,2})+y$",
-            memory: 760,
+            memory: 776,
             min_tier: 2,
             inputs: [
                 ("xy", true),
@@ -4162,7 +4377,7 @@ mod tests {
         }
         test_min_zero_inside_repetition {
             pattern: "^(a{0,2}){2,3}$",
-            memory: 720,
+            memory: 736,
             min_tier: 0,
             inputs: [
                 ("", true),
@@ -4178,8 +4393,8 @@ mod tests {
         }
         test_one_plus_inside_min_zero_repetition {
             pattern: "^(a+){0,3}$",
-            memory: 680,
-            min_tier: 2,
+            memory: 696,
+            min_tier: 3,
             inputs: [
                 ("", true),
                 ("a", true),
@@ -4193,7 +4408,7 @@ mod tests {
         }
         test_min_zero_wildcard {
             pattern: "^.{0,3}$",
-            memory: 896,
+            memory: 912,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -4205,7 +4420,7 @@ mod tests {
         }
         test_none_min_repetition {
             pattern: "^a{0,3}$",
-            memory: 640,
+            memory: 656,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -4220,7 +4435,7 @@ mod tests {
         }
         test_literal_single {
             pattern: "^a$",
-            memory: 520,
+            memory: 536,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4233,7 +4448,7 @@ mod tests {
         }
         test_literal_multi {
             pattern: "^abc$",
-            memory: 600,
+            memory: 616,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -4251,7 +4466,7 @@ mod tests {
         }
         test_dot_single {
             pattern: "^.$",
-            memory: 776,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4265,7 +4480,7 @@ mod tests {
         }
         test_alternation_bare {
             pattern: "^(a|bc)$",
-            memory: 640,
+            memory: 656,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4281,7 +4496,7 @@ mod tests {
         }
         test_alternation_three_way {
             pattern: "^(a|b|c)$",
-            memory: 776,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4295,7 +4510,7 @@ mod tests {
         }
         test_question_mark_single {
             pattern: "^a?$",
-            memory: 560,
+            memory: 576,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4307,7 +4522,7 @@ mod tests {
         }
         test_question_mark_group {
             pattern: "^(ab)?$",
-            memory: 600,
+            memory: 616,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4321,7 +4536,7 @@ mod tests {
         }
         test_question_mark_prefix {
             pattern: "^a?b$",
-            memory: 600,
+            memory: 616,
             min_tier: 1,
             inputs: [
                 ("b", true),
@@ -4336,7 +4551,7 @@ mod tests {
         }
         test_star_single {
             pattern: "^a*$",
-            memory: 560,
+            memory: 576,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4353,7 +4568,7 @@ mod tests {
         }
         test_star_group {
             pattern: "^(ab)*$",
-            memory: 600,
+            memory: 616,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4370,7 +4585,7 @@ mod tests {
         }
         test_star_then_literal {
             pattern: "^a*b$",
-            memory: 600,
+            memory: 616,
             min_tier: 1,
             inputs: [
                 ("b", true),
@@ -4388,7 +4603,7 @@ mod tests {
         }
         test_min_n_unbounded {
             pattern: "^a{2,}$",
-            memory: 600,
+            memory: 616,
             min_tier: 2,
             inputs: [
                 ("aa", true),
@@ -4405,7 +4620,7 @@ mod tests {
         }
         test_min_n_unbounded_group {
             pattern: "^(ab){2,}$",
-            memory: 640,
+            memory: 656,
             min_tier: 2,
             inputs: [
                 ("abab", true),
@@ -4422,7 +4637,7 @@ mod tests {
         }
         test_bounded_range {
             pattern: "^a{3,5}$",
-            memory: 600,
+            memory: 616,
             min_tier: 2,
             inputs: [
                 ("aaa", true),
@@ -4439,7 +4654,7 @@ mod tests {
         }
         test_exact_repetition {
             pattern: "^a{3,3}$",
-            memory: 600,
+            memory: 616,
             min_tier: 2,
             inputs: [
                 ("aaa", true),
@@ -4454,7 +4669,7 @@ mod tests {
         }
         test_byte_class_range {
             pattern: "^[a-c]$",
-            memory: 776,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4467,7 +4682,7 @@ mod tests {
         }
         test_byte_class_one_plus {
             pattern: "^[a-c]+$",
-            memory: 816,
+            memory: 832,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4480,7 +4695,7 @@ mod tests {
         }
         test_byte_class_counted {
             pattern: "^[a-c]{2,3}$",
-            memory: 856,
+            memory: 872,
             min_tier: 2,
             inputs: [
                 ("", false),
@@ -4494,7 +4709,7 @@ mod tests {
         }
         test_byte_class_disjoint {
             pattern: "^[ax]$",
-            memory: 776,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4506,7 +4721,7 @@ mod tests {
         }
         test_byte_class_multi_range {
             pattern: "^[a-cx-z]+$",
-            memory: 816,
+            memory: 832,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4520,7 +4735,7 @@ mod tests {
         }
         test_byte_class_with_wildcard {
             pattern: "^[a-c].*[x-z]$",
-            memory: 1408,
+            memory: 1424,
             min_tier: 1,
             inputs: [
                 ("ax", true),
@@ -4533,7 +4748,7 @@ mod tests {
         }
         test_digit {
             pattern: r#"^\d$"#,
-            memory: 776,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 ("0", true),
@@ -4549,7 +4764,7 @@ mod tests {
         }
         test_digit_plus {
             pattern: r#"^\d+$"#,
-            memory: 816,
+            memory: 832,
             min_tier: 1,
             inputs: [
                 ("0", true),
@@ -4565,7 +4780,7 @@ mod tests {
         }
         test_digit_counted {
             pattern: r#"^\d{3,5}$"#,
-            memory: 856,
+            memory: 872,
             min_tier: 2,
             inputs: [
                 ("123", true),
@@ -4581,7 +4796,7 @@ mod tests {
         }
         test_non_digit {
             pattern: r#"^\D$"#,
-            memory: 776,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4597,7 +4812,7 @@ mod tests {
         }
         test_non_digit_plus {
             pattern: r#"^\D+$"#,
-            memory: 816,
+            memory: 832,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -4611,7 +4826,7 @@ mod tests {
         }
         test_space {
             pattern: r#"^\s$"#,
-            memory: 776,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -4626,7 +4841,7 @@ mod tests {
         }
         test_space_plus {
             pattern: r#"^\s+$"#,
-            memory: 816,
+            memory: 832,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -4640,7 +4855,7 @@ mod tests {
         }
         test_non_space {
             pattern: r#"^\S$"#,
-            memory: 776,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4655,7 +4870,7 @@ mod tests {
         }
         test_non_space_plus {
             pattern: r#"^\S+$"#,
-            memory: 816,
+            memory: 832,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -4669,7 +4884,7 @@ mod tests {
         }
         test_word {
             pattern: r#"^\w$"#,
-            memory: 776,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4686,7 +4901,7 @@ mod tests {
         }
         test_word_plus {
             pattern: r#"^\w+$"#,
-            memory: 816,
+            memory: 832,
             min_tier: 1,
             inputs: [
                 ("hello", true),
@@ -4701,7 +4916,7 @@ mod tests {
         }
         test_word_counted {
             pattern: r#"^\w{2,4}$"#,
-            memory: 856,
+            memory: 872,
             min_tier: 2,
             inputs: [
                 ("ab", true),
@@ -4716,7 +4931,7 @@ mod tests {
         }
         test_non_word {
             pattern: r#"^\W$"#,
-            memory: 776,
+            memory: 792,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -4732,7 +4947,7 @@ mod tests {
         }
         test_non_word_plus {
             pattern: r#"^\W+$"#,
-            memory: 816,
+            memory: 832,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -4747,7 +4962,7 @@ mod tests {
         }
         test_predefined_mixed {
             pattern: r#"^\d+\s+\w+$"#,
-            memory: 1488,
+            memory: 1504,
             min_tier: 1,
             inputs: [
                 ("42 hello", true),
@@ -5478,7 +5693,7 @@ mod tests {
         test_unanchored_counter_alternation_body {
             pattern: "(a|bc){2,4}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 3,
             inputs: [
                 ("aa", true),
                 ("abc", true),
@@ -5513,7 +5728,7 @@ mod tests {
         test_unanchored_counter_nested {
             pattern: "((a|b){1,2}){2,3}",
             memory: 0,
-            min_tier: 3,
+            min_tier: 4,
             inputs: [
                 ("ab", true),
                 ("aabb", true),
@@ -5697,7 +5912,7 @@ mod tests {
         test_multiline_alternation_counter {
             pattern: "(?m:^)(a|bc){2,3}(?m:$)",
             memory: 0,
-            min_tier: 2,
+            min_tier: 3,
             inputs: [
                 ("aa", true),
                 ("abc", true),
@@ -5949,7 +6164,7 @@ mod tests {
         test_nested_a2_x3 {
             pattern: "(a{2}){3}",
             memory: 0,
-            min_tier: 3,
+            min_tier: 4,
             inputs: [
                 ("aaaaa", false),
                 ("aaaaaa", true),
@@ -5959,7 +6174,7 @@ mod tests {
         test_nested_a3_x2 {
             pattern: "(a{3}){2}",
             memory: 0,
-            min_tier: 3,
+            min_tier: 4,
             inputs: [
                 ("aaaa", false),
                 ("aaaaa", false),
@@ -5992,7 +6207,7 @@ mod tests {
         test_nested_a23_x2 {
             pattern: "(a{2,3}){2}",
             memory: 0,
-            min_tier: 3,
+            min_tier: 4,
             inputs: [
                 ("aaa", false),
                 ("aaaa", true),
@@ -6004,7 +6219,7 @@ mod tests {
         test_nested_a2_x2_x2 {
             pattern: "((a{2}){2}){2}",
             memory: 0,
-            min_tier: 3,
+            min_tier: 4,
             inputs: [
                 ("aaaaaaa", false),
                 ("aaaaaaaa", true),
@@ -6014,7 +6229,7 @@ mod tests {
         test_nested_a2_x23 {
             pattern: "(a{2}){2,3}",
             memory: 0,
-            min_tier: 3,
+            min_tier: 4,
             inputs: [
                 ("aaa", false),
                 ("aaaa", true),
@@ -6070,7 +6285,7 @@ mod tests {
         test_nested_a12_x2 {
             pattern: "^(a{1,2}){2}$",
             memory: 0,
-            min_tier: 3,
+            min_tier: 4,
             inputs: [
                 ("aa", true),
                 ("aaa", true),
@@ -6217,7 +6432,7 @@ mod tests {
         test_step_fused_multi_counter_same_byte {
             pattern: "a{2}.*a{3}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 3,
             inputs: [
                 ("aaaaa", true),
                 ("aabaa", false),
@@ -6246,7 +6461,7 @@ mod tests {
         test_step_fused_byteclass_and_literal {
             pattern: "[a-z]{2}a{2}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 3,
             inputs: [
                 ("xyaa", true),
                 ("aaaa", true),
@@ -6262,7 +6477,7 @@ mod tests {
         test_step_fused_reseed_with_counter {
             pattern: "(a{2}){2}",
             memory: 0,
-            min_tier: 3,
+            min_tier: 4,
             inputs: [
                 ("aaaa", true),
                 ("aaa", false),
@@ -7367,7 +7582,7 @@ mod tests {
     fn test_word_boundary_dfa_eligible() {
         let re = build_regex_unchecked(r"\bfoo\b");
         assert!(re.dfa_eligible, "\\bfoo\\b should be DFA-eligible");
-        assert!(!re.counting_dfa_eligible);
+        assert!(!re.tier4_eligible);
     }
 
     /// Verify that patterns with \B are DFA-eligible.
