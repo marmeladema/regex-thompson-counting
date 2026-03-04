@@ -974,14 +974,22 @@ impl<'a> Tier2DfaMatcher<'a> {
         }
     }
 
+    /// Slot lookup using byte-class compression (stride < 256).
     #[inline(always)]
     fn ensure_transition(&mut self, byte: u8) -> usize {
-        let class = if self.cache.stride == 256 {
-            byte as usize
-        } else {
-            self.regex.byte_classes[byte as usize] as usize
-        };
+        let class = self.regex.byte_classes[byte as usize] as usize;
         let slot = self.current.idx() * self.cache.stride + class;
+        if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
+            let trans = self.cache.populate(self.current, byte, self.regex);
+            self.cache.transitions[slot] = trans;
+        }
+        slot
+    }
+
+    /// Slot lookup using identity mapping (stride = 256, no byte-class indirection).
+    #[inline(always)]
+    fn ensure_transition_direct(&mut self, byte: u8) -> usize {
+        let slot = self.current.idx() * 256 + byte as usize;
         if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
             let trans = self.cache.populate(self.current, byte, self.regex);
             self.cache.transitions[slot] = trans;
@@ -997,6 +1005,22 @@ impl<'a> Tier2DfaMatcher<'a> {
         }
 
         let slot = self.ensure_transition(byte);
+        self.step_inner(slot);
+    }
+
+    #[inline(always)]
+    fn step_direct(&mut self, byte: u8) {
+        if self.current == DfaStateId::DEAD {
+            self.step_from_dead(byte);
+            return;
+        }
+
+        let slot = self.ensure_transition_direct(byte);
+        self.step_inner(slot);
+    }
+
+    #[inline(always)]
+    fn step_inner(&mut self, slot: usize) {
         let t = &self.cache.transitions[slot];
 
         // Fast path: non-counting, no seeds, no live counters.
@@ -1178,11 +1202,20 @@ impl<'a> Tier2DfaMatcher<'a> {
             }
         };
 
-        for &b in input {
-            if self.ever_matched {
-                return;
+        if self.cache.stride == 256 {
+            for &b in input {
+                if self.ever_matched {
+                    return;
+                }
+                self.step_direct(b);
             }
-            self.step(b);
+        } else {
+            for &b in input {
+                if self.ever_matched {
+                    return;
+                }
+                self.step(b);
+            }
         }
     }
 
