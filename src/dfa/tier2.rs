@@ -978,8 +978,8 @@ impl<'a> Tier2DfaMatcher<'a> {
         slot
     }
 
-    #[inline]
-    pub fn step(&mut self, byte: u8) {
+    #[inline(always)]
+    fn step(&mut self, byte: u8) {
         if self.current == DfaStateId::DEAD {
             self.step_from_dead(byte);
             return;

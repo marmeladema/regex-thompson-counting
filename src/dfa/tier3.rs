@@ -934,44 +934,6 @@ impl<'a> Tier3DfaMatcher<'a> {
         }
     }
 
-    #[inline(always)]
-    fn ensure_transition(&mut self, byte: u8) -> usize {
-        let class = if self.cache.stride == 256 {
-            byte as usize
-        } else {
-            self.regex.byte_classes[byte as usize] as usize
-        };
-        let slot = self.current.idx() * self.cache.stride + class;
-        if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
-            let trans = self.cache.populate(self.current, byte, self.regex);
-            self.cache.transitions[slot] = trans;
-        }
-        slot
-    }
-
-    #[inline]
-    pub fn step(&mut self, byte: u8) {
-        if self.current == DfaStateId::DEAD {
-            self.step_from_dead(byte);
-            return;
-        }
-
-        let slot = self.ensure_transition(byte);
-        let t = &self.cache.transitions[slot];
-
-        // Fast path: non-counting, no seeds, no live instances.
-        if !t.is_counting && t.seeds.is_empty() && !self.has_live_instances {
-            self.current = t.no_break;
-            self.match_at_end = t.no_break_is_match_at_end;
-            if t.no_break_is_match {
-                self.ever_matched = true;
-            }
-            return;
-        }
-
-        self.step_slow(slot);
-    }
-
     /// Slow path: handles counting transitions and instance processing.
     #[inline(never)]
     fn step_slow(&mut self, slot: usize) {

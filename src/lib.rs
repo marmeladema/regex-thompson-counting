@@ -2641,17 +2641,6 @@ impl<'a> AnyMatcher<'a> {
         }
     }
 
-    /// Advance the simulation by one input byte.
-    pub fn step(&mut self, b: u8) {
-        match self {
-            Self::Dfa(d) => d.step(b),
-            Self::Tier2Dfa(d) => d.step(b),
-            Self::Tier3Dfa(d) => d.step(b),
-            Self::Tier4Dfa(d) => d.step(b),
-            Self::Nfa(n) => n.step(b),
-        }
-    }
-
     /// Signal end-of-input and return the final match result.
     pub fn finish(self) -> bool {
         match self {
@@ -3577,7 +3566,7 @@ mod tests {
         // "abcdef" fed one byte at a time.
         let mut m = mem.matcher(&re);
         for &b in b"abcdef" {
-            m.step(b);
+            m.chunk(&[b]);
         }
         assert!(m.finish(), "expected match for 'abcdef' byte-at-a-time");
 
@@ -3805,7 +3794,7 @@ mod tests {
         // Re-use the same MatcherMemory — matcher() resets all state.
         let mut matcher = memory.matcher(regex);
         for &b in input.as_bytes() {
-            matcher.step(b);
+            matcher.chunk(&[b]);
         }
         let actual_step = matcher.finish();
 

@@ -995,7 +995,7 @@ impl<'a> Tier4DfaMatcher<'a> {
 
     /// Advance by one byte.
     #[inline]
-    pub fn step(&mut self, byte: u8) {
+    fn step(&mut self, byte: u8) {
         let trans = if self.cache.stride == 256 {
             self.cache.transition_direct(self.current, byte, self.regex)
         } else {
