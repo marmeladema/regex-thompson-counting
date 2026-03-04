@@ -253,7 +253,8 @@ pub(crate) struct Tier2DfaCache {
     /// if the successor contains any interior state for counter `c`, then
     /// counter `c`'s instances should survive.  Otherwise, old instances
     /// should be cleared (only re-seeded first-byte instances remain).
-    counter_body_interior: Vec<Vec<u32>>,
+    counter_body_interior: Vec<u32>,
+    counter_body_ranges: Vec<(usize, usize)>,
 }
 
 impl fmt::Debug for Tier2DfaCache {
@@ -282,6 +283,7 @@ impl Tier2DfaCache {
             start_is_match_at_end: false,
             start_seeds: Box::new([]),
             counter_body_interior: Vec::new(),
+            counter_body_ranges: Vec::new(),
         }
     }
 
@@ -636,7 +638,8 @@ impl Tier2DfaCache {
     /// counter's instances should be cleared (the body was interrupted).
     fn compute_counter_reset(&self, successor_nfa_states: &[StateIdx], skip_mask: u64) -> u64 {
         let mut mask: u64 = 0;
-        for (ci, interior) in self.counter_body_interior.iter().enumerate() {
+        for (ci, &(start, end)) in self.counter_body_ranges.iter().enumerate() {
+            let interior = &self.counter_body_interior[start..end];
             if (skip_mask >> ci) & 1 != 0 {
                 continue;
             }
@@ -704,6 +707,7 @@ impl Tier2DfaCache {
         self.start_is_match_at_end = false;
         self.start_seeds = Box::new([]);
         self.counter_body_interior.clear();
+        self.counter_body_ranges.clear();
     }
 
     pub(crate) fn prepare(&mut self, regex: &Regex) {
@@ -718,7 +722,9 @@ impl Tier2DfaCache {
         // For a counter with body length L, the interior states are all
         // consuming states reachable from the body entry that are NOT the
         // first consuming state (i.e., body positions 1..L-1).
-        self.counter_body_interior = compute_body_interiors(regex);
+        let (flat, ranges) = compute_body_interiors(regex);
+        self.counter_body_interior = flat;
+        self.counter_body_ranges = ranges;
 
         let cr = self.epsilon_closure(
             std::iter::once(regex.start),
@@ -768,11 +774,11 @@ struct ClosureResult {
 /// consuming states reachable within the body BEFORE CInc.
 ///
 /// For L=1, there are no interior states (only the first consuming state).
-fn compute_body_interiors(regex: &Regex) -> Vec<Vec<u32>> {
+fn compute_body_interiors(regex: &Regex) -> (Vec<u32>, Vec<(usize, usize)>) {
     let states = &regex.states;
     let byte_tables = &regex.byte_tables;
     let num_counters = regex.num_counters;
-    let mut result = vec![Vec::new(); num_counters];
+    let mut per_counter: Vec<Vec<u32>> = vec![Vec::new(); num_counters];
 
     for s in states.iter() {
         if let State::CounterInstance { counter, out } = s {
@@ -824,20 +830,25 @@ fn compute_body_interiors(regex: &Regex) -> Vec<Vec<u32>> {
             }
 
             // Interior = all body consuming states minus the first states.
-            let interior: Vec<u32> = all_body_consuming
+            let mut interior: Vec<u32> = all_body_consuming
                 .into_iter()
                 .filter(|s| !first_set.contains(s))
                 .collect();
-            result[ci] = interior;
+            interior.sort_unstable();
+            interior.dedup();
+            per_counter[ci] = interior;
         }
     }
 
-    // Sort and dedup each counter's interior set.
-    for v in &mut result {
-        v.sort_unstable();
-        v.dedup();
+    // Flatten into a single Vec with (start, end) ranges.
+    let mut flat: Vec<u32> = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(num_counters);
+    for v in per_counter {
+        let start = flat.len();
+        flat.extend(v);
+        ranges.push((start, flat.len()));
     }
-    result
+    (flat, ranges)
 }
 
 fn consume_byte(idx: StateIdx, byte: u8, regex: &Regex) -> Option<StateIdx> {
