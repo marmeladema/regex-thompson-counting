@@ -13,7 +13,7 @@
 //! Counter-free patterns (Tier 1 eligible) are also Tier 2 eligible — the
 //! differential counter logic is simply dormant.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::{
@@ -30,17 +30,97 @@ use super::{DfaState, DfaStateId};
 /// Maximum number of DFA states.
 const DFA_MAX_STATES: usize = 2048;
 
+/// Sentinel value for "no node" in the [`DeltaPool`] linked list.
+const SENTINEL: u32 = u32::MAX;
+
 // ---------------------------------------------------------------------------
-// Differential counter
+// Delta pool (arena-backed linked list for counter deltas)
+// ---------------------------------------------------------------------------
+
+/// Arena-backed pool of linked-list nodes for counter deltas.
+///
+/// All counters share a single `DeltaPool`.  Each [`DiffCounter`] owns a
+/// linked list (head/tail indices) whose nodes live in this pool.  Freed
+/// nodes are threaded into an intrusive free list and recycled by
+/// subsequent allocations.
+///
+/// Between matches, [`reset`](Self::reset) clears the backing vecs
+/// (retaining heap capacity) so the pool's memory is reused across
+/// matcher invocations without per-counter loops.
+#[derive(Clone, Debug)]
+struct DeltaPool {
+    /// Node payload (delta value).
+    values: Vec<u32>,
+    /// `next[i]` = index of the successor node, or [`SENTINEL`].
+    next: Vec<u32>,
+    /// Head of the intrusive free list threaded through `next[]`,
+    /// or [`SENTINEL`] if the free list is empty.
+    free_head: u32,
+}
+
+impl DeltaPool {
+    fn new() -> Self {
+        Self {
+            values: Vec::new(),
+            next: Vec::new(),
+            free_head: SENTINEL,
+        }
+    }
+
+    /// Allocate a node with the given value.  Reuses a freed slot if
+    /// available, otherwise appends to the end of the arena.
+    #[inline]
+    fn alloc(&mut self, val: u32) -> u32 {
+        if self.free_head != SENTINEL {
+            let idx = self.free_head;
+            self.free_head = self.next[idx as usize];
+            self.values[idx as usize] = val;
+            self.next[idx as usize] = SENTINEL;
+            idx
+        } else {
+            let idx = self.values.len() as u32;
+            self.values.push(val);
+            self.next.push(SENTINEL);
+            idx
+        }
+    }
+
+    /// Return a single node to the free list for reuse.
+    #[inline]
+    fn free_node(&mut self, idx: u32) {
+        self.next[idx as usize] = self.free_head;
+        self.free_head = idx;
+    }
+
+    /// Return an entire linked-list chain `[head … tail]` to the free
+    /// list in O(1).  `tail.next` must be [`SENTINEL`].
+    #[inline]
+    fn free_chain(&mut self, head: u32, tail: u32) {
+        debug_assert_ne!(head, SENTINEL);
+        debug_assert_ne!(tail, SENTINEL);
+        self.next[tail as usize] = self.free_head;
+        self.free_head = head;
+    }
+
+    /// Clear all nodes (retaining heap capacity).
+    fn reset(&mut self) {
+        self.values.clear();
+        self.next.clear();
+        self.free_head = SENTINEL;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Differential counter (per-phase, no heap)
 // ---------------------------------------------------------------------------
 
 /// Differential counter for one phase of one counter.
 ///
 /// All instances in the same phase increment in lockstep.  We store only
 /// the oldest instance's absolute value and the count of active instances.
-/// Deltas between consecutive instances are recorded in a queue so that
-/// when the oldest is deallocated, the new oldest's value can be recovered
-/// in O(1).
+/// Deltas between consecutive instances are recorded as a linked list in
+/// the shared [`DeltaPool`] so that when the oldest is deallocated, the
+/// new oldest's value can be recovered in O(1).
 #[derive(Clone, Debug)]
 struct DiffCounter {
     /// Absolute value of the oldest (highest-value) instance.
@@ -49,8 +129,10 @@ struct DiffCounter {
     count: u32,
     /// Sum of all deltas (oldest_value − youngest_value).
     total_delta: u32,
-    /// Queue of deltas: front = gap between oldest and 2nd-oldest.
-    deltas: VecDeque<u32>,
+    /// Head of the delta linked list in the pool, or [`SENTINEL`].
+    head: u32,
+    /// Tail of the delta linked list in the pool, or [`SENTINEL`].
+    tail: u32,
 }
 
 impl DiffCounter {
@@ -59,11 +141,12 @@ impl DiffCounter {
             oldest: 0,
             count: 0,
             total_delta: 0,
-            deltas: VecDeque::new(),
+            head: SENTINEL,
+            tail: SENTINEL,
         }
     }
 
-    /// Youngest instance value, or 0 if no instances.
+    /// Youngest instance value.
     #[inline]
     fn youngest(&self) -> u32 {
         debug_assert!(self.count > 0);
@@ -79,25 +162,35 @@ impl DiffCounter {
 
     /// Deallocate the oldest instance.  Returns `true` if instances remain.
     #[inline]
-    fn dealloc_oldest(&mut self) -> bool {
+    fn dealloc_oldest(&mut self, pool: &mut DeltaPool) -> bool {
         debug_assert!(self.count > 0);
         self.count -= 1;
         if self.count > 0 {
-            let d = self.deltas.pop_front().unwrap();
-            // New oldest = old oldest − delta
+            let old_head = self.head;
+            debug_assert_ne!(old_head, SENTINEL);
+            let d = pool.values[old_head as usize];
+            self.head = pool.next[old_head as usize];
+            if self.head == SENTINEL {
+                self.tail = SENTINEL;
+            }
+            pool.free_node(old_head);
             self.oldest -= d;
             self.total_delta -= d;
             true
         } else {
+            if self.head != SENTINEL {
+                pool.free_chain(self.head, self.tail);
+            }
             self.total_delta = 0;
-            self.deltas.clear();
+            self.head = SENTINEL;
+            self.tail = SENTINEL;
             false
         }
     }
 
     /// Allocate a new instance with a given initial value (youngest).
     #[inline]
-    fn alloc_new_with_value(&mut self, value: u32) {
+    fn alloc_new_with_value(&mut self, value: u32, pool: &mut DeltaPool) {
         if self.count == 0 {
             self.oldest = value;
             self.count = 1;
@@ -105,7 +198,13 @@ impl DiffCounter {
         } else {
             let youngest_val = self.youngest();
             let gap = youngest_val - value;
-            self.deltas.push_back(gap);
+            let node = pool.alloc(gap);
+            if self.tail != SENTINEL {
+                pool.next[self.tail as usize] = node;
+            } else {
+                self.head = node;
+            }
+            self.tail = node;
             self.total_delta += gap;
             self.count += 1;
         }
@@ -113,8 +212,8 @@ impl DiffCounter {
 
     /// Allocate a new instance with value 0 (youngest).
     #[inline]
-    fn alloc_new(&mut self) {
-        self.alloc_new_with_value(0);
+    fn alloc_new(&mut self, pool: &mut DeltaPool) {
+        self.alloc_new_with_value(0, pool);
     }
 
     #[inline]
@@ -122,58 +221,48 @@ impl DiffCounter {
         self.count == 0
     }
 
-    /// Reset to empty state.
-    fn clear(&mut self) {
+    /// Return nodes to the pool and reset to empty state.
+    #[inline]
+    fn clear(&mut self, pool: &mut DeltaPool) {
+        if self.head != SENTINEL {
+            pool.free_chain(self.head, self.tail);
+        }
         self.oldest = 0;
         self.count = 0;
         self.total_delta = 0;
-        self.deltas.clear();
+        self.head = SENTINEL;
+        self.tail = SENTINEL;
+    }
+
+    /// Reset to empty state without returning nodes to the pool.
+    /// Used after [`DeltaPool::reset`] when all nodes are already
+    /// invalidated.
+    #[inline]
+    fn reset(&mut self) {
+        self.oldest = 0;
+        self.count = 0;
+        self.total_delta = 0;
+        self.head = SENTINEL;
+        self.tail = SENTINEL;
     }
 }
 
 // ---------------------------------------------------------------------------
-// Per-counter state
+// Per-counter metadata (no heap)
 // ---------------------------------------------------------------------------
 
-/// Runtime state for one counter using differential encoding.
-///
-/// For a counter body of fixed byte-length `L`, instances partition into
-/// `L` phase groups based on `creation_position mod L`.  Within each
-/// phase, all instances pass through CInc simultaneously (every `L` bytes).
-///
-/// For single-byte bodies (L=1), there is exactly one phase.
+/// Per-counter metadata indexing into the flat phases array.
 #[derive(Clone, Debug)]
-struct CounterState {
-    /// One differential counter per phase.  `phases.len() == body_length`.
-    phases: Vec<DiffCounter>,
+struct CounterMeta {
+    /// Start index in the flat `phases` array.
+    phase_start: usize,
+    /// Number of phases (= body_length).
+    num_phases: usize,
     /// Which phase fires CInc on the current byte (cycles 0..L-1).
-    /// After CInc fires, this advances to `(active_phase + 1) % L`.
     active_phase: usize,
     /// Counter parameters.
     min: u32,
     max: u32,
-}
-
-impl CounterState {
-    fn new(body_length: usize, min: u32, max: u32) -> Self {
-        Self {
-            phases: (0..body_length).map(|_| DiffCounter::new()).collect(),
-            active_phase: 0,
-            min,
-            max,
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.phases.iter().all(|p| p.is_empty())
-    }
-
-    fn clear(&mut self) {
-        for p in &mut self.phases {
-            p.clear();
-        }
-        self.active_phase = 0;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -255,10 +344,13 @@ pub(crate) struct Tier2DfaCache {
     /// should be cleared (only re-seeded first-byte instances remain).
     counter_body_interior: Vec<u32>,
     counter_body_ranges: Vec<(usize, usize)>,
-    /// Per-counter differential state, reused across matcher invocations
-    /// to avoid per-match allocation.  Initialized in `prepare()`,
-    /// cleared and re-seeded in `Tier2DfaMatcher::new()`.
-    counter_states: Vec<CounterState>,
+    /// Shared arena for delta linked-list nodes across all counters.
+    delta_pool: DeltaPool,
+    /// Flat array of differential counters for all phases of all counters.
+    /// Indexed via [`CounterMeta::phase_start`].
+    phases: Vec<DiffCounter>,
+    /// Per-counter metadata (phase range, active_phase, min, max).
+    counter_meta: Vec<CounterMeta>,
 }
 
 impl fmt::Debug for Tier2DfaCache {
@@ -288,7 +380,9 @@ impl Tier2DfaCache {
             start_seeds: Box::new([]),
             counter_body_interior: Vec::new(),
             counter_body_ranges: Vec::new(),
-            counter_states: Vec::new(),
+            delta_pool: DeltaPool::new(),
+            phases: Vec::new(),
+            counter_meta: Vec::new(),
         }
     }
 
@@ -319,6 +413,99 @@ impl Tier2DfaCache {
         self.transitions
             .extend(std::iter::repeat_with(Transition::empty).take(self.stride));
         Some(id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Counter helper methods (split-borrow safe: these operate on `self`
+    // directly, so the borrow checker can see field disjointness)
+    // -----------------------------------------------------------------------
+
+    /// Increment the active phase of counter `c_idx`.
+    /// Returns `true` if any instance can break (oldest >= min).
+    #[inline]
+    fn counter_increment(&mut self, c_idx: usize) -> bool {
+        let m = &self.counter_meta[c_idx];
+        let phase_idx = m.phase_start + m.active_phase;
+        let min = m.min;
+        let max = m.max;
+        // m borrow ends here (NLL: all fields copied to locals).
+
+        let phase = &mut self.phases[phase_idx];
+        if phase.is_empty() {
+            return false;
+        }
+        phase.increment_all();
+        let can_break = phase.oldest >= min;
+        if can_break {
+            while !phase.is_empty() && phase.oldest >= max {
+                phase.dealloc_oldest(&mut self.delta_pool);
+            }
+        }
+        can_break
+    }
+
+    /// Clear all phases of counter `c_idx`, returning nodes to the pool.
+    #[inline]
+    fn counter_reset_idx(&mut self, c_idx: usize) {
+        let start = self.counter_meta[c_idx].phase_start;
+        let end = start + self.counter_meta[c_idx].num_phases;
+        for p in &mut self.phases[start..end] {
+            p.clear(&mut self.delta_pool);
+        }
+    }
+
+    /// Advance active_phase for every counter (called on every byte).
+    #[inline]
+    fn advance_all_phases(&mut self) {
+        for m in &mut self.counter_meta {
+            m.active_phase = (m.active_phase + 1) % m.num_phases;
+        }
+    }
+
+    /// Seed a new counter instance into the appropriate phase.
+    ///
+    /// Targets the phase that will fire CInc when this instance completes
+    /// its first body iteration.  The body has L bytes, and the phase
+    /// clock has already been advanced for this byte, so:
+    ///   `target_phase = (active_phase + L - 1) % L`
+    #[inline]
+    fn seed_counter(&mut self, c_idx: usize, initial_value: u32) {
+        let m = &self.counter_meta[c_idx];
+        let nph = m.num_phases;
+        let target_phase = (m.active_phase + nph - 1) % nph;
+        let phase_idx = m.phase_start + target_phase;
+        // m borrow ends here.
+        self.phases[phase_idx].alloc_new_with_value(initial_value, &mut self.delta_pool);
+    }
+
+    /// Check if any phase has live instances.
+    #[inline]
+    fn has_live_phases(&self) -> bool {
+        self.phases.iter().any(|p| !p.is_empty())
+    }
+
+    /// Clear all counter instances and reset active phases.
+    fn clear_all_counters(&mut self) {
+        for ci in 0..self.counter_meta.len() {
+            let start = self.counter_meta[ci].phase_start;
+            let end = start + self.counter_meta[ci].num_phases;
+            for p in &mut self.phases[start..end] {
+                p.clear(&mut self.delta_pool);
+            }
+            self.counter_meta[ci].active_phase = 0;
+        }
+    }
+
+    /// Reset all phases and the delta pool for a new match.
+    /// Does NOT deallocate — just invalidates all nodes and resets scalars.
+    fn reset_for_new_match(&mut self) {
+        self.delta_pool.reset();
+        for p in &mut self.phases {
+            p.reset();
+        }
+        for m in &mut self.counter_meta {
+            m.active_phase = 0;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -713,7 +900,9 @@ impl Tier2DfaCache {
         self.start_seeds = Box::new([]);
         self.counter_body_interior.clear();
         self.counter_body_ranges.clear();
-        self.counter_states.clear();
+        self.delta_pool.reset();
+        self.phases.clear();
+        self.counter_meta.clear();
     }
 
     #[inline]
@@ -754,13 +943,24 @@ impl Tier2DfaCache {
         self.start_is_match_at_end = self.states[self.start_id.idx()].is_match_at_end;
         self.start_seeds = cr.seed_instances.iter().map(|&(c, _s)| (c, 0u32)).collect();
 
-        // Initialize counter_states with the correct sizes.  These are
-        // reused across matcher invocations — only allocated once per regex.
-        self.counter_states.clear();
+        // Initialize flat phases and counter metadata.
+        // Allocated once per regex, reused across matcher invocations.
+        self.phases.clear();
+        self.counter_meta.clear();
         for ci in 0..regex.num_counters {
             let (min, max, body_len) = regex.counter_info(ci);
-            self.counter_states
-                .push(CounterState::new(body_len.max(1), min as u32, max as u32));
+            let nph = body_len.max(1);
+            let phase_start = self.phases.len();
+            for _ in 0..nph {
+                self.phases.push(DiffCounter::new());
+            }
+            self.counter_meta.push(CounterMeta {
+                phase_start,
+                num_phases: nph,
+                active_phase: 0,
+                min: min as u32,
+                max: max as u32,
+            });
         }
     }
 }
@@ -799,13 +999,14 @@ fn compute_body_interiors(regex: &Regex) -> (Vec<u32>, Vec<(usize, usize)>) {
     for s in states.iter() {
         if let State::CounterInstance { counter, out } = s {
             let ci = counter.idx();
-            // Find "first" consuming states: reachable from CI.out through
-            // epsilon states only.
+            // Find "first" consuming states: reachable from CI.out
+            // through epsilon states only.
             let first = consuming_states_from(*out, states);
             let first_set: std::collections::HashSet<u32> = first.iter().map(|s| s.0).collect();
 
-            // Walk the entire body from CI.out, following consuming states
-            // through their successors, to find all consuming states.
+            // Walk the entire body from CI.out, following consuming
+            // states through their successors, to find all consuming
+            // states.
             let mut all_body_consuming: Vec<u32> = Vec::new();
             let mut stack: Vec<StateIdx> = vec![*out];
             let mut visited = vec![false; states.len()];
@@ -956,21 +1157,26 @@ pub struct Tier2DfaMatcher<'a> {
 impl<'a> Tier2DfaMatcher<'a> {
     #[inline]
     pub(crate) fn new(cache: &'a mut Tier2DfaCache, regex: &'a Regex) -> Self {
-        // Reset counter states — reuse existing allocations.
-        for cs in &mut cache.counter_states {
-            cs.clear();
-        }
+        // Reset pool and all phase scalars — O(1) pool reset plus
+        // O(num_phases) scalar writes, no per-node deallocation.
+        cache.reset_for_new_match();
 
         // Seed initial counter instances.
         // At the start (before any bytes), active_phase is 0.
         // Seed into the phase that fires CInc when the body completes
         // (after L bytes).  That's phase (0 + L - 1) % L = L - 1.
         let mut has_live = false;
-        for &(counter, _initial_value) in cache.start_seeds.iter() {
+        // Iterate start_seeds by index to avoid borrow conflict with
+        // seed_counter (which borrows cache mutably).
+        let num_start_seeds = cache.start_seeds.len();
+        for si in 0..num_start_seeds {
+            let (counter, _initial_value) = cache.start_seeds[si];
             let c_idx = counter.idx();
-            let nph = cache.counter_states[c_idx].phases.len();
+            let m = &cache.counter_meta[c_idx];
+            let nph = m.num_phases;
             let target_phase = (nph - 1) % nph;
-            cache.counter_states[c_idx].phases[target_phase].alloc_new();
+            let phase_idx = m.phase_start + target_phase;
+            cache.phases[phase_idx].alloc_new(&mut cache.delta_pool);
             has_live = true;
         }
 
@@ -1045,8 +1251,8 @@ impl<'a> Tier2DfaMatcher<'a> {
         }
 
         // Slow path: snapshot scalar transition fields into locals so the
-        // borrow on self.cache.transitions is released before we mutate
-        // self.cache.counter_states.
+        // borrow on self.cache.transitions is released before we call
+        // helper methods that borrow self.cache mutably.
         let is_counting = t.is_counting;
         let counting_mask = t.counting_mask;
         let no_break = t.no_break;
@@ -1068,26 +1274,8 @@ impl<'a> Tier2DfaMatcher<'a> {
             while mask != 0 {
                 let c_idx = mask.trailing_zeros() as usize;
                 mask &= mask - 1; // clear lowest set bit
-
-                if c_idx < self.cache.counter_states.len() {
-                    let cs = &mut self.cache.counter_states[c_idx];
-                    let phase_idx = cs.active_phase;
-                    let phase = &mut cs.phases[phase_idx];
-
-                    if !phase.is_empty() {
-                        // Increment all instances in this phase.
-                        phase.increment_all();
-
-                        // Check break condition: oldest >= min.
-                        if phase.oldest >= cs.min {
-                            any_can_break = true;
-
-                            // Deallocate instances that must break (value >= max).
-                            while !phase.is_empty() && phase.oldest >= cs.max {
-                                phase.dealloc_oldest();
-                            }
-                        }
-                    }
+                if c_idx < self.cache.counter_meta.len() && self.cache.counter_increment(c_idx) {
+                    any_can_break = true;
                 }
             }
 
@@ -1118,51 +1306,39 @@ impl<'a> Tier2DfaMatcher<'a> {
         // Apply counter_reset: clear instances for counters whose body
         // was interrupted (no interior body NFA states in the successor).
         if counter_reset != 0 {
-            for (ci, cs) in self.cache.counter_states.iter_mut().enumerate() {
-                if (counter_reset >> ci) & 1 != 0 {
-                    cs.clear();
+            let mut mask = counter_reset;
+            while mask != 0 {
+                let c_idx = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                if c_idx < self.cache.counter_meta.len() {
+                    self.cache.counter_reset_idx(c_idx);
                 }
             }
         }
 
         // Advance active_phase for EVERY counter on EVERY byte.
         // This keeps the phase clock synchronized with byte position.
-        for cs in &mut self.cache.counter_states {
-            let nph = cs.phases.len();
-            cs.active_phase = (cs.active_phase + 1) % nph;
-        }
+        self.cache.advance_all_phases();
 
         // Seed new counter instances.
         // Access seeds by index: each index yields a Copy tuple, so the
         // temporary borrow on self.cache.transitions ends before we
-        // mutate self.cache.counter_states.
+        // call seed_counter.
         for si in 0..num_seeds {
             let (counter, initial_value) = self.cache.transitions[slot].seeds[si];
             let c_idx = counter.idx();
-            if c_idx < self.cache.counter_states.len() {
-                let cs = &mut self.cache.counter_states[c_idx];
-                // Seed into the phase that will fire CInc when this
-                // instance completes its first body iteration.  The body
-                // has L bytes.  CInc fires L-1 bytes from now (the phase
-                // clock has already been advanced for this byte).
-                // active_phase was just advanced, so it's one step ahead.
-                // We need the phase that fires after L-1 MORE bytes:
-                //   target_phase = (active_phase + L - 1) % L
-                let nph = cs.phases.len();
-                let target_phase = (cs.active_phase + nph - 1) % nph;
-                cs.phases[target_phase].alloc_new_with_value(initial_value);
+            if c_idx < self.cache.counter_meta.len() {
+                self.cache.seed_counter(c_idx, initial_value);
             }
         }
 
         // Update has_live_counters flag.
-        self.has_live_counters = self.cache.counter_states.iter().any(|cs| !cs.is_empty());
+        self.has_live_counters = self.cache.has_live_phases();
     }
 
     fn step_from_dead(&mut self, byte: u8) {
         if self.has_live_counters {
-            for cs in &mut self.cache.counter_states {
-                cs.clear();
-            }
+            self.cache.clear_all_counters();
             self.has_live_counters = false;
         }
         self.match_at_end = false;
@@ -1180,22 +1356,17 @@ impl<'a> Tier2DfaMatcher<'a> {
         }
 
         // Advance active_phase for every counter (every byte ticks the clock).
-        for cs in &mut self.cache.counter_states {
-            let nph = cs.phases.len();
-            cs.active_phase = (cs.active_phase + 1) % nph;
-        }
+        self.cache.advance_all_phases();
 
         // Seed with phase-aware placement.
+        // `trans` is an owned local — no borrow conflict with cache.
         for &(counter, initial_value) in trans.seeds.iter() {
             let c_idx = counter.idx();
-            if c_idx < self.cache.counter_states.len() {
-                let cs = &mut self.cache.counter_states[c_idx];
-                let nph = cs.phases.len();
-                let target_phase = (cs.active_phase + nph - 1) % nph;
-                cs.phases[target_phase].alloc_new_with_value(initial_value);
+            if c_idx < self.cache.counter_meta.len() {
+                self.cache.seed_counter(c_idx, initial_value);
             }
         }
-        self.has_live_counters = self.cache.counter_states.iter().any(|cs| !cs.is_empty());
+        self.has_live_counters = self.cache.has_live_phases();
     }
 
     #[inline(always)]
