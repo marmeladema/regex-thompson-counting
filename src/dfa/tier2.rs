@@ -522,7 +522,7 @@ impl Tier2DfaCache {
     fn epsilon_closure(
         &mut self,
         seeds: impl Iterator<Item = StateIdx>,
-        states: &[State],
+        regex: &Regex,
         at_start: bool,
         prev_byte: Option<u8>,
         next_byte: Option<u8>,
@@ -548,14 +548,14 @@ impl Tier2DfaCache {
             }
             self.closure_visited[i] = true;
 
-            match states[idx] {
+            match regex.states[idx] {
                 State::Split { out, out1 } => {
                     self.closure_stack.push(out1);
                     self.closure_stack.push(out);
                 }
                 State::Assert { kind, out } => {
                     if kind == AssertKind::End {
-                        if self.can_reach_match(out, states) {
+                        if regex.state_can_reach_match[out.idx()] {
                             is_match_at_end = true;
                         }
                         continue;
@@ -595,7 +595,7 @@ impl Tier2DfaCache {
 
         let mut seed_instances: Vec<(CounterIdx, StateIdx)> = Vec::new();
         for &(counter, ci_out) in &self.closure_seeds {
-            let consuming = consuming_states_from(ci_out, states);
+            let consuming = consuming_states_from(ci_out, &regex.states);
             for c in consuming {
                 seed_instances.push((counter, c));
             }
@@ -611,32 +611,6 @@ impl Tier2DfaCache {
             encountered_cinc,
             seed_instances: seed_instances.into_boxed_slice(),
         }
-    }
-
-    fn can_reach_match(&self, start: StateIdx, states: &[State]) -> bool {
-        let mut stack = vec![start];
-        let mut visited = vec![false; states.len()];
-        while let Some(idx) = stack.pop() {
-            let i = idx.idx();
-            if visited[i] {
-                continue;
-            }
-            visited[i] = true;
-            match states[idx] {
-                State::Match => return true,
-                State::Split { out, out1 } => {
-                    stack.push(out1);
-                    stack.push(out);
-                }
-                State::Assert { out, .. } => stack.push(out),
-                State::CounterInstance { out, .. } => stack.push(out),
-                State::CounterIncrement { out, .. } => {
-                    stack.push(out);
-                }
-                _ => {}
-            }
-        }
-        false
     }
 
     fn resolve_deferred(&self, from_state: &DfaState, byte: u8, regex: &Regex) -> Vec<StateIdx> {
@@ -663,7 +637,7 @@ impl Tier2DfaCache {
         for &assert_idx in state.deferred_asserts.iter() {
             if let State::Assert { kind, out } = regex.states[assert_idx]
                 && kind.eval(false, true, prev, None) == AssertEval::Pass
-                && self.can_reach_match(out, &regex.states)
+                && regex.state_can_reach_match[out.idx()]
             {
                 return true;
             }
@@ -692,7 +666,7 @@ impl Tier2DfaCache {
                 let resolved_prev = from_state.prev_byte_representative();
                 let cr = self.epsilon_closure(
                     extra.into_iter(),
-                    &regex.states,
+                    regex,
                     false,
                     resolved_prev,
                     Some(byte),
@@ -722,7 +696,7 @@ impl Tier2DfaCache {
         // Probe: full "both" closure to detect CInc and collect seeds.
         let probe = self.epsilon_closure(
             targets.iter().copied().chain(std::iter::once(regex.start)),
-            &regex.states,
+            regex,
             false,
             Some(byte),
             None,
@@ -776,7 +750,7 @@ impl Tier2DfaCache {
         if is_counting {
             let cr_nb = self.epsilon_closure(
                 targets.iter().copied().chain(std::iter::once(regex.start)),
-                &regex.states,
+                regex,
                 false,
                 Some(byte),
                 None,
@@ -926,14 +900,7 @@ impl Tier2DfaCache {
         self.counter_body_interior = flat;
         self.counter_body_ranges = ranges;
 
-        let cr = self.epsilon_closure(
-            std::iter::once(regex.start),
-            &regex.states,
-            true,
-            None,
-            None,
-            true,
-        );
+        let cr = self.epsilon_closure(std::iter::once(regex.start), regex, true, None, None, true);
         self.start_id = self
             .intern_state(
                 cr.nfa_states,

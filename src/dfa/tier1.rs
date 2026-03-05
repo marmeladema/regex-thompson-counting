@@ -129,7 +129,7 @@ impl DfaCache {
     fn epsilon_closure(
         &mut self,
         seeds: impl Iterator<Item = StateIdx>,
-        states: &[State],
+        regex: &Regex,
         at_start: bool,
         at_end: bool,
         prev_byte: Option<u8>,
@@ -153,7 +153,7 @@ impl DfaCache {
             }
             self.closure_visited[i] = true;
 
-            match states[idx] {
+            match regex.states[idx] {
                 State::Split { out, out1 } => {
                     self.closure_stack.push(out1);
                     self.closure_stack.push(out);
@@ -165,7 +165,7 @@ impl DfaCache {
                     if kind == AssertKind::End {
                         if at_end {
                             self.closure_stack.push(out);
-                        } else if self.can_reach_match(out, states) {
+                        } else if regex.state_can_reach_match[out.idx()] {
                             is_match_at_end = true;
                         }
                         continue;
@@ -207,36 +207,6 @@ impl DfaCache {
         (nfa_states, deferred, is_match, is_match_at_end)
     }
 
-    /// Check if `Match` is reachable from `idx` through epsilon transitions.
-    /// Follows Split, all Assert kinds (optimistically), to determine if
-    /// a match is *possible* (used for `is_match_at_end` via `$`).
-    fn can_reach_match(&self, start: StateIdx, states: &[State]) -> bool {
-        let mut stack = vec![start];
-        let mut visited = vec![false; states.len()];
-        while let Some(idx) = stack.pop() {
-            let i = idx.idx();
-            if visited[i] {
-                continue;
-            }
-            visited[i] = true;
-            match states[idx] {
-                State::Match => return true,
-                State::Split { out, out1 } => {
-                    stack.push(out1);
-                    stack.push(out);
-                }
-                State::Assert { out, .. } => {
-                    // Follow all assertions optimistically — if there is
-                    // *any* path through assertions to Match, we consider
-                    // a match possible.
-                    stack.push(out);
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-
     /// Resolve deferred assertions from `from_state` given that `byte` is the
     /// next input byte.  Returns extra NFA targets (the `out` states of
     /// passing assertions) that should be followed through epsilon closure.
@@ -269,7 +239,7 @@ impl DfaCache {
         for &assert_idx in state.deferred_asserts.iter() {
             if let State::Assert { kind, out } = regex.states[assert_idx] {
                 let result = kind.eval(false, true, prev, None);
-                if result == AssertEval::Pass && self.can_reach_match(out, &regex.states) {
+                if result == AssertEval::Pass && regex.state_can_reach_match[out.idx()] {
                     return true;
                 }
             }
@@ -350,7 +320,7 @@ impl DfaCache {
                 let (resolved_consumers, _resolved_deferred, resolved_match, resolved_match_at_end) =
                     self.epsilon_closure(
                         extra.into_iter(),
-                        &regex.states,
+                        regex,
                         false,
                         false,
                         resolved_prev,
@@ -421,7 +391,7 @@ impl DfaCache {
                     // No consuming state produced a target.  Re-seed.
                     let (nfa_set, deferred, mut m, mut mae) = self.epsilon_closure(
                         std::iter::once(regex.start),
-                        &regex.states,
+                        regex,
                         false,
                         false,
                         Some(byte),
@@ -444,7 +414,7 @@ impl DfaCache {
 
                 let seeds = targets.into_iter().chain(std::iter::once(regex.start));
                 let (nfa_set, deferred, mut m, mut mae) =
-                    self.epsilon_closure(seeds, &regex.states, false, false, Some(byte), None);
+                    self.epsilon_closure(seeds, regex, false, false, Some(byte), None);
                 m |= resolved_match;
                 mae |= resolved_match_at_end;
                 if nfa_set.is_empty() && deferred.is_empty() && !m && !mae {
@@ -482,7 +452,7 @@ impl DfaCache {
         if targets.is_empty() {
             let (nfa_set, deferred, is_match, is_match_at_end) = self.epsilon_closure(
                 std::iter::once(regex.start),
-                &regex.states,
+                regex,
                 false,
                 false,
                 Some(byte),
@@ -503,7 +473,7 @@ impl DfaCache {
 
         let seeds = targets.into_iter().chain(std::iter::once(regex.start));
         let (nfa_set, deferred, is_match, is_match_at_end) =
-            self.epsilon_closure(seeds, &regex.states, false, false, Some(byte), None);
+            self.epsilon_closure(seeds, regex, false, false, Some(byte), None);
 
         if nfa_set.is_empty() && deferred.is_empty() && !is_match && !is_match_at_end {
             return DfaStateId::DEAD;
@@ -551,14 +521,8 @@ impl DfaCache {
         // Start state: at_start=true, prev_byte=None, at_end=false.
         // Deferred assertions at start (e.g., `\b` at pos 0) get
         // prev=None → prev_was_word=false.
-        let (nfa_set, deferred, is_match, is_match_at_end) = self.epsilon_closure(
-            std::iter::once(regex.start),
-            &regex.states,
-            true,
-            false,
-            None,
-            None,
-        );
+        let (nfa_set, deferred, is_match, is_match_at_end) =
+            self.epsilon_closure(std::iter::once(regex.start), regex, true, false, None, None);
         let pw = false; // At start, prev is always non-word.
         self.start_id = self
             .intern_state(nfa_set, deferred, is_match, is_match_at_end, pw)

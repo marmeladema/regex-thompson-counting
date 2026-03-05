@@ -234,7 +234,7 @@ impl Tier3DfaCache {
     fn epsilon_closure(
         &mut self,
         seeds: impl Iterator<Item = StateIdx>,
-        states: &[State],
+        regex: &Regex,
         at_start: bool,
         prev_byte: Option<u8>,
         next_byte: Option<u8>,
@@ -260,14 +260,14 @@ impl Tier3DfaCache {
             }
             self.closure_visited[i] = true;
 
-            match states[idx] {
+            match regex.states[idx] {
                 State::Split { out, out1 } => {
                     self.closure_stack.push(out1);
                     self.closure_stack.push(out);
                 }
                 State::Assert { kind, out } => {
                     if kind == AssertKind::End {
-                        if self.can_reach_match(out, states) {
+                        if regex.state_can_reach_match[out.idx()] {
                             is_match_at_end = true;
                         }
                         continue;
@@ -310,7 +310,7 @@ impl Tier3DfaCache {
         // Resolve CI seed pairs to (counter, consuming_state) pairs.
         let mut seed_instances: Vec<(CounterIdx, StateIdx)> = Vec::new();
         for &(counter, ci_out) in &self.closure_seeds {
-            let consuming = consuming_states_from(ci_out, states);
+            let consuming = consuming_states_from(ci_out, &regex.states);
             for c in consuming {
                 seed_instances.push((counter, c));
             }
@@ -326,37 +326,6 @@ impl Tier3DfaCache {
             encountered_cinc,
             seed_instances: seed_instances.into_boxed_slice(),
         }
-    }
-
-    fn can_reach_match(&self, start: StateIdx, states: &[State]) -> bool {
-        let mut stack = vec![start];
-        let mut visited = vec![false; states.len()];
-        while let Some(idx) = stack.pop() {
-            let i = idx.idx();
-            if visited[i] {
-                continue;
-            }
-            visited[i] = true;
-            match states[idx] {
-                State::Match => return true,
-                State::Split { out, out1 } => {
-                    stack.push(out1);
-                    stack.push(out);
-                }
-                State::Assert { out, .. } => stack.push(out),
-                State::CounterInstance { out, .. } => stack.push(out),
-                State::CounterIncrement { out, .. } => {
-                    // Only follow the continue path (out).  The break path
-                    // (out1) requires a counter instance with value >= min,
-                    // which we cannot verify structurally.  Counter-aware
-                    // break matching is handled by instance tracking in
-                    // step_slow / finish.
-                    stack.push(out);
-                }
-                _ => {}
-            }
-        }
-        false
     }
 
     fn resolve_deferred(&self, from_state: &DfaState, byte: u8, regex: &Regex) -> Vec<StateIdx> {
@@ -383,7 +352,7 @@ impl Tier3DfaCache {
         for &assert_idx in state.deferred_asserts.iter() {
             if let State::Assert { kind, out } = regex.states[assert_idx]
                 && kind.eval(false, true, prev, None) == AssertEval::Pass
-                && self.can_reach_match(out, &regex.states)
+                && regex.state_can_reach_match[out.idx()]
             {
                 return true;
             }
@@ -414,7 +383,7 @@ impl Tier3DfaCache {
                 let resolved_prev = from_state.prev_byte_representative();
                 let cr = self.epsilon_closure(
                     extra.into_iter(),
-                    &regex.states,
+                    regex,
                     false,
                     resolved_prev,
                     Some(byte),
@@ -455,7 +424,7 @@ impl Tier3DfaCache {
                 .iter()
                 .copied()
                 .chain(std::iter::once(regex.start)),
-            &regex.states,
+            regex,
             false,
             Some(byte),
             None,
@@ -507,7 +476,7 @@ impl Tier3DfaCache {
                     .iter()
                     .copied()
                     .chain(std::iter::once(regex.start)),
-                &regex.states,
+                regex,
                 false,
                 Some(byte),
                 None,
@@ -609,13 +578,17 @@ impl Tier3DfaCache {
 
             let cr_continue = self.epsilon_closure(
                 targets.iter().copied(),
-                &regex.states,
+                regex,
                 false,
                 None,
                 None,
                 false, // follow_break=false → continue only
             );
-            let cr_break_only = self.epsilon_closure_break_only(targets, &regex.states);
+            let cr_break_only = self.epsilon_closure_break_only(
+                targets,
+                &regex.states,
+                &regex.state_can_reach_match,
+            );
 
             OriginAction::Increment {
                 advance_origins: cr_no_cinc.into_boxed_slice(),
@@ -627,14 +600,7 @@ impl Tier3DfaCache {
             }
         } else {
             // No CInc ��� just advance.
-            let cr = self.epsilon_closure(
-                targets.iter().copied(),
-                &regex.states,
-                false,
-                None,
-                None,
-                true,
-            );
+            let cr = self.epsilon_closure(targets.iter().copied(), regex, false, None, None, true);
             if cr.nfa_states.is_empty() {
                 OriginAction::Dead
             } else {
@@ -647,7 +613,12 @@ impl Tier3DfaCache {
 
     /// Epsilon closure that only follows the CInc break path (out1), not
     /// the continue path (out).  Returns (is_match, is_match_at_end).
-    fn epsilon_closure_break_only(&self, targets: &[StateIdx], states: &[State]) -> (bool, bool) {
+    fn epsilon_closure_break_only(
+        &self,
+        targets: &[StateIdx],
+        states: &[State],
+        can_reach_match: &[bool],
+    ) -> (bool, bool) {
         let mut stack: Vec<StateIdx> = Vec::new();
         let mut visited = vec![false; states.len()];
         let mut is_match = false;
@@ -690,7 +661,7 @@ impl Tier3DfaCache {
                     stack.push(out);
                 }
                 State::Assert { kind, out } => {
-                    if kind == AssertKind::End && self.can_reach_match(out, states) {
+                    if kind == AssertKind::End && can_reach_match[out.idx()] {
                         is_match_at_end = true;
                     }
                     // Do NOT follow other assertions.  Deferred assertions
@@ -741,7 +712,7 @@ impl Tier3DfaCache {
 
         let cr = self.epsilon_closure(
             std::iter::once(regex.start),
-            &regex.states,
+            regex,
             true,
             None,
             None,
