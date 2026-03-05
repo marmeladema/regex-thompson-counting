@@ -24,7 +24,7 @@ mod tier2;
 mod tier3;
 mod tier4;
 
-use std::collections::HashMap;
+use ahash::HashMap;
 
 pub(crate) use tier1::{DfaCache, DfaMatcher};
 pub(crate) use tier2::{Tier2DfaCache, Tier2DfaMatcher};
@@ -163,7 +163,7 @@ impl DfaMemory {
     pub(crate) fn new(num_nfa_states: usize) -> Self {
         Self {
             states: Vec::new(),
-            state_map: HashMap::new(),
+            state_map: HashMap::default(),
             stride: 256, // default; overwritten by prepare()
             closure_stack: Vec::new(),
             closure_result: Vec::new(),

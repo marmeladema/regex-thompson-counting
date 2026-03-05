@@ -323,7 +323,7 @@ impl Tier4DfaCache {
     pub(crate) fn new(num_nfa_states: usize) -> Self {
         Self {
             states: Vec::new(),
-            state_map: HashMap::new(),
+            state_map: HashMap::default(),
             transitions: Vec::new(),
             programs: Vec::new(),
             origin_program_tables: Vec::new(),

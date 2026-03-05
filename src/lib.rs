@@ -67,6 +67,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use regex_syntax::hir::{self, HirKind};
 
+use ahash::HashMap;
+
 /// Global counter for assigning unique IDs to compiled regexes.
 static NEXT_REGEX_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1313,8 +1315,7 @@ impl RegexBuilder {
 
         // Build signature for each byte.
         // To keep things efficient, we hash signatures on the fly.
-        use std::collections::HashMap;
-        let mut class_map: HashMap<Vec<u32>, u8> = HashMap::new();
+        let mut class_map: HashMap<Vec<u32>, u8> = HashMap::default();
         let mut mapping = [0u8; 256];
         let mut next_class: u8 = 0;
 
