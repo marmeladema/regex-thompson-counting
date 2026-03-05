@@ -233,18 +233,6 @@ impl DiffCounter {
         self.head = SENTINEL;
         self.tail = SENTINEL;
     }
-
-    /// Reset to empty state without returning nodes to the pool.
-    /// Used after [`DeltaPool::reset`] when all nodes are already
-    /// invalidated.
-    #[inline]
-    fn reset(&mut self) {
-        self.oldest = 0;
-        self.count = 0;
-        self.total_delta = 0;
-        self.head = SENTINEL;
-        self.tail = SENTINEL;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +339,9 @@ pub(crate) struct Tier2DfaCache {
     phases: Vec<DiffCounter>,
     /// Per-counter metadata (phase range, active_phase, min, max).
     counter_meta: Vec<CounterMeta>,
+    /// Total number of phase slots (sum of num_phases across counters).
+    /// Computed once in `prepare()`, used by `ensure_phases()` for lazy resize.
+    total_phases: usize,
 }
 
 impl fmt::Debug for Tier2DfaCache {
@@ -383,6 +374,7 @@ impl Tier2DfaCache {
             delta_pool: DeltaPool::new(),
             phases: Vec::new(),
             counter_meta: Vec::new(),
+            total_phases: 0,
         }
     }
 
@@ -497,12 +489,23 @@ impl Tier2DfaCache {
     }
 
     /// Reset all phases and the delta pool for a new match.
-    /// Does NOT deallocate — just invalidates all nodes and resets scalars.
+    /// O(1): just clears the pool and phases vec (capacity retained).
+    /// Phases are lazily repopulated by [`ensure_phases`] on the first
+    /// slow-path byte that actually needs counter operations.
     fn reset_for_new_match(&mut self) {
         self.delta_pool.reset();
-        for p in &mut self.phases {
-            p.reset();
+        self.phases.clear();
+    }
+
+    /// Lazily populate the phases vec and reset active_phase for all counters.
+    /// Called once per match on the first slow-path byte; subsequent calls
+    /// short-circuit on the `is_empty` check.
+    #[inline]
+    fn ensure_phases(&mut self) {
+        if !self.phases.is_empty() {
+            return;
         }
+        self.phases.resize(self.total_phases, DiffCounter::new());
         for m in &mut self.counter_meta {
             m.active_phase = 0;
         }
@@ -903,6 +906,7 @@ impl Tier2DfaCache {
         self.delta_pool.reset();
         self.phases.clear();
         self.counter_meta.clear();
+        self.total_phases = 0;
     }
 
     #[inline]
@@ -962,6 +966,7 @@ impl Tier2DfaCache {
                 max: max as u32,
             });
         }
+        self.total_phases = self.phases.len();
     }
 }
 
@@ -1157,26 +1162,29 @@ pub struct Tier2DfaMatcher<'a> {
 impl<'a> Tier2DfaMatcher<'a> {
     #[inline]
     pub(crate) fn new(cache: &'a mut Tier2DfaCache, regex: &'a Regex) -> Self {
-        // Reset pool and all phase scalars — O(1) pool reset plus
-        // O(num_phases) scalar writes, no per-node deallocation.
+        // O(1) reset: clears the delta pool and phases vec.
+        // Phases are lazily repopulated on the first slow-path byte.
         cache.reset_for_new_match();
 
-        // Seed initial counter instances.
-        // At the start (before any bytes), active_phase is 0.
-        // Seed into the phase that fires CInc when the body completes
-        // (after L bytes).  That's phase (0 + L - 1) % L = L - 1.
+        // Seed initial counter instances (only for patterns where the
+        // start state directly reaches a CounterInstance via epsilons).
+        // For most patterns (e.g. AWS keys), start_seeds is empty and
+        // this block is skipped entirely — no counter work at all.
         let mut has_live = false;
-        // Iterate start_seeds by index to avoid borrow conflict with
-        // seed_counter (which borrows cache mutably).
-        let num_start_seeds = cache.start_seeds.len();
-        for si in 0..num_start_seeds {
-            let (counter, _initial_value) = cache.start_seeds[si];
-            let c_idx = counter.idx();
-            let m = &cache.counter_meta[c_idx];
-            let nph = m.num_phases;
-            let target_phase = (nph - 1) % nph;
-            let phase_idx = m.phase_start + target_phase;
-            cache.phases[phase_idx].alloc_new(&mut cache.delta_pool);
+        if !cache.start_seeds.is_empty() {
+            cache.ensure_phases();
+            // Iterate start_seeds by index to avoid borrow conflict with
+            // seed_counter (which borrows cache mutably).
+            let num_start_seeds = cache.start_seeds.len();
+            for si in 0..num_start_seeds {
+                let (counter, _initial_value) = cache.start_seeds[si];
+                let c_idx = counter.idx();
+                let m = &cache.counter_meta[c_idx];
+                let nph = m.num_phases;
+                let target_phase = (nph - 1) % nph;
+                let phase_idx = m.phase_start + target_phase;
+                cache.phases[phase_idx].alloc_new(&mut cache.delta_pool);
+            }
             has_live = true;
         }
 
@@ -1252,7 +1260,8 @@ impl<'a> Tier2DfaMatcher<'a> {
 
         // Slow path: snapshot scalar transition fields into locals so the
         // borrow on self.cache.transitions is released before we call
-        // helper methods that borrow self.cache mutably.
+        // helper methods (including ensure_phases) that borrow self.cache
+        // mutably.
         let is_counting = t.is_counting;
         let counting_mask = t.counting_mask;
         let no_break = t.no_break;
@@ -1264,6 +1273,10 @@ impl<'a> Tier2DfaMatcher<'a> {
         let counter_reset = t.counter_reset;
         let num_seeds = t.seeds.len();
         // `t` borrow ends here (NLL: last use was t.seeds.len()).
+
+        // Ensure counter phases are populated before any counter ops.
+        // First call per match does the work; subsequent calls short-circuit.
+        self.cache.ensure_phases();
 
         self.match_at_end = false;
         let mut any_can_break = false;
@@ -1354,6 +1367,9 @@ impl<'a> Tier2DfaMatcher<'a> {
                 self.match_at_end = true;
             }
         }
+
+        // Ensure counter phases are populated before counter ops.
+        self.cache.ensure_phases();
 
         // Advance active_phase for every counter (every byte ticks the clock).
         self.cache.advance_all_phases();
