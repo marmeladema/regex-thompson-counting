@@ -3,22 +3,15 @@
 //! Standard lazy subset construction with support for deferred
 //! assertions (`\b`, `\B`, `EndLF`).
 
-use std::collections::HashMap;
 use std::fmt;
 
-use crate::{
-    AssertEval, AssertKind, Prefilter, Regex, State, StateIdx, byte_match_ci, is_word_byte,
-};
+use crate::{Prefilter, Regex, State, StateIdx, byte_match_ci, dfa::DfaMemory, is_word_byte};
 
-use super::{DfaState, DfaStateId};
+use super::DfaStateId;
 
 // ---------------------------------------------------------------------------
 // DFA cache (Tier 1)
 // ---------------------------------------------------------------------------
-
-/// Maximum number of DFA states before the flat transition table stops
-/// growing.  2048 states × stride entries × 4 bytes.
-const DFA_MAX_STATES: usize = 2048;
 
 /// Lazy DFA cache: append-only state table + flat transition table.
 ///
@@ -33,37 +26,16 @@ const DFA_MAX_STATES: usize = 2048;
 /// `Regex`.  A unique regex ID detects when a different regex is used
 /// and clears the cache.
 pub(crate) struct DfaCache {
-    /// Append-only table of DFA states.  Index = `DfaStateId`.
-    states: Vec<DfaState>,
-    /// Reverse lookup: canonical `DfaState → DfaStateId`.
-    state_map: HashMap<DfaState, DfaStateId>,
+    memory: DfaMemory,
     /// Flat transition table: `transitions[state.0 * stride + byte_class]`.
     /// Unpopulated slots contain `DfaStateId::UNPOPULATED`.
     transitions: Vec<DfaStateId>,
-    /// Number of byte equivalence classes — the stride of each DFA state
-    /// row in the transition table.  Copied from [`Regex::num_byte_classes`]
-    /// during [`prepare()`].
-    stride: usize,
-    /// Scratch space for epsilon closure (avoids allocation per populate).
-    closure_stack: Vec<StateIdx>,
-    /// Scratch space for collecting NFA consuming states during closure.
-    closure_result: Vec<StateIdx>,
-    /// Scratch space for collecting deferred assert states during closure.
-    closure_deferred: Vec<StateIdx>,
-    /// Scratch visited set for epsilon closure.
-    closure_visited: Vec<bool>,
-    /// Identity of the regex this cache was built for (see `Regex::id`).
-    regex_id: u64,
-    /// Cached start state (at_start=true, position 0).
-    start_id: DfaStateId,
-    /// Whether the start state is itself a match.
-    start_is_match: bool,
 }
 
 impl fmt::Debug for DfaCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DfaCache")
-            .field("num_states", &self.states.len())
+            .field("num_states", &self.memory.states.len())
             .finish()
     }
 }
@@ -71,17 +43,8 @@ impl fmt::Debug for DfaCache {
 impl DfaCache {
     pub(crate) fn new(num_nfa_states: usize) -> Self {
         Self {
-            states: Vec::new(),
-            state_map: HashMap::new(),
+            memory: DfaMemory::new(num_nfa_states),
             transitions: Vec::new(),
-            stride: 256, // default; overwritten by prepare()
-            closure_stack: Vec::new(),
-            closure_result: Vec::new(),
-            closure_deferred: Vec::new(),
-            closure_visited: vec![false; num_nfa_states],
-            regex_id: 0,
-            start_id: DfaStateId::DEAD,
-            start_is_match: false,
         }
     }
 
@@ -96,26 +59,18 @@ impl DfaCache {
         is_match_at_end: bool,
         prev_was_word: bool,
     ) -> Option<DfaStateId> {
-        let state = DfaState {
+        let stride = self.memory.stride;
+        self.memory.intern_state(
             nfa_states,
             deferred_asserts,
             is_match,
             is_match_at_end,
             prev_was_word,
-        };
-        if let Some(&id) = self.state_map.get(&state) {
-            return Some(id);
-        }
-        if self.states.len() >= DFA_MAX_STATES {
-            return None;
-        }
-        let id = DfaStateId(self.states.len() as u32);
-        self.state_map.insert(state.clone(), id);
-        self.states.push(state);
-        // Extend the flat transition table with `stride` UNPOPULATED slots.
-        self.transitions
-            .extend(std::iter::repeat_n(DfaStateId::UNPOPULATED, self.stride));
-        Some(id)
+            || {
+                self.transitions
+                    .extend(std::iter::repeat_n(DfaStateId::UNPOPULATED, stride));
+            },
+        )
     }
 
     /// Compute the epsilon closure from a set of NFA seed states.
@@ -135,116 +90,20 @@ impl DfaCache {
         prev_byte: Option<u8>,
         next_byte: Option<u8>,
     ) -> (Box<[StateIdx]>, Box<[StateIdx]>, bool, bool) {
-        self.closure_stack.clear();
-        self.closure_result.clear();
-        self.closure_deferred.clear();
-        for v in self.closure_visited.iter_mut() {
-            *v = false;
-        }
+        let (is_match, is_match_at_end) = self.memory.epsilon_closure(
+            seeds,
+            regex,
+            at_start,
+            at_end,
+            prev_byte,
+            next_byte,
+            |_, _, _| unreachable!(),
+            |_, _, _, _, _, _| unreachable!(),
+        );
 
-        let mut is_match = false;
-        let mut is_match_at_end = false;
-
-        self.closure_stack.extend(seeds);
-        while let Some(idx) = self.closure_stack.pop() {
-            let i = idx.idx();
-            if self.closure_visited[i] {
-                continue;
-            }
-            self.closure_visited[i] = true;
-
-            match regex.states[idx] {
-                State::Split { out, out1 } => {
-                    self.closure_stack.push(out1);
-                    self.closure_stack.push(out);
-                }
-                State::Assert { kind, out } => {
-                    // Special handling for $ (End): it fails when not at
-                    // end-of-input, but we still need to record that a
-                    // match is possible if we reach end-of-input later.
-                    if kind == AssertKind::End {
-                        if at_end {
-                            self.closure_stack.push(out);
-                        } else if regex.state_can_reach_match[out.idx()] {
-                            is_match_at_end = true;
-                        }
-                        continue;
-                    }
-                    let result = kind.eval(at_start, at_end, prev_byte, next_byte);
-                    match result {
-                        AssertEval::Pass => {
-                            self.closure_stack.push(out);
-                        }
-                        AssertEval::Fail => {
-                            // Assertion failed — skip.
-                        }
-                        AssertEval::Defer => {
-                            // Park this assert for deferred resolution.
-                            self.closure_deferred.push(idx);
-                        }
-                    }
-                }
-                State::Match => {
-                    is_match = true;
-                }
-                State::Byte { .. }
-                | State::ByteCI { .. }
-                | State::ByteClass { .. }
-                | State::ByteTable { .. } => {
-                    self.closure_result.push(idx);
-                }
-                State::CounterInstance { .. } | State::CounterIncrement { .. } => {
-                    debug_assert!(false, "counter state in DFA-eligible pattern");
-                }
-            }
-        }
-
-        self.closure_result.sort_unstable_by_key(|s| s.0);
-        self.closure_deferred.sort_unstable_by_key(|s| s.0);
-
-        let nfa_states: Box<[StateIdx]> = self.closure_result.as_slice().into();
-        let deferred: Box<[StateIdx]> = self.closure_deferred.as_slice().into();
+        let nfa_states: Box<[StateIdx]> = self.memory.closure_result.as_slice().into();
+        let deferred: Box<[StateIdx]> = self.memory.closure_deferred.as_slice().into();
         (nfa_states, deferred, is_match, is_match_at_end)
-    }
-
-    /// Resolve deferred assertions from `from_state` given that `byte` is the
-    /// next input byte.  Returns extra NFA targets (the `out` states of
-    /// passing assertions) that should be followed through epsilon closure.
-    ///
-    /// `prev_was_word` is the word-ness of the byte that *entered* `from_state`.
-    fn resolve_deferred(&self, from_state: &DfaState, byte: u8, regex: &Regex) -> Vec<StateIdx> {
-        let mut extra_targets = Vec::new();
-        if from_state.deferred_asserts.is_empty() {
-            return extra_targets;
-        }
-        let prev = from_state.prev_byte_representative();
-        for &assert_idx in from_state.deferred_asserts.iter() {
-            if let State::Assert { kind, out } = regex.states[assert_idx] {
-                let result = kind.eval(false, false, prev, Some(byte));
-                if result == AssertEval::Pass {
-                    extra_targets.push(out);
-                }
-            }
-        }
-        extra_targets
-    }
-
-    /// Resolve deferred assertions at end-of-input.  Returns true if any
-    /// deferred assertion passes and `Match` is reachable from its `out`.
-    fn resolve_deferred_at_end(&self, state: &DfaState, regex: &Regex) -> bool {
-        if state.deferred_asserts.is_empty() {
-            return false;
-        }
-        let prev = state.prev_byte_representative();
-        for &assert_idx in state.deferred_asserts.iter() {
-            if let State::Assert { kind, out } = regex.states[assert_idx] {
-                let result = kind.eval(false, true, prev, None);
-                if result == AssertEval::Pass && regex.state_can_reach_match[out.idx()] {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     /// Compute the DFA transition for `(from_state, byte)`, using byte-class
@@ -255,7 +114,7 @@ impl DfaCache {
             return self.transition_from_dead(byte, regex);
         }
         let class = regex.byte_classes[byte as usize] as usize;
-        let slot = from.idx() * self.stride + class;
+        let slot = from.idx() * self.memory.stride + class;
         let cached = self.transitions[slot];
         if cached != DfaStateId::UNPOPULATED {
             return cached;
@@ -299,10 +158,10 @@ impl DfaCache {
         let mut targets: Vec<StateIdx> = Vec::new();
 
         if from != DfaStateId::DEAD {
-            let from_state = &self.states[from.idx()];
+            let from_state = &self.memory.states[from.idx()];
 
             // Phase 1: resolve deferred assertions.
-            let extra = self.resolve_deferred(from_state, byte, regex);
+            let extra = from_state.resolve_deferred(byte, regex);
             // The extra targets are `out` states of passing assertions.
             // These need to go through epsilon closure, where they may
             // reach consuming states that then also consume `byte`.
@@ -329,7 +188,7 @@ impl DfaCache {
                 // These resolved consumers can now consume `byte`.
                 // NOTE: We must re-read from_state after epsilon_closure
                 // because it borrows &mut self.
-                let from_state = &self.states[from.idx()];
+                let from_state = &self.memory.states[from.idx()];
                 for &idx in resolved_consumers.iter() {
                     let target = match regex.states[idx] {
                         State::Byte { byte: b2, out } if byte == b2 => Some(out),
@@ -490,33 +349,19 @@ impl DfaCache {
 
     /// Reset the cache for reuse with a new regex.
     fn clear(&mut self, num_nfa_states: usize, stride: usize) {
-        self.states.clear();
-        self.state_map.clear();
+        self.memory.clear(num_nfa_states, stride);
         self.transitions.clear();
-        self.stride = stride;
-        self.closure_deferred.clear();
-        self.closure_visited.clear();
-        self.closure_visited.resize(num_nfa_states, false);
-        self.regex_id = 0;
-        self.start_id = DfaStateId::DEAD;
-        self.start_is_match = false;
-    }
-
-    /// Number of interned DFA states (for diagnostics / testing).
-    #[allow(dead_code)]
-    pub(crate) fn num_states(&self) -> usize {
-        self.states.len()
     }
 
     /// Prepare the cache for use with `regex`.
     #[inline]
     pub(crate) fn prepare(&mut self, regex: &Regex) {
         let id = regex.id;
-        if self.regex_id == id && self.start_id != DfaStateId::DEAD {
+        if self.memory.regex_id == id && self.memory.start_id != DfaStateId::DEAD {
             return;
         }
         self.clear(regex.states.len(), regex.num_byte_classes);
-        self.regex_id = id;
+        self.memory.regex_id = id;
 
         // Start state: at_start=true, prev_byte=None, at_end=false.
         // Deferred assertions at start (e.g., `\b` at pos 0) get
@@ -524,10 +369,10 @@ impl DfaCache {
         let (nfa_set, deferred, is_match, is_match_at_end) =
             self.epsilon_closure(std::iter::once(regex.start), regex, true, false, None, None);
         let pw = false; // At start, prev is always non-word.
-        self.start_id = self
+        self.memory.start_id = self
             .intern_state(nfa_set, deferred, is_match, is_match_at_end, pw)
             .expect("start state exceeds DFA_MAX_STATES");
-        self.start_is_match = self.states[self.start_id.idx()].is_match;
+        self.memory.start_is_match = self.memory.states[self.memory.start_id.idx()].is_match;
     }
 }
 
@@ -548,8 +393,8 @@ impl<'a> DfaMatcher<'a> {
     #[inline]
     pub(crate) fn new(cache: &'a mut DfaCache, regex: &'a Regex) -> Self {
         DfaMatcher {
-            current: cache.start_id,
-            ever_matched: cache.start_is_match,
+            current: cache.memory.start_id,
+            ever_matched: cache.memory.start_is_match,
             cache,
             regex,
             prefilter: regex.prefilter,
@@ -558,12 +403,13 @@ impl<'a> DfaMatcher<'a> {
 
     #[inline(always)]
     pub fn step(&mut self, byte: u8) {
-        if self.cache.stride == 256 {
+        if self.cache.memory.stride == 256 {
             self.current = self.cache.transition_direct(self.current, byte, self.regex);
         } else {
             self.current = self.cache.transition(self.current, byte, self.regex);
         }
-        if self.current != DfaStateId::DEAD && self.cache.states[self.current.idx()].is_match {
+        if self.current != DfaStateId::DEAD && self.cache.memory.states[self.current.idx()].is_match
+        {
             self.ever_matched = true;
         }
     }
@@ -602,14 +448,14 @@ impl<'a> DfaMatcher<'a> {
             }
         };
 
-        if self.cache.stride == 256 {
+        if self.cache.memory.stride == 256 {
             for &b in input {
                 if self.ever_matched {
                     return;
                 }
                 self.current = self.cache.transition_direct(self.current, b, self.regex);
                 if self.current != DfaStateId::DEAD
-                    && self.cache.states[self.current.idx()].is_match
+                    && self.cache.memory.states[self.current.idx()].is_match
                 {
                     self.ever_matched = true;
                 }
@@ -621,7 +467,7 @@ impl<'a> DfaMatcher<'a> {
                 }
                 self.current = self.cache.transition(self.current, b, self.regex);
                 if self.current != DfaStateId::DEAD
-                    && self.cache.states[self.current.idx()].is_match
+                    && self.cache.memory.states[self.current.idx()].is_match
                 {
                     self.ever_matched = true;
                 }
@@ -635,12 +481,13 @@ impl<'a> DfaMatcher<'a> {
             return true;
         }
         if self.current != DfaStateId::DEAD {
-            let state = &self.cache.states[self.current.idx()];
+            let state = &self.cache.memory.states[self.current.idx()];
             if state.is_match_at_end {
                 return true;
             }
+
             // Check deferred assertions at end-of-input.
-            if self.cache.resolve_deferred_at_end(state, self.regex) {
+            if state.resolve_deferred_at_end(self.regex) {
                 return true;
             }
         }

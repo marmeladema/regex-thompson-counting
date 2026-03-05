@@ -24,12 +24,18 @@ mod tier2;
 mod tier3;
 mod tier4;
 
+use std::collections::HashMap;
+
 pub(crate) use tier1::{DfaCache, DfaMatcher};
 pub(crate) use tier2::{Tier2DfaCache, Tier2DfaMatcher};
 pub(crate) use tier3::{Tier3DfaCache, Tier3DfaMatcher};
 pub(crate) use tier4::{Tier4DfaCache, Tier4DfaMatcher};
 
-use crate::StateIdx;
+use crate::{AssertEval, AssertKind, CounterIdx, Regex, State, StateIdx};
+
+/// Maximum number of DFA states before the flat transition table stops
+/// growing.  2048 states × stride entries × 4 bytes.
+const DFA_MAX_STATES: usize = 2048;
 
 // ---------------------------------------------------------------------------
 // DFA state table (shared by Tier 1 and Tier 3)
@@ -92,5 +98,228 @@ impl DfaState {
         } else {
             Some(b' ')
         }
+    }
+
+    /// Resolve deferred assertions from `from_state` given that `byte` is the
+    /// next input byte.  Returns extra NFA targets (the `out` states of
+    /// passing assertions) that should be followed through epsilon closure.
+    ///
+    /// `prev_was_word` is the word-ness of the byte that *entered* `from_state`.
+    #[inline]
+    fn resolve_deferred(&self, byte: u8, regex: &Regex) -> Vec<StateIdx> {
+        let mut extra = Vec::new();
+        if self.deferred_asserts.is_empty() {
+            return extra;
+        }
+        let prev = self.prev_byte_representative();
+        for &assert_idx in self.deferred_asserts.iter() {
+            if let State::Assert { kind, out } = regex.states[assert_idx]
+                && kind.eval(false, false, prev, Some(byte)) == AssertEval::Pass
+            {
+                extra.push(out);
+            }
+        }
+        extra
+    }
+
+    /// Resolve deferred assertions at end-of-input.  Returns true if any
+    /// deferred assertion passes and `Match` is reachable from its `out`.
+    #[inline]
+    fn resolve_deferred_at_end(&self, regex: &Regex) -> bool {
+        if self.deferred_asserts.is_empty() {
+            return false;
+        }
+        let prev = self.prev_byte_representative();
+        for &assert_idx in self.deferred_asserts.iter() {
+            if let State::Assert { kind, out } = regex.states[assert_idx]
+                && kind.eval(false, true, prev, None) == AssertEval::Pass
+                && regex.state_can_reach_match[out.idx()]
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[derive(Debug)]
+struct DfaMemory {
+    states: Vec<DfaState>,
+    state_map: HashMap<DfaState, DfaStateId>,
+    stride: usize,
+    // Scratch space for closure.
+    closure_stack: Vec<StateIdx>,
+    closure_result: Vec<StateIdx>,
+    closure_deferred: Vec<StateIdx>,
+    closure_visited: Vec<bool>,
+    regex_id: u64,
+    start_id: DfaStateId,
+    start_is_match: bool,
+    start_is_match_at_end: bool,
+}
+
+impl DfaMemory {
+    #[inline]
+    pub(crate) fn new(num_nfa_states: usize) -> Self {
+        Self {
+            states: Vec::new(),
+            state_map: HashMap::new(),
+            stride: 256, // default; overwritten by prepare()
+            closure_stack: Vec::new(),
+            closure_result: Vec::new(),
+            closure_deferred: Vec::new(),
+            closure_visited: vec![false; num_nfa_states],
+            regex_id: 0,
+            start_id: DfaStateId::DEAD,
+            start_is_match: false,
+            start_is_match_at_end: false,
+        }
+    }
+
+    /// Reset the cache for reuse with a new regex.
+    #[inline]
+    fn clear(&mut self, num_nfa_states: usize, stride: usize) {
+        self.states.clear();
+        self.state_map.clear();
+        self.stride = stride;
+        self.closure_deferred.clear();
+        self.closure_visited.clear();
+        self.closure_visited.resize(num_nfa_states, false);
+        self.regex_id = 0;
+        self.start_id = DfaStateId::DEAD;
+        self.start_is_match = false;
+    }
+
+    /// Compute the epsilon closure from a set of NFA seed states.
+    ///
+    /// Follows `Split` and evaluable assertions (`Start`, `End`, `StartLF`).
+    /// Assertions that need the next byte (`WordAscii`, `WordAsciiNegate`,
+    /// `EndLF`) are evaluated with `next=None`; if they return `Defer`, the
+    /// Assert state index is collected in `closure_deferred`.
+    ///
+    /// Returns `(consuming_states, deferred_asserts, is_match, is_match_at_end)`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn epsilon_closure(
+        &mut self,
+        seeds: impl Iterator<Item = StateIdx>,
+        regex: &Regex,
+        at_start: bool,
+        at_end: bool,
+        prev_byte: Option<u8>,
+        next_byte: Option<u8>,
+        mut counter_instance: impl FnMut(&mut Self, CounterIdx, StateIdx),
+        mut counter_increment: impl FnMut(&mut Self, CounterIdx, StateIdx, StateIdx, usize, usize),
+    ) -> (bool, bool) {
+        self.closure_stack.clear();
+        self.closure_result.clear();
+        self.closure_deferred.clear();
+        for v in self.closure_visited.iter_mut() {
+            *v = false;
+        }
+
+        let mut is_match = false;
+        let mut is_match_at_end = false;
+
+        self.closure_stack.extend(seeds);
+        while let Some(idx) = self.closure_stack.pop() {
+            let i = idx.idx();
+            if self.closure_visited[i] {
+                continue;
+            }
+            self.closure_visited[i] = true;
+
+            match regex.states[idx] {
+                State::Split { out, out1 } => {
+                    self.closure_stack.push(out1);
+                    self.closure_stack.push(out);
+                }
+                State::Assert { kind, out } => {
+                    // Special handling for $ (End): it fails when not at
+                    // end-of-input, but we still need to record that a
+                    // match is possible if we reach end-of-input later.
+                    if kind == AssertKind::End {
+                        if at_end {
+                            self.closure_stack.push(out);
+                        } else if regex.state_can_reach_match[out.idx()] {
+                            is_match_at_end = true;
+                        }
+                        continue;
+                    }
+                    let result = kind.eval(at_start, at_end, prev_byte, next_byte);
+                    match result {
+                        AssertEval::Pass => {
+                            self.closure_stack.push(out);
+                        }
+                        AssertEval::Fail => {
+                            // Assertion failed — skip.
+                        }
+                        AssertEval::Defer => {
+                            // Park this assert for deferred resolution.
+                            self.closure_deferred.push(idx);
+                        }
+                    }
+                }
+                State::Match => {
+                    is_match = true;
+                }
+                State::Byte { .. }
+                | State::ByteCI { .. }
+                | State::ByteClass { .. }
+                | State::ByteTable { .. } => {
+                    self.closure_result.push(idx);
+                }
+                State::CounterInstance { counter, out } => {
+                    counter_instance(self, counter, out);
+                }
+                State::CounterIncrement {
+                    counter,
+                    out,
+                    out1,
+                    min,
+                    max,
+                } => {
+                    counter_increment(self, counter, out, out1, min, max);
+                }
+            }
+        }
+
+        self.closure_result.sort_unstable_by_key(|s| s.0);
+        self.closure_deferred.sort_unstable_by_key(|s| s.0);
+
+        (is_match, is_match_at_end)
+    }
+
+    /// Look up or insert a DFA state for the given sorted NFA state set.
+    /// Returns `None` if the state cap ([`DFA_MAX_STATES`]) has been reached
+    /// and the state is not already interned.
+    #[inline]
+    fn intern_state(
+        &mut self,
+        nfa_states: Box<[StateIdx]>,
+        deferred_asserts: Box<[StateIdx]>,
+        is_match: bool,
+        is_match_at_end: bool,
+        prev_was_word: bool,
+        mut transition: impl FnMut(),
+    ) -> Option<DfaStateId> {
+        let state = DfaState {
+            nfa_states,
+            deferred_asserts,
+            is_match,
+            is_match_at_end,
+            prev_was_word,
+        };
+        if let Some(&id) = self.state_map.get(&state) {
+            return Some(id);
+        }
+        if self.states.len() >= DFA_MAX_STATES {
+            return None;
+        }
+        let id = DfaStateId(self.states.len() as u32);
+        self.state_map.insert(state.clone(), id);
+        self.states.push(state);
+        transition();
+        Some(id)
     }
 }

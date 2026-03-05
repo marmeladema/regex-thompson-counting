@@ -13,22 +13,17 @@
 //! Counter-free patterns (Tier 1 eligible) are also Tier 2 eligible — the
 //! differential counter logic is simply dormant.
 
-use std::collections::HashMap;
 use std::fmt;
 
 use crate::{
-    AssertEval, AssertKind, CounterIdx, Prefilter, Regex, State, StateIdx, byte_match_ci,
-    is_word_byte,
+    CounterIdx, Prefilter, Regex, State, StateIdx, byte_match_ci, dfa::DfaMemory, is_word_byte,
 };
 
-use super::{DfaState, DfaStateId};
+use super::DfaStateId;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// Maximum number of DFA states.
-const DFA_MAX_STATES: usize = 2048;
 
 /// Sentinel value for "no node" in the [`DeltaPool`] linked list.
 const SENTINEL: u32 = u32::MAX;
@@ -307,20 +302,9 @@ impl Transition {
 
 /// Lazy DFA cache for Tier 2 (differential counters + deferred assertions).
 pub(crate) struct Tier2DfaCache {
-    states: Vec<DfaState>,
-    state_map: HashMap<DfaState, DfaStateId>,
-    transitions: Vec<Transition>,
-    stride: usize,
-    // Scratch space for closure.
-    closure_stack: Vec<StateIdx>,
-    closure_result: Vec<StateIdx>,
-    closure_deferred: Vec<StateIdx>,
-    closure_visited: Vec<bool>,
+    memory: DfaMemory,
     closure_seeds: Vec<(CounterIdx, StateIdx)>,
-    regex_id: u64,
-    start_id: DfaStateId,
-    start_is_match: bool,
-    start_is_match_at_end: bool,
+    transitions: Vec<Transition>,
     start_seeds: Box<[(CounterIdx, u32)]>,
     /// Per-counter: set of NFA consuming state indices that are in the
     /// "interior" of the counter body (i.e., body positions 1..L-1 for
@@ -347,7 +331,7 @@ pub(crate) struct Tier2DfaCache {
 impl fmt::Debug for Tier2DfaCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Tier2DfaCache")
-            .field("num_states", &self.states.len())
+            .field("num_states", &self.memory.states.len())
             .finish()
     }
 }
@@ -355,19 +339,9 @@ impl fmt::Debug for Tier2DfaCache {
 impl Tier2DfaCache {
     pub(crate) fn new(num_nfa_states: usize) -> Self {
         Self {
-            states: Vec::new(),
-            state_map: HashMap::new(),
+            memory: DfaMemory::new(num_nfa_states),
             transitions: Vec::new(),
-            stride: 256,
-            closure_stack: Vec::new(),
-            closure_result: Vec::new(),
-            closure_deferred: Vec::new(),
-            closure_visited: vec![false; num_nfa_states],
             closure_seeds: Vec::new(),
-            regex_id: 0,
-            start_id: DfaStateId::DEAD,
-            start_is_match: false,
-            start_is_match_at_end: false,
             start_seeds: Box::new([]),
             counter_body_interior: Vec::new(),
             counter_body_ranges: Vec::new(),
@@ -386,25 +360,18 @@ impl Tier2DfaCache {
         is_match_at_end: bool,
         prev_was_word: bool,
     ) -> Option<DfaStateId> {
-        let state = DfaState {
+        let stride = self.memory.stride;
+        self.memory.intern_state(
             nfa_states,
             deferred_asserts,
             is_match,
             is_match_at_end,
             prev_was_word,
-        };
-        if let Some(&id) = self.state_map.get(&state) {
-            return Some(id);
-        }
-        if self.states.len() >= DFA_MAX_STATES {
-            return None;
-        }
-        let id = DfaStateId(self.states.len() as u32);
-        self.state_map.insert(state.clone(), id);
-        self.states.push(state);
-        self.transitions
-            .extend(std::iter::repeat_with(Transition::empty).take(self.stride));
-        Some(id)
+            || {
+                self.transitions
+                    .extend(std::iter::repeat_with(Transition::empty).take(stride));
+            },
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -528,70 +495,29 @@ impl Tier2DfaCache {
         next_byte: Option<u8>,
         follow_break: bool,
     ) -> ClosureResult {
-        self.closure_stack.clear();
-        self.closure_result.clear();
-        self.closure_deferred.clear();
-        self.closure_seeds.clear();
-        for v in self.closure_visited.iter_mut() {
-            *v = false;
-        }
-
-        let mut is_match = false;
-        let mut is_match_at_end = false;
         let mut encountered_cinc = false;
 
-        self.closure_stack.extend(seeds);
-        while let Some(idx) = self.closure_stack.pop() {
-            let i = idx.idx();
-            if self.closure_visited[i] {
-                continue;
-            }
-            self.closure_visited[i] = true;
+        self.closure_seeds.clear();
 
-            match regex.states[idx] {
-                State::Split { out, out1 } => {
-                    self.closure_stack.push(out1);
-                    self.closure_stack.push(out);
+        let (is_match, is_match_at_end) = self.memory.epsilon_closure(
+            seeds,
+            regex,
+            at_start,
+            false,
+            prev_byte,
+            next_byte,
+            |memory, counter, out| {
+                memory.closure_stack.push(out);
+                self.closure_seeds.push((counter, out));
+            },
+            |memory, _, out, out1, _, _| {
+                encountered_cinc = true;
+                memory.closure_stack.push(out);
+                if follow_break {
+                    memory.closure_stack.push(out1);
                 }
-                State::Assert { kind, out } => {
-                    if kind == AssertKind::End {
-                        if regex.state_can_reach_match[out.idx()] {
-                            is_match_at_end = true;
-                        }
-                        continue;
-                    }
-                    let result = kind.eval(at_start, false, prev_byte, next_byte);
-                    match result {
-                        AssertEval::Pass => self.closure_stack.push(out),
-                        AssertEval::Fail => {}
-                        AssertEval::Defer => self.closure_deferred.push(idx),
-                    }
-                }
-                State::Match => {
-                    is_match = true;
-                }
-                State::CounterInstance { counter, out } => {
-                    self.closure_stack.push(out);
-                    self.closure_seeds.push((counter, out));
-                }
-                State::CounterIncrement { out, out1, .. } => {
-                    encountered_cinc = true;
-                    self.closure_stack.push(out);
-                    if follow_break {
-                        self.closure_stack.push(out1);
-                    }
-                }
-                State::Byte { .. }
-                | State::ByteCI { .. }
-                | State::ByteClass { .. }
-                | State::ByteTable { .. } => {
-                    self.closure_result.push(idx);
-                }
-            }
-        }
-
-        self.closure_result.sort_unstable_by_key(|s| s.0);
-        self.closure_deferred.sort_unstable_by_key(|s| s.0);
+            },
+        );
 
         let mut seed_instances: Vec<(CounterIdx, StateIdx)> = Vec::new();
         for &(counter, ci_out) in &self.closure_seeds {
@@ -604,45 +530,13 @@ impl Tier2DfaCache {
         seed_instances.dedup();
 
         ClosureResult {
-            nfa_states: self.closure_result.as_slice().into(),
-            deferred_asserts: self.closure_deferred.as_slice().into(),
+            nfa_states: self.memory.closure_result.as_slice().into(),
+            deferred_asserts: self.memory.closure_deferred.as_slice().into(),
             is_match,
             is_match_at_end,
             encountered_cinc,
             seed_instances: seed_instances.into_boxed_slice(),
         }
-    }
-
-    fn resolve_deferred(&self, from_state: &DfaState, byte: u8, regex: &Regex) -> Vec<StateIdx> {
-        let mut extra = Vec::new();
-        if from_state.deferred_asserts.is_empty() {
-            return extra;
-        }
-        let prev = from_state.prev_byte_representative();
-        for &assert_idx in from_state.deferred_asserts.iter() {
-            if let State::Assert { kind, out } = regex.states[assert_idx]
-                && kind.eval(false, false, prev, Some(byte)) == AssertEval::Pass
-            {
-                extra.push(out);
-            }
-        }
-        extra
-    }
-
-    fn resolve_deferred_at_end(&self, state: &DfaState, regex: &Regex) -> bool {
-        if state.deferred_asserts.is_empty() {
-            return false;
-        }
-        let prev = state.prev_byte_representative();
-        for &assert_idx in state.deferred_asserts.iter() {
-            if let State::Assert { kind, out } = regex.states[assert_idx]
-                && kind.eval(false, true, prev, None) == AssertEval::Pass
-                && regex.state_can_reach_match[out.idx()]
-            {
-                return true;
-            }
-        }
-        false
     }
 
     // -----------------------------------------------------------------------
@@ -658,10 +552,10 @@ impl Tier2DfaCache {
         let mut resolved_is_match_at_end = false;
 
         if from != DfaStateId::DEAD {
-            let from_state = &self.states[from.idx()];
+            let from_state = &self.memory.states[from.idx()];
 
             // Phase 1: resolve deferred assertions.
-            let extra = self.resolve_deferred(from_state, byte, regex);
+            let extra = from_state.resolve_deferred(byte, regex);
             if !extra.is_empty() {
                 let resolved_prev = from_state.prev_byte_representative();
                 let cr = self.epsilon_closure(
@@ -685,7 +579,7 @@ impl Tier2DfaCache {
             }
 
             // Phase 2: consuming states consume `byte`.
-            let nfa_states = self.states[from.idx()].nfa_states.clone();
+            let nfa_states = self.memory.states[from.idx()].nfa_states.clone();
             for &idx in nfa_states.iter() {
                 if let Some(t) = consume_byte(idx, byte, regex) {
                     targets.push(t);
@@ -856,24 +750,15 @@ impl Tier2DfaCache {
         if id == DfaStateId::DEAD {
             (false, false)
         } else {
-            let s = &self.states[id.idx()];
+            let s = &self.memory.states[id.idx()];
             (s.is_match, s.is_match_at_end)
         }
     }
 
     fn clear(&mut self, num_nfa_states: usize, stride: usize) {
-        self.states.clear();
-        self.state_map.clear();
+        self.memory.clear(num_nfa_states, stride);
         self.transitions.clear();
-        self.stride = stride;
-        self.closure_deferred.clear();
         self.closure_seeds.clear();
-        self.closure_visited.clear();
-        self.closure_visited.resize(num_nfa_states, false);
-        self.regex_id = 0;
-        self.start_id = DfaStateId::DEAD;
-        self.start_is_match = false;
-        self.start_is_match_at_end = false;
         self.start_seeds = Box::new([]);
         self.counter_body_interior.clear();
         self.counter_body_ranges.clear();
@@ -886,11 +771,11 @@ impl Tier2DfaCache {
     #[inline]
     pub(crate) fn prepare(&mut self, regex: &Regex) {
         let id = regex.id;
-        if self.regex_id == id && self.start_id != DfaStateId::DEAD {
+        if self.memory.regex_id == id && self.memory.start_id != DfaStateId::DEAD {
             return;
         }
         self.clear(regex.states.len(), regex.num_byte_classes);
-        self.regex_id = id;
+        self.memory.regex_id = id;
 
         // Precompute body interior consuming states for each counter.
         // For a counter with body length L, the interior states are all
@@ -901,7 +786,7 @@ impl Tier2DfaCache {
         self.counter_body_ranges = ranges;
 
         let cr = self.epsilon_closure(std::iter::once(regex.start), regex, true, None, None, true);
-        self.start_id = self
+        self.memory.start_id = self
             .intern_state(
                 cr.nfa_states,
                 cr.deferred_asserts,
@@ -910,8 +795,9 @@ impl Tier2DfaCache {
                 false,
             )
             .expect("start state exceeds DFA_MAX_STATES");
-        self.start_is_match = self.states[self.start_id.idx()].is_match;
-        self.start_is_match_at_end = self.states[self.start_id.idx()].is_match_at_end;
+        self.memory.start_is_match = self.memory.states[self.memory.start_id.idx()].is_match;
+        self.memory.start_is_match_at_end =
+            self.memory.states[self.memory.start_id.idx()].is_match_at_end;
         self.start_seeds = cr.seed_instances.iter().map(|&(c, _s)| (c, 0u32)).collect();
 
         // Initialize flat phases and counter metadata.
@@ -1156,9 +1042,9 @@ impl<'a> Tier2DfaMatcher<'a> {
         }
 
         Tier2DfaMatcher {
-            current: cache.start_id,
-            ever_matched: cache.start_is_match,
-            match_at_end: cache.start_is_match_at_end,
+            current: cache.memory.start_id,
+            ever_matched: cache.memory.start_is_match,
+            match_at_end: cache.memory.start_is_match_at_end,
             has_live_counters: has_live,
             cache,
             regex,
@@ -1170,7 +1056,7 @@ impl<'a> Tier2DfaMatcher<'a> {
     #[inline(always)]
     fn ensure_transition(&mut self, byte: u8) -> usize {
         let class = self.regex.byte_classes[byte as usize] as usize;
-        let slot = self.current.idx() * self.cache.stride + class;
+        let slot = self.current.idx() * self.cache.memory.stride + class;
         if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
             let trans = self.cache.populate(self.current, byte, self.regex);
             self.cache.transitions[slot] = trans;
@@ -1358,7 +1244,7 @@ impl<'a> Tier2DfaMatcher<'a> {
             return;
         }
 
-        let start_id = self.cache.start_id;
+        let start_id = self.cache.memory.start_id;
 
         // Prefilter-aware scanning: when the DFA is in the start state and
         // a prefilter is available, use memchr to skip ahead to the next
@@ -1381,7 +1267,7 @@ impl<'a> Tier2DfaMatcher<'a> {
 
     #[inline(always)]
     fn chunk_no_prefilter(&mut self, input: &[u8]) {
-        if self.cache.stride == 256 {
+        if self.cache.memory.stride == 256 {
             for &b in input {
                 if self.ever_matched {
                     return;
@@ -1426,7 +1312,7 @@ impl<'a> Tier2DfaMatcher<'a> {
                     return;
                 }
             }
-            if self.cache.stride == 256 {
+            if self.cache.memory.stride == 256 {
                 self.step_direct(input[i]);
             } else {
                 self.step(input[i]);
@@ -1444,11 +1330,11 @@ impl<'a> Tier2DfaMatcher<'a> {
             return true;
         }
         if self.current != DfaStateId::DEAD {
-            let state = &self.cache.states[self.current.idx()];
+            let state = &self.cache.memory.states[self.current.idx()];
             if state.is_match_at_end {
                 return true;
             }
-            if self.cache.resolve_deferred_at_end(state, self.regex) {
+            if state.resolve_deferred_at_end(self.regex) {
                 return true;
             }
         }
