@@ -1382,6 +1382,20 @@ impl RegexBuilder {
     /// that wires CI → body → CInc in a single-copy loop.  Nested
     /// repetitions share the same body copy (each gets its own counter
     /// index, no remapping needed).
+    /// Returns the number of NFA states a single copy of `hir` would
+    /// produce, if the body is "simple" (a single consuming state).
+    /// Returns 0 for non-simple bodies (alternation, concatenation,
+    /// nested repetition, etc.) — the caller should NOT unroll these.
+    fn simple_body_nfa_states(hir: &Hir) -> usize {
+        match hir.kind() {
+            // Single-byte literal → 1 Byte state.
+            HirKind::Literal(lit) if lit.0.len() == 1 => 1,
+            // Byte or Unicode class → 1 ByteClass / ByteCI state.
+            HirKind::Class(_) => 1,
+            _ => 0,
+        }
+    }
+
     fn hir2postfix(&mut self, hir: &Hir) -> Result<(), Error> {
         match hir.kind() {
             HirKind::Empty => {
@@ -1534,10 +1548,27 @@ impl RegexBuilder {
                 }
 
                 if min > 0 {
-                    let counter = self.next_counter()?;
-                    self.hir2postfix(&rep.sub)?;
-                    self.postfix
-                        .push(RegexHirNode::CounterLoop { counter, min, max });
+                    // Fixed repetitions of simple (single-NFA-state) bodies
+                    // can be unrolled into N concatenated copies, eliminating
+                    // the counter entirely.  This makes the sub-pattern
+                    // eligible for tier 1 (pure DFA) instead of tier 2/3.
+                    let body_nfa_states = Self::simple_body_nfa_states(&rep.sub);
+                    if min == max
+                        && body_nfa_states > 0
+                        && min * body_nfa_states <= MAX_UNROLL_NFA_STATES
+                    {
+                        for i in 0..min {
+                            self.hir2postfix(&rep.sub)?;
+                            if i > 0 {
+                                self.postfix.push(RegexHirNode::Catenate);
+                            }
+                        }
+                    } else {
+                        let counter = self.next_counter()?;
+                        self.hir2postfix(&rep.sub)?;
+                        self.postfix
+                            .push(RegexHirNode::CounterLoop { counter, min, max });
+                    }
                 } else {
                     // {0,max}: lower to (body{1,max})? — the `?` wrapping
                     // provides the zero-match path.
@@ -2513,6 +2544,11 @@ const MAX_COUNTERS: usize = 256;
 /// Maximum counters for tier 2: the `counting_mask` and `counter_reset`
 /// fields in `Transition` are `u64` bitmasks.
 const MAX_TIER2_COUNTERS: usize = 64;
+
+/// Maximum NFA states produced by unrolling a fixed repetition.
+/// `a{N}` is expanded to N literal copies when N * body_states <= this limit,
+/// eliminating the counter and making the pattern eligible for a simpler tier.
+const MAX_UNROLL_NFA_STATES: usize = 128;
 
 /// Sentinel value: this counter slot is inactive (thread is not inside
 /// this counter's repetition body).
@@ -4217,7 +4253,7 @@ mod tests {
         test_counting {
             pattern: "^.*a.{3}bc$",
             memory: 1011,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("aybzbc", true),
                 ("axaybzbc", true),
@@ -4359,7 +4395,7 @@ mod tests {
         test_one_plus_with_counting {
             pattern: "^.*a.{3}b+c$",
             memory: 1044,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("a123bc", true),
                 ("a123bbc", true),
@@ -4816,7 +4852,7 @@ mod tests {
         test_exact_repetition {
             pattern: "^a{3,3}$",
             memory: 590,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("aaa", true),
                 ("", false),
@@ -5827,7 +5863,7 @@ mod tests {
         test_unanchored_counter_simple_2 {
             pattern: "a{3}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("aaa", true),
                 ("aa", false),
@@ -5841,7 +5877,7 @@ mod tests {
         test_unanchored_counter_simple_3 {
             pattern: "[0-9]{4}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("1234", true),
                 ("123", false),
@@ -6325,7 +6361,7 @@ mod tests {
         test_nested_a2_x3 {
             pattern: "(a{2}){3}",
             memory: 0,
-            min_tier: 4,
+            min_tier: 2,
             inputs: [
                 ("aaaaa", false),
                 ("aaaaaa", true),
@@ -6335,7 +6371,7 @@ mod tests {
         test_nested_a3_x2 {
             pattern: "(a{3}){2}",
             memory: 0,
-            min_tier: 4,
+            min_tier: 2,
             inputs: [
                 ("aaaa", false),
                 ("aaaaa", false),
@@ -6390,7 +6426,7 @@ mod tests {
         test_nested_a2_x23 {
             pattern: "(a{2}){2,3}",
             memory: 0,
-            min_tier: 4,
+            min_tier: 2,
             inputs: [
                 ("aaa", false),
                 ("aaaa", true),
@@ -6424,7 +6460,7 @@ mod tests {
         test_non_nested_a4 {
             pattern: "a{4}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("aaa", false),
                 ("aaaa", true),
@@ -6435,7 +6471,7 @@ mod tests {
         test_non_nested_a2 {
             pattern: "a{2}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("aa", true),
                 ("a", false),
@@ -6593,7 +6629,7 @@ mod tests {
         test_step_fused_multi_counter_same_byte {
             pattern: "a{2}.*a{3}",
             memory: 0,
-            min_tier: 3,
+            min_tier: 1,
             inputs: [
                 ("aaaaa", true),
                 ("aabaa", false),
@@ -6622,7 +6658,7 @@ mod tests {
         test_step_fused_byteclass_and_literal {
             pattern: "[a-z]{2}a{2}",
             memory: 0,
-            min_tier: 3,
+            min_tier: 1,
             inputs: [
                 ("xyaa", true),
                 ("aaaa", true),
@@ -6638,7 +6674,7 @@ mod tests {
         test_step_fused_reseed_with_counter {
             pattern: "(a{2}){2}",
             memory: 0,
-            min_tier: 4,
+            min_tier: 2,
             inputs: [
                 ("aaaa", true),
                 ("aaa", false),
@@ -7605,7 +7641,7 @@ mod tests {
         test_multi_counter_two_fixed {
             pattern: "^[A-Z]{4}[0-9]{16}$",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("ABCD1234567890123456", true),
                 ("ABCD12345678901234567", false),
@@ -7641,7 +7677,7 @@ mod tests {
         test_multi_counter_three_fixed {
             pattern: "^a{2}b{3}c{2}$",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("aabbbcc", true),
                 ("abbbcc", false),
@@ -7676,7 +7712,7 @@ mod tests {
         test_multi_counter_unanchored {
             pattern: "[A-Z]{3}[0-9]{3}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("ABC123", true),
                 ("xxABC123xx", true),
@@ -7689,7 +7725,7 @@ mod tests {
         test_multi_counter_with_literal_prefix {
             pattern: "^ID-[A-Z]{4}-[0-9]{6}$",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("ID-ABCD-123456", true),
                 ("ID-ABCD-12345", false),
@@ -7705,7 +7741,7 @@ mod tests {
         test_multi_counter_overlapping_falls_to_tier3 {
             pattern: r"^\w{3}\d{2}$",
             memory: 0,
-            min_tier: 3,
+            min_tier: 1,
             inputs: [
                 ("abc12", true),
                 ("a1b23", true),
@@ -7738,7 +7774,7 @@ mod tests {
                     assert!(byte_val <= 0xFF, "ran out of disjoint bytes");
                     pat.push_str(&format!("[\\x{:02x}]", byte_val));
                 }
-                pat.push_str("{2}");
+                pat.push_str("{2,3}");
             }
             pat.push('$');
             pat
