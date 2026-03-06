@@ -419,35 +419,29 @@ impl<'a> DfaMatcher<'a> {
         if self.ever_matched {
             return;
         }
+        let start_id = self.cache.memory.start_id;
 
-        let input = match self.prefilter {
-            Prefilter::None => input,
-            Prefilter::Memchr1(b) => {
-                if let Some(idx) = memchr::memchr(b, input) {
-                    self.prefilter = Prefilter::None;
-                    &input[idx..]
-                } else {
-                    return;
-                }
+        // Prefilter-aware scanning: when the DFA is in the start state and
+        // a prefilter is available, use memchr to skip ahead to the next
+        // candidate byte instead of stepping byte-by-byte.  This is
+        // re-engaged every time the DFA returns to the start state, not
+        // just once at chunk entry.
+        match self.prefilter {
+            Prefilter::None => self.chunk_no_prefilter(input),
+            Prefilter::Memchr1(needle) => {
+                self.chunk_prefilter(input, start_id, |hay| memchr::memchr(needle, hay));
             }
             Prefilter::Memchr2(b1, b2) => {
-                if let Some(idx) = memchr::memchr2(b1, b2, input) {
-                    self.prefilter = Prefilter::None;
-                    &input[idx..]
-                } else {
-                    return;
-                }
+                self.chunk_prefilter(input, start_id, |hay| memchr::memchr2(b1, b2, hay));
             }
             Prefilter::Memchr3(b1, b2, b3) => {
-                if let Some(idx) = memchr::memchr3(b1, b2, b3, input) {
-                    self.prefilter = Prefilter::None;
-                    &input[idx..]
-                } else {
-                    return;
-                }
+                self.chunk_prefilter(input, start_id, |hay| memchr::memchr3(b1, b2, b3, hay));
             }
-        };
+        }
+    }
 
+    #[inline(always)]
+    fn chunk_no_prefilter(&mut self, input: &[u8]) {
         if self.cache.memory.stride == 256 {
             for &b in input {
                 if self.ever_matched {
@@ -472,6 +466,50 @@ impl<'a> DfaMatcher<'a> {
                     self.ever_matched = true;
                 }
             }
+        }
+    }
+
+    /// Prefilter-integrated scanning loop.
+    ///
+    /// When `current == start_id`, the DFA is in its start state where
+    /// non-matching bytes loop back to start.  Instead of stepping through
+    /// those bytes one by one, we use the `finder` (memchr) to skip ahead
+    /// to the next candidate byte.  Once a candidate is found, we step
+    /// through the DFA normally until it returns to the start state (or
+    /// matches / reaches end of input).
+    #[inline(always)]
+    fn chunk_prefilter(
+        &mut self,
+        input: &[u8],
+        start_id: DfaStateId,
+        finder: impl Fn(&[u8]) -> Option<usize>,
+    ) {
+        let mut i = 0;
+        while i < input.len() {
+            if self.ever_matched {
+                return;
+            }
+            // When at the start state, skip ahead with memchr.
+            if self.current == start_id {
+                if let Some(offset) = finder(&input[i..]) {
+                    i += offset;
+                } else {
+                    return;
+                }
+            }
+            if self.cache.memory.stride == 256 {
+                self.current = self
+                    .cache
+                    .transition_direct(self.current, input[i], self.regex);
+            } else {
+                self.current = self.cache.transition(self.current, input[i], self.regex);
+            }
+            if self.current != DfaStateId::DEAD
+                && self.cache.memory.states[self.current.idx()].is_match
+            {
+                self.ever_matched = true;
+            }
+            i += 1;
         }
     }
 
