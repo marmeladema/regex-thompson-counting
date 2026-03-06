@@ -2191,6 +2191,7 @@ impl RegexBuilder {
         // DFA split remains correct with multiple counters.
         let tier2_eligible = tier3_eligible
             && !counter_info.is_empty()
+            && counter_info.len() <= MAX_TIER2_COUNTERS
             && counter_info.iter().all(|&(_, _, body_len)| body_len > 0)
             && disjoint_bytes;
 
@@ -2508,6 +2509,10 @@ impl fmt::Display for CounterIdx {
 
 /// Maximum number of counters supported (limited by `CounterIdx(u8)`).
 const MAX_COUNTERS: usize = 256;
+
+/// Maximum counters for tier 2: the `counting_mask` and `counter_reset`
+/// fields in `Transition` are `u64` bitmasks.
+const MAX_TIER2_COUNTERS: usize = 64;
 
 /// Sentinel value: this counter slot is inactive (thread is not inside
 /// this counter's repetition body).
@@ -7710,6 +7715,50 @@ mod tests {
                 ("", false),
             ],
         }
+    }
+
+    /// Tier 2 encodes counter identity in `u64` bitmasks, so patterns with
+    /// more than 64 counters must fall through to tier 3.
+    #[test]
+    fn test_tier2_counter_limit_64() {
+        // Helper: build "^<ch1>{2}<ch2>{2}...$" for `n` disjoint single-byte
+        // counters.  Uses a-z, A-Z, 0-9, then hex-escaped byte singletons
+        // so we never need to worry about regex metacharacter escaping.
+        fn build_n_counter_pattern(n: usize) -> String {
+            // 26 + 26 + 10 = 62 plain chars, then hex-escaped singletons.
+            let plain: Vec<char> = ('a'..='z').chain('A'..='Z').chain('0'..='9').collect();
+            let mut pat = String::from("^");
+            for i in 0..n {
+                if i < plain.len() {
+                    pat.push(plain[i]);
+                } else {
+                    // Use a byte value that doesn't collide with the plain set.
+                    // 0x80..0xFF are all > 127, so disjoint from ASCII letters/digits.
+                    let byte_val = 0x80 + (i - plain.len());
+                    assert!(byte_val <= 0xFF, "ran out of disjoint bytes");
+                    pat.push_str(&format!("[\\x{:02x}]", byte_val));
+                }
+                pat.push_str("{2}");
+            }
+            pat.push('$');
+            pat
+        }
+
+        let re64 = build_regex_unchecked(&build_n_counter_pattern(64));
+        assert!(
+            re64.tier2_eligible,
+            "64-counter pattern should be tier 2 eligible"
+        );
+
+        let re65 = build_regex_unchecked(&build_n_counter_pattern(65));
+        assert!(
+            !re65.tier2_eligible,
+            "65-counter pattern should NOT be tier 2 eligible"
+        );
+        assert!(
+            re65.tier3_eligible,
+            "65-counter pattern should fall to tier 3"
+        );
     }
 
     /// `\d\d` — two identical predefined classes share one lookup table.
