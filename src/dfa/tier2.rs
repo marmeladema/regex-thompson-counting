@@ -16,10 +16,11 @@
 use std::fmt;
 
 use crate::{
-    CounterIdx, Prefilter, Regex, State, StateIdx, byte_match_ci, dfa::DfaMemory, is_word_byte,
+    AssertEval, CounterIdx, Prefilter, Regex, State, StateIdx, byte_match_ci, dfa::DfaMemory,
+    is_word_byte,
 };
 
-use super::DfaStateId;
+use super::{DfaState, DfaStateId};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -496,6 +497,7 @@ impl Tier2DfaCache {
         follow_break: bool,
     ) -> ClosureResult {
         let mut encountered_cinc = false;
+        let mut cinc_mask: u64 = 0;
 
         self.closure_seeds.clear();
 
@@ -510,8 +512,9 @@ impl Tier2DfaCache {
                 memory.closure_stack.push(out);
                 self.closure_seeds.push((counter, out));
             },
-            |memory, _, out, out1, _, _| {
+            |memory, counter, out, out1, _, _| {
                 encountered_cinc = true;
+                cinc_mask |= 1u64 << counter.idx();
                 memory.closure_stack.push(out);
                 if follow_break {
                     memory.closure_stack.push(out1);
@@ -535,6 +538,7 @@ impl Tier2DfaCache {
             is_match,
             is_match_at_end,
             encountered_cinc,
+            cinc_mask,
             seed_instances: seed_instances.into_boxed_slice(),
         }
     }
@@ -548,8 +552,12 @@ impl Tier2DfaCache {
 
         let mut resolved_seeds: Vec<(CounterIdx, u32)> = Vec::new();
         let mut resolved_cinc = false;
+        let mut resolved_cinc_mask: u64 = 0;
         let mut resolved_is_match = false;
         let mut resolved_is_match_at_end = false;
+        // Match reachable through CInc break path in Phase 1 resolution.
+        // Only valid when any_can_break is true (counter >= min).
+        let mut resolved_break_match = false;
 
         if from != DfaStateId::DEAD {
             let from_state = &self.memory.states[from.idx()];
@@ -558,19 +566,41 @@ impl Tier2DfaCache {
             let extra = from_state.resolve_deferred(byte, regex);
             if !extra.is_empty() {
                 let resolved_prev = from_state.prev_byte_representative();
+                // Use follow_break=false: the CInc break path should NOT
+                // contribute to resolved_is_match.  Match via counter break
+                // is handled by the with_break DFA successor, gated by
+                // the counter condition in step_inner.
                 let cr = self.epsilon_closure(
                     extra.into_iter(),
                     regex,
                     false,
                     resolved_prev,
                     Some(byte),
-                    true,
+                    false,
                 );
                 resolved_seeds = cr.seed_instances.iter().map(|&(c, _s)| (c, 0u32)).collect();
 
                 resolved_cinc = cr.encountered_cinc;
+                resolved_cinc_mask = cr.cinc_mask;
                 resolved_is_match = cr.is_match;
                 resolved_is_match_at_end = cr.is_match_at_end;
+
+                // If CInc was reached via Phase 1 resolution, check if
+                // the break path (CInc.out1) can reach Match.  This match
+                // is conditional on the counter meeting min.
+                if cr.encountered_cinc {
+                    // Check if any counter reached via Phase 1 resolution
+                    // has a break path that can reach Match.
+                    let mut mask = cr.cinc_mask;
+                    while mask != 0 {
+                        let ci = mask.trailing_zeros() as usize;
+                        mask &= mask - 1;
+                        if regex.counter_break_can_match[ci] {
+                            resolved_break_match = true;
+                            break;
+                        }
+                    }
+                }
                 for &idx in cr.nfa_states.iter() {
                     if let Some(t) = consume_byte(idx, byte, regex) {
                         targets.push(t);
@@ -600,8 +630,10 @@ impl Tier2DfaCache {
         let is_counting = probe.encountered_cinc || resolved_cinc;
 
         // Find ALL counters that fire CInc at this transition.
+        // Include counters reached via resolved deferred assertions
+        // (Phase 1) which are not reachable from targets alone.
         let counting_mask = if is_counting {
-            find_cinc_counters(&targets, &regex.states)
+            find_cinc_counters(&targets, &regex.states) | resolved_cinc_mask
         } else {
             0
         };
@@ -664,7 +696,7 @@ impl Tier2DfaCache {
                 no_break_is_match: nb_m || resolved_is_match,
                 no_break_is_match_at_end: nb_mae || resolved_is_match_at_end,
                 with_break: wb_id,
-                with_break_is_match: wb_m || resolved_is_match,
+                with_break_is_match: wb_m || resolved_is_match || resolved_break_match,
                 with_break_is_match_at_end: wb_mae || resolved_is_match_at_end,
                 is_counting: true,
                 counting_mask,
@@ -833,6 +865,8 @@ struct ClosureResult {
     is_match: bool,
     is_match_at_end: bool,
     encountered_cinc: bool,
+    /// Bitmask of counters that reached CInc during this closure.
+    cinc_mask: u64,
     seed_instances: Box<[(CounterIdx, StateIdx)]>,
 }
 
@@ -1334,8 +1368,83 @@ impl<'a> Tier2DfaMatcher<'a> {
             if state.is_match_at_end {
                 return true;
             }
+            // Standard deferred resolution: handles assertions outside
+            // counter bodies (deferred assert -> Match path).
             if state.resolve_deferred_at_end(self.regex) {
                 return true;
+            }
+            // Tier 2 specific: handle deferred assertions inside counter
+            // bodies.  When a deferred assertion resolves at end-of-input
+            // and reaches CInc, we need to check whether incrementing the
+            // counter allows a break to Match.
+            if self.resolve_deferred_cinc_at_end(state) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if resolving deferred assertions at end-of-input reaches a
+    /// CInc whose counter, after one more increment, allows a break to
+    /// Match.  This handles patterns like `(\w\b){1,3}` where the last
+    /// `\b` is only resolved at end-of-input.
+    fn resolve_deferred_cinc_at_end(&self, state: &DfaState) -> bool {
+        if state.deferred_asserts.is_empty() {
+            return false;
+        }
+        let prev = state.prev_byte_representative();
+        let states = &self.regex.states;
+        for &assert_idx in state.deferred_asserts.iter() {
+            if let State::Assert { kind, out } = states[assert_idx]
+                && kind.eval(false, true, prev, None) == AssertEval::Pass
+            {
+                // The assertion passes at end-of-input.  Walk epsilon states
+                // from `out` looking for CInc.
+                let mut stack = vec![out];
+                let mut visited = vec![false; states.len()];
+                while let Some(idx) = stack.pop() {
+                    let i = idx.idx();
+                    if visited[i] {
+                        continue;
+                    }
+                    visited[i] = true;
+                    match states[idx] {
+                        State::CounterIncrement { counter, min, .. } => {
+                            let ci = counter.idx();
+                            if !self.regex.counter_break_can_match[ci] {
+                                continue;
+                            }
+                            // Check if this counter has a live instance
+                            // that would reach >= min after one increment.
+                            if ci < self.cache.counter_meta.len() {
+                                let m = &self.cache.counter_meta[ci];
+                                for ph in 0..m.num_phases {
+                                    let phase = &self.cache.phases[m.phase_start + ph];
+                                    if !phase.is_empty() && phase.oldest + 1 >= min as u32 {
+                                        return true;
+                                    }
+                                }
+                            }
+                            // min=0: always breakable even with no live instances.
+                            if min == 0 {
+                                return true;
+                            }
+                        }
+                        State::Split { out, out1 } => {
+                            stack.push(out1);
+                            stack.push(out);
+                        }
+                        State::Assert { kind, out } => {
+                            // Nested assertion (unlikely but handle it):
+                            // evaluate at end-of-input.
+                            if kind.eval(false, true, prev, None) == AssertEval::Pass {
+                                stack.push(out);
+                            }
+                        }
+                        State::CounterInstance { out, .. } => stack.push(out),
+                        _ => {}
+                    }
+                }
             }
         }
         false

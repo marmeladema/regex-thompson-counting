@@ -827,6 +827,11 @@ pub struct Regex {
     /// CounterIncrement continue path).  Used by DFA tiers 1–3 to avoid
     /// a per-call DFS in `epsilon_closure` and `resolve_deferred_at_end`.
     pub(crate) state_can_reach_match: Box<[bool]>,
+    /// Precomputed per-counter flag: `counter_break_can_match[ci]` is `true`
+    /// iff the break path (`out1`) of the `CounterIncrement` state for
+    /// counter `ci` can reach the `Match` state through epsilon transitions.
+    /// Avoids scanning all NFA states at DFA populate time.
+    pub(crate) counter_break_can_match: Box<[bool]>,
 }
 impl Regex {
     /// Return the total memory footprint (in bytes) of this compiled
@@ -843,7 +848,13 @@ impl Regex {
         let classes_alloc = self.classes.len() * std::mem::size_of::<ByteClass>();
         let byte_tables_alloc = self.byte_tables.len() * std::mem::size_of::<ByteMap>();
         let reach_match_alloc = self.state_can_reach_match.len() * std::mem::size_of::<bool>();
-        inline + states_alloc + classes_alloc + byte_tables_alloc + reach_match_alloc
+        let break_match_alloc = self.counter_break_can_match.len() * std::mem::size_of::<bool>();
+        inline
+            + states_alloc
+            + classes_alloc
+            + byte_tables_alloc
+            + reach_match_alloc
+            + break_match_alloc
     }
     /// Return per-counter info: `(min, max, body_byte_length)`.
     ///
@@ -1843,69 +1854,71 @@ impl RegexBuilder {
         };
         let tier4_eligible = has_counters && !has_deferred_assert && !has_zero_width_counter_body;
 
-        // Check for deferred assertions inside a counter body.  Tier 2
-        // cannot handle these because the CInc increment is separated from
-        // byte consumption by a deferred assertion, breaking the origin-
-        // action model.  Tier 2 only supports deferred assertions that are
-        // OUTSIDE the counter body (before CI or after CInc break).
-        let has_deferred_in_counter_body = has_counters && {
-            let states = &self.states;
-            fn body_has_deferred(
-                start: StateIdx,
-                own_counter: CounterIdx,
-                states: &[State],
-                byte_tables: &[ByteMap],
-            ) -> bool {
-                let mut stack = vec![start];
-                let mut visited = vec![false; states.len()];
-                while let Some(idx) = stack.pop() {
-                    let i = idx.idx();
-                    if visited[i] {
+        // Check for deferred assertions inside a counter body.  Tier 3
+        // cannot handle these at all.  Tier 2 can handle them for L=1
+        // bodies (the single-phase model correctly defers the CInc to
+        // the next byte via Phase 1 resolution + cinc_mask), but NOT
+        // for L>1 bodies (counter_reset can prematurely clear instances
+        // when the NFA is between the last consuming state and CInc).
+        fn body_has_deferred(
+            start: StateIdx,
+            own_counter: CounterIdx,
+            states: &[State],
+            byte_tables: &[ByteMap],
+        ) -> bool {
+            let mut stack = vec![start];
+            let mut visited = vec![false; states.len()];
+            while let Some(idx) = stack.pop() {
+                let i = idx.idx();
+                if visited[i] {
+                    continue;
+                }
+                visited[i] = true;
+                match states[idx] {
+                    State::CounterIncrement { counter, .. } if counter == own_counter => {
                         continue;
                     }
-                    visited[i] = true;
-                    match states[idx] {
-                        State::CounterIncrement { counter, .. } if counter == own_counter => {
-                            continue;
+                    State::Assert { kind, out } => {
+                        if matches!(
+                            kind,
+                            AssertKind::EndLF
+                                | AssertKind::EndCRLF
+                                | AssertKind::StartCRLF
+                                | AssertKind::WordAscii
+                                | AssertKind::WordAsciiNegate
+                                | AssertKind::WordStartAscii
+                                | AssertKind::WordEndAscii
+                        ) {
+                            return true;
                         }
-                        State::Assert { kind, out } => {
-                            if matches!(
-                                kind,
-                                AssertKind::EndLF
-                                    | AssertKind::EndCRLF
-                                    | AssertKind::StartCRLF
-                                    | AssertKind::WordAscii
-                                    | AssertKind::WordAsciiNegate
-                                    | AssertKind::WordStartAscii
-                                    | AssertKind::WordEndAscii
-                            ) {
-                                return true;
-                            }
-                            stack.push(out);
-                        }
-                        State::Split { out, out1 } => {
-                            stack.push(out1);
-                            stack.push(out);
-                        }
-                        State::CounterInstance { out, .. } => stack.push(out),
-                        // Follow through consuming states — deferred
-                        // assertions may appear after a byte match within
-                        // the counter body (e.g. `(?m:a$){2,3}`).
-                        State::Byte { out, .. }
-                        | State::ByteCI { out, .. }
-                        | State::ByteClass { out, .. } => stack.push(out),
-                        State::ByteTable { table } => {
-                            for &succ in byte_tables[table.idx()].0.iter() {
-                                if succ != StateIdx::NONE {
-                                    stack.push(succ);
-                                }
-                            }
-                        }
-                        _ => {}
+                        stack.push(out);
                     }
+                    State::Split { out, out1 } => {
+                        stack.push(out1);
+                        stack.push(out);
+                    }
+                    State::CounterInstance { out, .. } => stack.push(out),
+                    // Follow through consuming states -- deferred
+                    // assertions may appear after a byte match within
+                    // the counter body (e.g. `(?m:a$){2,3}`).
+                    State::Byte { out, .. }
+                    | State::ByteCI { out, .. }
+                    | State::ByteClass { out, .. } => stack.push(out),
+                    State::ByteTable { table } => {
+                        for &succ in byte_tables[table.idx()].0.iter() {
+                            if succ != StateIdx::NONE {
+                                stack.push(succ);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                false
             }
+            false
+        }
+
+        let has_deferred_in_counter_body = has_counters && {
+            let states = &self.states;
             let byte_tables = &self.byte_tables;
             states.iter().any(|s| {
                 if let State::CounterInstance { counter, out } = s {
@@ -1916,14 +1929,12 @@ impl RegexBuilder {
             })
         };
 
-        // Tier 3 eligibility: non-nested counters.  Tier 2 supports
-        // deferred assertions (\b, \B, EndLF) unlike Tier 3, but only
-        // when they are outside the counter body.
-        let tier3_eligible = has_counters
-            && !has_crlf_assert
-            && !has_zero_width_counter_body
-            && !has_deferred_in_counter_body
-            && {
+        // Non-nested counter eligibility: shared base for tier 2 and tier 3.
+        // Does NOT include the deferred-in-counter-body check (tier 2 handles
+        // deferred assertions inside counter bodies via Phase 1 resolution;
+        // tier 3 does not).
+        let non_nested_eligible =
+            has_counters && !has_crlf_assert && !has_zero_width_counter_body && {
                 let states = &self.states;
                 fn has_nesting(states: &[State]) -> bool {
                     for s in states.iter() {
@@ -1986,6 +1997,12 @@ impl RegexBuilder {
                 }
                 !has_nesting(states)
             };
+
+        // Tier 3 eligibility: non-nested counters WITHOUT deferred assertions
+        // inside counter bodies.  Tier 3 cannot handle deferred assertions in
+        // counter bodies because it lacks the Phase 1 deferred resolution that
+        // tier 2 has.
+        let tier3_eligible = non_nested_eligible && !has_deferred_in_counter_body;
 
         // Compute per-counter info: (min, max, body_byte_length).
         // body_byte_length is the fixed number of bytes consumed per iteration,
@@ -2212,15 +2229,50 @@ impl RegexBuilder {
         // Tier 2 eligibility: non-nested counters with fixed-length bodies
         // and pairwise-disjoint byte sets.
         //
-        // Same structural requirements as tier3 (non-nested, no CRLF, no
-        // zero-width bodies, no deferred asserts inside body), plus:
-        //  - every counter body must have a fixed byte-length (> 0), and
-        //  - the byte sets of different counter bodies must not overlap.
+        // Uses non_nested_eligible (not tier3_eligible) because tier 2
+        // supports deferred assertions inside L=1 counter bodies via its
+        // Phase 1 deferred resolution + cinc_mask mechanism.  For L>1
+        // bodies, deferred assertions break the phase-clock model (the
+        // counter_reset logic can prematurely clear instances when the
+        // NFA is between the last consuming state and CInc due to a
+        // deferred assertion), so they remain ineligible.
+        //
+        // Additional requirements beyond non-nested:
+        //  - every counter body must have a fixed byte-length (> 0),
+        //  - the byte sets of different counter bodies must not overlap,
+        //  - at most MAX_TIER2_COUNTERS counters (u64 bitmask limit), and
+        //  - if a body contains a deferred assertion, body_len must be 1.
         //
         // The disjoint-bytes condition guarantees that at most one counter
         // fires CInc per DFA transition, so the binary with_break/no_break
         // DFA split remains correct with multiple counters.
-        let tier2_eligible = tier3_eligible
+        let has_deferred_in_long_body = has_deferred_in_counter_body && {
+            // Check if any counter with a deferred assertion in its body
+            // has body_length > 1.  L=1 bodies are safe because the single
+            // phase handles the 1-byte deferral correctly.
+            let states = &self.states;
+            let byte_tables = &self.byte_tables;
+            states.iter().any(|s| {
+                if let State::CounterInstance { counter, out } = s {
+                    let ci = counter.idx();
+                    let body_len = counter_info.get(ci).map_or(0, |info| info.2);
+                    body_len > 1 && body_has_deferred(*out, *counter, states, byte_tables)
+                } else {
+                    false
+                }
+            })
+        };
+        // Multi-counter + deferred-in-body: the probe closure cannot
+        // see past deferred assertions to follow CInc break paths, so
+        // the with_break DFA successor misses the next counter's entry
+        // states.  Single-counter is fine (break leads to Match, handled
+        // by resolved_break_match).
+        let has_deferred_in_multi_counter_body =
+            has_deferred_in_counter_body && counter_info.len() > 1;
+
+        let tier2_eligible = non_nested_eligible
+            && !has_deferred_in_long_body
+            && !has_deferred_in_multi_counter_body
             && !counter_info.is_empty()
             && counter_info.len() <= MAX_TIER2_COUNTERS
             && counter_info.iter().all(|&(_, _, body_len)| body_len > 0)
@@ -2269,6 +2321,13 @@ impl RegexBuilder {
         // Precompute can-reach-match for every NFA state.
         let state_can_reach_match = Self::compute_can_reach_match(self.states.as_slice());
 
+        // Precompute per-counter: can the break path (out1) reach Match?
+        let counter_break_can_match = Self::compute_counter_break_can_match(
+            self.states.as_slice(),
+            &state_can_reach_match,
+            self.counters.len(),
+        );
+
         Ok(Regex {
             id: NEXT_REGEX_ID.fetch_add(1, Ordering::Relaxed),
             states: StateList(self.states.to_vec().into_boxed_slice()),
@@ -2287,6 +2346,7 @@ impl RegexBuilder {
             num_byte_classes,
             prefilter,
             state_can_reach_match,
+            counter_break_can_match,
         })
     }
     // -----------------------------------------------------------------------
@@ -2407,6 +2467,26 @@ impl RegexBuilder {
             }
         }
 
+        result.into_boxed_slice()
+    }
+
+    /// For each counter index, check whether its `CounterIncrement` break
+    /// path (`out1`) can reach the `Match` state.  Returns a `Box<[bool]>`
+    /// of length `num_counters`.
+    fn compute_counter_break_can_match(
+        states: &[State],
+        state_can_reach_match: &[bool],
+        num_counters: usize,
+    ) -> Box<[bool]> {
+        let mut result = vec![false; num_counters];
+        for s in states {
+            if let State::CounterIncrement { counter, out1, .. } = *s {
+                let ci = counter.idx();
+                if ci < num_counters && state_can_reach_match[out1.idx()] {
+                    result[ci] = true;
+                }
+            }
+        }
         result.into_boxed_slice()
     }
 
@@ -4252,7 +4332,7 @@ mod tests {
     match_tests! {
         test_counting {
             pattern: "^.*a.{3}bc$",
-            memory: 1011,
+            memory: 1027,
             min_tier: 1,
             inputs: [
                 ("aybzbc", true),
@@ -4271,7 +4351,7 @@ mod tests {
         }
         test_range {
             pattern: "^(a|bc){1,2}$",
-            memory: 689,
+            memory: 706,
             min_tier: 3,
             inputs: [
                 ("a", true),
@@ -4287,7 +4367,7 @@ mod tests {
         }
         test_nested_counting {
             pattern: "^((a|bc){1,2}){2,3}$",
-            memory: 755,
+            memory: 773,
             min_tier: 4,
             inputs: [
                 ("", false),
@@ -4304,7 +4384,7 @@ mod tests {
         }
         test_aaaaa {
             pattern: "^(a|a?){2,3}$",
-            memory: 689,
+            memory: 706,
             min_tier: 0,
             inputs: [
                 ("", true),
@@ -4321,7 +4401,7 @@ mod tests {
         }
         test_one_plus_basic {
             pattern: "^a+$",
-            memory: 557,
+            memory: 573,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4336,7 +4416,7 @@ mod tests {
         }
         test_one_plus_wildcard {
             pattern: "^.+$",
-            memory: 813,
+            memory: 829,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4347,7 +4427,7 @@ mod tests {
         }
         test_one_plus_catenation {
             pattern: "^a+b+$",
-            memory: 623,
+            memory: 639,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4362,7 +4442,7 @@ mod tests {
         }
         test_one_plus_group {
             pattern: "^(ab)+$",
-            memory: 590,
+            memory: 606,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4375,7 +4455,7 @@ mod tests {
         }
         test_one_plus_alternate {
             pattern: "^(a|b)+$",
-            memory: 813,
+            memory: 829,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4394,7 +4474,7 @@ mod tests {
         }
         test_one_plus_with_counting {
             pattern: "^.*a.{3}b+c$",
-            memory: 1044,
+            memory: 1060,
             min_tier: 1,
             inputs: [
                 ("a123bc", true),
@@ -4413,7 +4493,7 @@ mod tests {
         }
         test_repetition_inside_one_plus {
             pattern: "^(a{2,3})+$",
-            memory: 623,
+            memory: 640,
             min_tier: 2,
             inputs: [
                 ("", false),
@@ -4431,7 +4511,7 @@ mod tests {
         }
         test_range_alternation_inside_one_plus {
             pattern: "^((a|bc){1,2})+$",
-            memory: 722,
+            memory: 739,
             min_tier: 3,
             inputs: [
                 ("", false),
@@ -4443,7 +4523,7 @@ mod tests {
         }
         test_one_plus_inside_repetition {
             pattern: "^(a+){2,3}$",
-            memory: 623,
+            memory: 640,
             min_tier: 3,
             inputs: [
                 ("", false),
@@ -4459,7 +4539,7 @@ mod tests {
         }
         test_one_plus_alternation_inside_repetition {
             pattern: "^((a|b)+){2,4}$",
-            memory: 879,
+            memory: 896,
             min_tier: 3,
             inputs: [
                 ("", false),
@@ -4470,7 +4550,7 @@ mod tests {
         }
         test_mixed_plus_and_repetition_inside_one_plus {
             pattern: "^(a+b{2,3})+$",
-            memory: 689,
+            memory: 706,
             min_tier: 2,
             inputs: [
                 ("", false),
@@ -4490,7 +4570,7 @@ mod tests {
         }
         test_min_zero_basic {
             pattern: "^a{0,2}$",
-            memory: 623,
+            memory: 640,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -4502,7 +4582,7 @@ mod tests {
         }
         test_min_zero_max_one {
             pattern: "^a{0,1}$",
-            memory: 557,
+            memory: 573,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4513,7 +4593,7 @@ mod tests {
         }
         test_min_zero_alternation {
             pattern: "^(a|bc){0,3}$",
-            memory: 722,
+            memory: 739,
             min_tier: 3,
             inputs: [
                 ("", true),
@@ -4524,7 +4604,7 @@ mod tests {
         }
         test_min_zero_unbounded {
             pattern: "^a{0,}$",
-            memory: 557,
+            memory: 573,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4541,7 +4621,7 @@ mod tests {
         }
         test_min_zero_unbounded_group {
             pattern: "^(ab){0,}$",
-            memory: 590,
+            memory: 606,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4554,7 +4634,7 @@ mod tests {
         }
         test_min_zero_inside_one_plus {
             pattern: "^x(a{0,2})+y$",
-            memory: 722,
+            memory: 739,
             min_tier: 2,
             inputs: [
                 ("xy", true),
@@ -4574,7 +4654,7 @@ mod tests {
         }
         test_min_zero_inside_repetition {
             pattern: "^(a{0,2}){2,3}$",
-            memory: 689,
+            memory: 707,
             min_tier: 0,
             inputs: [
                 ("", true),
@@ -4590,7 +4670,7 @@ mod tests {
         }
         test_one_plus_inside_min_zero_repetition {
             pattern: "^(a+){0,3}$",
-            memory: 656,
+            memory: 673,
             min_tier: 3,
             inputs: [
                 ("", true),
@@ -4605,7 +4685,7 @@ mod tests {
         }
         test_min_zero_wildcard {
             pattern: "^.{0,3}$",
-            memory: 879,
+            memory: 896,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -4617,7 +4697,7 @@ mod tests {
         }
         test_none_min_repetition {
             pattern: "^a{0,3}$",
-            memory: 623,
+            memory: 640,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -4632,7 +4712,7 @@ mod tests {
         }
         test_literal_single {
             pattern: "^a$",
-            memory: 524,
+            memory: 540,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4645,7 +4725,7 @@ mod tests {
         }
         test_literal_multi {
             pattern: "^abc$",
-            memory: 590,
+            memory: 606,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -4663,7 +4743,7 @@ mod tests {
         }
         test_dot_single {
             pattern: "^.$",
-            memory: 780,
+            memory: 796,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4677,7 +4757,7 @@ mod tests {
         }
         test_alternation_bare {
             pattern: "^(a|bc)$",
-            memory: 623,
+            memory: 639,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4693,7 +4773,7 @@ mod tests {
         }
         test_alternation_three_way {
             pattern: "^(a|b|c)$",
-            memory: 780,
+            memory: 796,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -4707,7 +4787,7 @@ mod tests {
         }
         test_question_mark_single {
             pattern: "^a?$",
-            memory: 557,
+            memory: 573,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4719,7 +4799,7 @@ mod tests {
         }
         test_question_mark_group {
             pattern: "^(ab)?$",
-            memory: 590,
+            memory: 606,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4733,7 +4813,7 @@ mod tests {
         }
         test_question_mark_prefix {
             pattern: "^a?b$",
-            memory: 590,
+            memory: 606,
             min_tier: 1,
             inputs: [
                 ("b", true),
@@ -4748,7 +4828,7 @@ mod tests {
         }
         test_star_single {
             pattern: "^a*$",
-            memory: 557,
+            memory: 573,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4765,7 +4845,7 @@ mod tests {
         }
         test_star_group {
             pattern: "^(ab)*$",
-            memory: 590,
+            memory: 606,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -4782,7 +4862,7 @@ mod tests {
         }
         test_star_then_literal {
             pattern: "^a*b$",
-            memory: 590,
+            memory: 606,
             min_tier: 1,
             inputs: [
                 ("b", true),
@@ -4800,7 +4880,7 @@ mod tests {
         }
         test_min_n_unbounded {
             pattern: "^a{2,}$",
-            memory: 590,
+            memory: 607,
             min_tier: 2,
             inputs: [
                 ("aa", true),
@@ -4817,7 +4897,7 @@ mod tests {
         }
         test_min_n_unbounded_group {
             pattern: "^(ab){2,}$",
-            memory: 623,
+            memory: 640,
             min_tier: 2,
             inputs: [
                 ("abab", true),
@@ -4834,7 +4914,7 @@ mod tests {
         }
         test_bounded_range {
             pattern: "^a{3,5}$",
-            memory: 590,
+            memory: 607,
             min_tier: 2,
             inputs: [
                 ("aaa", true),
@@ -4851,7 +4931,7 @@ mod tests {
         }
         test_exact_repetition {
             pattern: "^a{3,3}$",
-            memory: 590,
+            memory: 606,
             min_tier: 1,
             inputs: [
                 ("aaa", true),
@@ -4880,7 +4960,7 @@ mod tests {
         }
         test_byte_class_range {
             pattern: "^[a-c]$",
-            memory: 780,
+            memory: 796,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4893,7 +4973,7 @@ mod tests {
         }
         test_byte_class_one_plus {
             pattern: "^[a-c]+$",
-            memory: 813,
+            memory: 829,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4906,7 +4986,7 @@ mod tests {
         }
         test_byte_class_counted {
             pattern: "^[a-c]{2,3}$",
-            memory: 846,
+            memory: 863,
             min_tier: 2,
             inputs: [
                 ("", false),
@@ -4920,7 +5000,7 @@ mod tests {
         }
         test_byte_class_disjoint {
             pattern: "^[ax]$",
-            memory: 780,
+            memory: 796,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4932,7 +5012,7 @@ mod tests {
         }
         test_byte_class_multi_range {
             pattern: "^[a-cx-z]+$",
-            memory: 813,
+            memory: 829,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -4946,7 +5026,7 @@ mod tests {
         }
         test_byte_class_with_wildcard {
             pattern: "^[a-c].*[x-z]$",
-            memory: 1391,
+            memory: 1407,
             min_tier: 1,
             inputs: [
                 ("ax", true),
@@ -4959,7 +5039,7 @@ mod tests {
         }
         test_digit {
             pattern: r#"^\d$"#,
-            memory: 780,
+            memory: 796,
             min_tier: 1,
             inputs: [
                 ("0", true),
@@ -4975,7 +5055,7 @@ mod tests {
         }
         test_digit_plus {
             pattern: r#"^\d+$"#,
-            memory: 813,
+            memory: 829,
             min_tier: 1,
             inputs: [
                 ("0", true),
@@ -4991,7 +5071,7 @@ mod tests {
         }
         test_digit_counted {
             pattern: r#"^\d{3,5}$"#,
-            memory: 846,
+            memory: 863,
             min_tier: 2,
             inputs: [
                 ("123", true),
@@ -5007,7 +5087,7 @@ mod tests {
         }
         test_non_digit {
             pattern: r#"^\D$"#,
-            memory: 780,
+            memory: 796,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -5023,7 +5103,7 @@ mod tests {
         }
         test_non_digit_plus {
             pattern: r#"^\D+$"#,
-            memory: 813,
+            memory: 829,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -5037,7 +5117,7 @@ mod tests {
         }
         test_space {
             pattern: r#"^\s$"#,
-            memory: 780,
+            memory: 796,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -5052,7 +5132,7 @@ mod tests {
         }
         test_space_plus {
             pattern: r#"^\s+$"#,
-            memory: 813,
+            memory: 829,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -5066,7 +5146,7 @@ mod tests {
         }
         test_non_space {
             pattern: r#"^\S$"#,
-            memory: 780,
+            memory: 796,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -5081,7 +5161,7 @@ mod tests {
         }
         test_non_space_plus {
             pattern: r#"^\S+$"#,
-            memory: 813,
+            memory: 829,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -5095,7 +5175,7 @@ mod tests {
         }
         test_word {
             pattern: r#"^\w$"#,
-            memory: 780,
+            memory: 796,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -5112,7 +5192,7 @@ mod tests {
         }
         test_word_plus {
             pattern: r#"^\w+$"#,
-            memory: 813,
+            memory: 829,
             min_tier: 1,
             inputs: [
                 ("hello", true),
@@ -5127,7 +5207,7 @@ mod tests {
         }
         test_word_counted {
             pattern: r#"^\w{2,4}$"#,
-            memory: 846,
+            memory: 863,
             min_tier: 2,
             inputs: [
                 ("ab", true),
@@ -5142,7 +5222,7 @@ mod tests {
         }
         test_non_word {
             pattern: r#"^\W$"#,
-            memory: 780,
+            memory: 796,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -5158,7 +5238,7 @@ mod tests {
         }
         test_non_word_plus {
             pattern: r#"^\W+$"#,
-            memory: 813,
+            memory: 829,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -5173,7 +5253,7 @@ mod tests {
         }
         test_predefined_mixed {
             pattern: r#"^\d+\s+\w+$"#,
-            memory: 1457,
+            memory: 1473,
             min_tier: 1,
             inputs: [
                 ("42 hello", true),
@@ -6173,7 +6253,7 @@ mod tests {
         test_counter_body_with_assertion_2 {
             pattern: "(?m:a$){2,3}",
             memory: 0,
-            min_tier: 0,
+            min_tier: 2,
             inputs: [
                 ("a\na", false),
                 ("a\na\na", false),
@@ -6186,7 +6266,7 @@ mod tests {
         test_counter_body_with_assertion_3 {
             pattern: "(?m:^a$){2,3}",
             memory: 0,
-            min_tier: 0,
+            min_tier: 2,
             inputs: [
                 ("a\na", false),
                 ("a\na\na", false),
@@ -6194,6 +6274,85 @@ mod tests {
                 ("", false),
                 ("a\nab\na", false),
                 ("x\na\na\nx", false),
+            ],
+        }
+        // Deferred assertion in L=1 counter body (promoted to tier 2)
+        test_counter_body_word_boundary_end_1 {
+            pattern: r"(\w\b){1,3}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("a", true),
+                ("ab", true),
+                ("a ", true),
+                ("a b", true),
+                ("abc", true),
+                ("", false),
+                (" ", false),
+            ],
+        }
+        test_counter_body_word_boundary_end_2 {
+            pattern: r"(\w\b){2,4}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("a", false),
+                ("ab", false),
+                ("a b", false),
+                ("a b c", false),
+                ("", false),
+            ],
+        }
+        test_counter_body_word_boundary_end_3 {
+            pattern: r"(\w\b){1,2}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("a", true),
+                ("ab", true),
+                ("a ", true),
+                ("a b", true),
+                ("", false),
+            ],
+        }
+        test_counter_body_dot_boundary {
+            pattern: r"(.\b){2,4}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("a b", true),
+                ("a b c", true),
+                ("abcd", false),
+                ("ab", false),
+                ("a", false),
+                ("", false),
+                ("a  b", true),
+            ],
+        }
+        test_counter_body_boundary_at_start {
+            pattern: r"(\ba){2,4}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("aa", false),
+                ("a a", false),
+                ("a", false),
+                ("", false),
+            ],
+        }
+        // Multi-counter with deferred assertion in body → NFA simulator
+        // (break path through deferred assert can't be followed in probe closure)
+        test_multi_counter_deferred_body {
+            pattern: r"(a\B){2,3}(b\B){2,3}",
+            memory: 0,
+            min_tier: 0,
+            inputs: [
+                ("aabbc", true),
+                ("aabb", false),
+                ("aaabbbx", true),
+                ("aabbx", true),
+                ("abx", false),
+                ("", false),
             ],
         }
         // Deferred assertion patterns (migrated from standalone tests)
