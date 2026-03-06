@@ -833,6 +833,146 @@ pub struct Regex {
     /// Avoids scanning all NFA states at DFA populate time.
     pub(crate) counter_break_can_match: Box<[bool]>,
 }
+/// Diagnostic snapshot of a compiled [`Regex`].
+///
+/// Returned by [`Regex::info`].  Implements [`Display`](fmt::Display) so it
+/// can be printed directly or written to any formatter.
+pub struct RegexInfo {
+    // Memory
+    pub memory_total: usize,
+    pub memory_states: usize,
+    pub memory_classes: usize,
+    pub memory_byte_tables: usize,
+    pub num_states: usize,
+    pub state_size: usize,
+    pub num_classes: usize,
+    pub class_size: usize,
+    pub num_byte_tables: usize,
+    pub byte_table_size: usize,
+    // NFA state breakdown
+    pub n_split: usize,
+    pub n_byte: usize,
+    pub n_byte_ci: usize,
+    pub n_byte_class: usize,
+    pub n_byte_table: usize,
+    pub n_assert: usize,
+    pub n_counter_instance: usize,
+    pub n_counter_increment: usize,
+    pub n_match: usize,
+    // Counters: (index, min, max)
+    pub counters: Vec<(usize, usize, usize)>,
+    // Assertions
+    pub assert_kinds: Vec<String>,
+    pub n_deferred: usize,
+    // Byte classes
+    pub num_byte_classes: usize,
+    // Execution
+    pub execution_tier: &'static str,
+    // Start closure
+    pub start_closure_len: usize,
+    pub start_closure_matches: bool,
+    // Prefilter
+    pub prefilter_desc: String,
+}
+
+impl fmt::Display for RegexInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Memory
+        writeln!(f, "Memory")?;
+        writeln!(f, "  total:       {} bytes", self.memory_total)?;
+        writeln!(
+            f,
+            "  states:      {} bytes ({} states \u{00d7} {} bytes/state)",
+            self.memory_states, self.num_states, self.state_size
+        )?;
+        writeln!(
+            f,
+            "  classes:     {} bytes ({} tables \u{00d7} {} bytes/table)",
+            self.memory_classes, self.num_classes, self.class_size
+        )?;
+        writeln!(
+            f,
+            "  byte_tables: {} bytes ({} tables \u{00d7} {} bytes/table)",
+            self.memory_byte_tables, self.num_byte_tables, self.byte_table_size
+        )?;
+
+        // NFA state breakdown
+        writeln!(f)?;
+        writeln!(f, "NFA states: {}", self.num_states)?;
+        writeln!(f, "  Split:            {}", self.n_split)?;
+        writeln!(f, "  Byte:             {}", self.n_byte)?;
+        writeln!(f, "  ByteCI:           {}", self.n_byte_ci)?;
+        writeln!(f, "  ByteClass:        {}", self.n_byte_class)?;
+        writeln!(f, "  ByteTable:        {}", self.n_byte_table)?;
+        writeln!(f, "  Assert:           {}", self.n_assert)?;
+        writeln!(f, "  CounterInstance:  {}", self.n_counter_instance)?;
+        writeln!(f, "  CounterIncrement: {}", self.n_counter_increment)?;
+        writeln!(f, "  Match:            {}", self.n_match)?;
+
+        // Counters
+        if !self.counters.is_empty() {
+            writeln!(f)?;
+            writeln!(f, "Counters: {}", self.counters.len())?;
+            for &(idx, min, max) in &self.counters {
+                writeln!(f, "  counter[{idx}]: {{{min},{max}}}")?;
+            }
+        }
+
+        // Assertions
+        if !self.assert_kinds.is_empty() {
+            writeln!(f)?;
+            writeln!(
+                f,
+                "Assertion kinds: {} (across {} state{})",
+                self.assert_kinds.len(),
+                self.n_assert,
+                if self.n_assert == 1 { "" } else { "s" }
+            )?;
+            for k in &self.assert_kinds {
+                writeln!(f, "  {k}")?;
+            }
+        }
+
+        // Deferred assertions
+        if self.n_deferred > 0 {
+            writeln!(f)?;
+            writeln!(
+                f,
+                "Deferred assertions: {} (resolved at DFA transition time)",
+                self.n_deferred
+            )?;
+        }
+
+        // Byte equivalence classes
+        writeln!(f)?;
+        if self.num_byte_classes < 256 {
+            writeln!(
+                f,
+                "Byte equivalence classes: {} (DFA stride, vs 256 raw)",
+                self.num_byte_classes
+            )?;
+        } else {
+            writeln!(f, "Byte equivalence classes: disabled (stride=256)")?;
+        }
+
+        // Execution tier
+        writeln!(f)?;
+        writeln!(f, "Execution: {}", self.execution_tier)?;
+
+        // Start closure
+        writeln!(f)?;
+        writeln!(
+            f,
+            "Start closure: {} consuming states (precomputed: {})",
+            self.start_closure_len,
+            self.start_closure_len > 0
+        )?;
+        writeln!(f, "Start matches empty: {}", self.start_closure_matches)?;
+        write!(f, "Prefilter: {}", self.prefilter_desc)?;
+        Ok(())
+    }
+}
+
 impl Regex {
     /// Return the total memory footprint (in bytes) of this compiled
     /// regex, including both inline and heap-allocated data.
@@ -885,36 +1025,8 @@ impl Regex {
         }
     }
     /// Print diagnostic information about this compiled regex.
-    pub fn info(&self, mut out: impl Write) {
-        // -- Memory --
-        let mem = self.memory_size();
-        writeln!(out, "Memory").unwrap();
-        writeln!(out, "  total:       {} bytes", mem).unwrap();
-        writeln!(
-            out,
-            "  states:      {} bytes ({} states × {} bytes/state)",
-            self.states.len() * std::mem::size_of::<State>(),
-            self.states.len(),
-            std::mem::size_of::<State>()
-        )
-        .unwrap();
-        writeln!(
-            out,
-            "  classes:     {} bytes ({} tables × {} bytes/table)",
-            self.classes.len() * std::mem::size_of::<ByteClass>(),
-            self.classes.len(),
-            std::mem::size_of::<ByteClass>()
-        )
-        .unwrap();
-        writeln!(
-            out,
-            "  byte_tables: {} bytes ({} tables × {} bytes/table)",
-            self.byte_tables.len() * std::mem::size_of::<ByteMap>(),
-            self.byte_tables.len(),
-            std::mem::size_of::<ByteMap>()
-        )
-        .unwrap();
-
+    /// Return a [`RegexInfo`] snapshot of compiled regex diagnostics.
+    pub fn info(&self) -> RegexInfo {
         // -- NFA state breakdown --
         let mut n_split = 0usize;
         let mut n_byte = 0usize;
@@ -938,29 +1050,15 @@ impl Regex {
                 State::Match => n_match += 1,
             }
         }
-        writeln!(out).unwrap();
-        writeln!(out, "NFA states: {}", self.states.len()).unwrap();
-        writeln!(out, "  Split:            {n_split}").unwrap();
-        writeln!(out, "  Byte:             {n_byte}").unwrap();
-        writeln!(out, "  ByteCI:           {n_byte_ci}").unwrap();
-        writeln!(out, "  ByteClass:        {n_byte_class}").unwrap();
-        writeln!(out, "  ByteTable:        {n_byte_table}").unwrap();
-        writeln!(out, "  Assert:           {n_assert}").unwrap();
-        writeln!(out, "  CounterInstance:  {n_counter_instance}").unwrap();
-        writeln!(out, "  CounterIncrement: {n_counter_increment}").unwrap();
-        writeln!(out, "  Match:            {n_match}").unwrap();
 
         // -- Counters --
-        if self.num_counters > 0 {
-            writeln!(out).unwrap();
-            writeln!(out, "Counters: {}", self.num_counters).unwrap();
-            for s in self.states.iter() {
-                if let State::CounterIncrement {
-                    counter, min, max, ..
-                } = s
-                {
-                    writeln!(out, "  counter[{}]: {{{},{}}}", counter.idx(), min, max).unwrap();
-                }
+        let mut counters = Vec::new();
+        for s in self.states.iter() {
+            if let State::CounterIncrement {
+                counter, min, max, ..
+            } = s
+            {
+                counters.push((counter.idx(), *min, *max));
             }
         }
 
@@ -969,19 +1067,6 @@ impl Regex {
         for s in self.states.iter() {
             if let State::Assert { kind, .. } = s {
                 assert_kinds.insert(format!("{:?}", kind));
-            }
-        }
-        if !assert_kinds.is_empty() {
-            writeln!(out).unwrap();
-            writeln!(
-                out,
-                "Assertion kinds: {} (across {n_assert} state{})",
-                assert_kinds.len(),
-                if n_assert == 1 { "" } else { "s" }
-            )
-            .unwrap();
-            for k in &assert_kinds {
-                writeln!(out, "  {k}").unwrap();
             }
         }
 
@@ -1001,31 +1086,9 @@ impl Regex {
                 )
             })
             .count();
-        if n_deferred > 0 {
-            writeln!(out).unwrap();
-            writeln!(
-                out,
-                "Deferred assertions: {n_deferred} (resolved at DFA transition time)"
-            )
-            .unwrap();
-        }
-
-        // -- Byte equivalence classes --
-        writeln!(out).unwrap();
-        if self.num_byte_classes < 256 {
-            writeln!(
-                out,
-                "Byte equivalence classes: {} (DFA stride, vs 256 raw)",
-                self.num_byte_classes
-            )
-            .unwrap();
-        } else {
-            writeln!(out, "Byte equivalence classes: disabled (stride=256)").unwrap();
-        }
 
         // -- Execution tier --
-        writeln!(out).unwrap();
-        let tier = if self.dfa_eligible {
+        let execution_tier = if self.dfa_eligible {
             "Tier 1: Lazy DFA (flat table, no counters, deferred assertions)"
         } else if self.tier2_eligible {
             "Tier 2: Differential-counter DFA (fixed-length bodies, O(1) counters)"
@@ -1036,19 +1099,9 @@ impl Regex {
         } else {
             "NFA simulator (general case)"
         };
-        writeln!(out, "Execution: {tier}").unwrap();
 
-        // -- Start closure --
-        writeln!(out).unwrap();
-        writeln!(
-            out,
-            "Start closure: {} consuming states (precomputed: {})",
-            self.start_closure.len(),
-            !self.start_closure.is_empty()
-        )
-        .unwrap();
-        writeln!(out, "Start matches empty: {}", self.start_closure_matches).unwrap();
-        let pf_desc = match &self.prefilter {
+        // -- Prefilter --
+        let prefilter_desc = match &self.prefilter {
             Prefilter::None => "none".to_string(),
             Prefilter::Memchr1(b) => format!("memchr1({:?})", *b as char),
             Prefilter::Memchr2(a, b) => format!("memchr2({:?}, {:?})", *a as char, *b as char),
@@ -1059,7 +1112,36 @@ impl Regex {
                 )
             }
         };
-        writeln!(out, "Prefilter: {}", pf_desc).unwrap();
+
+        RegexInfo {
+            memory_total: self.memory_size(),
+            memory_states: self.states.len() * std::mem::size_of::<State>(),
+            memory_classes: self.classes.len() * std::mem::size_of::<ByteClass>(),
+            memory_byte_tables: self.byte_tables.len() * std::mem::size_of::<ByteMap>(),
+            num_states: self.states.len(),
+            state_size: std::mem::size_of::<State>(),
+            num_classes: self.classes.len(),
+            class_size: std::mem::size_of::<ByteClass>(),
+            num_byte_tables: self.byte_tables.len(),
+            byte_table_size: std::mem::size_of::<ByteMap>(),
+            n_split,
+            n_byte,
+            n_byte_ci,
+            n_byte_class,
+            n_byte_table,
+            n_assert,
+            n_counter_instance,
+            n_counter_increment,
+            n_match,
+            counters,
+            assert_kinds: assert_kinds.into_iter().collect(),
+            n_deferred,
+            num_byte_classes: self.num_byte_classes,
+            execution_tier,
+            start_closure_len: self.start_closure.len(),
+            start_closure_matches: self.start_closure_matches,
+            prefilter_desc,
+        }
     }
 
     /// Emit a Graphviz DOT representation of the NFA.

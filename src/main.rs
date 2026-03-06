@@ -157,12 +157,9 @@ fn parse_args() -> Command {
 
 fn run_info(pattern: &str) {
     let regex = parse_pattern(pattern);
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    writeln!(out, "Pattern: {pattern}").unwrap();
-    writeln!(out).unwrap();
-    regex.info(&mut out);
-    out.flush().unwrap();
+    println!("Pattern: {pattern}");
+    println!();
+    println!("{}", regex.info());
 }
 
 fn run_dot(pattern: &str) {
