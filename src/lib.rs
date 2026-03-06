@@ -4864,6 +4864,20 @@ mod tests {
                 ("bbb", false),
             ],
         }
+        test_wildcard_fixed_unrolled {
+            pattern: "^a.{3}b$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("a123b", true),
+                ("a   b", true),
+                ("abcdb", true),
+                ("ab", false),
+                ("a12b", false),
+                ("a1234b", false),
+                ("", false),
+            ],
+        }
         test_byte_class_range {
             pattern: "^[a-c]$",
             memory: 780,
