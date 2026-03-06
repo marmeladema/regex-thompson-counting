@@ -1959,9 +1959,92 @@ impl RegexBuilder {
         // Compute per-counter info: (min, max, body_byte_length).
         // body_byte_length is the fixed number of bytes consumed per iteration,
         // or 0 if the body has variable length.
-        let counter_info: Box<[(usize, usize, usize)]> = if has_counters {
+        #[allow(clippy::type_complexity)]
+        let (counter_info, disjoint_bytes): (Box<[(usize, usize, usize)]>, bool) = if has_counters {
             let states = &self.states;
             let byte_tables = &self.byte_tables;
+
+            /// Check that the byte sets matched by different counter bodies
+            /// are pairwise disjoint.  When this holds, at most one counter
+            /// fires CInc on any DFA transition, so the binary
+            /// with_break/no_break split is correct for multiple counters.
+            fn counter_bodies_have_disjoint_bytes(
+                states: &[State],
+                classes: &indexmap::set::IndexSet<ByteClass>,
+                byte_tables: &[ByteMap],
+            ) -> bool {
+                // Collect per-counter byte sets (as [bool; 256]).
+                let mut counter_bytes: Vec<(CounterIdx, [bool; 256])> = Vec::new();
+                for s in states.iter() {
+                    if let State::CounterInstance { counter, out } = s {
+                        let mut bytes = [false; 256];
+                        // Walk the body from CI.out to find all consuming
+                        // states, stopping at CInc for the same counter.
+                        let mut stack = vec![*out];
+                        let mut visited = vec![false; states.len()];
+                        while let Some(idx) = stack.pop() {
+                            let i = idx.idx();
+                            if visited[i] {
+                                continue;
+                            }
+                            visited[i] = true;
+                            match states[idx] {
+                                State::CounterIncrement { counter: c, .. } if c == *counter => {}
+                                State::Split { out, out1 } => {
+                                    stack.push(out1);
+                                    stack.push(out);
+                                }
+                                State::Assert { out, .. } | State::CounterInstance { out, .. } => {
+                                    stack.push(out);
+                                }
+                                State::Byte { byte, out } => {
+                                    bytes[byte as usize] = true;
+                                    stack.push(out);
+                                }
+                                State::ByteCI { byte, out } => {
+                                    bytes[byte as usize] = true;
+                                    bytes[(byte ^ 0x20) as usize] = true;
+                                    stack.push(out);
+                                }
+                                State::ByteClass { class, out } => {
+                                    let table = &classes[class.idx()];
+                                    for b in 0..=255u8 {
+                                        if table[b] {
+                                            bytes[b as usize] = true;
+                                        }
+                                    }
+                                    stack.push(out);
+                                }
+                                State::ByteTable { table } => {
+                                    let map = &byte_tables[table.idx()];
+                                    for b in 0..=255u8 {
+                                        if map[b] != StateIdx::NONE {
+                                            bytes[b as usize] = true;
+                                            stack.push(map[b]);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        counter_bytes.push((*counter, bytes));
+                    }
+                }
+                // Pairwise disjointness check.
+                for i in 0..counter_bytes.len() {
+                    for j in (i + 1)..counter_bytes.len() {
+                        if counter_bytes[i].0 == counter_bytes[j].0 {
+                            continue; // same counter (shouldn't happen)
+                        }
+                        for b in 0..256 {
+                            if counter_bytes[i].1[b] && counter_bytes[j].1[b] {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
+            }
 
             /// Compute the fixed byte-length of a counter body.
             /// Returns `Some(len)` if all paths through the body consume
@@ -2087,20 +2170,29 @@ impl RegexBuilder {
                     info[ci].2 = body_len;
                 }
             }
-            info.into_boxed_slice()
+            let disjoint_bytes =
+                counter_bodies_have_disjoint_bytes(states, &self.classes, byte_tables);
+
+            (info.into_boxed_slice(), disjoint_bytes)
         } else {
-            Box::new([])
+            (Box::new([]), true)
         };
 
-        // Tier 2 eligibility: single non-nested counter with fixed-length body.
+        // Tier 2 eligibility: non-nested counters with fixed-length bodies
+        // and pairwise-disjoint byte sets.
+        //
         // Same structural requirements as tier3 (non-nested, no CRLF, no
-        // zero-width bodies, no deferred asserts inside body), plus the
-        // counter body must have a fixed byte-length.  Currently limited
-        // to single-counter patterns because the with_break/no_break DFA
-        // split assumes one counter fires per transition.
+        // zero-width bodies, no deferred asserts inside body), plus:
+        //  - every counter body must have a fixed byte-length (> 0), and
+        //  - the byte sets of different counter bodies must not overlap.
+        //
+        // The disjoint-bytes condition guarantees that at most one counter
+        // fires CInc per DFA transition, so the binary with_break/no_break
+        // DFA split remains correct with multiple counters.
         let tier2_eligible = tier3_eligible
-            && counter_info.len() == 1
-            && counter_info.iter().all(|&(_, _, body_len)| body_len > 0);
+            && !counter_info.is_empty()
+            && counter_info.iter().all(|&(_, _, body_len)| body_len > 0)
+            && disjoint_bytes;
 
         // Compute byte equivalence classes before moving data out.
         let classes_slice: Vec<ByteClass> = self.classes.iter().copied().collect();
@@ -7497,6 +7589,125 @@ mod tests {
                 ("", false),
                 ("a1b", false),
                 ("1b2", false),
+            ],
+        }
+
+        // -----------------------------------------------------------------
+        // Multi-counter tier 2 tests: non-nested counters with disjoint
+        // character classes should use tier 2 (differential counters).
+        // -----------------------------------------------------------------
+
+        test_multi_counter_two_fixed {
+            pattern: "^[A-Z]{4}[0-9]{16}$",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("ABCD1234567890123456", true),
+                ("ABCD12345678901234567", false),
+                ("ABCD123456789012345", false),
+                ("ABC1234567890123456", false),
+                ("ABCDE1234567890123456", false),
+                ("abcd1234567890123456", false),
+                ("", false),
+            ],
+        }
+        test_multi_counter_two_ranges {
+            pattern: "^a{3,5}b{2,4}$",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("aaabb", true),
+                ("aaaabb", true),
+                ("aaaaabb", true),
+                ("aaabbb", true),
+                ("aaabbbb", true),
+                ("aaaabbbb", true),
+                ("aaaaabbb", true),
+                ("aaaaabbbb", true),
+                ("aab", false),
+                ("aaab", false),
+                ("aaaaaabb", false),
+                ("aaabbbbb", false),
+                ("", false),
+                ("ab", false),
+                ("ba", false),
+            ],
+        }
+        test_multi_counter_three_fixed {
+            pattern: "^a{2}b{3}c{2}$",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("aabbbcc", true),
+                ("abbbcc", false),
+                ("aaabbcc", false),
+                ("aabbcc", false),
+                ("aabbbbcc", false),
+                ("aabbbc", false),
+                ("aabbbccc", false),
+                ("", false),
+            ],
+        }
+        test_multi_counter_three_ranges {
+            pattern: "^x{1,3}y{2,4}z{1,2}$",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("xyyz", true),
+                ("xxyyz", true),
+                ("xxxyyz", true),
+                ("xyyyz", true),
+                ("xyyyyz", true),
+                ("xxyyyyzz", true),
+                ("xxxyyyyzz", true),
+                ("yz", false),
+                ("xyz", false),
+                ("xxxxyyyz", false),
+                ("xxyyyyyzz", false),
+                ("xxxyyzzzz", false),
+                ("", false),
+            ],
+        }
+        test_multi_counter_unanchored {
+            pattern: "[A-Z]{3}[0-9]{3}",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("ABC123", true),
+                ("xxABC123xx", true),
+                ("AB123", false),
+                ("ABC12", false),
+                ("abc123", false),
+                ("", false),
+            ],
+        }
+        test_multi_counter_with_literal_prefix {
+            pattern: "^ID-[A-Z]{4}-[0-9]{6}$",
+            memory: 0,
+            min_tier: 2,
+            inputs: [
+                ("ID-ABCD-123456", true),
+                ("ID-ABCD-12345", false),
+                ("ID-ABC-123456", false),
+                ("ID-ABCDE-123456", false),
+                ("ID-ABCD-1234567", false),
+                ("ID-abcd-123456", false),
+                ("IDABCD123456", false),
+                ("", false),
+            ],
+        }
+        // Overlapping character classes: must NOT be tier 2.
+        test_multi_counter_overlapping_falls_to_tier3 {
+            pattern: r"^\w{3}\d{2}$",
+            memory: 0,
+            min_tier: 3,
+            inputs: [
+                ("abc12", true),
+                ("a1b23", true),
+                ("12345", true),
+                ("ab1", false),
+                ("abcd1", false),
+                ("", false),
             ],
         }
     }
