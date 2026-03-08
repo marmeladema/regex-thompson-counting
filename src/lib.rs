@@ -2976,9 +2976,14 @@ impl MatcherMemory {
             nlist_has_assert: false,
             counter_pool: &mut self.counter_pool,
             prefilter: regex.prefilter,
+            at_start_state: false,
         };
 
         m.startlist(m.start);
+        // Initially at start state — clist is exactly the start closure.
+        // If the start closure has deferred asserts, disable re-engagement
+        // because the prefilter doesn't account for bytes behind asserts.
+        m.at_start_state = !m.has_assert;
         m
     }
 }
@@ -3091,6 +3096,10 @@ pub struct NfaMatcher<'a> {
     nlist_has_assert: bool,
     counter_pool: &'a mut CounterPool,
     prefilter: Prefilter,
+    /// True when `clist` is in its initial configuration (only start closure
+    /// entries, no in-progress matches, no live deferred assertions).
+    /// Safe to re-engage memchr prefilter when true.
+    at_start_state: bool,
 }
 
 /// Internal operations for iterative [`Matcher::addstate`] traversal.
@@ -3287,7 +3296,10 @@ impl<'a> NfaMatcher<'a> {
     /// Advance the simulation by one input byte.
     #[inline(always)]
     fn step(&mut self, b: u8) {
+        self.at_start_state = false;
+
         // --- Pre-consumption: resolve deferred assertions ---
+        let mut had_deferred_resolution = false;
         if self.has_assert {
             let mut any_expanded = false;
             let clist_len = self.clist.len();
@@ -3321,6 +3333,7 @@ impl<'a> NfaMatcher<'a> {
                     self.addstate(out, ctx_clone, Some(b));
                 }
             }
+            had_deferred_resolution = any_expanded;
             if any_expanded {
                 self.clist.append(self.nlist);
                 self.listid += 1;
@@ -3337,6 +3350,7 @@ impl<'a> NfaMatcher<'a> {
         );
         self.free_ctx_visited();
         let mut clist = std::mem::take(self.clist);
+        let mut any_consumed = false;
 
         // Fused pass: push Visit ops for matching consuming states
         // (back-to-front for LIFO ordering) + re-seed.
@@ -3370,6 +3384,7 @@ impl<'a> NfaMatcher<'a> {
                 }
             };
             self.addstack.push(AddStateOp::Visit(target, ctx));
+            any_consumed = true;
         }
 
         self.drain_addstack(None);
@@ -3397,6 +3412,11 @@ impl<'a> NfaMatcher<'a> {
         self.nlist_has_assert = false;
         self.listid += 1;
         self.free_ctx_visited();
+
+        // Re-engagement: if no consuming state matched and no deferred
+        // assertion resolved, clist is just the re-seeded start closure.
+        // The prefilter can safely skip to the next candidate byte.
+        self.at_start_state = !any_consumed && !had_deferred_resolution && !self.has_assert;
     }
 
     /// Feed an entire byte slice through the matcher, one byte at a time.
@@ -3408,40 +3428,51 @@ impl<'a> NfaMatcher<'a> {
         if self.ever_matched {
             return;
         }
-
-        let input = match self.prefilter {
-            Prefilter::None => input,
-            Prefilter::Memchr1(b) => {
-                if let Some(idx) = memchr::memchr(b, input) {
-                    self.prefilter = Prefilter::None;
-                    &input[idx..]
-                } else {
-                    return;
-                }
+        match self.prefilter {
+            Prefilter::None => self.chunk_no_prefilter(input),
+            Prefilter::Memchr1(needle) => {
+                self.chunk_prefilter(input, |hay| memchr::memchr(needle, hay));
             }
             Prefilter::Memchr2(b1, b2) => {
-                if let Some(idx) = memchr::memchr2(b1, b2, input) {
-                    self.prefilter = Prefilter::None;
-                    &input[idx..]
-                } else {
-                    return;
-                }
+                self.chunk_prefilter(input, |hay| memchr::memchr2(b1, b2, hay));
             }
             Prefilter::Memchr3(b1, b2, b3) => {
-                if let Some(idx) = memchr::memchr3(b1, b2, b3, input) {
-                    self.prefilter = Prefilter::None;
-                    &input[idx..]
-                } else {
-                    return;
-                }
+                self.chunk_prefilter(input, |hay| memchr::memchr3(b1, b2, b3, hay));
             }
-        };
+        }
+    }
 
+    /// Fast path: no prefilter, process every byte.
+    fn chunk_no_prefilter(&mut self, input: &[u8]) {
         for &b in input {
             if self.ever_matched {
                 return;
             }
             self.step(b);
+        }
+    }
+
+    /// Prefilter path: when `at_start_state` is true, use memchr to skip
+    /// to the next candidate byte.  Falls back to byte-at-a-time when a
+    /// partial match is in progress.
+    fn chunk_prefilter(&mut self, input: &[u8], finder: impl Fn(&[u8]) -> Option<usize>) {
+        let mut i = 0;
+        while i < input.len() {
+            if self.ever_matched {
+                return;
+            }
+            // When the NFA is in its start configuration (only re-seeded
+            // start closure threads, no live deferred assertions), use
+            // memchr to skip non-candidate bytes.
+            if self.at_start_state {
+                if let Some(offset) = finder(&input[i..]) {
+                    i += offset;
+                } else {
+                    return;
+                }
+            }
+            self.step(input[i]);
+            i += 1;
         }
     }
 
