@@ -1602,11 +1602,27 @@ impl RegexBuilder {
                 Ok(())
             }
             HirKind::Alternation(children) => {
-                for (idx, child) in children.iter().enumerate() {
+                let mut count = 0;
+                let mut has_empty = false;
+                for child in children {
+                    let before = self.postfix.len();
                     self.hir2postfix(child)?;
-                    if idx > 0 {
-                        self.postfix.push(RegexHirNode::Alternate);
+                    if self.postfix.len() > before {
+                        count += 1;
+                        if count > 1 {
+                            self.postfix.push(RegexHirNode::Alternate);
+                        }
+                    } else {
+                        // Child produced nothing (Empty).  Record it so we
+                        // can wrap the whole alternation in `?` below.
+                        has_empty = true;
                     }
+                }
+                // An empty alternative means the pattern can match the
+                // empty string at this position, i.e. the whole alternation
+                // is optional.
+                if has_empty && count > 0 {
+                    self.postfix.push(RegexHirNode::RepeatZeroOne);
                 }
                 Ok(())
             }
@@ -8102,6 +8118,98 @@ mod tests {
                 ("ab1", false),
                 ("abcd1", false),
                 ("", false),
+            ],
+        }
+
+        // --- Alternation with empty branches (common-prefix factoring) ---
+
+        // Regression: `(?i)(groups|group)` panicked because regex-syntax
+        // factors it into `group(s|ε)`, producing an Alternation with an
+        // Empty child.
+        test_alternation_empty_branch_ci {
+            pattern: r"(?i)\[(groups|group)\]",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("[groups]", true),
+                ("[group]", true),
+                ("[GROUP]", true),
+                ("[GROUPS]", true),
+                ("[grape]", false),
+                ("hello", false),
+            ],
+        }
+        // Explicit `(a|)` — one branch is empty.
+        test_alternation_explicit_empty {
+            pattern: "(a|)",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("b", true),
+            ],
+        }
+        // Empty branch first: `(|a)`.
+        test_alternation_empty_first {
+            pattern: "(|a)",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("b", true),
+            ],
+        }
+        // Three-way alternation with empty branch: `(a|b|)`.
+        test_alternation_three_way_empty {
+            pattern: "(a|b|)",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("b", true),
+                ("c", true),
+            ],
+        }
+        // Anchored common-prefix factoring: `^(abc|ab)$` → `^ab(c?)$`.
+        test_alternation_common_prefix_anchored {
+            pattern: "^(abc|ab)$",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),
+                ("ab", true),
+                ("a", false),
+                ("abcd", false),
+            ],
+        }
+        // Case-insensitive common-prefix: `(?i)(abc|ab)`.
+        test_alternation_common_prefix_ci {
+            pattern: "(?i)(abc|ab)",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("ab", true),
+                ("abc", true),
+                ("AB", true),
+                ("ABC", true),
+                ("x", false),
+            ],
+        }
+        // Common-prefix with counter body: `^(a{2,3}b|a{2,3})$`.
+        test_alternation_common_prefix_counter {
+            pattern: "^(a{2,3}b|a{2,3})$",
+            memory: 0,
+            min_tier: 3,
+            inputs: [
+                ("aa", true),
+                ("aaa", true),
+                ("aab", true),
+                ("aaab", true),
+                ("a", false),
+                ("aaaab", false),
             ],
         }
     }
