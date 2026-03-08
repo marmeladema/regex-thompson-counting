@@ -2945,6 +2945,73 @@ impl MatcherMemory {
         }
     }
 
+    /// Create a matcher forced to a specific execution tier.
+    ///
+    /// Tier 0 = NFA simulator (always available), tiers 1–4 = DFA tiers.
+    /// Returns `Err` with a message if the pattern is not eligible for the
+    /// requested tier.
+    pub fn matcher_for_tier<'a>(
+        &'a mut self,
+        regex: &'a Regex,
+        tier: u8,
+    ) -> Result<AnyMatcher<'a>, String> {
+        match tier {
+            0 => {
+                let nfa = self.nfa_matcher(regex);
+                Ok(AnyMatcher::Nfa(nfa))
+            }
+            1 => {
+                if !regex.dfa_eligible {
+                    return Err("pattern is not eligible for tier 1 (pure DFA)".into());
+                }
+                let cache = self
+                    .dfa_cache
+                    .get_or_insert_with(|| DfaCache::new(regex.states.len()));
+                cache.prepare(regex);
+                let dfa = DfaMatcher::new(cache, regex);
+                Ok(AnyMatcher::Dfa(dfa))
+            }
+            2 => {
+                if !regex.tier2_eligible {
+                    return Err(
+                        "pattern is not eligible for tier 2 (differential-counter DFA)".into(),
+                    );
+                }
+                let cache = self
+                    .tier2_cache
+                    .get_or_insert_with(|| Tier2DfaCache::new(regex.states.len()));
+                cache.prepare(regex);
+                let dfa = Tier2DfaMatcher::new(cache, regex);
+                Ok(AnyMatcher::Tier2Dfa(dfa))
+            }
+            3 => {
+                if !regex.tier3_eligible {
+                    return Err(
+                        "pattern is not eligible for tier 3 (conditional-transition DFA)".into(),
+                    );
+                }
+                let cache = self
+                    .tier3_cache
+                    .get_or_insert_with(|| Tier3DfaCache::new(regex.states.len()));
+                cache.prepare(regex);
+                let dfa = Tier3DfaMatcher::new(cache, regex);
+                Ok(AnyMatcher::Tier3Dfa(dfa))
+            }
+            4 => {
+                if !regex.tier4_eligible {
+                    return Err("pattern is not eligible for tier 4 (counter-program DFA)".into());
+                }
+                let cache = self
+                    .tier4_cache
+                    .get_or_insert_with(|| Tier4DfaCache::new(regex.states.len()));
+                cache.prepare(regex);
+                let dfa = Tier4DfaMatcher::new(cache, regex, &mut self.counting_pool);
+                Ok(AnyMatcher::Tier4Dfa(dfa))
+            }
+            _ => Err(format!("invalid tier {tier}: must be 0..4")),
+        }
+    }
+
     /// Create an NFA matcher (always available, used as fallback).
     fn nfa_matcher<'a>(&'a mut self, regex: &'a Regex) -> NfaMatcher<'a> {
         self.lastlist.clear();

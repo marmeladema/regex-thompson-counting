@@ -43,6 +43,7 @@ Commands:
 
 Options:
   --chunk-size <N>   Feed input in chunks of N bytes (default: entire input at once)
+  --tier <0|1|2|3|4> Force a specific execution tier (0=NFA, 1-4=DFA tiers)
   --debug            Print matcher state after each step
   -h, --help         Print this help message"
     );
@@ -59,6 +60,7 @@ enum Command {
         pattern: String,
         inputs: Vec<String>,
         chunk_size: Option<usize>,
+        tier: Option<u8>,
         debug: bool,
     },
 }
@@ -71,6 +73,7 @@ fn parse_args() -> Command {
     }
 
     let mut chunk_size: Option<usize> = None;
+    let mut tier: Option<u8> = None;
     let mut debug = false;
     let mut positional = Vec::new();
 
@@ -95,6 +98,22 @@ fn parse_args() -> Command {
                     eprintln!("error: --chunk-size must be > 0");
                     process::exit(1);
                 }
+            }
+            "--tier" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --tier requires a value (0-4)");
+                    process::exit(1);
+                }
+                let t = args[i].parse::<u8>().unwrap_or_else(|_| {
+                    eprintln!("error: --tier must be 0, 1, 2, 3, or 4");
+                    process::exit(1);
+                });
+                if t > 4 {
+                    eprintln!("error: --tier must be 0, 1, 2, 3, or 4");
+                    process::exit(1);
+                }
+                tier = Some(t);
             }
             "--debug" => {
                 debug = true;
@@ -144,6 +163,7 @@ fn parse_args() -> Command {
                 pattern: positional[1].clone(),
                 inputs: positional[2..].to_vec(),
                 chunk_size,
+                tier,
                 debug,
             }
         }
@@ -170,7 +190,13 @@ fn run_dot(pattern: &str) {
     out.flush().unwrap();
 }
 
-fn run_match(pattern: &str, inputs: &[String], chunk_size: Option<usize>, debug: bool) {
+fn run_match(
+    pattern: &str,
+    inputs: &[String],
+    chunk_size: Option<usize>,
+    tier: Option<u8>,
+    debug: bool,
+) {
     let regex = parse_pattern(pattern);
     let mut memory = MatcherMemory::default();
 
@@ -179,12 +205,21 @@ fn run_match(pattern: &str, inputs: &[String], chunk_size: Option<usize>, debug:
     if let Some(cs) = chunk_size {
         eprintln!("chunk_size: {cs}");
     }
+    if let Some(t) = tier {
+        eprintln!("tier: {t} (forced)");
+    }
     eprintln!();
 
     let mut any_failed = false;
     for input in inputs {
         let bytes = input.as_bytes();
-        let mut matcher = memory.matcher(&regex);
+        let mut matcher = match tier {
+            Some(t) => memory.matcher_for_tier(&regex, t).unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                process::exit(1);
+            }),
+            None => memory.matcher(&regex),
+        };
 
         if debug {
             eprintln!("--- input: {:?} ---", input);
@@ -241,7 +276,8 @@ fn main() {
             pattern,
             inputs,
             chunk_size,
+            tier,
             debug,
-        } => run_match(&pattern, &inputs, chunk_size, debug),
+        } => run_match(&pattern, &inputs, chunk_size, tier, debug),
     }
 }
