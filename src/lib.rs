@@ -1273,7 +1273,15 @@ pub struct RegexBuilder {
     /// Maximum allowed `max` value for bounded repetitions (e.g.
     /// `a{1,1000}`).  Patterns exceeding this limit are rejected at
     /// compile time.  Default: 1000.
-    pub max_repetition: usize,
+    max_repetition: usize,
+    /// Maximum NFA states that may be produced by unrolling a repetition
+    /// (fixed or non-fixed) of a simple body into concatenated copies.
+    /// Set to 0 to disable unrolling entirely.  Default: 32.
+    max_unroll_states: usize,
+    /// When true, we are currently inside the body of a repetition that
+    /// will use a counter.  Non-fixed unrolling is suppressed because it
+    /// would change the atomicity of the counter body.
+    in_repetition_body: bool,
 }
 
 impl Default for RegexBuilder {
@@ -1286,10 +1294,28 @@ impl Default for RegexBuilder {
             classes: IndexSet::new(),
             byte_tables: Vec::new(),
             max_repetition: 1000,
+            max_unroll_states: DEFAULT_MAX_UNROLL_STATES,
+            in_repetition_body: false,
         }
     }
 }
 impl RegexBuilder {
+    /// Set the maximum allowed `max` value for bounded repetitions
+    /// (e.g. `a{1,1000}`).  Patterns exceeding this limit are rejected
+    /// at compile time.  Default: 1000.
+    pub fn max_repetition(&mut self, limit: usize) -> &mut Self {
+        self.max_repetition = limit;
+        self
+    }
+
+    /// Set the maximum NFA states that may be produced by unrolling a
+    /// repetition of a simple body into concatenated copies.  Set to 0
+    /// to disable unrolling entirely.  Default: 32.
+    pub fn max_unroll_states(&mut self, limit: usize) -> &mut Self {
+        self.max_unroll_states = limit;
+        self
+    }
+
     /// Allocate a fresh counter index.
     fn next_counter(&mut self) -> Result<CounterIdx, Error> {
         let counter = self.counters.len();
@@ -1489,6 +1515,102 @@ impl RegexBuilder {
         }
     }
 
+    /// Try to unroll `X{min,max}` (where `min >= 1`) into concatenated
+    /// copies, eliminating the counter.  Returns `Ok(true)` if unrolling
+    /// was performed.
+    ///
+    /// Three cases:
+    /// - **Fixed** (`min == max`): emit `min` copies concatenated.
+    ///   Cost: `min * body_nfa` states.
+    /// - **Bounded non-fixed** (`min < max < ∞`): emit `min` mandatory
+    ///   copies, then `(max - min)` nested optional copies.
+    ///   Cost: `max * body_nfa + (max - min)` states (Split per `?`).
+    /// - **Unbounded** (`min >= 2`, `max == ∞`): emit `(min - 1)` copies
+    ///   then `X+`.  Cost: `min * body_nfa + 1` states (Split for `+`).
+    fn try_unroll(
+        &mut self,
+        min: usize,
+        max: usize,
+        body_nfa: usize,
+        limit: usize,
+        sub: &Hir,
+    ) -> Result<bool, Error> {
+        if body_nfa == 0 || limit == 0 {
+            return Ok(false);
+        }
+
+        // Non-fixed unrolling inside a counter body would break atomicity:
+        // the optional tail merges with the next counter iteration.
+        // Only fixed unrolling (min == max) is safe inside counter bodies.
+        if min != max && self.in_repetition_body {
+            return Ok(false);
+        }
+
+        if min == max {
+            // Fixed: X{N} → X·X·…·X  (N copies)
+            let cost = min * body_nfa;
+            if cost > limit {
+                return Ok(false);
+            }
+            self.emit_n_copies(min, sub)?;
+            return Ok(true);
+        }
+
+        if max != usize::MAX {
+            // Bounded non-fixed: X{min,max}
+            //   → X·…·X · (X·(X·(…·X?)?)?)?
+            //   min mandatory + (max-min) nested optional
+            //
+            // Postfix sequence (max body copies total):
+            //   X×max  ?  (Cat ?)×(optional-1)  Cat×min
+            let optional = max - min;
+            let cost = max * body_nfa + optional;
+            if cost > limit {
+                return Ok(false);
+            }
+            // Emit all max body copies.
+            for _ in 0..max {
+                self.hir2postfix(sub)?;
+            }
+            // Innermost optional: wrap last body in ?
+            self.postfix.push(RegexHirNode::RepeatZeroOne);
+            // Each remaining optional layer: Cat with previous body, then ?
+            for _ in 1..optional {
+                self.postfix.push(RegexHirNode::Catenate);
+                self.postfix.push(RegexHirNode::RepeatZeroOne);
+            }
+            // Concatenate each mandatory body with the growing tail.
+            for _ in 0..min {
+                self.postfix.push(RegexHirNode::Catenate);
+            }
+            return Ok(true);
+        }
+
+        // Unbounded: X{min,∞} where min >= 2 → X·…·X·X+
+        //   (min-1) copies then X+.  Cost: min*body_nfa + 1
+        let cost = min * body_nfa + 1;
+        if cost > limit {
+            return Ok(false);
+        }
+        self.emit_n_copies(min - 1, sub)?;
+        self.hir2postfix(sub)?;
+        self.postfix.push(RegexHirNode::RepeatOnePlus);
+        self.postfix.push(RegexHirNode::Catenate);
+        Ok(true)
+    }
+
+    /// Emit `n` concatenated copies of `sub` in postfix form.
+    /// Produces a single fragment on the stack: X·X·…·X.
+    fn emit_n_copies(&mut self, n: usize, sub: &Hir) -> Result<(), Error> {
+        for i in 0..n {
+            self.hir2postfix(sub)?;
+            if i > 0 {
+                self.postfix.push(RegexHirNode::Catenate);
+            }
+        }
+        Ok(())
+    }
+
     fn hir2postfix(&mut self, hir: &Hir) -> Result<(), Error> {
         match hir.kind() {
             HirKind::Empty => {
@@ -1656,33 +1778,35 @@ impl RegexBuilder {
                     return Ok(());
                 }
 
-                if min > 0 {
-                    // Fixed repetitions of simple (single-NFA-state) bodies
-                    // can be unrolled into N concatenated copies, eliminating
-                    // the counter entirely.  This makes the sub-pattern
-                    // eligible for tier 1 (pure DFA) instead of tier 2/3.
-                    let body_nfa_states = Self::simple_body_nfa_states(&rep.sub);
-                    if min == max
-                        && body_nfa_states > 0
-                        && min * body_nfa_states <= MAX_UNROLL_NFA_STATES
-                    {
-                        for i in 0..min {
-                            self.hir2postfix(&rep.sub)?;
-                            if i > 0 {
-                                self.postfix.push(RegexHirNode::Catenate);
-                            }
-                        }
-                    } else {
-                        let counter = self.next_counter()?;
-                        self.hir2postfix(&rep.sub)?;
-                        self.postfix
-                            .push(RegexHirNode::CounterLoop { counter, min, max });
-                    }
+                // Try to unroll simple bodies to eliminate the counter.
+                let body_nfa = Self::simple_body_nfa_states(&rep.sub);
+                let limit = self.max_unroll_states;
+
+                if min > 0 && self.try_unroll(min, max, body_nfa, limit, &rep.sub)? {
+                    // Successfully unrolled — no counter needed.
+                } else if min == 0
+                    && max != usize::MAX
+                    && self.try_unroll(1, max, body_nfa, limit.saturating_sub(1), &rep.sub)?
+                {
+                    // {0,max}: unrolled inner {1,max}, wrap in `?`.
+                    // (limit-1 because the outer `?` adds 1 Split state.)
+                    self.postfix.push(RegexHirNode::RepeatZeroOne);
+                } else if min > 0 {
+                    let counter = self.next_counter()?;
+                    let saved = self.in_repetition_body;
+                    self.in_repetition_body = true;
+                    self.hir2postfix(&rep.sub)?;
+                    self.in_repetition_body = saved;
+                    self.postfix
+                        .push(RegexHirNode::CounterLoop { counter, min, max });
                 } else {
                     // {0,max}: lower to (body{1,max})? — the `?` wrapping
                     // provides the zero-match path.
                     let counter = self.next_counter()?;
+                    let saved = self.in_repetition_body;
+                    self.in_repetition_body = true;
                     self.hir2postfix(&rep.sub)?;
+                    self.in_repetition_body = saved;
                     self.postfix.push(RegexHirNode::CounterLoop {
                         counter,
                         min: 1,
@@ -2723,10 +2847,9 @@ const MAX_COUNTERS: usize = 256;
 /// fields in `Transition` are `u64` bitmasks.
 const MAX_TIER2_COUNTERS: usize = 64;
 
-/// Maximum NFA states produced by unrolling a fixed repetition.
-/// `a{N}` is expanded to N literal copies when N * body_states <= this limit,
-/// eliminating the counter and making the pattern eligible for a simpler tier.
-const MAX_UNROLL_NFA_STATES: usize = 128;
+/// Default maximum NFA states produced by unrolling a repetition.
+/// Used by [`RegexBuilder::default()`].
+const DEFAULT_MAX_UNROLL_STATES: usize = 32;
 
 /// Sentinel value: this counter slot is inactive (thread is not inside
 /// this counter's repetition body).
@@ -4292,8 +4415,14 @@ mod tests {
     /// asserting a specific memory size.  Used by dedup tests that
     /// compare sizes relatively rather than absolutely.
     fn build_regex_unchecked(pattern: &str) -> Regex {
+        build_regex_with_unroll(pattern, DEFAULT_MAX_UNROLL_STATES)
+    }
+
+    /// Build a compiled [`Regex`] with a specific unroll limit.
+    fn build_regex_with_unroll(pattern: &str, max_unroll_states: usize) -> Regex {
         let hir = parse_hir_bytes(pattern);
         let mut builder = RegexBuilder::default();
+        builder.max_unroll_states(max_unroll_states);
         builder
             .build(&hir)
             .expect("our builder should accept the HIR")
@@ -4448,30 +4577,14 @@ mod tests {
         );
     }
 
-    /// Central test runner for data-driven match tests.
-    ///
-    /// For each input, queries the regex crate oracle for the expected
-    /// result, then tests NFA and all compatible DFA tiers.
-    fn run_match_test(pattern: &str, memory: usize, min_tier: u8, inputs: &[(&str, bool)]) {
-        let re = build_regex_unchecked(pattern);
-
-        // Verify declared min_tier matches the compiled regex.
-        let actual_tier = compute_min_tier(&re);
-        assert_eq!(
-            actual_tier, min_tier,
-            "min_tier mismatch for `{}`: declared={}, actual={}",
-            pattern, min_tier, actual_tier
-        );
-
-        // Assert memory size if specified (0 = skip).
-        if memory > 0 {
-            assert_memory_size(pattern, &re, memory);
-        }
-
-        // Oracle: regex crate is the source of truth.
-        let full = format!("(?s-u){}", pattern);
-        let oracle = regex::bytes::Regex::new(&full).expect("regex crate should parse pattern");
-
+    /// Test a single compiled regex against the oracle on all inputs,
+    /// exercising NFA and every eligible DFA tier.
+    fn test_all_tiers(
+        pattern: &str,
+        re: &Regex,
+        oracle: &regex::bytes::Regex,
+        inputs: &[(&str, bool)],
+    ) {
         for &(input, expected_hint) in inputs {
             let expected = oracle.is_match(input.as_bytes());
 
@@ -4483,31 +4596,91 @@ mod tests {
             );
 
             // Always test NFA.
-            test_nfa(pattern, &re, input, expected);
+            test_nfa(pattern, re, input, expected);
 
             // Test each DFA tier the regex is actually eligible for.
             if re.dfa_eligible {
-                test_tier1(pattern, &re, input, expected);
+                test_tier1(pattern, re, input, expected);
             }
             if re.tier2_eligible {
-                test_tier2(pattern, &re, input, expected);
+                test_tier2(pattern, re, input, expected);
             }
             if re.tier3_eligible {
-                test_tier3(pattern, &re, input, expected);
+                test_tier3(pattern, re, input, expected);
             }
             if re.tier4_eligible {
-                test_tier4(pattern, &re, input, expected);
+                test_tier4(pattern, re, input, expected);
             }
         }
     }
 
+    /// Central test runner for data-driven match tests.
+    ///
+    /// For each input, queries the regex crate oracle for the expected
+    /// result, then tests NFA and all compatible DFA tiers.
+    ///
+    /// Two builds are exercised:
+    /// 1. With the specified `unroll_limit` — verifies `min_tier` and memory.
+    /// 2. With `unroll_limit=0` (disabled) — ensures counter-based DFA tiers
+    ///    are still tested even when unrolling would promote the pattern.
+    fn run_match_test(
+        pattern: &str,
+        memory: usize,
+        min_tier: u8,
+        unroll_limit: usize,
+        inputs: &[(&str, bool)],
+    ) {
+        let re = build_regex_with_unroll(pattern, unroll_limit);
+
+        // Verify declared min_tier matches the compiled regex.
+        let actual_tier = compute_min_tier(&re);
+        assert_eq!(
+            actual_tier, min_tier,
+            "min_tier mismatch for `{}` (unroll={}): declared={}, actual={}",
+            pattern, unroll_limit, min_tier, actual_tier
+        );
+
+        // Assert memory size if specified (0 = skip).
+        if memory > 0 {
+            assert_memory_size(pattern, &re, memory);
+        }
+
+        // Oracle: regex crate is the source of truth.
+        let full = format!("(?s-u){}", pattern);
+        let oracle = regex::bytes::Regex::new(&full).expect("regex crate should parse pattern");
+
+        // Run with the configured unroll limit.
+        test_all_tiers(pattern, &re, &oracle, inputs);
+
+        // Run again with unrolling disabled to exercise counter-based tiers.
+        if unroll_limit > 0 {
+            let re_no_unroll = build_regex_with_unroll(pattern, 0);
+            test_all_tiers(pattern, &re_no_unroll, &oracle, inputs);
+        }
+    }
+
+    /// Resolve unroll_limit: if specified use it, otherwise use the default.
+    macro_rules! unroll_limit {
+        () => {
+            DEFAULT_MAX_UNROLL_STATES
+        };
+        ($val:literal) => {
+            $val
+        };
+    }
+
     /// Generate one `#[test]` function per entry in the table.
+    ///
+    /// Each entry specifies `pattern`, `memory` (0 to skip), `min_tier`,
+    /// an optional `unroll_limit` (defaults to `DEFAULT_MAX_UNROLL_STATES`),
+    /// and a list of `(input, expected)` pairs.
     macro_rules! match_tests {
         ($(
             $name:ident {
                 pattern: $pattern:literal,
                 memory: $memory:literal,
                 min_tier: $tier:literal,
+                $(unroll_limit: $unroll:literal,)?
                 inputs: [$(($input:literal, $expected:literal)),* $(,)?],
             }
         )*) => {
@@ -4518,6 +4691,7 @@ mod tests {
                         $pattern,
                         $memory,
                         $tier,
+                        unroll_limit!($($unroll)?),
                         &[$(($input, $expected)),*],
                     );
                 }
@@ -4689,8 +4863,8 @@ mod tests {
         }
         test_repetition_inside_one_plus {
             pattern: "^(a{2,3})+$",
-            memory: 640,
-            min_tier: 2,
+            memory: 672,
+            min_tier: 1,
             inputs: [
                 ("", false),
                 ("a", false),
@@ -4746,8 +4920,8 @@ mod tests {
         }
         test_mixed_plus_and_repetition_inside_one_plus {
             pattern: "^(a+b{2,3})+$",
-            memory: 706,
-            min_tier: 2,
+            memory: 738,
+            min_tier: 1,
             inputs: [
                 ("", false),
                 ("a", false),
@@ -4766,8 +4940,8 @@ mod tests {
         }
         test_min_zero_basic {
             pattern: "^a{0,2}$",
-            memory: 640,
-            min_tier: 2,
+            memory: 639,
+            min_tier: 1,
             inputs: [
                 ("", true),
                 ("a", true),
@@ -4830,8 +5004,8 @@ mod tests {
         }
         test_min_zero_inside_one_plus {
             pattern: "^x(a{0,2})+y$",
-            memory: 739,
-            min_tier: 2,
+            memory: 738,
+            min_tier: 1,
             inputs: [
                 ("xy", true),
                 ("xay", true),
@@ -4881,8 +5055,8 @@ mod tests {
         }
         test_min_zero_wildcard {
             pattern: "^.{0,3}$",
-            memory: 896,
-            min_tier: 2,
+            memory: 961,
+            min_tier: 1,
             inputs: [
                 ("", true),
                 ("a", true),
@@ -4893,8 +5067,8 @@ mod tests {
         }
         test_none_min_repetition {
             pattern: "^a{0,3}$",
-            memory: 640,
-            min_tier: 2,
+            memory: 705,
+            min_tier: 1,
             inputs: [
                 ("", true),
                 ("a", true),
@@ -5076,8 +5250,8 @@ mod tests {
         }
         test_min_n_unbounded {
             pattern: "^a{2,}$",
-            memory: 607,
-            min_tier: 2,
+            memory: 606,
+            min_tier: 1,
             inputs: [
                 ("aa", true),
                 ("aaa", true),
@@ -5110,8 +5284,8 @@ mod tests {
         }
         test_bounded_range {
             pattern: "^a{3,5}$",
-            memory: 607,
-            min_tier: 2,
+            memory: 738,
+            min_tier: 1,
             inputs: [
                 ("aaa", true),
                 ("aaaa", true),
@@ -5125,7 +5299,73 @@ mod tests {
                 ("baaa", false),
             ],
         }
-        test_exact_repetition {
+        // ── Non-fixed unrolling edge-case tests ──────────────────────────
+        test_unroll_byte_class_bounded {
+            pattern: "[0-9a-f]{1,4}",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("0f", true),
+                ("abcd", true),
+                ("", false),
+                ("g", false),
+                ("xyz", false),
+            ],
+        }
+        test_unroll_byte_class_unbounded {
+            pattern: "[0-9a-f]{2,}",
+            memory: 0,
+            min_tier: 1,
+            inputs: [
+                ("ab", true),
+                ("0123456789", true),
+                ("", false),
+                ("a", false),
+                ("g", false),
+            ],
+        }
+        test_unroll_at_budget_limit {
+            pattern: "^a{1,16}$",
+            memory: 1530,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("aaaa", true),
+                ("aaaaaaaaaaaaaaaa", true),
+                ("", false),
+                ("aaaaaaaaaaaaaaaaa", false),
+                ("b", false),
+            ],
+        }
+        test_unroll_over_budget {
+            pattern: "^a{1,17}$",
+            memory: 607,
+            min_tier: 2,
+            inputs: [
+                ("a", true),
+                ("aaaa", true),
+                ("aaaaaaaaaaaaaaaaa", true),
+                ("", false),
+                ("aaaaaaaaaaaaaaaaaa", false),
+                ("b", false),
+            ],
+        }
+        test_unroll_zero_min_bounded {
+            pattern: "^a{0,4}$",
+            memory: 771,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("aa", true),
+                ("aaa", true),
+                ("aaaa", true),
+                ("aaaaa", false),
+                ("b", false),
+            ],
+        }
+                test_exact_repetition {
             pattern: "^a{3,3}$",
             memory: 606,
             min_tier: 1,
@@ -5182,8 +5422,8 @@ mod tests {
         }
         test_byte_class_counted {
             pattern: "^[a-c]{2,3}$",
-            memory: 863,
-            min_tier: 2,
+            memory: 895,
+            min_tier: 1,
             inputs: [
                 ("", false),
                 ("a", false),
@@ -5267,8 +5507,8 @@ mod tests {
         }
         test_digit_counted {
             pattern: r#"^\d{3,5}$"#,
-            memory: 863,
-            min_tier: 2,
+            memory: 994,
+            min_tier: 1,
             inputs: [
                 ("123", true),
                 ("1234", true),
@@ -5403,8 +5643,8 @@ mod tests {
         }
         test_word_counted {
             pattern: r#"^\w{2,4}$"#,
-            memory: 863,
-            min_tier: 2,
+            memory: 961,
+            min_tier: 1,
             inputs: [
                 ("ab", true),
                 ("abc", true),
@@ -5785,7 +6025,7 @@ mod tests {
         test_multiline_with_counting {
             pattern: r#"(?m)^\d{2,4}$"#,
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("12", true),
                 ("123", true),
@@ -6047,7 +6287,7 @@ mod tests {
         test_word_boundary_counter {
             pattern: r#"\b\w{3,5}\b"#,
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("abc", true),
                 ("abcde", true),
@@ -6136,7 +6376,7 @@ mod tests {
         test_unanchored_counter_simple_1 {
             pattern: r#"\w{3,5}"#,
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("abc", true),
                 ("abcde", true),
@@ -6230,7 +6470,7 @@ mod tests {
         test_unanchored_counter_min_zero {
             pattern: "a{0,3}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("", true),
                 ("a", true),
@@ -6244,7 +6484,7 @@ mod tests {
         test_unanchored_counter_unbounded {
             pattern: "a{2,}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("aa", true),
                 ("aaa", true),
@@ -6258,7 +6498,7 @@ mod tests {
         test_unanchored_counter_wildcard_body {
             pattern: ".{3,5}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("abc", true),
                 ("abcde", true),
@@ -6271,7 +6511,7 @@ mod tests {
         test_partial_anchor_start_counter_1 {
             pattern: "^a{2,3}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("aa", true),
                 ("aaa", true),
@@ -6284,7 +6524,7 @@ mod tests {
         test_partial_anchor_start_counter_2 {
             pattern: r#"^\d{2,4}"#,
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("12", true),
                 ("1234", true),
@@ -6297,7 +6537,7 @@ mod tests {
         test_partial_anchor_end_counter_1 {
             pattern: "a{2,3}$",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("aa", true),
                 ("aaa", true),
@@ -6310,7 +6550,7 @@ mod tests {
         test_partial_anchor_end_counter_2 {
             pattern: r#"\d{2,4}$"#,
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("12", true),
                 ("1234", true),
@@ -6414,13 +6654,13 @@ mod tests {
         test_empty_input_unanchored_counter {
             pattern: "a{0,3}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [("", true)],
         }
         test_unanchored_byte_class_counter {
             pattern: r#"\d{2,4}"#,
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("12", true),
                 ("1234", true),
@@ -6666,7 +6906,7 @@ mod tests {
         test_word_start_with_counter {
             pattern: r#"\b{start}\w{3,5}\b{end}"#,
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("abc", true),
                 ("abcde", true),
@@ -6715,7 +6955,7 @@ mod tests {
         test_unanchored_counter_a35 {
             pattern: "a{3,5}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("aaa", true),
                 ("aaaa", true),
@@ -7148,7 +7388,7 @@ mod tests {
         test_ci_counted {
             pattern: "^(?i)a{2,4}$",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("aa", true),
                 ("AA", true),
@@ -7175,7 +7415,7 @@ mod tests {
         test_ci_counted_min_zero {
             pattern: "^(?i)a{0,3}$",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("", true),
                 ("a", true),
@@ -7584,7 +7824,7 @@ mod tests {
         test_ci_counted_wildcard {
             pattern: "^(?i).{2,4}$",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("ab", true),
                 ("AB", true),
@@ -7759,7 +7999,7 @@ mod tests {
         test_partial_ci_counted_group {
             pattern: "^a(?i:b){2,4}c$",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("abbc", true),
                 ("aBBc", true),
@@ -8024,7 +8264,7 @@ mod tests {
         test_multi_counter_two_ranges {
             pattern: "^a{3,5}b{2,4}$",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("aaabb", true),
                 ("aaaabb", true),
@@ -8061,7 +8301,7 @@ mod tests {
         test_multi_counter_three_ranges {
             pattern: "^x{1,3}y{2,4}z{1,2}$",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("xyyz", true),
                 ("xxyyz", true),
@@ -8202,7 +8442,7 @@ mod tests {
         test_alternation_common_prefix_counter {
             pattern: "^(a{2,3}b|a{2,3})$",
             memory: 0,
-            min_tier: 3,
+            min_tier: 1,
             inputs: [
                 ("aa", true),
                 ("aaa", true),
@@ -8241,13 +8481,13 @@ mod tests {
             pat
         }
 
-        let re64 = build_regex_unchecked(&build_n_counter_pattern(64));
+        let re64 = build_regex_with_unroll(&build_n_counter_pattern(64), 0);
         assert!(
             re64.tier2_eligible,
             "64-counter pattern should be tier 2 eligible"
         );
 
-        let re65 = build_regex_unchecked(&build_n_counter_pattern(65));
+        let re65 = build_regex_with_unroll(&build_n_counter_pattern(65), 0);
         assert!(
             !re65.tier2_eligible,
             "65-counter pattern should NOT be tier 2 eligible"
@@ -8483,7 +8723,8 @@ mod tests {
         );
 
         // Pattern starting with counter: closure should be empty
-        let re = build_regex_unchecked("a{2,3}");
+        // (disable unrolling so the counter is preserved)
+        let re = build_regex_with_unroll("a{2,3}", 0);
         assert!(
             re.start_closure.is_empty(),
             "counter at start should disable start_closure"
@@ -8625,12 +8866,15 @@ mod tests {
     fn test_too_many_counters() {
         // Build a pattern with 257 independent counted repetitions,
         // which requires 257 counters and should exceed the u8 limit.
+        // Disable unrolling so each `a{2,3}` creates a counter.
         let mut pattern = String::from("^");
         for _ in 0..257 {
             pattern.push_str("a{2,3}");
         }
         pattern.push('$');
-        let result = RegexBuilder::default().build(&regex_syntax::parse(&pattern).unwrap());
+        let mut builder = RegexBuilder::default();
+        builder.max_unroll_states(0);
+        let result = builder.build(&regex_syntax::parse(&pattern).unwrap());
         assert!(
             matches!(result, Err(Error::TooManyCounters)),
             "expected TooManyCounters error, got {result:?}"
@@ -8640,12 +8884,15 @@ mod tests {
     #[test]
     fn test_256_counters_ok() {
         // 256 counters should be fine (indices 0..255 fit in u8).
+        // Disable unrolling so each `a{2,3}` creates a counter.
         let mut pattern = String::from("^");
         for _ in 0..256 {
             pattern.push_str("a{2,3}");
         }
         pattern.push('$');
-        let result = RegexBuilder::default().build(&regex_syntax::parse(&pattern).unwrap());
+        let mut builder = RegexBuilder::default();
+        builder.max_unroll_states(0);
+        let result = builder.build(&regex_syntax::parse(&pattern).unwrap());
         assert!(
             result.is_ok(),
             "256 counters should succeed, got {result:?}"
