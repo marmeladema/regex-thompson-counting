@@ -1501,17 +1501,71 @@ impl RegexBuilder {
     /// that wires CI → body → CInc in a single-copy loop.  Nested
     /// repetitions share the same body copy (each gets its own counter
     /// index, no remapping needed).
-    /// Returns the number of NFA states a single copy of `hir` would
-    /// produce, if the body is "simple" (a single consuming state).
-    /// Returns 0 for non-simple bodies (alternation, concatenation,
-    /// nested repetition, etc.) — the caller should NOT unroll these.
-    fn simple_body_nfa_states(hir: &Hir) -> usize {
+    /// Estimate the number of NFA states a single copy of `hir` would
+    /// produce.  Returns `Some(n)` for bodies we can unroll, `None` for
+    /// bodies that are too complex or would require special handling
+    /// (e.g. nested non-fixed repetitions that would need their own
+    /// counter).  Fixed inner repetitions are estimated recursively.
+    fn estimate_nfa_states(hir: &Hir) -> Option<usize> {
         match hir.kind() {
             // Single-byte literal → 1 Byte state.
-            HirKind::Literal(lit) if lit.0.len() == 1 => 1,
+            HirKind::Literal(lit) if lit.0.len() == 1 => Some(1),
+            // Multi-byte literal → N Byte states.
+            HirKind::Literal(lit) => Some(lit.0.len()),
             // Byte or Unicode class → 1 ByteClass / ByteCI state.
-            HirKind::Class(_) => 1,
-            _ => 0,
+            HirKind::Class(_) => Some(1),
+            // Assertion → 1 Assert state.
+            HirKind::Look(_) => Some(1),
+            // Wildcard (.) → 1 state.
+            HirKind::Empty => Some(0),
+            // Capture is just a wrapper.
+            HirKind::Capture(cap) => Self::estimate_nfa_states(&cap.sub),
+            // Concatenation: sum of children.
+            HirKind::Concat(children) => {
+                let mut total = 0;
+                for child in children {
+                    total += Self::estimate_nfa_states(child)?;
+                }
+                Some(total)
+            }
+            // Alternation: sum of children + (N-1) Split states.
+            HirKind::Alternation(children) => {
+                let mut total = 0;
+                let mut count = 0;
+                for child in children {
+                    total += Self::estimate_nfa_states(child)?;
+                    count += 1;
+                }
+                if count > 1 {
+                    total += count - 1; // Split states
+                }
+                Some(total)
+            }
+            HirKind::Repetition(rep) => {
+                let inner = Self::estimate_nfa_states(&rep.sub)?;
+                let min = rep.min as usize;
+                let max = rep.max.map_or(usize::MAX, |m| m as usize);
+                if min == 0 && max == 1 {
+                    // `?` → inner + 1 Split
+                    Some(inner + 1)
+                } else if min == 0 && max == usize::MAX {
+                    // `*` → inner + 1 Split
+                    Some(inner + 1)
+                } else if min == 1 && max == usize::MAX {
+                    // `+` → inner + 1 Split
+                    Some(inner + 1)
+                } else if min == max {
+                    // Fixed: can be unrolled — N copies.
+                    Some(min * inner)
+                } else {
+                    // Non-fixed bounded/unbounded: will use a counter
+                    // (CI + body + CInc) or be unrolled.  Estimate the
+                    // counter path cost: inner + 2 (CI + CInc) + 1 (Split
+                    // for the loop).  If min==0, add 1 for the outer `?`.
+                    let counter_cost = inner + 3 + if min == 0 { 1 } else { 0 };
+                    Some(counter_cost)
+                }
+            }
         }
     }
 
@@ -1779,7 +1833,7 @@ impl RegexBuilder {
                 }
 
                 // Try to unroll simple bodies to eliminate the counter.
-                let body_nfa = Self::simple_body_nfa_states(&rep.sub);
+                let body_nfa = Self::estimate_nfa_states(&rep.sub).unwrap_or(0);
                 let limit = self.max_unroll_states;
 
                 if min > 0 && self.try_unroll(min, max, body_nfa, limit, &rep.sub)? {
@@ -4721,8 +4775,8 @@ mod tests {
         }
         test_range {
             pattern: "^(a|bc){1,2}$",
-            memory: 706,
-            min_tier: 3,
+            memory: 804,
+            min_tier: 1,
             inputs: [
                 ("a", true),
                 ("bc", true),
@@ -4737,8 +4791,8 @@ mod tests {
         }
         test_nested_counting {
             pattern: "^((a|bc){1,2}){2,3}$",
-            memory: 773,
-            min_tier: 4,
+            memory: 1431,
+            min_tier: 1,
             inputs: [
                 ("", false),
                 ("a", false),
@@ -4754,8 +4808,8 @@ mod tests {
         }
         test_aaaaa {
             pattern: "^(a|a?){2,3}$",
-            memory: 706,
-            min_tier: 0,
+            memory: 936,
+            min_tier: 1,
             inputs: [
                 ("", true),
                 ("a", true),
@@ -4881,8 +4935,8 @@ mod tests {
         }
         test_range_alternation_inside_one_plus {
             pattern: "^((a|bc){1,2})+$",
-            memory: 739,
-            min_tier: 3,
+            memory: 837,
+            min_tier: 1,
             inputs: [
                 ("", false),
                 ("a", true),
@@ -4893,8 +4947,8 @@ mod tests {
         }
         test_one_plus_inside_repetition {
             pattern: "^(a+){2,3}$",
-            memory: 640,
-            min_tier: 3,
+            memory: 738,
+            min_tier: 1,
             inputs: [
                 ("", false),
                 ("a", false),
@@ -4909,8 +4963,8 @@ mod tests {
         }
         test_one_plus_alternation_inside_repetition {
             pattern: "^((a|b)+){2,4}$",
-            memory: 896,
-            min_tier: 3,
+            memory: 1093,
+            min_tier: 1,
             inputs: [
                 ("", false),
                 ("a", false),
@@ -4963,8 +5017,8 @@ mod tests {
         }
         test_min_zero_alternation {
             pattern: "^(a|bc){0,3}$",
-            memory: 739,
-            min_tier: 3,
+            memory: 1002,
+            min_tier: 1,
             inputs: [
                 ("", true),
                 ("a", true),
@@ -5024,8 +5078,8 @@ mod tests {
         }
         test_min_zero_inside_repetition {
             pattern: "^(a{0,2}){2,3}$",
-            memory: 707,
-            min_tier: 0,
+            memory: 936,
+            min_tier: 1,
             inputs: [
                 ("", true),
                 ("a", true),
@@ -5040,8 +5094,8 @@ mod tests {
         }
         test_one_plus_inside_min_zero_repetition {
             pattern: "^(a+){0,3}$",
-            memory: 673,
-            min_tier: 3,
+            memory: 804,
+            min_tier: 1,
             inputs: [
                 ("", true),
                 ("a", true),
@@ -5267,8 +5321,8 @@ mod tests {
         }
         test_min_n_unbounded_group {
             pattern: "^(ab){2,}$",
-            memory: 640,
-            min_tier: 2,
+            memory: 672,
+            min_tier: 1,
             inputs: [
                 ("abab", true),
                 ("ababab", true),
@@ -5365,7 +5419,90 @@ mod tests {
                 ("b", false),
             ],
         }
-                test_exact_repetition {
+        // ── Complex-body unrolling tests (estimate_nfa_states) ────────────
+        test_unroll_multi_byte_fixed {
+            pattern: "^(ab){3}$",
+            memory: 705,
+            min_tier: 1,
+            inputs: [
+                ("ababab", true),
+                ("", false),
+                ("ab", false),
+                ("abab", false),
+                ("abababab", false),
+                ("aaa", false),
+            ],
+        }
+        test_unroll_multi_byte_bounded {
+            pattern: "^(ab){2,4}$",
+            memory: 837,
+            min_tier: 1,
+            inputs: [
+                ("abab", true),
+                ("ababab", true),
+                ("abababab", true),
+                ("", false),
+                ("ab", false),
+                ("ababababab", false),
+            ],
+        }
+        test_unroll_alternation_body {
+            pattern: "^(a|bc){2,3}$",
+            memory: 936,
+            min_tier: 1,
+            inputs: [
+                ("aa", true),
+                ("abc", true),
+                ("bca", true),
+                ("bcbc", true),
+                ("aaa", true),
+                ("bcbcbc", true),
+                ("", false),
+                ("a", false),
+                ("bc", false),
+                ("aaaa", false),
+            ],
+        }
+        test_unroll_nested_fixed_flattened {
+            pattern: "^((a{2}){3}){2}$",
+            memory: 903,
+            min_tier: 1,
+            inputs: [
+                ("aaaaaaaaaaaa", true),
+                ("aaaaaaaaaaa", false),
+                ("aaaaaaaaaaaaa", false),
+                ("", false),
+            ],
+        }
+        test_unroll_ipv4_octets {
+            pattern: r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}",
+            memory: 1456,
+            min_tier: 1,
+            inputs: [
+                ("192.168.1.1", true),
+                ("10.0.0.1", true),
+                ("0.0.0.0", true),
+                ("999.999.999.999", true),
+                ("1.2.3", false),
+                ("1.2.3.", false),
+                ("abc", false),
+            ],
+        }
+        test_unroll_concat_with_inner_rep {
+            pattern: "(a+b){2,3}",
+            memory: 771,
+            min_tier: 1,
+            inputs: [
+                ("abab", true),
+                ("aabab", true),
+                ("ababab", true),
+                ("abaabb", true),
+                ("ab", false),
+                ("a", false),
+                ("bb", false),
+            ],
+        }
+        test_exact_repetition {
             pattern: "^a{3,3}$",
             memory: 606,
             min_tier: 1,
@@ -6419,8 +6556,8 @@ mod tests {
         }
         test_unanchored_counter_alternation_body {
             pattern: "(a|bc){2,4}",
-            memory: 0,
-            min_tier: 3,
+            memory: 1035,
+            min_tier: 1,
             inputs: [
                 ("aa", true),
                 ("abc", true),
@@ -6438,8 +6575,8 @@ mod tests {
         }
         test_unanchored_counter_multi_byte_body {
             pattern: "(ab){2,3}",
-            memory: 0,
-            min_tier: 2,
+            memory: 672,
+            min_tier: 1,
             inputs: [
                 ("abab", true),
                 ("ababab", true),
@@ -6455,7 +6592,7 @@ mod tests {
         test_unanchored_counter_nested {
             pattern: "((a|b){1,2}){2,3}",
             memory: 0,
-            min_tier: 4,
+            min_tier: 1,
             inputs: [
                 ("ab", true),
                 ("aabb", true),
@@ -6596,8 +6733,8 @@ mod tests {
         }
         test_unanchored_byte_table_counter {
             pattern: "(ab|cd|ef){2,3}",
-            memory: 0,
-            min_tier: 2,
+            memory: 4338,
+            min_tier: 1,
             inputs: [
                 ("abcd", true),
                 ("abcdef", true),
@@ -6639,7 +6776,7 @@ mod tests {
         test_multiline_alternation_counter {
             pattern: "(?m:^)(a|bc){2,3}(?m:$)",
             memory: 0,
-            min_tier: 3,
+            min_tier: 1,
             inputs: [
                 ("aa", true),
                 ("abc", true),
@@ -6675,7 +6812,7 @@ mod tests {
         test_counter_body_with_assertion_1 {
             pattern: "(?m:^a){2,3}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("a\na", false),
                 ("a\na\na", false),
@@ -6689,7 +6826,7 @@ mod tests {
         test_counter_body_with_assertion_2 {
             pattern: "(?m:a$){2,3}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("a\na", false),
                 ("a\na\na", false),
@@ -6702,7 +6839,7 @@ mod tests {
         test_counter_body_with_assertion_3 {
             pattern: "(?m:^a$){2,3}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("a\na", false),
                 ("a\na\na", false),
@@ -6716,7 +6853,7 @@ mod tests {
         test_counter_body_word_boundary_end_1 {
             pattern: r"(\w\b){1,3}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("a", true),
                 ("ab", true),
@@ -6730,7 +6867,7 @@ mod tests {
         test_counter_body_word_boundary_end_2 {
             pattern: r"(\w\b){2,4}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("a", false),
                 ("ab", false),
@@ -6742,7 +6879,7 @@ mod tests {
         test_counter_body_word_boundary_end_3 {
             pattern: r"(\w\b){1,2}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("a", true),
                 ("ab", true),
@@ -6754,7 +6891,7 @@ mod tests {
         test_counter_body_dot_boundary {
             pattern: r"(.\b){2,4}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("a b", true),
                 ("a b c", true),
@@ -6768,7 +6905,7 @@ mod tests {
         test_counter_body_boundary_at_start {
             pattern: r"(\ba){2,4}",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("aa", false),
                 ("a a", false),
@@ -6781,7 +6918,7 @@ mod tests {
         test_multi_counter_deferred_body {
             pattern: r"(a\B){2,3}(b\B){2,3}",
             memory: 0,
-            min_tier: 0,
+            min_tier: 1,
             inputs: [
                 ("aabbc", true),
                 ("aabb", false),
@@ -6969,8 +7106,8 @@ mod tests {
         // Nested counter patterns (migrated from survey_nested_counter_bugs)
         test_nested_a2_x3 {
             pattern: "(a{2}){3}",
-            memory: 0,
-            min_tier: 2,
+            memory: 639,
+            min_tier: 1,
             inputs: [
                 ("aaaaa", false),
                 ("aaaaaa", true),
@@ -6979,8 +7116,8 @@ mod tests {
         }
         test_nested_a3_x2 {
             pattern: "(a{3}){2}",
-            memory: 0,
-            min_tier: 2,
+            memory: 639,
+            min_tier: 1,
             inputs: [
                 ("aaaa", false),
                 ("aaaaa", false),
@@ -6990,8 +7127,8 @@ mod tests {
         }
         test_nested_ab_x2 {
             pattern: "(ab){2}",
-            memory: 0,
-            min_tier: 2,
+            memory: 573,
+            min_tier: 1,
             inputs: [
                 ("aba", false),
                 ("abab", true),
@@ -7001,8 +7138,8 @@ mod tests {
         }
         test_nested_ab_x3 {
             pattern: "(ab){3}",
-            memory: 0,
-            min_tier: 2,
+            memory: 639,
+            min_tier: 1,
             inputs: [
                 ("ababa", false),
                 ("ababab", true),
@@ -7012,8 +7149,8 @@ mod tests {
         }
         test_nested_a23_x2 {
             pattern: "(a{2,3}){2}",
-            memory: 0,
-            min_tier: 4,
+            memory: 705,
+            min_tier: 1,
             inputs: [
                 ("aaa", false),
                 ("aaaa", true),
@@ -7024,8 +7161,8 @@ mod tests {
         }
         test_nested_a2_x2_x2 {
             pattern: "((a{2}){2}){2}",
-            memory: 0,
-            min_tier: 4,
+            memory: 705,
+            min_tier: 1,
             inputs: [
                 ("aaaaaaa", false),
                 ("aaaaaaaa", true),
@@ -7034,8 +7171,8 @@ mod tests {
         }
         test_nested_a2_x23 {
             pattern: "(a{2}){2,3}",
-            memory: 0,
-            min_tier: 2,
+            memory: 672,
+            min_tier: 1,
             inputs: [
                 ("aaa", false),
                 ("aaaa", true),
@@ -7046,8 +7183,8 @@ mod tests {
         }
         test_nested_dotdot_x2 {
             pattern: "(..){2}",
-            memory: 0,
-            min_tier: 2,
+            memory: 829,
+            min_tier: 1,
             inputs: [
                 ("aaa", false),
                 ("aaaa", true),
@@ -7057,8 +7194,8 @@ mod tests {
         }
         test_nested_abc_x2 {
             pattern: "(abc){2}",
-            memory: 0,
-            min_tier: 2,
+            memory: 639,
+            min_tier: 1,
             inputs: [
                 ("abcab", false),
                 ("abcabc", true),
@@ -7091,7 +7228,7 @@ mod tests {
         test_nested_a12_x2 {
             pattern: "^(a{1,2}){2}$",
             memory: 0,
-            min_tier: 4,
+            min_tier: 1,
             inputs: [
                 ("aa", true),
                 ("aaa", true),
@@ -7139,7 +7276,7 @@ mod tests {
         test_byte_table_counted_with_suffix {
             pattern: "^(ab|cd|ef){1,3}x$",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("abx", true),
                 ("cdx", true),
@@ -7252,8 +7389,8 @@ mod tests {
         }
         test_step_fused_alternation_overlap {
             pattern: "(a|a){2,3}",
-            memory: 0,
-            min_tier: 2,
+            memory: 573,
+            min_tier: 1,
             inputs: [
                 ("aa", true),
                 ("aaa", true),
@@ -7282,8 +7419,8 @@ mod tests {
         }
         test_step_fused_reseed_with_counter {
             pattern: "(a{2}){2}",
-            memory: 0,
-            min_tier: 2,
+            memory: 573,
+            min_tier: 1,
             inputs: [
                 ("aaaa", true),
                 ("aaa", false),
@@ -7609,7 +7746,7 @@ mod tests {
         test_ci_counted_group {
             pattern: "^(?i)(ab){2,3}$",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("abab", true),
                 ("ABAB", true),
@@ -7758,7 +7895,7 @@ mod tests {
         test_ci_counted_alternation {
             pattern: "^(?i)(a|b){1,2}$",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("a", true),
                 ("A", true),
@@ -8169,7 +8306,7 @@ mod tests {
         test_partial_ci_counted_group_then_literal {
             pattern: "^(?i:ab){2,3}c$",
             memory: 0,
-            min_tier: 2,
+            min_tier: 1,
             inputs: [
                 ("ababc", true),
                 ("ABABc", true),
