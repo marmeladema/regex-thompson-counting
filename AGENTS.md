@@ -114,6 +114,16 @@ Example:
 cargo run --release -- info '(?i)\bselect\b'
 ```
 
+### JSON output (machine-readable)
+
+```bash
+cargo run --release -- --format json info '<pattern>'
+```
+
+Returns a JSON object with structured fields: `memory`, `nfa_states`,
+`counters`, `execution`, `start_closure`, `prefilter`, etc.  Useful for
+scripting (e.g. `bless_memory.py`) and programmatic inspection.
+
 ### Match testing
 
 ```bash
@@ -151,3 +161,48 @@ cargo fmt                           # format
 | grep_every_line | `target/gungraun/regex-thompson-counting/flamegraph/grep_group/bench_grep_every_line/callgrind.bench_grep_every_line.out` |
 
 Flamegraph SVGs are next to the `.out` files (same directory, `.svg` extension).
+
+## 7. Blessing Memory Sizes
+
+Test entries in `src/lib.rs` (`match_tests!` macro) include `memory: N` fields
+that assert the compiled regex memory footprint.  After changes to the NFA
+compiler or `State` layout these values may drift.
+
+### Update all stale memory values
+
+```bash
+python3 scripts/bless_memory.py
+```
+
+This compiles each pattern via `rethoc --format json info`, reads
+`memory.total` from the JSON output, and updates `src/lib.rs` in place.
+
+### Check mode (CI-friendly)
+
+```bash
+python3 scripts/bless_memory.py --check
+```
+
+Exits with code 1 if any values are stale.  Does not modify files.
+
+### Dry-run mode
+
+```bash
+python3 scripts/bless_memory.py --dry-run
+```
+
+Shows what would change without writing.
+
+### What it does NOT touch
+
+- `min_tier:` values — left alone to avoid masking tier regressions.
+
+### Prerequisite
+
+The script requires a release build of `rethoc`:
+
+```bash
+cargo build --release
+```
+
+If `target/release/rethoc` does not exist, the script builds it automatically.

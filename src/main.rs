@@ -34,6 +34,13 @@ fn parse_pattern(pattern: &str, unroll_limit: Option<usize>) -> Regex {
     })
 }
 
+/// Output format for the `info` command.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Text,
+    Json,
+}
+
 fn print_usage() {
     eprintln!(
         "\
@@ -45,11 +52,12 @@ Commands:
   match <pattern> <input>...     Match pattern against one or more inputs
 
 Options:
-  --chunk-size <N>   Feed input in chunks of N bytes (default: entire input at once)
-  --tier <0|1|2|3|4> Force a specific execution tier (0=NFA, 1-4=DFA tiers)
-  --unroll-limit <N> Max NFA states for repetition unrolling (0=disable, default: 32)
-  --debug            Print matcher state after each step
-  -h, --help         Print this help message"
+  --format <text|json> Output format for info command (default: text)
+  --chunk-size <N>     Feed input in chunks of N bytes (default: entire input at once)
+  --tier <0|1|2|3|4>   Force a specific execution tier (0=NFA, 1-4=DFA tiers)
+  --unroll-limit <N>   Max NFA states for repetition unrolling (0=disable, default: 32)
+  --debug              Print matcher state after each step
+  -h, --help           Print this help message"
     );
 }
 
@@ -57,6 +65,7 @@ enum Command {
     Info {
         pattern: String,
         unroll_limit: Option<usize>,
+        format: Format,
     },
     Dot {
         pattern: String,
@@ -82,6 +91,7 @@ fn parse_args() -> Command {
     let mut chunk_size: Option<usize> = None;
     let mut tier: Option<u8> = None;
     let mut unroll_limit: Option<usize> = None;
+    let mut format = Format::Text;
     let mut debug = false;
     let mut positional = Vec::new();
 
@@ -134,6 +144,21 @@ fn parse_args() -> Command {
                     process::exit(1);
                 }));
             }
+            "--format" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --format requires a value (text or json)");
+                    process::exit(1);
+                }
+                format = match args[i].as_str() {
+                    "text" => Format::Text,
+                    "json" => Format::Json,
+                    other => {
+                        eprintln!("error: unknown format: {other} (expected 'text' or 'json')");
+                        process::exit(1);
+                    }
+                };
+            }
             "--debug" => {
                 debug = true;
             }
@@ -163,6 +188,7 @@ fn parse_args() -> Command {
             Command::Info {
                 pattern: positional[1].clone(),
                 unroll_limit,
+                format,
             }
         }
         "dot" => {
@@ -197,11 +223,22 @@ fn parse_args() -> Command {
     }
 }
 
-fn run_info(pattern: &str, unroll_limit: Option<usize>) {
+fn run_info(pattern: &str, unroll_limit: Option<usize>, format: Format) {
     let regex = parse_pattern(pattern, unroll_limit);
-    println!("Pattern: {pattern}");
-    println!();
-    println!("{}", regex.info());
+    let info = regex.info();
+    match format {
+        Format::Text => {
+            println!("Pattern: {pattern}");
+            println!();
+            println!("{info}");
+        }
+        Format::Json => {
+            println!(
+                "{}",
+                serde_json::to_string(&info).expect("RegexInfo should serialize to JSON")
+            );
+        }
+    }
 }
 
 fn run_dot(pattern: &str, unroll_limit: Option<usize>) {
@@ -296,7 +333,8 @@ fn main() {
         Command::Info {
             pattern,
             unroll_limit,
-        } => run_info(&pattern, unroll_limit),
+            format,
+        } => run_info(&pattern, unroll_limit, format),
         Command::Dot {
             pattern,
             unroll_limit,
