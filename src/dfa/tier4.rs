@@ -60,6 +60,59 @@ enum CounterOp {
     EmitMatchAtEnd,
 }
 
+// ---------------------------------------------------------------------------
+// Iterative trace frames
+// ---------------------------------------------------------------------------
+
+/// Work item for the iterative epsilon closure in
+/// `epsilon_closure_with_program`.  Processed LIFO.
+///
+/// See [`Tier4DfaCache::epsilon_closure_with_program`] for an
+/// explanation of the stack-based mark/unmark cycle detection.
+enum TraceFrame {
+    /// Process NFA state `idx`: mark it visited, inspect the NFA state
+    /// type, and push child frames.
+    Visit(StateIdx),
+    /// Unmark `idx` from `closure_visited`.  Pushed *before* children
+    /// so it fires *after* them (LIFO).  This is the "exit" half of
+    /// stack-based cycle detection: once a subtree completes, sibling
+    /// branches may revisit the state to build their own program nodes.
+    Unmark(usize),
+    /// Pop the ops stack and wrap the sub-program in `Init`.
+    FinishInit { counter: CounterIdx },
+    /// Finish the continue subtree of a `CounterIncrement`: pop continue
+    /// ops, push them as a sentinel, push a new level for the break path.
+    FinishIncrementContinue,
+    /// Finish the break subtree: pop break ops and continue ops, build
+    /// the `Increment` node on the parent level.
+    FinishIncrementBreak {
+        counter: CounterIdx,
+        min: usize,
+        max: usize,
+    },
+}
+
+/// Work item for the iterative `$`-gate epsilon trace
+/// (`trace_end_iterative`).  Same structure as `TraceFrame` but without
+/// `closure_result` or assertion context (simpler sub-graph).
+enum TraceEndFrame {
+    Visit(StateIdx),
+    Unmark(usize),
+    FinishInit {
+        counter: CounterIdx,
+    },
+    FinishIncrementContinue,
+    FinishIncrementBreak {
+        counter: CounterIdx,
+        min: usize,
+        max: usize,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Program execution
+// ---------------------------------------------------------------------------
+
 /// Outcome of applying a counter program to one context.
 enum ProgramResult {
     /// The context survives with updated counter values at the given
@@ -292,8 +345,26 @@ pub(crate) struct Tier4DfaCache {
     /// seed program at index `i` consists only of `EmitContinue` ops,
     /// `seed_emit_origins[i]` is `Some(origins)`.  Otherwise `None`.
     seed_emit_origins: Vec<Option<Box<[StateIdx]>>>,
-    /// Scratch visited set for epsilon closure.
+    /// Scratch visited set for epsilon closure (stack-based mark/unmark).
     closure_visited: Vec<bool>,
+    /// Scratch work stack for the main epsilon closure.
+    closure_work: Vec<TraceFrame>,
+    /// Scratch flat buffer for counter ops being built.  Levels are
+    /// delimited by indices in `closure_ops_levels`.
+    closure_ops: Vec<CounterOp>,
+    /// Stack of start-indices into `closure_ops`, one per nesting level.
+    closure_ops_levels: Vec<usize>,
+    /// Scratch buffer for NFA consuming states found during closure.
+    closure_result: Vec<StateIdx>,
+    /// Scratch visited set for the `$`-gate sub-closure (separate from
+    /// the main `closure_visited` because `$`-gate states may overlap).
+    closure_end_visited: Vec<bool>,
+    /// Scratch work stack for the `$`-gate sub-closure.
+    closure_end_work: Vec<TraceEndFrame>,
+    /// Scratch flat buffer for `$`-gate counter ops.
+    closure_end_ops: Vec<CounterOp>,
+    /// Level indices for `closure_end_ops`.
+    closure_end_levels: Vec<usize>,
     /// Number of byte equivalence classes — the stride of each DFA state
     /// row in the transition table.  Copied from [`Regex::num_byte_classes`]
     /// during [`prepare()`].
@@ -329,6 +400,14 @@ impl Tier4DfaCache {
             origin_program_tables: Vec::new(),
             seed_emit_origins: Vec::new(),
             closure_visited: vec![false; num_nfa_states],
+            closure_work: Vec::new(),
+            closure_ops: Vec::new(),
+            closure_ops_levels: Vec::new(),
+            closure_result: Vec::new(),
+            closure_end_visited: vec![false; num_nfa_states],
+            closure_end_work: Vec::new(),
+            closure_end_ops: Vec::new(),
+            closure_end_levels: Vec::new(),
             stride: 256,
             regex_id: 0,
             start_id: DfaStateId::DEAD,
@@ -404,14 +483,44 @@ impl Tier4DfaCache {
 
     /// Epsilon closure that records counter operations into a program tree.
     ///
-    /// Unlike `DfaMemory::epsilon_closure` (used by tiers 1–3) which uses
-    /// an iterative stack, this uses a recursive DFS because the counter
-    /// program structure mirrors the recursion tree (Init → body →
-    /// Increment with branches).
+    /// Uses an iterative work stack with an explicit frame stack for
+    /// building the nested `CounterOp` tree.  This avoids unbounded
+    /// recursion depth on adversarial patterns (the engine accepts
+    /// untrusted patterns and inputs).
+    ///
+    /// # Cycle detection: stack-based mark/unmark
+    ///
+    /// Unlike tiers 1–3 which permanently mark each state as visited,
+    /// tier 4 uses **stack-based** marking: a state is marked on entry
+    /// and unmarked (via `Unmark` frame) when its subtree completes.
+    ///
+    /// This is necessary because the counter program tree requires
+    /// sibling branches to independently traverse shared NFA states.
+    /// For example, in `(a?){2}` the NFA has a cycle `CInc → Split →
+    /// CInc`.  The `on_continue` subtree of the outer `Increment` must
+    /// re-enter the `CInc` node to build the inner `Increment` — with
+    /// permanent marking, this second visit would be skipped and the
+    /// program tree would be incomplete.
+    ///
+    /// Stack-based marking prevents infinite loops (a state on the
+    /// current DFS path is skipped) while allowing sibling branches to
+    /// revisit it after the first branch completes.
+    ///
+    /// Leaf states (Match, Byte, etc.) and dead-end assertions unmark
+    /// immediately since they have no children.  Branching states
+    /// (Split, CounterInstance, CounterIncrement) push `Unmark` before
+    /// their children so it fires after all children complete (LIFO).
+    ///
+    /// # Scratch buffer reuse
+    ///
+    /// All scratch buffers (`closure_work`, `closure_ops`,
+    /// `closure_ops_levels`, `closure_result`) live on `Tier4DfaCache`
+    /// and are reused across calls.  The ops buffer is flat: nesting
+    /// levels are tracked by start-indices in `closure_ops_levels`.
+    /// When a level completes, ops are drained from that index onward.
     ///
     /// Variable naming follows the conventions in `DfaMemory`:
-    /// - `closure_visited` — per-state visited flag (stack-based: marked
-    ///   on entry, unmarked on exit, to allow sibling branches to revisit)
+    /// - `closure_visited` — per-state visited flag
     /// - `closure_result` — sorted NFA consuming states
     ///
     /// Returns: `(sorted NFA consuming states, is_match, is_match_at_end, program ops)`.
@@ -427,306 +536,324 @@ impl Tier4DfaCache {
             *v = false;
         }
 
-        let mut closure_result: Vec<StateIdx> = Vec::new();
+        self.closure_result.clear();
         let mut is_match = false;
         let mut is_match_at_end = false;
-        let mut ops = Vec::new();
 
-        let seeds: Vec<StateIdx> = seeds.collect();
-        for seed in seeds {
-            Self::trace_epsilon(
-                seed,
-                states,
-                at_start,
-                prev_byte,
-                &mut self.closure_visited,
-                &mut closure_result,
-                &mut is_match,
-                &mut is_match_at_end,
-                &mut ops,
-            );
+        // Flat ops buffer with level tracking.  `closure_ops_levels`
+        // stores the start index of each nesting level in `closure_ops`.
+        // Popping a level drains ops from that index onward.
+        self.closure_ops.clear();
+        self.closure_ops_levels.clear();
+        self.closure_ops_levels.push(0); // root level starts at 0
+
+        // Reusable work stack.
+        self.closure_work.clear();
+        self.closure_work.extend(seeds.map(TraceFrame::Visit));
+        self.closure_work.reverse(); // so first seed is processed first (LIFO)
+
+        while let Some(frame) = self.closure_work.pop() {
+            match frame {
+                TraceFrame::Visit(idx) => {
+                    let i = idx.idx();
+                    if self.closure_visited[i] {
+                        continue;
+                    }
+                    self.closure_visited[i] = true;
+
+                    match states[idx] {
+                        State::Split { out, out1 } => {
+                            self.closure_work.push(TraceFrame::Unmark(i));
+                            self.closure_work.push(TraceFrame::Visit(out1));
+                            self.closure_work.push(TraceFrame::Visit(out));
+                        }
+                        State::Assert { kind, out } => match kind {
+                            AssertKind::Start => {
+                                if at_start {
+                                    self.closure_work.push(TraceFrame::Unmark(i));
+                                    self.closure_work.push(TraceFrame::Visit(out));
+                                } else {
+                                    self.closure_visited[i] = false;
+                                }
+                            }
+                            AssertKind::End => {
+                                // `$` gate: trace separately for
+                                // match-at-end paths.
+                                let sub_ops = self.trace_end_iterative(out, states);
+                                if !sub_ops.is_empty() {
+                                    is_match_at_end = true;
+                                    self.closure_ops.extend(sub_ops);
+                                }
+                                self.closure_visited[i] = false;
+                            }
+                            AssertKind::StartLF => {
+                                if at_start || prev_byte == Some(b'\n') {
+                                    self.closure_work.push(TraceFrame::Unmark(i));
+                                    self.closure_work.push(TraceFrame::Visit(out));
+                                } else {
+                                    self.closure_visited[i] = false;
+                                }
+                            }
+                            _ => {
+                                debug_assert!(
+                                    false,
+                                    "unsupported assertion in tier 4 pattern: {:?}",
+                                    kind
+                                );
+                                self.closure_visited[i] = false;
+                            }
+                        },
+                        State::CounterInstance { counter, out } => {
+                            self.closure_work.push(TraceFrame::Unmark(i));
+                            self.closure_work.push(TraceFrame::FinishInit { counter });
+                            // Push a new level: ops from here onward
+                            // belong to the Init body.
+                            self.closure_ops_levels.push(self.closure_ops.len());
+                            self.closure_work.push(TraceFrame::Visit(out));
+                        }
+                        State::CounterIncrement {
+                            counter,
+                            out,
+                            out1,
+                            min,
+                            max,
+                        } => {
+                            // Two subtrees: continue (out) then break (out1).
+                            // Push in reverse order for correct LIFO processing.
+                            self.closure_work.push(TraceFrame::Unmark(i));
+                            self.closure_work.push(TraceFrame::FinishIncrementBreak {
+                                counter,
+                                min,
+                                max,
+                            });
+                            self.closure_work.push(TraceFrame::Visit(out1));
+                            self.closure_work.push(TraceFrame::FinishIncrementContinue);
+                            // New level for continue path.
+                            self.closure_ops_levels.push(self.closure_ops.len());
+                            self.closure_work.push(TraceFrame::Visit(out));
+                        }
+                        State::Match => {
+                            is_match = true;
+                            self.closure_ops.push(CounterOp::EmitMatch);
+                            self.closure_visited[i] = false;
+                        }
+                        State::Byte { .. }
+                        | State::ByteCI { .. }
+                        | State::ByteClass { .. }
+                        | State::ByteTable { .. } => {
+                            self.closure_result.push(idx);
+                            self.closure_ops
+                                .push(CounterOp::EmitContinue { origin: idx });
+                            self.closure_visited[i] = false;
+                        }
+                    }
+                }
+                TraceFrame::Unmark(i) => {
+                    self.closure_visited[i] = false;
+                }
+                TraceFrame::FinishInit { counter } => {
+                    let start = self.closure_ops_levels.pop().unwrap();
+                    let sub_ops = self.closure_ops.drain(start..).collect();
+                    self.closure_ops.push(CounterOp::Init {
+                        counter,
+                        then: sub_ops,
+                    });
+                }
+                TraceFrame::FinishIncrementContinue => {
+                    // Drain the continue ops, stash them as a temporary
+                    // Init carrier on the flat buffer, then start a new
+                    // level for the break path.
+                    let start = self.closure_ops_levels.pop().unwrap();
+                    let cont_ops: Vec<CounterOp> = self.closure_ops.drain(start..).collect();
+                    // Stash continue ops inside a sentinel Init node.
+                    self.closure_ops.push(CounterOp::Init {
+                        counter: CounterIdx(u8::MAX),
+                        then: cont_ops,
+                    });
+                    // New level for break path.
+                    self.closure_ops_levels.push(self.closure_ops.len());
+                }
+                TraceFrame::FinishIncrementBreak { counter, min, max } => {
+                    // Pop break ops.
+                    let start = self.closure_ops_levels.pop().unwrap();
+                    let raw_break_ops: Vec<CounterOp> = self.closure_ops.drain(start..).collect();
+                    // Pop the stashed continue ops (sentinel Init node).
+                    let cont_sentinel = self.closure_ops.pop().unwrap();
+                    let cont_ops = match cont_sentinel {
+                        CounterOp::Init { then, .. } => then,
+                        _ => unreachable!("expected stashed continue ops"),
+                    };
+                    let break_ops = vec![CounterOp::Remove {
+                        counter,
+                        then: raw_break_ops,
+                    }];
+                    self.closure_ops.push(CounterOp::Increment {
+                        counter,
+                        min,
+                        max,
+                        on_continue: cont_ops,
+                        on_break: break_ops,
+                    });
+                }
+            }
         }
 
-        closure_result.sort_unstable_by_key(|s| s.0);
-        closure_result.dedup();
+        debug_assert_eq!(
+            self.closure_ops_levels.len(),
+            1,
+            "closure_ops_levels should have exactly one level (root)"
+        );
 
-        (
-            closure_result.into_boxed_slice(),
-            is_match,
-            is_match_at_end,
-            ops,
-        )
+        self.closure_result.sort_unstable_by_key(|s| s.0);
+        self.closure_result.dedup();
+
+        let ops = self.closure_ops.drain(..).collect();
+        let result = self
+            .closure_result
+            .drain(..)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        (result, is_match, is_match_at_end, ops)
     }
 
-    /// Recursive trace through epsilon states, recording counter ops.
+    /// Iterative epsilon trace for the `$` (End) path.
     ///
-    /// Uses **stack-based cycle detection**: a state is marked visited on
-    /// entry and unmarked on exit.  This prevents infinite loops on
-    /// epsilon-only cycles (e.g. `(a?){2}` where `CInc.continue → Split
-    /// → CInc`) while allowing sibling branches of the counter program
-    /// tree to re-traverse shared states.  The `closure_result` vec may
-    /// contain duplicates; the caller deduplicates it.
-    #[allow(clippy::too_many_arguments)]
-    fn trace_epsilon(
-        idx: StateIdx,
-        states: &[State],
-        at_start: bool,
-        prev_byte: Option<u8>,
-        closure_visited: &mut [bool],
-        closure_result: &mut Vec<StateIdx>,
-        is_match: &mut bool,
-        is_match_at_end: &mut bool,
-        ops: &mut Vec<CounterOp>,
-    ) {
-        let i = idx.idx();
-        if closure_visited[i] {
-            return;
+    /// This is separate from the main closure because the `$` gate's
+    /// sub-graph may contain counter operations that should only fire
+    /// at end-of-input.  Uses its own scratch buffers (`closure_end_*`)
+    /// because these states may also appear in the main closure, and
+    /// this method is called *during* `epsilon_closure_with_program`.
+    ///
+    /// Uses the same stack-based mark/unmark cycle detection as the
+    /// main closure — see [`epsilon_closure_with_program`] for details.
+    ///
+    /// Returns the sub-program with `EmitMatch` rewritten to
+    /// `EmitMatchAtEnd`.  Returns an empty vec if no Match is reachable.
+    fn trace_end_iterative(&mut self, start: StateIdx, states: &[State]) -> Vec<CounterOp> {
+        for v in self.closure_end_visited.iter_mut() {
+            *v = false;
         }
-        closure_visited[i] = true;
+        let mut is_match = false;
 
-        match states[idx] {
-            State::Split { out, out1 } => {
-                Self::trace_epsilon(
-                    out,
-                    states,
-                    at_start,
-                    prev_byte,
-                    closure_visited,
-                    closure_result,
-                    is_match,
-                    is_match_at_end,
-                    ops,
-                );
-                Self::trace_epsilon(
-                    out1,
-                    states,
-                    at_start,
-                    prev_byte,
-                    closure_visited,
-                    closure_result,
-                    is_match,
-                    is_match_at_end,
-                    ops,
-                );
-            }
-            State::Assert { kind, out } => match kind {
-                AssertKind::Start => {
-                    if at_start {
-                        Self::trace_epsilon(
+        self.closure_end_ops.clear();
+        self.closure_end_levels.clear();
+        self.closure_end_levels.push(0);
+
+        self.closure_end_work.clear();
+        self.closure_end_work.push(TraceEndFrame::Visit(start));
+
+        while let Some(frame) = self.closure_end_work.pop() {
+            match frame {
+                TraceEndFrame::Visit(idx) => {
+                    let i = idx.idx();
+                    if self.closure_end_visited[i] {
+                        continue;
+                    }
+                    self.closure_end_visited[i] = true;
+
+                    match states[idx] {
+                        State::Match => {
+                            is_match = true;
+                            self.closure_end_ops.push(CounterOp::EmitMatch);
+                            self.closure_end_visited[i] = false;
+                        }
+                        State::Split { out, out1 } => {
+                            self.closure_end_work.push(TraceEndFrame::Unmark(i));
+                            self.closure_end_work.push(TraceEndFrame::Visit(out1));
+                            self.closure_end_work.push(TraceEndFrame::Visit(out));
+                        }
+                        State::Assert { kind, out } => {
+                            // Inside a `$` gate, `$` itself is trivially
+                            // true.  `^` / `(?m:^)` cannot pass here.
+                            if kind == AssertKind::End {
+                                self.closure_end_work.push(TraceEndFrame::Unmark(i));
+                                self.closure_end_work.push(TraceEndFrame::Visit(out));
+                            } else {
+                                self.closure_end_visited[i] = false;
+                            }
+                        }
+                        State::CounterInstance { counter, out } => {
+                            self.closure_end_work.push(TraceEndFrame::Unmark(i));
+                            self.closure_end_work
+                                .push(TraceEndFrame::FinishInit { counter });
+                            self.closure_end_levels.push(self.closure_end_ops.len());
+                            self.closure_end_work.push(TraceEndFrame::Visit(out));
+                        }
+                        State::CounterIncrement {
+                            counter,
                             out,
-                            states,
-                            at_start,
-                            prev_byte,
-                            closure_visited,
-                            closure_result,
-                            is_match,
-                            is_match_at_end,
-                            ops,
-                        );
+                            out1,
+                            min,
+                            max,
+                        } => {
+                            self.closure_end_work.push(TraceEndFrame::Unmark(i));
+                            self.closure_end_work
+                                .push(TraceEndFrame::FinishIncrementBreak { counter, min, max });
+                            self.closure_end_work.push(TraceEndFrame::Visit(out1));
+                            self.closure_end_work
+                                .push(TraceEndFrame::FinishIncrementContinue);
+                            self.closure_end_levels.push(self.closure_end_ops.len());
+                            self.closure_end_work.push(TraceEndFrame::Visit(out));
+                        }
+                        _ => {
+                            // Consuming states block at end-of-input.
+                            self.closure_end_visited[i] = false;
+                        }
                     }
                 }
-                AssertKind::End => {
-                    // `$` gate: trace the sub-graph separately to find
-                    // match-at-end paths with their counter programs.
-                    let mut end_visited = vec![false; states.len()];
-                    let mut sub_match = false;
-                    let mut sub_ops = Vec::new();
-                    Self::trace_epsilon_for_end(
-                        out,
-                        states,
-                        &mut end_visited,
-                        &mut sub_match,
-                        &mut sub_ops,
-                    );
-                    if sub_match {
-                        *is_match_at_end = true;
-                        // Rewrite EmitMatch → EmitMatchAtEnd so the
-                        // program emits the right signal at end-of-input.
-                        rewrite_match_to_match_at_end(&mut sub_ops);
-                        ops.extend(sub_ops);
-                    }
+                TraceEndFrame::Unmark(i) => {
+                    self.closure_end_visited[i] = false;
                 }
-                AssertKind::StartLF => {
-                    if at_start || prev_byte == Some(b'\n') {
-                        Self::trace_epsilon(
-                            out,
-                            states,
-                            at_start,
-                            prev_byte,
-                            closure_visited,
-                            closure_result,
-                            is_match,
-                            is_match_at_end,
-                            ops,
-                        );
-                    }
+                TraceEndFrame::FinishInit { counter } => {
+                    let start = self.closure_end_levels.pop().unwrap();
+                    let sub_ops = self.closure_end_ops.drain(start..).collect();
+                    self.closure_end_ops.push(CounterOp::Init {
+                        counter,
+                        then: sub_ops,
+                    });
                 }
-                _ => {
-                    debug_assert!(false, "unsupported assertion in tier 4 pattern: {:?}", kind);
+                TraceEndFrame::FinishIncrementContinue => {
+                    let start = self.closure_end_levels.pop().unwrap();
+                    let cont_ops: Vec<CounterOp> = self.closure_end_ops.drain(start..).collect();
+                    self.closure_end_ops.push(CounterOp::Init {
+                        counter: CounterIdx(u8::MAX),
+                        then: cont_ops,
+                    });
+                    self.closure_end_levels.push(self.closure_end_ops.len());
                 }
-            },
-            State::CounterInstance { counter, out } => {
-                let mut sub_ops = Vec::new();
-                Self::trace_epsilon(
-                    out,
-                    states,
-                    at_start,
-                    prev_byte,
-                    closure_visited,
-                    closure_result,
-                    is_match,
-                    is_match_at_end,
-                    &mut sub_ops,
-                );
-                ops.push(CounterOp::Init {
-                    counter,
-                    then: sub_ops,
-                });
-            }
-            State::CounterIncrement {
-                counter,
-                out,
-                out1,
-                min,
-                max,
-            } => {
-                // Continue path (re-enter body).
-                let mut cont_ops = Vec::new();
-                Self::trace_epsilon(
-                    out,
-                    states,
-                    at_start,
-                    prev_byte,
-                    closure_visited,
-                    closure_result,
-                    is_match,
-                    is_match_at_end,
-                    &mut cont_ops,
-                );
-                // Break path (exit repetition).
-                // Wrap in Remove(counter) so that the counter is
-                // deactivated when the context exits this loop.  This
-                // prevents stale counter values from triggering
-                // Increment ops from other positions in the DFA state.
-                let mut raw_break_ops = Vec::new();
-                Self::trace_epsilon(
-                    out1,
-                    states,
-                    at_start,
-                    prev_byte,
-                    closure_visited,
-                    closure_result,
-                    is_match,
-                    is_match_at_end,
-                    &mut raw_break_ops,
-                );
-                let break_ops = vec![CounterOp::Remove {
-                    counter,
-                    then: raw_break_ops,
-                }];
-                ops.push(CounterOp::Increment {
-                    counter,
-                    min,
-                    max,
-                    on_continue: cont_ops,
-                    on_break: break_ops,
-                });
-            }
-            State::Match => {
-                *is_match = true;
-                ops.push(CounterOp::EmitMatch);
-            }
-            State::Byte { .. }
-            | State::ByteCI { .. }
-            | State::ByteClass { .. }
-            | State::ByteTable { .. } => {
-                closure_result.push(idx);
-                ops.push(CounterOp::EmitContinue { origin: idx });
+                TraceEndFrame::FinishIncrementBreak { counter, min, max } => {
+                    let start = self.closure_end_levels.pop().unwrap();
+                    let raw_break_ops: Vec<CounterOp> =
+                        self.closure_end_ops.drain(start..).collect();
+                    let cont_sentinel = self.closure_end_ops.pop().unwrap();
+                    let cont_ops = match cont_sentinel {
+                        CounterOp::Init { then, .. } => then,
+                        _ => unreachable!("expected stashed continue ops"),
+                    };
+                    let break_ops = vec![CounterOp::Remove {
+                        counter,
+                        then: raw_break_ops,
+                    }];
+                    self.closure_end_ops.push(CounterOp::Increment {
+                        counter,
+                        min,
+                        max,
+                        on_continue: cont_ops,
+                        on_break: break_ops,
+                    });
+                }
             }
         }
 
-        closure_visited[i] = false;
-    }
-
-    /// Trace epsilon transitions for the `$` (End) path.
-    ///
-    /// This is a separate function because the `$` gate's sub-graph may
-    /// contain counter operations that should only fire at end-of-input.
-    /// Uses its own `closure_visited` set (not the main one) because
-    /// these states may also appear in the main closure.
-    ///
-    /// Uses stack-based cycle detection like `trace_epsilon`.
-    fn trace_epsilon_for_end(
-        idx: StateIdx,
-        states: &[State],
-        closure_visited: &mut [bool],
-        is_match: &mut bool,
-        ops: &mut Vec<CounterOp>,
-    ) {
-        let i = idx.idx();
-        if closure_visited[i] {
-            return;
-        }
-        closure_visited[i] = true;
-
-        match states[idx] {
-            State::Match => {
-                *is_match = true;
-                ops.push(CounterOp::EmitMatch);
-            }
-            State::Split { out, out1 } => {
-                Self::trace_epsilon_for_end(out, states, closure_visited, is_match, ops);
-                Self::trace_epsilon_for_end(out1, states, closure_visited, is_match, ops);
-            }
-            State::Assert { kind, out } => {
-                // Inside a `$` gate, `$` itself is trivially true (we're
-                // already past end-of-input).  `^` and `(?m:^)` cannot
-                // pass here.  Other assertions are not tier 4 eligible.
-                if kind == AssertKind::End {
-                    Self::trace_epsilon_for_end(out, states, closure_visited, is_match, ops);
-                }
-            }
-            State::CounterInstance { counter, out } => {
-                let mut sub_ops = Vec::new();
-                Self::trace_epsilon_for_end(out, states, closure_visited, is_match, &mut sub_ops);
-                ops.push(CounterOp::Init {
-                    counter,
-                    then: sub_ops,
-                });
-            }
-            State::CounterIncrement {
-                counter,
-                out,
-                out1,
-                min,
-                max,
-            } => {
-                let mut cont_ops = Vec::new();
-                Self::trace_epsilon_for_end(out, states, closure_visited, is_match, &mut cont_ops);
-                let mut raw_break_ops = Vec::new();
-                Self::trace_epsilon_for_end(
-                    out1,
-                    states,
-                    closure_visited,
-                    is_match,
-                    &mut raw_break_ops,
-                );
-                let break_ops = vec![CounterOp::Remove {
-                    counter,
-                    then: raw_break_ops,
-                }];
-                ops.push(CounterOp::Increment {
-                    counter,
-                    min,
-                    max,
-                    on_continue: cont_ops,
-                    on_break: break_ops,
-                });
-            }
-            _ => {} // Consuming states block the path at end-of-input.
+        if !is_match {
+            return Vec::new();
         }
 
-        closure_visited[i] = false;
+        debug_assert_eq!(self.closure_end_levels.len(), 1);
+        let mut ops: Vec<CounterOp> = self.closure_end_ops.drain(..).collect();
+        rewrite_match_to_match_at_end(&mut ops);
+        ops
     }
 
     /// Compute a counting transition for `(from_state, byte)`, using
@@ -865,6 +992,17 @@ impl Tier4DfaCache {
         self.seed_emit_origins.clear();
         self.closure_visited.clear();
         self.closure_visited.resize(num_nfa_states, false);
+        self.closure_end_visited.clear();
+        self.closure_end_visited.resize(num_nfa_states, false);
+        // Scratch vecs are just cleared, not resized — they keep their
+        // heap allocation for reuse.
+        self.closure_work.clear();
+        self.closure_ops.clear();
+        self.closure_ops_levels.clear();
+        self.closure_result.clear();
+        self.closure_end_work.clear();
+        self.closure_end_ops.clear();
+        self.closure_end_levels.clear();
         self.stride = stride;
         self.regex_id = 0;
         self.start_id = DfaStateId::DEAD;
