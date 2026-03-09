@@ -57,11 +57,17 @@ struct Transition {
     with_break_is_match_at_end: bool,
     /// True if this transition crosses a CInc node.
     is_counting: bool,
-    /// New counter instances from CI nodes in the successor closure.
+    /// New counter instances from CI nodes reachable WITHOUT following
+    /// any CInc break path (always applied).
     /// The third element is the initial counter value (0 for fresh seeds,
     /// 1 for seeds from resolved deferred assertions whose origin already
     /// consumed the resolving byte through a CInc increment).
     seeds: Box<[(CounterIdx, StateIdx, u32)]>,
+    /// Additional seeds reachable only through CInc break paths.
+    /// Each entry is `(trigger, counter, origin, initial_value)`:
+    /// the seed for `counter` at `origin` is only applied when `trigger`
+    /// (the counter whose CInc break leads to this CI) actually breaks.
+    break_seeds: Box<[(CounterIdx, CounterIdx, StateIdx, u32)]>,
     /// Parallel arrays: `origin_keys[i]` → `origin_actions[i]`.
     origin_keys: Box<[StateIdx]>,
     origin_actions: Box<[OriginAction]>,
@@ -78,7 +84,9 @@ impl Transition {
             with_break_is_match_at_end: false,
             is_counting: false,
             seeds: Box::new([]),
+            break_seeds: Box::new([]),
             origin_keys: Box::new([]),
+
             origin_actions: Box::new([]),
         }
     }
@@ -342,21 +350,6 @@ impl Tier3DfaCache {
             }
         }
 
-        let mut seed_instances: Vec<(CounterIdx, StateIdx, u32)> = probe
-            .seed_instances
-            .iter()
-            .map(|&(c, s)| (c, s, 0u32))
-            .collect();
-        for s in &resolved_seeds {
-            if !seed_instances
-                .iter()
-                .any(|e| e.0 == s.0 && e.1 == s.1 && e.2 == s.2)
-            {
-                seed_instances.push(*s);
-            }
-        }
-        let seed_instances: Box<[(CounterIdx, StateIdx, u32)]> = seed_instances.into();
-
         // Compute DFA successors: no_break and with_break.
         if is_counting {
             // Two separate closures.
@@ -379,6 +372,42 @@ impl Tier3DfaCache {
             let (nb_m, nb_mae) = self.match_flags(nb_id);
             let (wb_m, wb_mae) = self.match_flags(wb_id);
 
+            // Unconditional seeds: reachable without following CInc break
+            // paths (from the no_break closure) plus resolved deferred seeds.
+            let mut seeds: Vec<(CounterIdx, StateIdx, u32)> = cr_nb
+                .seed_instances
+                .iter()
+                .map(|&(c, s)| (c, s, 0u32))
+                .collect();
+            for s in &resolved_seeds {
+                if !seeds.iter().any(|e| e.0 == s.0 && e.1 == s.1 && e.2 == s.2) {
+                    seeds.push(*s);
+                }
+            }
+
+            // Break-only seeds: reachable only through CInc break paths.
+            // Each seed is tagged with the counter whose CInc break leads
+            // to it — the seed is only applied when that specific counter's
+            // instance actually breaks.
+            let raw_break = cinc_break_seeds(&all_targets, &regex.states);
+            let mut break_seeds: Vec<(CounterIdx, CounterIdx, StateIdx, u32)> = Vec::new();
+            for (trigger, counter, origin) in raw_break {
+                let entry = (trigger, counter, origin, 0u32);
+                // Skip if this seed is already in the unconditional list.
+                if seeds
+                    .iter()
+                    .any(|e| e.0 == entry.1 && e.1 == entry.2 && e.2 == entry.3)
+                {
+                    continue;
+                }
+                if !break_seeds
+                    .iter()
+                    .any(|e| e.0 == entry.0 && e.1 == entry.1 && e.2 == entry.2 && e.3 == entry.3)
+                {
+                    break_seeds.push(entry);
+                }
+            }
+
             // Fold resolved deferred assertion matches into both
             // successors' flags.  `resolved_is_match` applies
             // unconditionally (the DFA state that was transitioned FROM
@@ -391,14 +420,27 @@ impl Tier3DfaCache {
                 with_break_is_match: wb_m || resolved_is_match,
                 with_break_is_match_at_end: wb_mae || resolved_is_match_at_end,
                 is_counting: true,
-                seeds: seed_instances,
+                seeds: seeds.into(),
+                break_seeds: break_seeds.into(),
                 origin_keys: origin_keys.into_boxed_slice(),
                 origin_actions: origin_actions.into_boxed_slice(),
             }
         } else {
-            // Non-counting: both successors are the same.
+            // Non-counting: both successors are the same.  All seeds are
+            // unconditional (no CInc break distinction).
             let id = self.intern_closure_result(&probe, byte);
             let (m, mae) = self.match_flags(id);
+
+            let mut seeds: Vec<(CounterIdx, StateIdx, u32)> = probe
+                .seed_instances
+                .iter()
+                .map(|&(c, s)| (c, s, 0u32))
+                .collect();
+            for s in &resolved_seeds {
+                if !seeds.iter().any(|e| e.0 == s.0 && e.1 == s.1 && e.2 == s.2) {
+                    seeds.push(*s);
+                }
+            }
 
             Transition {
                 no_break: id,
@@ -408,7 +450,8 @@ impl Tier3DfaCache {
                 with_break_is_match: m || resolved_is_match,
                 with_break_is_match_at_end: mae || resolved_is_match_at_end,
                 is_counting: false,
-                seeds: seed_instances,
+                seeds: seeds.into(),
+                break_seeds: Box::new([]),
                 origin_keys: origin_keys.into_boxed_slice(),
                 origin_actions: origin_actions.into_boxed_slice(),
             }
@@ -748,6 +791,84 @@ fn find_cinc_through_epsilon(start: StateIdx, states: &[State]) -> Option<(usize
     None
 }
 
+/// Collect break-triggered seeds: for each CInc reachable from `targets`
+/// through epsilon transitions, walk the break path (`out1`) and record
+/// any CI nodes found as `(trigger_counter, ci_counter, consuming_origin)`.
+///
+/// This tells us exactly which counter's break enables which seed,
+/// allowing the matcher to apply break seeds only when the specific
+/// triggering counter actually breaks.
+fn cinc_break_seeds(
+    targets: &[StateIdx],
+    states: &[State],
+) -> Vec<(CounterIdx, CounterIdx, StateIdx)> {
+    let mut result = Vec::new();
+
+    // Phase 1: find all CInc nodes reachable from targets through epsilon.
+    let mut cinc_nodes: Vec<(CounterIdx, StateIdx)> = Vec::new(); // (counter, break_target)
+    let mut stack: Vec<StateIdx> = targets.to_vec();
+    let mut visited = vec![false; states.len()];
+    while let Some(idx) = stack.pop() {
+        let i = idx.idx();
+        if visited[i] {
+            continue;
+        }
+        visited[i] = true;
+        match states[idx] {
+            State::CounterIncrement { counter, out1, .. } => {
+                cinc_nodes.push((counter, out1));
+                // Do NOT follow continue or break here.
+            }
+            State::Split { out, out1 } => {
+                stack.push(out1);
+                stack.push(out);
+            }
+            State::Assert { out, .. } => stack.push(out),
+            State::CounterInstance { out, .. } => stack.push(out),
+            _ => {} // consuming states stop the walk
+        }
+    }
+
+    // Phase 2: for each CInc, walk the break path and collect CI seeds.
+    for &(trigger, break_target) in &cinc_nodes {
+        // Walk from break_target through epsilon transitions to find
+        // CI nodes, stopping at consuming states and Match.
+        let mut ci_stack = vec![break_target];
+        let mut ci_visited = vec![false; states.len()];
+        while let Some(idx) = ci_stack.pop() {
+            let i = idx.idx();
+            if ci_visited[i] {
+                continue;
+            }
+            ci_visited[i] = true;
+            match states[idx] {
+                State::CounterInstance { counter, out } => {
+                    // Found a CI on the break path — record each consuming
+                    // origin it leads to, tagged with the triggering counter.
+                    let ci_consuming = consuming_states_from(out, states);
+                    for c in ci_consuming {
+                        result.push((trigger, counter, c));
+                    }
+                    // Also continue walking past CI to find more CIs
+                    // (e.g., CI-2 behind a Split after CInc-1.break).
+                    ci_stack.push(out);
+                }
+                State::Split { out, out1 } => {
+                    ci_stack.push(out1);
+                    ci_stack.push(out);
+                }
+                State::Assert { out, .. } => ci_stack.push(out),
+                // Stop at consuming states, Match, and CInc nodes.
+                _ => {}
+            }
+        }
+    }
+
+    result.sort_by_key(|&(t, c, s)| (t.idx(), c.idx(), s.0));
+    result.dedup();
+    result
+}
+
 /// Collect the CInc continue-path targets reachable from `targets` through
 /// epsilon transitions.  Walks Split, Assert, and CI nodes; when a
 /// `CounterIncrement` is reached, its `out` (continue) target is collected.
@@ -836,8 +957,13 @@ impl<'a> Tier3DfaMatcher<'a> {
 
         // Process each counter's instances against origin actions.
         let mut any_can_break = false;
+        // Track which specific counters had at least one break, so that
+        // break_seeds can be gated on the triggering counter.
+        let num_counters = self.counters.len();
+        let mut counter_broke = vec![false; num_counters];
 
-        for c_idx in 0..self.counters.len() {
+        #[allow(clippy::needless_range_loop)]
+        for c_idx in 0..num_counters {
             for inst in &self.counters[c_idx] {
                 let action = t
                     .origin_keys
@@ -886,6 +1012,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                         }
                         if do_break {
                             any_can_break = true;
+                            counter_broke[c_idx] = true;
                             if *break_is_match {
                                 self.ever_matched = true;
                             }
@@ -901,31 +1028,42 @@ impl<'a> Tier3DfaMatcher<'a> {
         // Select DFA successor.
         if t.is_counting && any_can_break {
             self.current = t.with_break;
-            if !t.is_counting {
-                // unreachable given the outer `if`, but kept for clarity
-                if t.with_break_is_match {
-                    self.ever_matched = true;
-                }
-                if t.with_break_is_match_at_end {
-                    self.match_at_end = true;
-                }
-            }
         } else {
             self.current = t.no_break;
-            if !t.is_counting {
-                if t.no_break_is_match {
-                    self.ever_matched = true;
-                }
-                if t.no_break_is_match_at_end {
-                    self.match_at_end = true;
-                }
+        }
+        if !t.is_counting {
+            // Non-counting transition: the DFA state flags are the final
+            // word (no counter logic to override them).
+            let (m, mae) = if any_can_break {
+                (t.with_break_is_match, t.with_break_is_match_at_end)
+            } else {
+                (t.no_break_is_match, t.no_break_is_match_at_end)
+            };
+            if m {
+                self.ever_matched = true;
+            }
+            if mae {
+                self.match_at_end = true;
+            }
+        } else {
+            // Counting transition: per-instance break flags already set
+            // `ever_matched` and `match_at_end` above.  Additionally,
+            // the no_break state's match flags capture paths that reach
+            // Match / $ → Match WITHOUT going through any CInc break —
+            // these are unconditionally valid regardless of counter state.
+            if t.no_break_is_match {
+                self.ever_matched = true;
+            }
+            if t.no_break_is_match_at_end {
+                self.match_at_end = true;
             }
         }
 
         // Swap instance lists.
         std::mem::swap(&mut self.counters, &mut self.next_instances);
 
-        // Seed new instances.
+        // Seed new instances: unconditional seeds always, break seeds
+        // only when at least one instance actually broke.
         for &(counter, origin, value) in t.seeds.iter() {
             let c_idx = counter.idx();
             let already = self.counters[c_idx]
@@ -933,6 +1071,20 @@ impl<'a> Tier3DfaMatcher<'a> {
                 .any(|inst| inst.value == value && inst.origin == origin);
             if !already {
                 self.counters[c_idx].push(Instance { value, origin });
+            }
+        }
+        // Apply break seeds only when the specific triggering counter
+        // actually broke.  This prevents premature seeding of downstream
+        // counters when adjacent counters share the same byte set.
+        for &(trigger, counter, origin, value) in t.break_seeds.iter() {
+            if counter_broke[trigger.idx()] {
+                let c_idx = counter.idx();
+                let already = self.counters[c_idx]
+                    .iter()
+                    .any(|inst| inst.value == value && inst.origin == origin);
+                if !already {
+                    self.counters[c_idx].push(Instance { value, origin });
+                }
             }
         }
 
@@ -1059,11 +1211,18 @@ impl<'a> Tier3DfaMatcher<'a> {
         if self.match_at_end {
             return true;
         }
+        // Note: we intentionally do NOT check `state.is_match_at_end` here.
+        // For non-counting transitions, `self.match_at_end` already captures
+        // the DFA state's match-at-end flag (set in the fast path or
+        // step_slow).  For counting transitions, the DFA state's flag is
+        // overly optimistic: the with_break closure follows ALL CInc break
+        // paths (including downstream counters that haven't actually reached
+        // their min), so `is_match_at_end` may be set even when no valid
+        // break chain leads to `$ → Match`.  Only `self.match_at_end`
+        // (computed per-instance in step_slow) correctly reflects whether a
+        // specific counter instance actually broke with enough value.
         if self.current != DfaStateId::DEAD {
             let state = &self.cache.memory.states[self.current.idx()];
-            if state.is_match_at_end {
-                return true;
-            }
             if state.resolve_deferred_at_end(self.regex) {
                 return true;
             }

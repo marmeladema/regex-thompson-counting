@@ -8622,6 +8622,26 @@ mod tests {
                 ("", false),
             ],
         }
+
+        // ── Adjacent same-byte sequential counters (pre-existing bug) ───
+        // Two counters on the same byte 'a' without a separator — tests
+        // the break_seeds fix in tier 3.
+
+        test_adjacent_same_byte_counters {
+            pattern: "^a{2,50}a{3,70}$",
+            memory: 707,
+            min_tier: 3,
+            inputs: [
+                ("aaaaa", true),
+                ("aaaaaa", true),
+                ("aaaaaaaaaa", true),
+                ("aaaa", false),
+                ("aaa", false),
+                ("aa", false),
+                ("a", false),
+                ("", false),
+            ],
+        }
     }
 
     /// Tier 2 encodes counter identity in `u64` bitmasks, so patterns with
@@ -9067,5 +9087,25 @@ mod tests {
             result.is_ok(),
             "256 counters should succeed, got {result:?}"
         );
+    }
+
+    /// Regression test: tier 3 false positive with adjacent same-byte
+    /// sequential counters.  `^a{2,50}a{3,70}$` has two counters on byte
+    /// 'a' (both too large to unroll), and the minimum total is 2+3=5.
+    /// Before the fix, the break-seed mechanism would prematurely seed the
+    /// second counter, producing false positives for short inputs.
+    #[test]
+    fn test_tier3_adjacent_counter_false_positive() {
+        let pattern = "^a{2,50}a{3,70}$";
+        let re = build_regex_unchecked(pattern);
+        let oracle = regex::bytes::Regex::new(&format!("(?s-u){}", pattern)).unwrap();
+        assert!(re.tier3_eligible, "pattern should be tier 3 eligible");
+        // Sweep lengths around the min (5) and max (120) boundaries.
+        for n in 0..130 {
+            let input: String = "a".repeat(n);
+            let expected = oracle.is_match(input.as_bytes());
+            test_nfa(pattern, &re, &input, expected);
+            test_tier3(pattern, &re, &input, expected);
+        }
     }
 }
