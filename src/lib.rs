@@ -8465,6 +8465,145 @@ mod tests {
                 ("aaaab", false),
             ],
         }
+        // ---------------------------------------------------------------
+        // Tier 3 regression: optional elements in counter bodies.
+        //
+        // These patterns have variable-length bodies (due to `?`) and are
+        // not tier 2 eligible, so they exercise tier 3's per-instance
+        // tracking.  The bug was that `continue_origins` included states
+        // reachable without crossing CInc, causing phantom counter
+        // increments when the optional element's byte overlapped with the
+        // next iteration's prefix.
+        // ---------------------------------------------------------------
+
+        // Optional at end of body: `(aaa?){2}` — the original bug case.
+        test_tier3_optional_end {
+            pattern: "^(aaa?){2}$",
+            memory: 771,
+            min_tier: 1,
+            inputs: [
+                ("aaaa", true),
+                ("aaaaa", true),
+                ("aaaaaa", true),
+                ("aaa", false),
+                ("aa", false),
+                ("a", false),
+                ("", false),
+            ],
+        }
+        // Optional in 2-char body: `(ab?){2}`.
+        test_tier3_optional_short_body {
+            pattern: "^(ab?){2}$",
+            memory: 705,
+            min_tier: 1,
+            inputs: [
+                ("aa", true),
+                ("aba", true),
+                ("aab", true),
+                ("abab", true),
+                ("ab", false),
+                ("a", false),
+                ("abba", false),
+                ("", false),
+            ],
+        }
+        // Optional at start of body: `(a?b){2}`.
+        test_tier3_optional_start {
+            pattern: "^(a?b){2}$",
+            memory: 705,
+            min_tier: 1,
+            inputs: [
+                ("bb", true),
+                ("abb", true),
+                ("bab", true),
+                ("abab", true),
+                ("ab", false),
+                ("b", false),
+                ("ba", false),
+                ("", false),
+            ],
+        }
+        // Optional in middle of 3-char body: `(ab?c){2}`.
+        test_tier3_optional_middle {
+            pattern: "^(ab?c){2}$",
+            memory: 771,
+            min_tier: 1,
+            inputs: [
+                ("acac", true),
+                ("abcac", true),
+                ("acabc", true),
+                ("abcabc", true),
+                ("ac", false),
+                ("abc", false),
+                ("abcab", false),
+                ("", false),
+            ],
+        }
+        // Higher count: `(ab?){3}`.
+        test_tier3_optional_higher_count {
+            pattern: "^(ab?){3}$",
+            memory: 804,
+            min_tier: 1,
+            inputs: [
+                ("aaa", true),
+                ("aaba", true),
+                ("aabab", true),
+                ("ababab", true),
+                ("abab", false),
+                ("aa", false),
+                ("abba", false),
+                ("", false),
+            ],
+        }
+        // Range count with optional: `(aab?){2,4}`.
+        test_tier3_optional_range {
+            pattern: "^(aab?){2,4}$",
+            memory: 1101,
+            min_tier: 1,
+            inputs: [
+                ("aaaa", true),
+                ("aabaa", true),
+                ("aabaab", true),
+                ("aabaabaab", true),
+                ("aabaabaabaa", true),
+                ("aabaabaabaabaab", false),
+                ("aa", false),
+                ("aab", false),
+                ("", false),
+            ],
+        }
+        // Range count, optional at start: `(a?b){3,5}`.
+        test_tier3_optional_range_start {
+            pattern: "^(a?b){3,5}$",
+            memory: 1068,
+            min_tier: 1,
+            inputs: [
+                ("bbb", true),
+                ("abbb", true),
+                ("abbab", true),
+                ("ababab", true),
+                ("abababab", true),
+                ("bb", false),
+                ("bbbbbb", false),
+                ("", false),
+            ],
+        }
+        // Multi-char body with optional: `(abc?d){2}`.
+        test_tier3_optional_multichar {
+            pattern: "^(abc?d){2}$",
+            memory: 837,
+            min_tier: 1,
+            inputs: [
+                ("abdabd", true),
+                ("abcdabd", true),
+                ("abdabcd", true),
+                ("abcdabcd", true),
+                ("abd", false),
+                ("abcd", false),
+                ("abcabc", false),
+                ("", false),
+            ],
+        }
     }
 
     /// Tier 2 encodes counter identity in `u64` bitmasks, so patterns with

@@ -465,8 +465,15 @@ impl Tier3DfaCache {
             // Check for non-CInc paths (e.g., `+` loop before CInc).
             let cr_no_cinc = epsilon_closure_stop_at_cinc(targets, &regex.states);
 
+            // Compute continue_origins by starting from the CInc continue
+            // targets only — NOT from all targets.  This avoids including
+            // consuming states reachable via non-CInc paths (e.g., optional
+            // elements in the body like `aaa?`), which already appear in
+            // advance_origins.  Without this, those states would be spawned
+            // with an incorrectly incremented counter value.
+            let cinc_outs = cinc_continue_targets(targets, &regex.states);
             let cr_continue = self.epsilon_closure(
-                targets.iter().copied(),
+                cinc_outs.into_iter(),
                 regex,
                 false,
                 None,
@@ -739,6 +746,36 @@ fn find_cinc_through_epsilon(start: StateIdx, states: &[State]) -> Option<(usize
         }
     }
     None
+}
+
+/// Collect the CInc continue-path targets reachable from `targets` through
+/// epsilon transitions.  Walks Split, Assert, and CI nodes; when a
+/// `CounterIncrement` is reached, its `out` (continue) target is collected.
+/// Consuming states and Match are NOT followed.
+fn cinc_continue_targets(targets: &[StateIdx], states: &[State]) -> Vec<StateIdx> {
+    let mut result = Vec::new();
+    let mut stack: Vec<StateIdx> = targets.to_vec();
+    let mut visited = vec![false; states.len()];
+    while let Some(idx) = stack.pop() {
+        let i = idx.idx();
+        if visited[i] {
+            continue;
+        }
+        visited[i] = true;
+        match states[idx] {
+            State::CounterIncrement { out, .. } => {
+                result.push(out);
+            }
+            State::Split { out, out1 } => {
+                stack.push(out1);
+                stack.push(out);
+            }
+            State::Assert { out, .. } => stack.push(out),
+            State::CounterInstance { out, .. } => stack.push(out),
+            _ => {}
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
