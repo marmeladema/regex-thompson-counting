@@ -74,6 +74,7 @@ static NEXT_REGEX_ID: AtomicU64 = AtomicU64::new(1);
 
 mod dfa;
 mod info;
+mod memrange;
 
 use dfa::{
     DfaCache, DfaMatcher, Tier2DfaCache, Tier2DfaMatcher, Tier3DfaCache, Tier3DfaMatcher,
@@ -320,6 +321,10 @@ pub(crate) enum Prefilter {
     Memchr2(u8, u8),
     /// Exactly three distinct bytes can start a match.
     Memchr3(u8, u8, u8),
+    /// All start bytes fall in a contiguous range `[lo, hi]` (inclusive).
+    /// Used when there are more than 3 distinct start bytes but they fit
+    /// within a range of at most 16 values.
+    Range(u8, u8),
 }
 
 impl AssertKind {
@@ -980,6 +985,7 @@ impl Regex {
                     *a as char, *b as char, *c as char
                 )
             }
+            Prefilter::Range(lo, hi) => format!("range(0x{:02X}..=0x{:02X})", lo, hi),
         };
 
         RegexInfo {
@@ -2703,7 +2709,16 @@ impl RegexBuilder {
             1 => Prefilter::Memchr1(bytes[0]),
             2 => Prefilter::Memchr2(bytes[0], bytes[1]),
             3 => Prefilter::Memchr3(bytes[0], bytes[1], bytes[2]),
-            _ => Prefilter::None,
+            _ => {
+                // Check if all start bytes fit in a range of at most 16 values.
+                let lo = bytes[0]; // bytes is sorted (from 0..=255 filter)
+                let hi = bytes[bytes.len() - 1];
+                if hi - lo < 16 {
+                    Prefilter::Range(lo, hi)
+                } else {
+                    Prefilter::None
+                }
+            }
         }
     }
 
@@ -3576,6 +3591,9 @@ impl<'a> NfaMatcher<'a> {
             }
             Prefilter::Memchr3(b1, b2, b3) => {
                 self.chunk_prefilter(input, |hay| memchr::memchr3(b1, b2, b3, hay));
+            }
+            Prefilter::Range(lo, hi) => {
+                self.chunk_prefilter(input, |hay| crate::memrange::memrange(lo, hi, hay));
             }
         }
     }

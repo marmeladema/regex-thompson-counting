@@ -1004,6 +1004,14 @@ impl<'a> Tier3DfaMatcher<'a> {
                     return;
                 }
             }
+            Prefilter::Range(lo, hi) => {
+                if let Some(idx) = crate::memrange::memrange(lo, hi, input) {
+                    self.prefilter = Prefilter::None;
+                    &input[idx..]
+                } else {
+                    return;
+                }
+            }
         };
 
         let stride = self.cache.memory.stride;

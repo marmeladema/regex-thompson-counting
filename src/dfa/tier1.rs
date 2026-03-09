@@ -437,6 +437,11 @@ impl<'a> DfaMatcher<'a> {
             Prefilter::Memchr3(b1, b2, b3) => {
                 self.chunk_prefilter(input, start_id, |hay| memchr::memchr3(b1, b2, b3, hay));
             }
+            Prefilter::Range(lo, hi) => {
+                self.chunk_prefilter(input, start_id, |hay| {
+                    crate::memrange::memrange(lo, hi, hay)
+                });
+            }
         }
     }
 
