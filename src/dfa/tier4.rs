@@ -404,9 +404,15 @@ impl Tier4DfaCache {
 
     /// Epsilon closure that records counter operations into a program tree.
     ///
-    /// Unlike Tier 1's `epsilon_closure` which uses an iterative stack,
-    /// this uses a recursive DFS because the counter program structure
-    /// mirrors the recursion tree (Init → body → Increment with branches).
+    /// Unlike `DfaMemory::epsilon_closure` (used by tiers 1–3) which uses
+    /// an iterative stack, this uses a recursive DFS because the counter
+    /// program structure mirrors the recursion tree (Init → body →
+    /// Increment with branches).
+    ///
+    /// Variable naming follows the conventions in `DfaMemory`:
+    /// - `closure_visited` — per-state visited flag (stack-based: marked
+    ///   on entry, unmarked on exit, to allow sibling branches to revisit)
+    /// - `closure_result` — sorted NFA consuming states
     ///
     /// Returns: `(sorted NFA consuming states, is_match, is_match_at_end, program ops)`.
     fn epsilon_closure_with_program(
@@ -421,7 +427,7 @@ impl Tier4DfaCache {
             *v = false;
         }
 
-        let mut nfa_result: Vec<StateIdx> = Vec::new();
+        let mut closure_result: Vec<StateIdx> = Vec::new();
         let mut is_match = false;
         let mut is_match_at_end = false;
         let mut ops = Vec::new();
@@ -434,18 +440,22 @@ impl Tier4DfaCache {
                 at_start,
                 prev_byte,
                 &mut self.closure_visited,
-                &mut nfa_result,
+                &mut closure_result,
                 &mut is_match,
                 &mut is_match_at_end,
                 &mut ops,
             );
         }
 
-        nfa_result.sort_unstable_by_key(|s| s.0);
-        nfa_result.dedup();
+        closure_result.sort_unstable_by_key(|s| s.0);
+        closure_result.dedup();
 
-        let nfa_states: Box<[StateIdx]> = nfa_result.into_boxed_slice();
-        (nfa_states, is_match, is_match_at_end, ops)
+        (
+            closure_result.into_boxed_slice(),
+            is_match,
+            is_match_at_end,
+            ops,
+        )
     }
 
     /// Recursive trace through epsilon states, recording counter ops.
@@ -454,7 +464,7 @@ impl Tier4DfaCache {
     /// entry and unmarked on exit.  This prevents infinite loops on
     /// epsilon-only cycles (e.g. `(a?){2}` where `CInc.continue → Split
     /// → CInc`) while allowing sibling branches of the counter program
-    /// tree to re-traverse shared states.  The `nfa_result` vec may
+    /// tree to re-traverse shared states.  The `closure_result` vec may
     /// contain duplicates; the caller deduplicates it.
     #[allow(clippy::too_many_arguments)]
     fn trace_epsilon(
@@ -462,17 +472,17 @@ impl Tier4DfaCache {
         states: &[State],
         at_start: bool,
         prev_byte: Option<u8>,
-        on_stack: &mut [bool],
-        nfa_result: &mut Vec<StateIdx>,
+        closure_visited: &mut [bool],
+        closure_result: &mut Vec<StateIdx>,
         is_match: &mut bool,
         is_match_at_end: &mut bool,
         ops: &mut Vec<CounterOp>,
     ) {
         let i = idx.idx();
-        if on_stack[i] {
+        if closure_visited[i] {
             return;
         }
-        on_stack[i] = true;
+        closure_visited[i] = true;
 
         match states[idx] {
             State::Split { out, out1 } => {
@@ -481,8 +491,8 @@ impl Tier4DfaCache {
                     states,
                     at_start,
                     prev_byte,
-                    on_stack,
-                    nfa_result,
+                    closure_visited,
+                    closure_result,
                     is_match,
                     is_match_at_end,
                     ops,
@@ -492,8 +502,8 @@ impl Tier4DfaCache {
                     states,
                     at_start,
                     prev_byte,
-                    on_stack,
-                    nfa_result,
+                    closure_visited,
+                    closure_result,
                     is_match,
                     is_match_at_end,
                     ops,
@@ -507,8 +517,8 @@ impl Tier4DfaCache {
                             states,
                             at_start,
                             prev_byte,
-                            on_stack,
-                            nfa_result,
+                            closure_visited,
+                            closure_result,
                             is_match,
                             is_match_at_end,
                             ops,
@@ -516,21 +526,22 @@ impl Tier4DfaCache {
                     }
                 }
                 AssertKind::End => {
-                    // Check if Match is reachable through this `$` gate.
+                    // `$` gate: trace the sub-graph separately to find
+                    // match-at-end paths with their counter programs.
+                    let mut end_visited = vec![false; states.len()];
                     let mut sub_match = false;
-                    let mut sub_match_at_end = false;
                     let mut sub_ops = Vec::new();
                     Self::trace_epsilon_for_end(
                         out,
                         states,
+                        &mut end_visited,
                         &mut sub_match,
-                        &mut sub_match_at_end,
                         &mut sub_ops,
                     );
                     if sub_match {
                         *is_match_at_end = true;
-                        // Wrap the sub-program ops so they emit
-                        // MatchAtEnd instead of Match.
+                        // Rewrite EmitMatch → EmitMatchAtEnd so the
+                        // program emits the right signal at end-of-input.
                         rewrite_match_to_match_at_end(&mut sub_ops);
                         ops.extend(sub_ops);
                     }
@@ -542,8 +553,8 @@ impl Tier4DfaCache {
                             states,
                             at_start,
                             prev_byte,
-                            on_stack,
-                            nfa_result,
+                            closure_visited,
+                            closure_result,
                             is_match,
                             is_match_at_end,
                             ops,
@@ -551,11 +562,7 @@ impl Tier4DfaCache {
                     }
                 }
                 _ => {
-                    debug_assert!(
-                        false,
-                        "complex assertion in counting-DFA pattern: {:?}",
-                        kind
-                    );
+                    debug_assert!(false, "unsupported assertion in tier 4 pattern: {:?}", kind);
                 }
             },
             State::CounterInstance { counter, out } => {
@@ -565,8 +572,8 @@ impl Tier4DfaCache {
                     states,
                     at_start,
                     prev_byte,
-                    on_stack,
-                    nfa_result,
+                    closure_visited,
+                    closure_result,
                     is_match,
                     is_match_at_end,
                     &mut sub_ops,
@@ -590,8 +597,8 @@ impl Tier4DfaCache {
                     states,
                     at_start,
                     prev_byte,
-                    on_stack,
-                    nfa_result,
+                    closure_visited,
+                    closure_result,
                     is_match,
                     is_match_at_end,
                     &mut cont_ops,
@@ -607,8 +614,8 @@ impl Tier4DfaCache {
                     states,
                     at_start,
                     prev_byte,
-                    on_stack,
-                    nfa_result,
+                    closure_visited,
+                    closure_result,
                     is_match,
                     is_match_at_end,
                     &mut raw_break_ops,
@@ -633,46 +640,55 @@ impl Tier4DfaCache {
             | State::ByteCI { .. }
             | State::ByteClass { .. }
             | State::ByteTable { .. } => {
-                nfa_result.push(idx);
+                closure_result.push(idx);
                 ops.push(CounterOp::EmitContinue { origin: idx });
             }
         }
 
-        on_stack[i] = false;
+        closure_visited[i] = false;
     }
 
     /// Trace epsilon transitions for the `$` (End) path.
     ///
     /// This is a separate function because the `$` gate's sub-graph may
     /// contain counter operations that should only fire at end-of-input.
-    /// We don't use the main `visited` set because these states may also
-    /// appear in the main closure.
-    #[allow(clippy::only_used_in_recursion)]
+    /// Uses its own `closure_visited` set (not the main one) because
+    /// these states may also appear in the main closure.
+    ///
+    /// Uses stack-based cycle detection like `trace_epsilon`.
     fn trace_epsilon_for_end(
         idx: StateIdx,
         states: &[State],
+        closure_visited: &mut [bool],
         is_match: &mut bool,
-        is_match_at_end: &mut bool,
         ops: &mut Vec<CounterOp>,
     ) {
+        let i = idx.idx();
+        if closure_visited[i] {
+            return;
+        }
+        closure_visited[i] = true;
+
         match states[idx] {
             State::Match => {
                 *is_match = true;
                 ops.push(CounterOp::EmitMatch);
             }
             State::Split { out, out1 } => {
-                Self::trace_epsilon_for_end(out, states, is_match, is_match_at_end, ops);
-                Self::trace_epsilon_for_end(out1, states, is_match, is_match_at_end, ops);
+                Self::trace_epsilon_for_end(out, states, closure_visited, is_match, ops);
+                Self::trace_epsilon_for_end(out1, states, closure_visited, is_match, ops);
             }
-            State::Assert {
-                kind: AssertKind::End | AssertKind::Start | AssertKind::StartLF,
-                out,
-            } => {
-                Self::trace_epsilon_for_end(out, states, is_match, is_match_at_end, ops);
+            State::Assert { kind, out } => {
+                // Inside a `$` gate, `$` itself is trivially true (we're
+                // already past end-of-input).  `^` and `(?m:^)` cannot
+                // pass here.  Other assertions are not tier 4 eligible.
+                if kind == AssertKind::End {
+                    Self::trace_epsilon_for_end(out, states, closure_visited, is_match, ops);
+                }
             }
             State::CounterInstance { counter, out } => {
                 let mut sub_ops = Vec::new();
-                Self::trace_epsilon_for_end(out, states, is_match, is_match_at_end, &mut sub_ops);
+                Self::trace_epsilon_for_end(out, states, closure_visited, is_match, &mut sub_ops);
                 ops.push(CounterOp::Init {
                     counter,
                     then: sub_ops,
@@ -686,13 +702,13 @@ impl Tier4DfaCache {
                 max,
             } => {
                 let mut cont_ops = Vec::new();
-                Self::trace_epsilon_for_end(out, states, is_match, is_match_at_end, &mut cont_ops);
+                Self::trace_epsilon_for_end(out, states, closure_visited, is_match, &mut cont_ops);
                 let mut raw_break_ops = Vec::new();
                 Self::trace_epsilon_for_end(
                     out1,
                     states,
+                    closure_visited,
                     is_match,
-                    is_match_at_end,
                     &mut raw_break_ops,
                 );
                 let break_ops = vec![CounterOp::Remove {
@@ -709,6 +725,8 @@ impl Tier4DfaCache {
             }
             _ => {} // Consuming states block the path at end-of-input.
         }
+
+        closure_visited[i] = false;
     }
 
     /// Compute a counting transition for `(from_state, byte)`, using
