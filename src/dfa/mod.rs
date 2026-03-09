@@ -8,6 +8,10 @@
 //!
 //! Only `StartCRLF` and `EndCRLF` remain DFA-ineligible.
 //!
+//! **Tier 2** (non-nested, fixed-length-body repetitions): Becchi-style
+//! differential counters.  O(1) per byte for patterns where every counter
+//! body has a fixed byte length.
+//!
 //! **Tier 3** (non-nested counted repetitions): DFA + conditional transitions.
 //! Precomputes separate DFA successor states per counter condition instead
 //! of using runtime counter programs.  Each counter tracked independently.
@@ -28,7 +32,7 @@ use ahash::HashMap;
 
 pub(crate) use tier1::{DfaCache, DfaMatcher};
 pub(crate) use tier2::{Tier2DfaCache, Tier2DfaMatcher};
-pub(crate) use tier3::{Tier3DfaCache, Tier3DfaMatcher};
+pub(crate) use tier3::{Tier3Analysis, Tier3DfaCache, Tier3DfaMatcher, compute_tier3_analysis};
 pub(crate) use tier4::{Tier4DfaCache, Tier4DfaMatcher};
 
 use crate::{AssertEval, AssertKind, CounterIdx, Regex, State, StateIdx};
@@ -38,10 +42,10 @@ use crate::{AssertEval, AssertKind, CounterIdx, Regex, State, StateIdx};
 const DFA_MAX_STATES: usize = 2048;
 
 // ---------------------------------------------------------------------------
-// DFA state table (shared by Tier 1 and Tier 3)
+// DFA state table (shared by all tiers)
 // ---------------------------------------------------------------------------
 
-/// Index into the DFA state table ([`DfaCache::states`]).
+/// Index into the DFA state table ([`DfaMemory::states`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct DfaStateId(u32);
 
@@ -61,8 +65,9 @@ impl DfaStateId {
 /// indices, plus flags derived from the epsilon closure.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct DfaState {
-    /// Sorted NFA state indices (consuming states only: Byte, ByteClass,
-    /// ByteTable).  Assert states are resolved during closure computation;
+    /// Sorted NFA state indices (consuming states only: Byte, ByteCI,
+    /// ByteClass, ByteTable).  Assert states are resolved during closure
+    /// computation;
     /// Match states set the `is_match` / `is_match_at_end` flags.
     pub(super) nfa_states: Box<[StateIdx]>,
     /// NFA Assert state indices whose evaluation was deferred because the
@@ -192,12 +197,15 @@ impl DfaMemory {
 
     /// Compute the epsilon closure from a set of NFA seed states.
     ///
-    /// Follows `Split` and evaluable assertions (`Start`, `End`, `StartLF`).
-    /// Assertions that need the next byte (`WordAscii`, `WordAsciiNegate`,
-    /// `EndLF`) are evaluated with `next=None`; if they return `Defer`, the
-    /// Assert state index is collected in `closure_deferred`.
+    /// Follows `Split` and evaluable assertions (`Start`, `StartLF`).
+    /// `End` (`$`) is handled specially: when not at end-of-input it sets
+    /// `is_match_at_end` instead of following `out`.  Assertions that may
+    /// need the next byte (`WordAscii`, `WordAsciiNegate`, `EndLF`) can
+    /// return `Defer`, in which case the Assert state index is collected
+    /// in `closure_deferred`.
     ///
-    /// Returns `(consuming_states, deferred_asserts, is_match, is_match_at_end)`.
+    /// Returns `(is_match, is_match_at_end)`.  Consuming states are left
+    /// in `self.closure_result`; deferred asserts in `self.closure_deferred`.
     #[allow(clippy::too_many_arguments)]
     #[inline]
     fn epsilon_closure(
