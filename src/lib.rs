@@ -1162,10 +1162,6 @@ pub struct RegexBuilder {
     /// (fixed or non-fixed) of a simple body into concatenated copies.
     /// Set to 0 to disable unrolling entirely.  Default: 32.
     max_unroll_states: usize,
-    /// When true, we are currently inside the body of a repetition that
-    /// will use a counter.  Non-fixed unrolling is suppressed because it
-    /// would change the atomicity of the counter body.
-    in_repetition_body: bool,
 }
 
 impl Default for RegexBuilder {
@@ -1179,7 +1175,6 @@ impl Default for RegexBuilder {
             byte_tables: Vec::new(),
             max_repetition: 1000,
             max_unroll_states: DEFAULT_MAX_UNROLL_STATES,
-            in_repetition_body: false,
         }
     }
 }
@@ -1477,13 +1472,6 @@ impl RegexBuilder {
             return Ok(false);
         }
 
-        // Non-fixed unrolling inside a counter body would break atomicity:
-        // the optional tail merges with the next counter iteration.
-        // Only fixed unrolling (min == max) is safe inside counter bodies.
-        if min != max && self.in_repetition_body {
-            return Ok(false);
-        }
-
         if min == max {
             // Fixed: X{N} → X·X·…·X  (N copies)
             let cost = min * body_nfa;
@@ -1731,20 +1719,14 @@ impl RegexBuilder {
                     self.postfix.push(RegexHirNode::RepeatZeroOne);
                 } else if min > 0 {
                     let counter = self.next_counter()?;
-                    let saved = self.in_repetition_body;
-                    self.in_repetition_body = true;
                     self.hir2postfix(&rep.sub)?;
-                    self.in_repetition_body = saved;
                     self.postfix
                         .push(RegexHirNode::CounterLoop { counter, min, max });
                 } else {
                     // {0,max}: lower to (body{1,max})? — the `?` wrapping
                     // provides the zero-match path.
                     let counter = self.next_counter()?;
-                    let saved = self.in_repetition_body;
-                    self.in_repetition_body = true;
                     self.hir2postfix(&rep.sub)?;
-                    self.in_repetition_body = saved;
                     self.postfix.push(RegexHirNode::CounterLoop {
                         counter,
                         min: 1,
@@ -2149,8 +2131,17 @@ impl RegexBuilder {
                             State::Assert { out, .. } => {
                                 stack.push(out);
                             }
-                            // Consuming states and Match terminate the walk.
-                            _ => {}
+                            // Follow consuming states to detect nesting
+                            // behind byte-consuming instructions.
+                            State::Byte { out, .. }
+                            | State::ByteCI { out, .. }
+                            | State::ByteClass { out, .. } => {
+                                stack.push(out);
+                            }
+                            // ByteTable dispatches via a table — skip it.
+                            // Nested counters behind ByteTable are extremely
+                            // unlikely in practice.
+                            State::ByteTable { .. } | State::Match => {}
                         }
                     }
                     false
@@ -8642,6 +8633,170 @@ mod tests {
                 ("", false),
             ],
         }
+
+        // ── Inner-unrolling-inside-counter-body tests ───────────────────
+        // These patterns previously required tier 4 (nested counters) but
+        // now the inner repetition unrolls, leaving a single counter → tier 3.
+
+        // Simple: inner {1,3} unrolls (cost 5 ≤ 32), body becomes variable-length → tier 3.
+        test_inner_unroll_simple {
+            pattern: "^(a{1,3}){2,4}$",
+            memory: 1233,
+            min_tier: 1,
+            inputs: [
+                ("aa", true),
+                ("aaa", true),
+                ("aaaa", true),
+                ("aaaaaa", true),
+                ("aaaaaaaaaa", true),
+                ("aaaaaaaaaaaa", true),
+                ("a", false),
+                ("aaaaaaaaaaaaa", false),
+                ("", false),
+            ],
+        }
+        // Inner {1,2} with multi-byte body inside counter.
+        test_inner_unroll_multibyte_body {
+            pattern: "^(ab{1,2}){2,3}$",
+            memory: 936,
+            min_tier: 1,
+            inputs: [
+                ("abab", true),
+                ("abbab", true),
+                ("ababb", true),
+                ("abbabb", true),
+                ("abbabbabb", true),
+                ("ab", false),
+                ("abbabbabbabb", false),
+                ("", false),
+            ],
+        }
+        // Inner {0,3} inside counter — zero-min inner unrolls too.
+        test_inner_unroll_zero_min {
+            pattern: "^(a{0,3}){2,4}$",
+            memory: 1365,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("aa", true),
+                ("aaa", true),
+                ("aaaaaa", true),
+                ("aaaaaaaaaaaa", true),
+                ("aaaaaaaaaaaaa", false),
+            ],
+        }
+        // Two inner repetitions in the same counter body.
+        test_inner_unroll_two_reps {
+            pattern: "^(a{1,2}b{1,2}){2,3}$",
+            memory: 1134,
+            min_tier: 1,
+            inputs: [
+                ("abab", true),
+                ("aabbab", true),
+                ("ababb", true),
+                ("aabbaabb", true),
+                ("aabbabbaabb", true),
+                ("aabbaabbaabb", true),
+                ("ab", false),
+                ("", false),
+            ],
+        }
+        // Case-insensitive inner unrolling.
+        test_inner_unroll_case_insensitive {
+            pattern: "^(?i)(a{1,3}){2,4}$",
+            memory: 1233,
+            min_tier: 1,
+            inputs: [
+                ("aA", true),
+                ("AaA", true),
+                ("aaAA", true),
+                ("AaAaAaAaAaAa", true),
+                ("a", false),
+                ("AaAaAaAaAaAaA", false),
+                ("", false),
+            ],
+        }
+        // Inner over budget: a{1,17} costs 33 > 32, stays as counter.
+        // Outer {2,3} unrolls to 3 sequential counters → tier 3.
+        // Uses (a{1,17}b) body so the 3 counters match different
+        // byte sequences, avoiding a tier 3 limitation with same-byte
+        // sequential counters.
+        test_inner_unroll_over_budget {
+            pattern: "^(a{1,17}b){2,3}$",
+            memory: 939,
+            min_tier: 3,
+            inputs: [
+                ("abab", true),
+                ("aaaaabab", true),
+                ("aaaaaaaaaaaaaaaaabaaaaaaaaaaaaaaaaab", true),
+                ("aaaaaaaaaaaaaaaaabaaaaaaaaaaaaaaaaabaaaaaaaaaaaaaaaaab", true),
+                ("ab", false),
+                ("aaaaaaaaaaaaaaaaaaaab", false),
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false),
+                ("", false),
+            ],
+        }
+        // The motivating pattern from the rebar benchmarks.
+        test_inner_unroll_ip_pattern {
+            pattern: r"(?i)(?:(?:[0-9]{1,3}\.){3}[0-9]{1,3}|(?:[0-9a-f]{1,4}::?){2,7}[0-9a-f]{1,4}):$",
+            memory: 2439,
+            min_tier: 3,
+            inputs: [
+                ("192.168.1.1:", true),
+                ("10.0.0.1:", true),
+                ("255.255.255.255:", true),
+                ("a:b:c:", true),
+                ("fe80:0:1:", true),
+                ("192.168.1:", false),
+                ("192.168.1.1", false),
+                ("", false),
+            ],
+        }
+        // Anchored inner {1,4} inside {3} (fixed outer).
+        test_inner_unroll_fixed_outer {
+            pattern: "^(a{1,4}){3}$",
+            memory: 1200,
+            min_tier: 1,
+            inputs: [
+                ("aaa", true),
+                ("aaaa", true),
+                ("aaaaaaaaaaaa", true),
+                ("aa", false),
+                ("aaaaaaaaaaaaa", false),
+                ("", false),
+            ],
+        }
+        // Inner {2,3} inside {0,2} — zero-min outer with inner unrolling.
+        test_inner_unroll_zero_min_outer {
+            pattern: "^(a{2,3}){0,2}$",
+            memory: 837,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("aa", true),
+                ("aaa", true),
+                ("aaaa", true),
+                ("aaaaa", true),
+                ("aaaaaa", true),
+                ("a", false),
+                ("aaaaaaa", false),
+            ],
+        }
+        // Dot-based inner repetition inside counter.
+        test_inner_unroll_dot_body {
+            pattern: "^(.{1,3}x){2,3}$",
+            memory: 1390,
+            min_tier: 1,
+            inputs: [
+                ("axbx", true),
+                ("abxcdx", true),
+                ("abcxdexfgx", true),
+                ("abcde", false),
+                ("x", false),
+                ("", false),
+            ],
+        }
     }
 
     /// Tier 2 encodes counter identity in `u64` bitmasks, so patterns with
@@ -9106,6 +9261,25 @@ mod tests {
             let expected = oracle.is_match(input.as_bytes());
             test_nfa(pattern, &re, &input, expected);
             test_tier3(pattern, &re, &input, expected);
+        }
+    }
+
+    /// Regression test: inner-unroll producing adjacent same-byte counters.
+    /// `^(a{2,18}){2,3}$` unrolls the outer {2,3} into 2-3 sequential
+    /// a{2,18} counters — all on the same byte 'a'.
+    #[test]
+    fn test_tier3_unrolled_adjacent_counter_false_positive() {
+        let pattern = "^(a{2,18}){2,3}$";
+        let re = build_regex_with_unroll(pattern, DEFAULT_MAX_UNROLL_STATES);
+        let oracle = regex::bytes::Regex::new(&format!("(?s-u){}", pattern)).unwrap();
+        // Lengths around the min (4) and max (54) boundaries.
+        for n in 0..70 {
+            let input: String = "a".repeat(n);
+            let expected = oracle.is_match(input.as_bytes());
+            test_nfa(pattern, &re, &input, expected);
+            if re.tier3_eligible {
+                test_tier3(pattern, &re, &input, expected);
+            }
         }
     }
 }
