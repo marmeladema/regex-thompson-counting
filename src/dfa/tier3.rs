@@ -87,18 +87,6 @@ pub(crate) struct Tier3Analysis {
     /// counter breaks: the seed for `counter` at `origin` is applied
     /// when `trigger`'s CInc break path is taken.
     pub(crate) break_seeds: Box<[Tier3BreakSeed]>,
-
-    /// `true` when range-compressed instance tracking is possible,
-    /// enabling the fast path in [`Tier3DfaMatcher::step_slow_ranged`].
-    ///
-    /// Instances at each origin within a counter always form a
-    /// contiguous value range, so they can be represented as
-    /// `(origin, min_val, max_val)` triples instead of individual
-    /// `Instance` structs.  This holds for both fixed-length and
-    /// variable-length bodies (see the contiguity argument in
-    /// [`analyze`]).  The cost drops from O(max_count) to
-    /// O(num_body_origins) per counter per byte.
-    pub(crate) all_counters_rangeable: bool,
 }
 
 /// What happens structurally when a byte is consumed at a given target.
@@ -150,7 +138,6 @@ pub(crate) fn compute_tier3_analysis(
     states: &[State],
     byte_tables: &[crate::ByteMap],
     state_can_reach_match: &[bool],
-    counter_info: &[(usize, usize, usize)],
 ) -> Tier3Analysis {
     let n = states.len();
 
@@ -252,66 +239,10 @@ pub(crate) fn compute_tier3_analysis(
         })
         .collect();
 
-    // -- Step 5: determine range-compressibility --------------------------------
-    //
-    // Range compression replaces the per-instance list `Vec<Instance>` with
-    // a per-origin `Vec<InstanceRange>` where each entry is an
-    // `(origin, min_value, max_value)` triple.  This collapses O(max_count)
-    // work per counter per byte down to O(num_body_origins).
-    //
-    // The original implementation only enabled this for fixed-length bodies
-    // (`body_byte_length > 0`), on the reasoning that fixed-length bodies
-    // produce exactly one origin and therefore trivially maintain a
-    // contiguous value range.  Variable-length bodies have multiple origins
-    // (one per possible body length), and it was unclear whether values at
-    // each origin would remain contiguous.
-    //
-    // **Why the fixed-length restriction was unnecessary:**
-    //
-    // Values at each origin always form a contiguous range [0, k] for some
-    // k, regardless of body length variability.  The argument proceeds by
-    // induction on the byte position in the input:
-    //
-    // 1. **Seed injection**: Every step, the unanchored loop injects a
-    //    fresh seed with value 0 at origin 0 (the body entry point).
-    //    This establishes value 0 at origin 0 on every step.
-    //
-    // 2. **Advance**: When a byte is consumed, an instance at
-    //    `(value, origin_i)` moves to `(value, origin_j)` for each
-    //    `origin_j` reachable from `origin_i` via epsilon closure.
-    //    Since the set of values at `origin_i` is contiguous [a, b]
-    //    by the inductive hypothesis, the set of values arriving at
-    //    `origin_j` from this source is also [a, b].  Multiple
-    //    sources merging at `origin_j` are each contiguous and all
-    //    anchored at 0, so their union is still contiguous.
-    //
-    // 3. **Continue (increment)**: When a counter body completes, the
-    //    instance at `(value, final_origin)` becomes `(value + 1, origin_0)`.
-    //    By the inductive hypothesis, `final_origin` holds [a, b], so
-    //    origin_0 receives [a+1, b+1].  Combined with the seed's
-    //    value 0 already at origin_0 (from step 1), origin_0 now has
-    //    [0, b+1] — still contiguous.
-    //
-    // 4. **Break (counter exhausted)**: When `value + 1 > max`, the
-    //    instance exits the counter entirely.  This removes the top
-    //    of the range but doesn't fragment it.
-    //
-    // The key insight is that all ranges are "anchored at 0" — they always
-    // include value 0 because of the continuous seed injection.  Two ranges
-    // that both start at 0 can never have a gap between them; their union
-    // is simply [0, max(b1, b2)], which `insert_range()` computes via
-    // min/max.
-    //
-    // This enables range compression for patterns like `(.{1,5}){0,100}z`
-    // or `(ab|a){1,50}c`, reducing per-byte cost from O(max_count) to
-    // O(num_origins) — typically single-digit even for complex bodies.
-    let all_counters_rangeable = !counter_info.is_empty();
-
     Tier3Analysis {
         targets: targets_vec.into_boxed_slice(),
         ci_origins: ci_origins_vec.into_boxed_slice(),
         break_seeds: break_seeds.into_boxed_slice(),
-        all_counters_rangeable,
     }
 }
 
@@ -433,7 +364,7 @@ impl OriginAction {
 }
 
 // ---------------------------------------------------------------------------
-// Instance tracking
+// Range-compressed instance tracking
 // ---------------------------------------------------------------------------
 
 /// Merge a `[min_val, max_val]` range into a sorted `Vec<InstanceRange>`.
@@ -461,21 +392,47 @@ fn insert_range(ranges: &mut Vec<InstanceRange>, origin: StateIdx, min_val: u32,
     });
 }
 
-/// A single active counter instance.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Instance {
-    /// Number of completed iterations (0 when freshly seeded at CI).
-    value: u32,
-    /// The NFA consuming state this instance is waiting at.
-    origin: StateIdx,
-}
-
 /// A contiguous range of counter values at a single origin.
 ///
 /// Represents the set of instances `{(v, origin) | min_val <= v <= max_val}`.
-/// Used by the range-compressed fast path when all counter bodies have fixed
-/// byte-length.  At steady state, each origin within a counter body
-/// accumulates a contiguous range `[0, max-1]`.
+/// At steady state, each origin within a counter body accumulates a
+/// contiguous range `[0, max-1]`.
+///
+/// ## Why values at each origin always form a contiguous range
+///
+/// This holds for both fixed-length and variable-length bodies.  The
+/// argument proceeds by induction on the byte position in the input:
+///
+/// 1. **Seed injection**: Every step, the unanchored loop injects a
+///    fresh seed with value 0 at origin 0 (the body entry point).
+///    This establishes value 0 at origin 0 on every step.
+///
+/// 2. **Advance**: When a byte is consumed, an instance at
+///    `(value, origin_i)` moves to `(value, origin_j)` for each
+///    `origin_j` reachable from `origin_i` via epsilon closure.
+///    Since the set of values at `origin_i` is contiguous `[a, b]`
+///    by the inductive hypothesis, the set of values arriving at
+///    `origin_j` from this source is also `[a, b]`.  Multiple
+///    sources merging at `origin_j` are each contiguous and all
+///    anchored at 0, so their union is still contiguous.
+///
+/// 3. **Continue (increment)**: When a counter body completes, the
+///    instance at `(value, final_origin)` becomes `(value + 1, origin_0)`.
+///    By the inductive hypothesis, `final_origin` holds `[a, b]`, so
+///    origin\_0 receives `[a+1, b+1]`.  Combined with the seed's
+///    value 0 already at origin\_0 (from step 1), origin\_0 now has
+///    `[0, b+1]` — still contiguous.
+///
+/// 4. **Break (counter exhausted)**: When `value + 1 > max`, the
+///    instance exits the counter entirely.  This removes the top
+///    of the range but doesn't fragment it.
+///
+/// The key insight is that all ranges are "anchored at 0" — they always
+/// include value 0 because of the continuous seed injection.  Two ranges
+/// that both start at 0 can never have a gap between them; their union
+/// is simply `[0, max(b1, b2)]`, which [`insert_range`] computes via
+/// min/max.  This reduces per-byte cost from O(max\_count) to
+/// O(num\_origins) — typically single-digit even for complex bodies.
 #[derive(Clone, Debug)]
 struct InstanceRange {
     /// The NFA consuming state these instances are waiting at.
@@ -1135,21 +1092,21 @@ fn break_closure(
 // ---------------------------------------------------------------------------
 
 /// Tier 3 DFA matcher.
+///
+/// Counter instances are tracked using range-compressed
+/// [`InstanceRange`] entries (one per origin per counter) rather than
+/// individual instances.  See the contiguity proof on [`InstanceRange`]
+/// for why this is always valid.
 pub struct Tier3DfaMatcher<'a> {
     cache: &'a mut Tier3DfaCache,
     memory: &'a mut DfaMemory,
     regex: &'a Regex,
     analysis: &'a Tier3Analysis,
     current: DfaStateId,
-    counters: Vec<Vec<Instance>>,
-    next_instances: Vec<Vec<Instance>>,
     /// Range-compressed instance storage (one `Vec<InstanceRange>` per
-    /// counter).  Used instead of `counters`/`next_instances` when
-    /// [`Tier3Analysis::all_counters_rangeable`] is true.
-    ranged_counters: Vec<Vec<InstanceRange>>,
-    next_ranged: Vec<Vec<InstanceRange>>,
-    /// `true` when range-compressed instance tracking is active.
-    use_ranges: bool,
+    /// counter).
+    counters: Vec<Vec<InstanceRange>>,
+    next_counters: Vec<Vec<InstanceRange>>,
     ever_matched: bool,
     match_at_end: bool,
     has_live_instances: bool,
@@ -1163,21 +1120,13 @@ impl<'a> Tier3DfaMatcher<'a> {
         regex: &'a Regex,
         analysis: &'a Tier3Analysis,
     ) -> Self {
-        let use_ranges = analysis.all_counters_rangeable;
         let nc = regex.num_counters;
 
-        let mut counters: Vec<Vec<Instance>> = (0..nc).map(|_| Vec::new()).collect();
-        let next_instances: Vec<Vec<Instance>> = (0..nc).map(|_| Vec::new()).collect();
-        let mut ranged_counters: Vec<Vec<InstanceRange>> = (0..nc).map(|_| Vec::new()).collect();
-        let next_ranged: Vec<Vec<InstanceRange>> = (0..nc).map(|_| Vec::new()).collect();
+        let mut counters: Vec<Vec<InstanceRange>> = (0..nc).map(|_| Vec::new()).collect();
+        let next_counters: Vec<Vec<InstanceRange>> = (0..nc).map(|_| Vec::new()).collect();
 
         for &(counter, origin, value) in cache.start_seeds.iter() {
-            let ci = counter.idx();
-            if use_ranges {
-                insert_range(&mut ranged_counters[ci], origin, value, value);
-            } else {
-                counters[ci].push(Instance { value, origin });
-            }
+            insert_range(&mut counters[counter.idx()], origin, value, value);
         }
 
         let ever_matched = cache.inner.start_is_match;
@@ -1194,201 +1143,29 @@ impl<'a> Tier3DfaMatcher<'a> {
             regex,
             analysis,
             counters,
-            next_instances,
-            ranged_counters,
-            next_ranged,
-            use_ranges,
+            next_counters,
             prefilter: regex.prefilter,
         }
     }
 
     /// Slow path: handles counting transitions and instance processing.
+    ///
+    /// Operates on range-compressed [`InstanceRange`] entries (one per
+    /// origin per counter).  This reduces per-byte work from O(max_count)
+    /// to O(num_body_origins) per counter.  See the contiguity proof on
+    /// [`InstanceRange`] for why range compression is always valid.
     #[inline(never)]
     fn step_slow(&mut self, slot: usize) {
         let t = &self.cache.transitions[slot];
 
-        // Reset next_instances.
-        for ni in &mut self.next_instances {
-            ni.clear();
-        }
-        self.match_at_end = false;
-
-        // Process each counter's instances against origin actions.
-        let mut any_can_break = false;
-        // Track which specific counters had at least one break, so that
-        // break_seeds can be gated on the triggering counter.
-        // Uses a u64 bitmask — tier 3 patterns have at most a handful of
-        // counters (well under 64), avoiding per-byte heap allocation.
-        let num_counters = self.counters.len();
-        debug_assert!(num_counters <= 64);
-        let mut counter_broke: u64 = 0;
-
-        #[allow(clippy::needless_range_loop)]
-        for c_idx in 0..num_counters {
-            for inst in &self.counters[c_idx] {
-                let action = t
-                    .origin_keys
-                    .iter()
-                    .position(|&k| k == inst.origin)
-                    .map(|i| &t.origin_actions[i]);
-
-                match action {
-                    Some(OriginAction::Advance { new_origins }) => {
-                        for &new_o in new_origins.iter() {
-                            self.next_instances[c_idx].push(Instance {
-                                value: inst.value,
-                                origin: new_o,
-                            });
-                        }
-                    }
-                    Some(OriginAction::Dead) | None => {}
-                    Some(OriginAction::Increment {
-                        advance_origins,
-                        min,
-                        max,
-                        continue_origins,
-                        break_is_match,
-                        break_is_match_at_end,
-                    }) => {
-                        // Advance-or-increment: instance always survives
-                        // at advance_origins with same value.
-                        for &new_o in advance_origins.iter() {
-                            self.next_instances[c_idx].push(Instance {
-                                value: inst.value,
-                                origin: new_o,
-                            });
-                        }
-                        // CInc fires.
-                        let new_val = inst.value + 1;
-                        let do_continue = new_val < *max;
-                        let do_break = new_val >= *min;
-
-                        if do_continue {
-                            for &new_o in continue_origins.iter() {
-                                self.next_instances[c_idx].push(Instance {
-                                    value: new_val,
-                                    origin: new_o,
-                                });
-                            }
-                        }
-                        if do_break {
-                            any_can_break = true;
-                            counter_broke |= 1u64 << c_idx;
-                            if *break_is_match {
-                                self.ever_matched = true;
-                            }
-                            if *break_is_match_at_end {
-                                self.match_at_end = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Dedup next_instances to prevent exponential growth.
-        //
-        // When a counter body has multiple origins (variable-length body),
-        // each instance fans out to several advance/continue origins.
-        // Without dedup, duplicate (value, origin) pairs multiply each
-        // step: N dupes × F fan-out = N×F dupes, compounding to O(F^N).
-        // Sort + dedup is O(n log n) with tiny elements (8 bytes each).
-        for ni in &mut self.next_instances {
-            if ni.len() > 1 {
-                ni.sort_unstable_by_key(|inst| (inst.origin.0, inst.value));
-                ni.dedup();
-            }
-        }
-
-        // Select DFA successor.
-        if t.is_counting && any_can_break {
-            self.current = t.with_break;
-        } else {
-            self.current = t.no_break;
-        }
-        if !t.is_counting {
-            // Non-counting transition: the DFA state flags are the final
-            // word (no counter logic to override them).
-            let (m, mae) = if any_can_break {
-                (t.with_break_is_match, t.with_break_is_match_at_end)
-            } else {
-                (t.no_break_is_match, t.no_break_is_match_at_end)
-            };
-            if m {
-                self.ever_matched = true;
-            }
-            if mae {
-                self.match_at_end = true;
-            }
-        } else {
-            // Counting transition: per-instance break flags already set
-            // `ever_matched` and `match_at_end` above.  Additionally,
-            // the no_break state's match flags capture paths that reach
-            // Match / $ → Match WITHOUT going through any CInc break —
-            // these are unconditionally valid regardless of counter state.
-            if t.no_break_is_match {
-                self.ever_matched = true;
-            }
-            if t.no_break_is_match_at_end {
-                self.match_at_end = true;
-            }
-        }
-
-        // Swap instance lists.
-        std::mem::swap(&mut self.counters, &mut self.next_instances);
-
-        // Seed new instances: unconditional seeds always, break seeds
-        // only when at least one instance actually broke.
-        for &(counter, origin, value) in t.seeds.iter() {
-            let c_idx = counter.idx();
-            let already = self.counters[c_idx]
-                .iter()
-                .any(|inst| inst.value == value && inst.origin == origin);
-            if !already {
-                self.counters[c_idx].push(Instance { value, origin });
-            }
-        }
-        // Apply break seeds only when the specific triggering counter
-        // actually broke.  This prevents premature seeding of downstream
-        // counters when adjacent counters share the same byte set.
-        for &(trigger, counter, origin, value) in t.break_seeds.iter() {
-            if counter_broke & (1u64 << trigger.idx()) != 0 {
-                let c_idx = counter.idx();
-                let already = self.counters[c_idx]
-                    .iter()
-                    .any(|inst| inst.value == value && inst.origin == origin);
-                if !already {
-                    self.counters[c_idx].push(Instance { value, origin });
-                }
-            }
-        }
-
-        // Update has_live_instances flag.
-        self.has_live_instances = self.counters.iter().any(|c| !c.is_empty());
-    }
-
-    /// Range-compressed slow path for counting transitions.
-    ///
-    /// Semantically equivalent to [`step_slow`] but operates on
-    /// `InstanceRange` entries (one per origin per counter) instead of
-    /// individual `Instance` structs.  This reduces per-byte work from
-    /// O(max_count) to O(body_length) per counter.
-    ///
-    /// Only valid when [`Tier3Analysis::all_counters_rangeable`] is true.
-    /// This applies to all patterns with counters, including those with
-    /// variable-length bodies (see the contiguity argument in [`analyze`]).
-    #[inline(never)]
-    fn step_slow_ranged(&mut self, slot: usize) {
-        let t = &self.cache.transitions[slot];
-
-        // Reset next_ranged.
-        for nr in &mut self.next_ranged {
+        // Reset next_counters.
+        for nr in &mut self.next_counters {
             nr.clear();
         }
         self.match_at_end = false;
 
         let mut any_can_break = false;
-        let num_counters = self.ranged_counters.len();
+        let num_counters = self.counters.len();
         // Use u64 bitmask — tier 3 patterns have at most a handful of
         // counters (well under 64).
         debug_assert!(num_counters <= 64);
@@ -1396,7 +1173,7 @@ impl<'a> Tier3DfaMatcher<'a> {
 
         #[allow(clippy::needless_range_loop)]
         for c_idx in 0..num_counters {
-            for range in &self.ranged_counters[c_idx] {
+            for range in &self.counters[c_idx] {
                 let action = t
                     .origin_keys
                     .iter()
@@ -1407,7 +1184,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                     Some(OriginAction::Advance { new_origins }) => {
                         for &new_o in new_origins.iter() {
                             insert_range(
-                                &mut self.next_ranged[c_idx],
+                                &mut self.next_counters[c_idx],
                                 new_o,
                                 range.min_val,
                                 range.max_val,
@@ -1427,7 +1204,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                         // advance_origins with the same values.
                         for &new_o in advance_origins.iter() {
                             insert_range(
-                                &mut self.next_ranged[c_idx],
+                                &mut self.next_counters[c_idx],
                                 new_o,
                                 range.min_val,
                                 range.max_val,
@@ -1444,7 +1221,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                             let cont_max = new_max.min(continue_cap);
                             for &new_o in continue_origins.iter() {
                                 insert_range(
-                                    &mut self.next_ranged[c_idx],
+                                    &mut self.next_counters[c_idx],
                                     new_o,
                                     new_min,
                                     cont_max,
@@ -1497,43 +1274,27 @@ impl<'a> Tier3DfaMatcher<'a> {
         }
 
         // Swap range lists.
-        std::mem::swap(&mut self.ranged_counters, &mut self.next_ranged);
+        std::mem::swap(&mut self.counters, &mut self.next_counters);
 
         // Seed new instances as single-value ranges.
         for &(counter, origin, value) in t.seeds.iter() {
-            insert_range(
-                &mut self.ranged_counters[counter.idx()],
-                origin,
-                value,
-                value,
-            );
+            insert_range(&mut self.counters[counter.idx()], origin, value, value);
         }
         // Break seeds gated on the triggering counter.
         for &(trigger, counter, origin, value) in t.break_seeds.iter() {
             if counter_broke & (1u64 << trigger.idx()) != 0 {
-                insert_range(
-                    &mut self.ranged_counters[counter.idx()],
-                    origin,
-                    value,
-                    value,
-                );
+                insert_range(&mut self.counters[counter.idx()], origin, value, value);
             }
         }
 
         // Update has_live_instances flag.
-        self.has_live_instances = self.ranged_counters.iter().any(|c| !c.is_empty());
+        self.has_live_instances = self.counters.iter().any(|c| !c.is_empty());
     }
 
     fn step_from_dead(&mut self, byte: u8) {
         if self.has_live_instances {
-            if self.use_ranges {
-                for c in &mut self.ranged_counters {
-                    c.clear();
-                }
-            } else {
-                for c in &mut self.counters {
-                    c.clear();
-                }
+            for c in &mut self.counters {
+                c.clear();
             }
             self.has_live_instances = false;
         }
@@ -1560,19 +1321,8 @@ impl<'a> Tier3DfaMatcher<'a> {
         }
 
         // Seed instances.
-        if self.use_ranges {
-            for &(counter, origin, value) in trans.seeds.iter() {
-                insert_range(
-                    &mut self.ranged_counters[counter.idx()],
-                    origin,
-                    value,
-                    value,
-                );
-            }
-        } else {
-            for &(counter, origin, value) in trans.seeds.iter() {
-                self.counters[counter.idx()].push(Instance { value, origin });
-            }
+        for &(counter, origin, value) in trans.seeds.iter() {
+            insert_range(&mut self.counters[counter.idx()], origin, value, value);
         }
         if !trans.seeds.is_empty() {
             self.has_live_instances = true;
@@ -1657,11 +1407,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                 continue;
             }
 
-            if self.use_ranges {
-                self.step_slow_ranged(slot);
-            } else {
-                self.step_slow(slot);
-            }
+            self.step_slow(slot);
         }
     }
 

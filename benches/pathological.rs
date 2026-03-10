@@ -81,10 +81,11 @@ const SIZES: &[usize] = &[1024, 4 * 1024, 16 * 1024, 64 * 1024, 128 * 1024];
 
 /// Maximum input size for slow engines (tier 4 and NFA).
 ///
-/// Both have O(N * max_count) per-byte cost on this pattern, making
-/// larger inputs impractical (1 KB already takes ~4 s for NFA and
-/// ~1.8 s for tier 4, so 10 samples at 4 KB would exceed 10 minutes).
-const SLOW_MAX_SIZE: usize = 1024;
+/// Both have O(N * max_count) per-byte cost on this pattern.  After
+/// hash-based dedup optimizations, 1 KB takes ~54 ms for NFA and
+/// ~145 ms for tier 4, making 4 KB practical (~1 s worst case per
+/// sample for tier 4).
+const SLOW_MAX_SIZE: usize = 4 * 1024;
 
 fn bench_no_match(c: &mut Criterion) {
     let hir = parse_hir(PATTERN);
