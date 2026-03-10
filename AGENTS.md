@@ -169,6 +169,16 @@ cargo bench --bench flamegraph -- --list  # list available benchmarks
 
 Callgrind output: `target/gungraun/regex-thompson-counting/flamegraph/<group>/<bench>/callgrind.<bench>.out`
 
+Criterion wall-clock benchmarks (SIMD `memrange` throughput):
+
+```bash
+cargo bench --bench memrange            # run all memrange benchmarks
+cargo bench --bench memrange -- "no_match"  # filter by name substring
+```
+
+Compares NEON (aarch64) / SSE2+AVX2 (x86_64) against the scalar fallback.
+Reports throughput in GiB/s.  HTML reports in `target/criterion/`.
+
 Rebar (comparative benchmarks against `rust/regex`):
 
 All rebar commands run from `bench/rebar/`.  The rebar binary is at

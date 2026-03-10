@@ -12,8 +12,13 @@
 /// Find the first byte in `haystack` in the inclusive range `[lo, hi]`.
 ///
 /// Returns `None` if `lo > hi`, the haystack is empty, or no byte is in range.
+///
+/// Uses SIMD acceleration (NEON on aarch64, SSE2/AVX2 on x86_64) when
+/// available, falling back to a scalar loop for short haystacks or
+/// unsupported targets.
+#[doc(hidden)]
 #[inline]
-pub(crate) fn memrange(lo: u8, hi: u8, haystack: &[u8]) -> Option<usize> {
+pub fn memrange(lo: u8, hi: u8, haystack: &[u8]) -> Option<usize> {
     if lo > hi || haystack.is_empty() {
         return None;
     }
@@ -24,6 +29,17 @@ pub(crate) fn memrange(lo: u8, hi: u8, haystack: &[u8]) -> Option<usize> {
 #[inline]
 fn memrange_fallback(lo: u8, hi: u8, haystack: &[u8]) -> Option<usize> {
     haystack.iter().position(|&b| b >= lo && b <= hi)
+}
+
+/// Scalar byte-at-a-time implementation, exposed for benchmarking against
+/// the SIMD-accelerated [`memrange`].
+#[doc(hidden)]
+#[inline]
+pub fn memrange_scalar(lo: u8, hi: u8, haystack: &[u8]) -> Option<usize> {
+    if lo > hi || haystack.is_empty() {
+        return None;
+    }
+    memrange_fallback(lo, hi, haystack)
 }
 
 // ---------------------------------------------------------------------------

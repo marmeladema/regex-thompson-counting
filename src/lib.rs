@@ -84,6 +84,12 @@ pub use info::{
     CounterInfo, ExecutionInfo, MemoryInfo, NfaStateBreakdown, RegexInfo, StartClosureInfo,
 };
 
+// Exposed for benchmarking SIMD vs scalar memrange throughput.
+#[doc(hidden)]
+pub use memrange::memrange as memrange_simd;
+#[doc(hidden)]
+pub use memrange::memrange_scalar;
+
 /// Re-export so users do not need a direct `regex-syntax` dependency.
 pub use regex_syntax::hir::Hir;
 
