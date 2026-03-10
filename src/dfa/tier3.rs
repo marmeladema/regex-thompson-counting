@@ -407,8 +407,8 @@ impl Tier3DfaCache {
 
     fn intern_state(
         &mut self,
-        nfa_states: Box<[StateIdx]>,
-        deferred_asserts: Box<[StateIdx]>,
+        nfa_states: &[StateIdx],
+        deferred_asserts: &[StateIdx],
         is_match: bool,
         is_match_at_end: bool,
         prev_was_word: bool,
@@ -715,8 +715,8 @@ impl Tier3DfaCache {
             is_word_byte(byte)
         };
         self.intern_state(
-            cr.nfa_states.clone(),
-            cr.deferred_asserts.clone(),
+            &cr.nfa_states,
+            &cr.deferred_asserts,
             cr.is_match,
             cr.is_match_at_end,
             pw,
@@ -805,8 +805,8 @@ impl Tier3DfaCache {
         );
         self.inner.start_id = self
             .intern_state(
-                cr.nfa_states,
-                cr.deferred_asserts,
+                &cr.nfa_states,
+                &cr.deferred_asserts,
                 cr.is_match,
                 cr.is_match_at_end,
                 false,

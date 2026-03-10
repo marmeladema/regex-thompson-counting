@@ -170,8 +170,29 @@ cargo bench --bench flamegraph -- --list  # list available benchmarks
 Callgrind output: `target/gungraun/regex-thompson-counting/flamegraph/<group>/<bench>/callgrind.<bench>.out`
 
 Rebar (comparative benchmarks against `rust/regex`):
+
+All rebar commands run from `bench/rebar/`.  The rebar binary is at
+`bench/rebar/target/release/rebar`.  The rethoc engine source is at
+`bench/rebar/engines/rethoc/` (depends on the root crate via path).
+
+rethoc supports rebar models `compile`, `count`, and `grep`.
+It does **not** support `count-spans`, `count-captures`, or `grep-captures`
+(no match position / capture reporting), so benchmarks using those models
+will error for rethoc.
+
 ```bash
-# from bench/rebar/
-cd bench/rebar/engines/rethoc && cargo build --release
-cd bench/rebar && ./target/release/rebar measure -f '<filter>' -e '^(rethoc|rust/regex)$'
+# Build both engines (from bench/rebar/)
+./target/release/rebar build -e '^(rethoc|rust/regex)$'
+
+# Run a specific benchmark and compare
+./target/release/rebar measure -f '<filter>' -e '^(rethoc|rust/regex)$' | tee /tmp/results.csv
+./target/release/rebar cmp /tmp/results.csv
+
+# Example filters:
+#   '^curated/09-aws-keys/quick$'       single benchmark
+#   '^curated/09-aws-keys/'             all aws-keys variants
+#   '.'                                 everything (slow)
+
+# Sanity-check (verify correctness without timing)
+./target/release/rebar measure -f '<filter>' -e '^(rethoc|rust/regex)$' --test
 ```

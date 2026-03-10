@@ -55,8 +55,8 @@ impl Tier1DfaCache {
     /// and the state is not already interned.
     fn intern_state(
         &mut self,
-        nfa_states: Box<[StateIdx]>,
-        deferred_asserts: Box<[StateIdx]>,
+        nfa_states: &[StateIdx],
+        deferred_asserts: &[StateIdx],
         is_match: bool,
         is_match_at_end: bool,
         prev_was_word: bool,
@@ -82,10 +82,12 @@ impl Tier1DfaCache {
     /// `EndLF`) are evaluated with `next=None`; if they return `Defer`, the
     /// Assert state index is collected in `closure_deferred`.
     ///
-    /// Returns `(consuming_states, deferred_asserts, is_match, is_match_at_end)`.
+    /// Returns `(is_match, is_match_at_end)`.  The consuming states and
+    /// deferred asserts are left in `memory.closure_result` and
+    /// `memory.closure_deferred` respectively, avoiding heap allocation
+    /// on the hot path.
     #[allow(clippy::too_many_arguments)]
     fn epsilon_closure(
-        &mut self,
         memory: &mut DfaMemory,
         seeds: impl Iterator<Item = StateIdx>,
         regex: &Regex,
@@ -93,8 +95,8 @@ impl Tier1DfaCache {
         at_end: bool,
         prev_byte: Option<u8>,
         next_byte: Option<u8>,
-    ) -> (Box<[StateIdx]>, Box<[StateIdx]>, bool, bool) {
-        let (is_match, is_match_at_end) = memory.epsilon_closure(
+    ) -> (bool, bool) {
+        memory.epsilon_closure(
             seeds,
             regex,
             at_start,
@@ -103,11 +105,7 @@ impl Tier1DfaCache {
             next_byte,
             |_, _, _| unreachable!(),
             |_, _, _, _, _, _| unreachable!(),
-        );
-
-        let nfa_states: Box<[StateIdx]> = memory.closure_result.as_slice().into();
-        let deferred: Box<[StateIdx]> = memory.closure_deferred.as_slice().into();
-        (nfa_states, deferred, is_match, is_match_at_end)
+        )
     }
 
     /// Compute the DFA transition for `(from_state, byte)`, using byte-class
@@ -203,19 +201,22 @@ impl Tier1DfaCache {
                 // Mini epsilon closure: find consuming states reachable
                 // from the resolved assertion outputs.
                 let resolved_prev = from_state.prev_byte_representative();
-                let (resolved_consumers, _resolved_deferred, resolved_match, resolved_match_at_end) =
-                    self.epsilon_closure(
-                        memory,
-                        extra.into_iter(),
-                        regex,
-                        false,
-                        false,
-                        resolved_prev,
-                        Some(byte), // next_byte: assertions in chain can see the current byte
-                    );
+                let (resolved_match, resolved_match_at_end) = Self::epsilon_closure(
+                    memory,
+                    extra.into_iter(),
+                    regex,
+                    false,
+                    false,
+                    resolved_prev,
+                    Some(byte), // next_byte: assertions in chain can see the current byte
+                );
                 // These resolved consumers can now consume `byte`.
+                // Copy closure_result before it's overwritten by the next
+                // epsilon_closure call or by reading from_state.
+                let resolved_consumers: Vec<StateIdx> = memory.closure_result.clone();
                 // NOTE: We must re-read from_state after epsilon_closure
-                // because it borrows &mut self.
+                // because it borrows &mut memory (not &mut self, but the
+                // previous borrow of from_state may have been invalidated).
                 let from_state = &self.inner.states[from.idx()];
                 for &idx in resolved_consumers.iter() {
                     let target = match regex.states[idx] {
@@ -247,13 +248,6 @@ impl Tier1DfaCache {
                 // passed with `next=byte` and Match follows).  This match
                 // occurs at the current position, so we should propagate it.
                 // We'll merge these flags into the final closure result below.
-                let _ = (resolved_match, resolved_match_at_end);
-                // Actually we need to track these — see below after Phase 2.
-                // For now, also note any deferred asserts from resolved closure
-                // go into the TO state, but since we just resolved with
-                // `next=Some(byte)`, there shouldn't be new deferred asserts
-                // (prev_byte is known, next is known → no Defer).
-                // _resolved_deferred should be empty.
 
                 // Phase 2: original consuming states consume `byte`.
                 let nfa_states = from_state.nfa_states.clone();
@@ -276,7 +270,7 @@ impl Tier1DfaCache {
                 // Phase 3: epsilon closure of all targets + re-seed.
                 if targets.is_empty() {
                     // No consuming state produced a target.  Re-seed.
-                    let (nfa_set, deferred, mut m, mut mae) = self.epsilon_closure(
+                    let (mut m, mut mae) = Self::epsilon_closure(
                         memory,
                         std::iter::once(regex.start),
                         regex,
@@ -287,34 +281,42 @@ impl Tier1DfaCache {
                     );
                     m |= resolved_match;
                     mae |= resolved_match_at_end;
-                    if nfa_set.is_empty() && deferred.is_empty() && !m && !mae {
+                    if memory.closure_result.is_empty()
+                        && memory.closure_deferred.is_empty()
+                        && !m
+                        && !mae
+                    {
                         return DfaStateId::DEAD;
                     }
-                    let pw = if deferred.is_empty() {
+                    let pw = if memory.closure_deferred.is_empty() {
                         false
                     } else {
                         is_word_byte(byte)
                     };
                     return self
-                        .intern_state(nfa_set, deferred, m, mae, pw)
+                        .intern_state(&memory.closure_result, &memory.closure_deferred, m, mae, pw)
                         .unwrap_or(DfaStateId::DEAD);
                 }
 
                 let seeds = targets.into_iter().chain(std::iter::once(regex.start));
-                let (nfa_set, deferred, mut m, mut mae) =
-                    self.epsilon_closure(memory, seeds, regex, false, false, Some(byte), None);
+                let (mut m, mut mae) =
+                    Self::epsilon_closure(memory, seeds, regex, false, false, Some(byte), None);
                 m |= resolved_match;
                 mae |= resolved_match_at_end;
-                if nfa_set.is_empty() && deferred.is_empty() && !m && !mae {
+                if memory.closure_result.is_empty()
+                    && memory.closure_deferred.is_empty()
+                    && !m
+                    && !mae
+                {
                     return DfaStateId::DEAD;
                 }
-                let pw = if deferred.is_empty() {
+                let pw = if memory.closure_deferred.is_empty() {
                     false
                 } else {
                     is_word_byte(byte)
                 };
                 return self
-                    .intern_state(nfa_set, deferred, m, mae, pw)
+                    .intern_state(&memory.closure_result, &memory.closure_deferred, m, mae, pw)
                     .unwrap_or(DfaStateId::DEAD);
             }
 
@@ -338,7 +340,7 @@ impl Tier1DfaCache {
         }
 
         if targets.is_empty() {
-            let (nfa_set, deferred, is_match, is_match_at_end) = self.epsilon_closure(
+            let (is_match, is_match_at_end) = Self::epsilon_closure(
                 memory,
                 std::iter::once(regex.start),
                 regex,
@@ -347,34 +349,54 @@ impl Tier1DfaCache {
                 Some(byte),
                 None,
             );
-            if nfa_set.is_empty() && deferred.is_empty() && !is_match && !is_match_at_end {
+            if memory.closure_result.is_empty()
+                && memory.closure_deferred.is_empty()
+                && !is_match
+                && !is_match_at_end
+            {
                 return DfaStateId::DEAD;
             }
-            let pw = if deferred.is_empty() {
+            let pw = if memory.closure_deferred.is_empty() {
                 false
             } else {
                 is_word_byte(byte)
             };
             return self
-                .intern_state(nfa_set, deferred, is_match, is_match_at_end, pw)
+                .intern_state(
+                    &memory.closure_result,
+                    &memory.closure_deferred,
+                    is_match,
+                    is_match_at_end,
+                    pw,
+                )
                 .unwrap_or(DfaStateId::DEAD);
         }
 
         let seeds = targets.into_iter().chain(std::iter::once(regex.start));
-        let (nfa_set, deferred, is_match, is_match_at_end) =
-            self.epsilon_closure(memory, seeds, regex, false, false, Some(byte), None);
+        let (is_match, is_match_at_end) =
+            Self::epsilon_closure(memory, seeds, regex, false, false, Some(byte), None);
 
-        if nfa_set.is_empty() && deferred.is_empty() && !is_match && !is_match_at_end {
+        if memory.closure_result.is_empty()
+            && memory.closure_deferred.is_empty()
+            && !is_match
+            && !is_match_at_end
+        {
             return DfaStateId::DEAD;
         }
 
-        let pw = if deferred.is_empty() {
+        let pw = if memory.closure_deferred.is_empty() {
             false
         } else {
             is_word_byte(byte)
         };
-        self.intern_state(nfa_set, deferred, is_match, is_match_at_end, pw)
-            .unwrap_or(DfaStateId::DEAD)
+        self.intern_state(
+            &memory.closure_result,
+            &memory.closure_deferred,
+            is_match,
+            is_match_at_end,
+            pw,
+        )
+        .unwrap_or(DfaStateId::DEAD)
     }
 
     /// Reset the cache for reuse with a new regex.
@@ -398,7 +420,7 @@ impl Tier1DfaCache {
         // Start state: at_start=true, prev_byte=None, at_end=false.
         // Deferred assertions at start (e.g., `\b` at pos 0) get
         // prev=None → prev_was_word=false.
-        let (nfa_set, deferred, is_match, is_match_at_end) = self.epsilon_closure(
+        let (is_match, is_match_at_end) = Self::epsilon_closure(
             memory,
             std::iter::once(regex.start),
             regex,
@@ -409,7 +431,13 @@ impl Tier1DfaCache {
         );
         let pw = false; // At start, prev is always non-word.
         self.inner.start_id = self
-            .intern_state(nfa_set, deferred, is_match, is_match_at_end, pw)
+            .intern_state(
+                &memory.closure_result,
+                &memory.closure_deferred,
+                is_match,
+                is_match_at_end,
+                pw,
+            )
             .expect("start state exceeds DFA_MAX_STATES");
         self.inner.start_is_match = self.inner.states[self.inner.start_id.idx()].is_match;
     }

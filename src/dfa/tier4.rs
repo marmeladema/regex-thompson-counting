@@ -14,7 +14,7 @@ use crate::{
     AssertKind, CounterCtx, CounterIdx, CounterPool, Regex, State, StateIdx, byte_match_ci,
 };
 
-use super::{DfaState, DfaStateId};
+use super::{DfaState, DfaStateId, DfaStateRef};
 
 /// Index into [`Tier4DfaCache::programs`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -417,26 +417,38 @@ impl Tier4DfaCache {
     }
 
     /// Look up or insert a DFA state.
+    ///
+    /// Takes a borrowed slice so that cache-hit probes (the common case)
+    /// are zero-allocation.  A heap-allocated [`DfaState`] is only created
+    /// on a cache miss when actual insertion is needed.
     fn intern_state(
         &mut self,
-        nfa_states: Box<[StateIdx]>,
+        nfa_states: &[StateIdx],
         is_match: bool,
         is_match_at_end: bool,
     ) -> DfaStateId {
-        let state = DfaState {
+        let probe = DfaStateRef {
             nfa_states,
+            deferred_asserts: &[],
+            is_match,
+            is_match_at_end,
+            prev_was_word: false,
+        };
+        if let Some(idx) = self.states.get_index_of(&probe) {
+            return DfaStateId(idx as u32);
+        }
+        let state = DfaState {
+            nfa_states: nfa_states.into(),
             deferred_asserts: Box::new([]),
             is_match,
             is_match_at_end,
             prev_was_word: false,
         };
-        let (idx, inserted) = self.states.insert_full(state);
-        if inserted {
-            self.transitions.resize(
-                self.states.len() * self.stride,
-                CountingTransition::UNPOPULATED,
-            );
-        }
+        let (idx, _) = self.states.insert_full(state);
+        self.transitions.resize(
+            self.states.len() * self.stride,
+            CountingTransition::UNPOPULATED,
+        );
         DfaStateId(idx as u32)
     }
 
@@ -970,7 +982,7 @@ impl Tier4DfaCache {
                 seed_program,
             };
         }
-        let next = self.intern_state(merged.into_boxed_slice(), is_match, is_match_at_end);
+        let next = self.intern_state(&merged, is_match, is_match_at_end);
         CountingTransition {
             next,
             origin_table: origin_table_idx,
@@ -1021,7 +1033,7 @@ impl Tier4DfaCache {
             true,
             None,
         );
-        self.start_id = self.intern_state(nfa_set, is_match, is_match_at_end);
+        self.start_id = self.intern_state(&nfa_set, is_match, is_match_at_end);
         self.start_program = self.intern_program(ops);
         self.start_is_match = is_match;
         self.start_is_match_at_end = is_match_at_end;

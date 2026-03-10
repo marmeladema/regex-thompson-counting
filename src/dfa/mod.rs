@@ -28,6 +28,7 @@ mod tier2;
 mod tier3;
 mod tier4;
 
+use indexmap::Equivalent;
 use indexmap::IndexSet;
 
 pub(crate) use tier1::{DfaMatcher, Tier1DfaCache};
@@ -144,6 +145,31 @@ impl DfaState {
             }
         }
         false
+    }
+}
+
+/// Borrowed view of [`DfaState`] for zero-allocation [`IndexSet`] lookups.
+///
+/// `DfaStateRef` mirrors `DfaState` but holds `&[StateIdx]` slices instead
+/// of `Box<[StateIdx]>`.  Because `Box<[T]>` and `&[T]` both delegate to
+/// `[T]::hash()`, the derived `Hash` impls produce identical hashes —
+/// making this safe to use with [`Equivalent`] for probing.
+#[derive(Hash)]
+pub(super) struct DfaStateRef<'a> {
+    nfa_states: &'a [StateIdx],
+    deferred_asserts: &'a [StateIdx],
+    is_match: bool,
+    is_match_at_end: bool,
+    prev_was_word: bool,
+}
+
+impl Equivalent<DfaState> for DfaStateRef<'_> {
+    fn equivalent(&self, key: &DfaState) -> bool {
+        self.nfa_states == &*key.nfa_states
+            && self.deferred_asserts == &*key.deferred_asserts
+            && self.is_match == key.is_match
+            && self.is_match_at_end == key.is_match_at_end
+            && self.prev_was_word == key.prev_was_word
     }
 }
 
@@ -302,29 +328,40 @@ impl DfaCache {
     /// Look up or insert a DFA state for the given sorted NFA state set.
     /// Returns `None` if the state cap ([`DFA_MAX_STATES`]) has been reached
     /// and the state is not already interned.
+    ///
+    /// Takes borrowed slices so that cache-hit probes (the common case)
+    /// are zero-allocation.  A heap-allocated [`DfaState`] is only created
+    /// on a cache miss when actual insertion is needed.
     #[inline]
     fn intern_state(
         &mut self,
-        nfa_states: Box<[StateIdx]>,
-        deferred_asserts: Box<[StateIdx]>,
+        nfa_states: &[StateIdx],
+        deferred_asserts: &[StateIdx],
         is_match: bool,
         is_match_at_end: bool,
         prev_was_word: bool,
         mut transition: impl FnMut(),
     ) -> Option<DfaStateId> {
-        let state = DfaState {
+        let probe = DfaStateRef {
             nfa_states,
             deferred_asserts,
             is_match,
             is_match_at_end,
             prev_was_word,
         };
-        if let Some(idx) = self.states.get_index_of(&state) {
+        if let Some(idx) = self.states.get_index_of(&probe) {
             return Some(DfaStateId(idx as u32));
         }
         if self.states.len() >= DFA_MAX_STATES {
             return None;
         }
+        let state = DfaState {
+            nfa_states: nfa_states.into(),
+            deferred_asserts: deferred_asserts.into(),
+            is_match,
+            is_match_at_end,
+            prev_was_word,
+        };
         let (idx, _) = self.states.insert_full(state);
         transition();
         Some(DfaStateId(idx as u32))
@@ -338,5 +375,233 @@ impl DfaCache {
         self.start_id = DfaStateId::DEAD;
         self.start_is_match = false;
         self.start_is_match_at_end = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    use super::*;
+
+    /// Compute the 64-bit hash of a value using [`DefaultHasher`].
+    fn hash_of(val: &impl Hash) -> u64 {
+        let mut h = DefaultHasher::new();
+        val.hash(&mut h);
+        h.finish()
+    }
+
+    /// Build a [`DfaState`] from the given fields (shorthand for tests).
+    fn make_state(
+        nfa: &[u32],
+        deferred: &[u32],
+        is_match: bool,
+        is_match_at_end: bool,
+        prev_was_word: bool,
+    ) -> DfaState {
+        DfaState {
+            nfa_states: nfa.iter().map(|&v| StateIdx(v)).collect(),
+            deferred_asserts: deferred.iter().map(|&v| StateIdx(v)).collect(),
+            is_match,
+            is_match_at_end,
+            prev_was_word,
+        }
+    }
+
+    /// Build a [`DfaStateRef`] from the given slices and flags.
+    fn make_ref<'a>(
+        nfa: &'a [StateIdx],
+        deferred: &'a [StateIdx],
+        is_match: bool,
+        is_match_at_end: bool,
+        prev_was_word: bool,
+    ) -> DfaStateRef<'a> {
+        DfaStateRef {
+            nfa_states: nfa,
+            deferred_asserts: deferred,
+            is_match,
+            is_match_at_end,
+            prev_was_word,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Hash consistency: DfaState and DfaStateRef must hash identically
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_state_ref_hash_empty() {
+        let state = make_state(&[], &[], false, false, false);
+        let r = make_ref(&[], &[], false, false, false);
+        assert_eq!(hash_of(&state), hash_of(&r));
+    }
+
+    #[test]
+    fn test_state_ref_hash_with_nfa_states() {
+        let state = make_state(&[1, 5, 42], &[], true, false, false);
+        let nfa: Vec<StateIdx> = [1, 5, 42].iter().map(|&v| StateIdx(v)).collect();
+        let r = make_ref(&nfa, &[], true, false, false);
+        assert_eq!(hash_of(&state), hash_of(&r));
+    }
+
+    #[test]
+    fn test_state_ref_hash_with_deferred() {
+        let state = make_state(&[3, 7], &[10, 20], false, true, true);
+        let nfa: Vec<StateIdx> = [3, 7].iter().map(|&v| StateIdx(v)).collect();
+        let deferred: Vec<StateIdx> = [10, 20].iter().map(|&v| StateIdx(v)).collect();
+        let r = make_ref(&nfa, &deferred, false, true, true);
+        assert_eq!(hash_of(&state), hash_of(&r));
+    }
+
+    #[test]
+    fn test_state_ref_hash_all_flags() {
+        // Exhaustively check all 8 flag combinations.
+        let nfa_raw = &[2, 4, 6];
+        let def_raw = &[8];
+        for m in [false, true] {
+            for mae in [false, true] {
+                for pw in [false, true] {
+                    let state = make_state(nfa_raw, def_raw, m, mae, pw);
+                    let nfa: Vec<StateIdx> = nfa_raw.iter().map(|&v| StateIdx(v)).collect();
+                    let deferred: Vec<StateIdx> = def_raw.iter().map(|&v| StateIdx(v)).collect();
+                    let r = make_ref(&nfa, &deferred, m, mae, pw);
+                    assert_eq!(
+                        hash_of(&state),
+                        hash_of(&r),
+                        "hash mismatch for flags ({m}, {mae}, {pw})"
+                    );
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Equivalent: DfaStateRef must correctly identify equal/unequal states
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_state_ref_equivalent_match() {
+        let state = make_state(&[1, 2, 3], &[10], true, false, true);
+        let nfa: Vec<StateIdx> = [1, 2, 3].iter().map(|&v| StateIdx(v)).collect();
+        let deferred: Vec<StateIdx> = [10].iter().map(|&v| StateIdx(v)).collect();
+        let r = make_ref(&nfa, &deferred, true, false, true);
+        assert!(r.equivalent(&state));
+    }
+
+    #[test]
+    fn test_state_ref_equivalent_empty() {
+        let state = make_state(&[], &[], false, false, false);
+        let r = make_ref(&[], &[], false, false, false);
+        assert!(r.equivalent(&state));
+    }
+
+    #[test]
+    fn test_state_ref_not_equivalent_nfa_differs() {
+        let state = make_state(&[1, 2], &[], false, false, false);
+        let nfa: Vec<StateIdx> = [1, 3].iter().map(|&v| StateIdx(v)).collect();
+        let r = make_ref(&nfa, &[], false, false, false);
+        assert!(!r.equivalent(&state));
+    }
+
+    #[test]
+    fn test_state_ref_not_equivalent_deferred_differs() {
+        let state = make_state(&[1], &[10], false, false, false);
+        let nfa: Vec<StateIdx> = [1].iter().map(|&v| StateIdx(v)).collect();
+        let deferred: Vec<StateIdx> = [11].iter().map(|&v| StateIdx(v)).collect();
+        let r = make_ref(&nfa, &deferred, false, false, false);
+        assert!(!r.equivalent(&state));
+    }
+
+    #[test]
+    fn test_state_ref_not_equivalent_is_match_differs() {
+        let state = make_state(&[1], &[], true, false, false);
+        let nfa: Vec<StateIdx> = [1].iter().map(|&v| StateIdx(v)).collect();
+        let r = make_ref(&nfa, &[], false, false, false);
+        assert!(!r.equivalent(&state));
+    }
+
+    #[test]
+    fn test_state_ref_not_equivalent_is_match_at_end_differs() {
+        let state = make_state(&[1], &[], false, true, false);
+        let nfa: Vec<StateIdx> = [1].iter().map(|&v| StateIdx(v)).collect();
+        let r = make_ref(&nfa, &[], false, false, false);
+        assert!(!r.equivalent(&state));
+    }
+
+    #[test]
+    fn test_state_ref_not_equivalent_prev_was_word_differs() {
+        let state = make_state(&[1], &[], false, false, true);
+        let nfa: Vec<StateIdx> = [1].iter().map(|&v| StateIdx(v)).collect();
+        let r = make_ref(&nfa, &[], false, false, false);
+        assert!(!r.equivalent(&state));
+    }
+
+    #[test]
+    fn test_state_ref_not_equivalent_length_differs() {
+        let state = make_state(&[1, 2, 3], &[], false, false, false);
+        let nfa: Vec<StateIdx> = [1, 2].iter().map(|&v| StateIdx(v)).collect();
+        let r = make_ref(&nfa, &[], false, false, false);
+        assert!(!r.equivalent(&state));
+    }
+
+    // -----------------------------------------------------------------------
+    // IndexSet round-trip: insert a DfaState, probe with DfaStateRef
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_indexset_probe_with_ref() {
+        let mut set: IndexSet<DfaState, ahash::RandomState> = IndexSet::default();
+        let state = make_state(&[5, 10, 15], &[20], true, false, false);
+        let (idx, inserted) = set.insert_full(state);
+        assert!(inserted);
+        assert_eq!(idx, 0);
+
+        // Probe with a DfaStateRef — should find the same index.
+        let nfa: Vec<StateIdx> = [5, 10, 15].iter().map(|&v| StateIdx(v)).collect();
+        let deferred: Vec<StateIdx> = [20].iter().map(|&v| StateIdx(v)).collect();
+        let r = make_ref(&nfa, &deferred, true, false, false);
+        assert_eq!(set.get_index_of(&r), Some(0));
+    }
+
+    #[test]
+    fn test_indexset_probe_miss() {
+        let mut set: IndexSet<DfaState, ahash::RandomState> = IndexSet::default();
+        set.insert_full(make_state(&[1, 2], &[], false, false, false));
+
+        // Different nfa_states — should not find.
+        let nfa: Vec<StateIdx> = [1, 3].iter().map(|&v| StateIdx(v)).collect();
+        let r = make_ref(&nfa, &[], false, false, false);
+        assert_eq!(set.get_index_of(&r), None);
+    }
+
+    #[test]
+    fn test_indexset_multiple_states() {
+        let mut set: IndexSet<DfaState, ahash::RandomState> = IndexSet::default();
+        set.insert_full(make_state(&[1], &[], false, false, false));
+        set.insert_full(make_state(&[2], &[], false, false, false));
+        set.insert_full(make_state(&[1], &[], true, false, false));
+
+        let nfa1: Vec<StateIdx> = [1].iter().map(|&v| StateIdx(v)).collect();
+        let nfa2: Vec<StateIdx> = [2].iter().map(|&v| StateIdx(v)).collect();
+
+        // Each ref finds its corresponding state at the correct index.
+        assert_eq!(
+            set.get_index_of(&make_ref(&nfa1, &[], false, false, false)),
+            Some(0)
+        );
+        assert_eq!(
+            set.get_index_of(&make_ref(&nfa2, &[], false, false, false)),
+            Some(1)
+        );
+        assert_eq!(
+            set.get_index_of(&make_ref(&nfa1, &[], true, false, false)),
+            Some(2)
+        );
+
+        // Non-existent combination.
+        assert_eq!(
+            set.get_index_of(&make_ref(&nfa2, &[], true, false, false)),
+            None
+        );
     }
 }
