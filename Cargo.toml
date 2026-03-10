@@ -39,3 +39,7 @@ harness = false
 [[bench]]
 name = "pathological"
 harness = false
+
+[[bench]]
+name = "pathological_profile"
+harness = false

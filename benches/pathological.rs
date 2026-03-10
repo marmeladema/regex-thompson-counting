@@ -1,33 +1,29 @@
-//! Criterion benchmarks comparing rethoc vs the `regex` crate on a
+//! Criterion benchmarks comparing rethoc tiers and the `regex` crate on a
 //! pathological bounded-repetition pattern.
 //!
 //! Pattern: `.{0,1000}.{0,1000}.{0,1000}a`
 //!
 //! Three sequential bounded repetitions with a wildcard body — this creates
 //! massive NFA state space (~3000 active states) that punishes engines
-//! without efficient counting.  rethoc compiles this to Tier 3
-//! (conditional DFA with 3 counters, 14 NFA states, 1177 bytes).
+//! without efficient counting.  rethoc compiles this to Tier 3 by default
+//! (conditional DFA with 3 counters, 14 NFA states).
 //!
-//! **Key findings**:
+//! We benchmark four engines:
 //!
-//! - **Compilation**: rethoc is ~140× faster (3 µs vs 430 µs).
-//!
-//! - **No-match**: the `regex` crate extracts `a` as a literal prefilter
-//!   and uses memchr to scan the input, returning instantly (~16 ns for
-//!   1 KB).  rethoc has no prefilter for this pattern and runs the full
-//!   Tier 3 DFA at every byte position (~5.4 ms for 1 KB).
-//!
-//! - **Match-at-end**: both engines must actually simulate the pattern.
-//!   rethoc's counting DFA is ~2.5× faster than the `regex` crate's
-//!   backtracker / NFA on this workload, but both exhibit super-linear
-//!   scaling.
+//! - **rethoc/tier3** — Conditional DFA with range-compressed counters.
+//!   O(body_length) per counter per byte.
+//! - **rethoc/tier4** — Counter-program DFA.  More general but slower on
+//!   this pattern because it tracks full counter contexts.
+//! - **rethoc/nfa** — Pure Thompson NFA simulation (tier 0).  Baseline
+//!   for rethoc without any DFA acceleration.
+//! - **regex** — The `regex` crate (for external comparison).
 //!
 //! Run with: `cargo bench --bench pathological`
 
 use std::hint::black_box;
 use std::time::Duration;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use regex_thompson_counting::{MatcherMemory, RegexBuilder};
 
@@ -80,9 +76,15 @@ fn bench_compile(c: &mut Criterion) {
 // Match benchmarks
 // ---------------------------------------------------------------------------
 
-/// Sizes for match benchmarks.  Both engines are super-linear on this
-/// pattern, so we cap at 64 KB to keep total bench time reasonable.
-const SIZES: &[usize] = &[1024, 4 * 1024, 16 * 1024, 64 * 1024];
+/// Sizes for match benchmarks.
+const SIZES: &[usize] = &[1024, 4 * 1024, 16 * 1024, 64 * 1024, 128 * 1024];
+
+/// Maximum input size for slow engines (tier 4 and NFA).
+///
+/// Both have O(N * max_count) per-byte cost on this pattern, making
+/// larger inputs impractical (1 KB already takes ~4 s for NFA and
+/// ~1.8 s for tier 4, so 10 samples at 4 KB would exceed 10 minutes).
+const SLOW_MAX_SIZE: usize = 1024;
 
 fn bench_no_match(c: &mut Criterion) {
     let hir = parse_hir(PATTERN);
@@ -101,18 +103,51 @@ fn bench_no_match(c: &mut Criterion) {
         let hay = vec![b'x'; size];
         group.throughput(Throughput::Bytes(size as u64));
 
-        group.bench_with_input(BenchmarkId::new("rethoc", size), &hay, |b, hay| {
+        // rethoc tier 3 (default — conditional DFA, range-compressed)
+        group.bench_with_input(BenchmarkId::new("rethoc/tier3", size), &hay, |b, hay| {
             let mut mem = MatcherMemory::default();
-            let mut m = mem.matcher(&rethoc_re);
+            // Warm up the DFA cache.
+            let mut m = mem.matcher_for_tier(&rethoc_re, 3).unwrap();
             m.chunk(hay);
             m.finish();
             b.iter(|| {
-                let mut m = mem.matcher(&rethoc_re);
+                let mut m = mem.matcher_for_tier(&rethoc_re, 3).unwrap();
                 m.chunk(black_box(hay));
                 black_box(m.finish())
             })
         });
 
+        // rethoc tier 4 (counter-program DFA) — only for small sizes.
+        if size <= SLOW_MAX_SIZE {
+            group.bench_with_input(BenchmarkId::new("rethoc/tier4", size), &hay, |b, hay| {
+                let mut mem = MatcherMemory::default();
+                let mut m = mem.matcher_for_tier(&rethoc_re, 4).unwrap();
+                m.chunk(hay);
+                m.finish();
+                b.iter(|| {
+                    let mut m = mem.matcher_for_tier(&rethoc_re, 4).unwrap();
+                    m.chunk(black_box(hay));
+                    black_box(m.finish())
+                })
+            });
+        }
+
+        // rethoc NFA (tier 0 — pure Thompson simulation) — only for small sizes.
+        if size <= SLOW_MAX_SIZE {
+            group.bench_with_input(BenchmarkId::new("rethoc/nfa", size), &hay, |b, hay| {
+                let mut mem = MatcherMemory::default();
+                let mut m = mem.matcher_for_tier(&rethoc_re, 0).unwrap();
+                m.chunk(hay);
+                m.finish();
+                b.iter(|| {
+                    let mut m = mem.matcher_for_tier(&rethoc_re, 0).unwrap();
+                    m.chunk(black_box(hay));
+                    black_box(m.finish())
+                })
+            });
+        }
+
+        // regex crate
         group.bench_with_input(BenchmarkId::new("regex", size), &hay, |b, hay| {
             let _ = regex_re.is_match(hay);
             b.iter(|| black_box(regex_re.is_match(black_box(hay))))
@@ -140,18 +175,50 @@ fn bench_match_at_end(c: &mut Criterion) {
         hay[size - 1] = b'a';
         group.throughput(Throughput::Bytes(size as u64));
 
-        group.bench_with_input(BenchmarkId::new("rethoc", size), &hay, |b, hay| {
+        // rethoc tier 3 (default — conditional DFA, range-compressed)
+        group.bench_with_input(BenchmarkId::new("rethoc/tier3", size), &hay, |b, hay| {
             let mut mem = MatcherMemory::default();
-            let mut m = mem.matcher(&rethoc_re);
+            let mut m = mem.matcher_for_tier(&rethoc_re, 3).unwrap();
             m.chunk(hay);
             m.finish();
             b.iter(|| {
-                let mut m = mem.matcher(&rethoc_re);
+                let mut m = mem.matcher_for_tier(&rethoc_re, 3).unwrap();
                 m.chunk(black_box(hay));
                 black_box(m.finish())
             })
         });
 
+        // rethoc tier 4 (counter-program DFA) — only for small sizes.
+        if size <= SLOW_MAX_SIZE {
+            group.bench_with_input(BenchmarkId::new("rethoc/tier4", size), &hay, |b, hay| {
+                let mut mem = MatcherMemory::default();
+                let mut m = mem.matcher_for_tier(&rethoc_re, 4).unwrap();
+                m.chunk(hay);
+                m.finish();
+                b.iter(|| {
+                    let mut m = mem.matcher_for_tier(&rethoc_re, 4).unwrap();
+                    m.chunk(black_box(hay));
+                    black_box(m.finish())
+                })
+            });
+        }
+
+        // rethoc NFA (tier 0 — pure Thompson simulation) — only for small sizes.
+        if size <= SLOW_MAX_SIZE {
+            group.bench_with_input(BenchmarkId::new("rethoc/nfa", size), &hay, |b, hay| {
+                let mut mem = MatcherMemory::default();
+                let mut m = mem.matcher_for_tier(&rethoc_re, 0).unwrap();
+                m.chunk(hay);
+                m.finish();
+                b.iter(|| {
+                    let mut m = mem.matcher_for_tier(&rethoc_re, 0).unwrap();
+                    m.chunk(black_box(hay));
+                    black_box(m.finish())
+                })
+            });
+        }
+
+        // regex crate
         group.bench_with_input(BenchmarkId::new("regex", size), &hay, |b, hay| {
             let _ = regex_re.is_match(hay);
             b.iter(|| black_box(regex_re.is_match(black_box(hay))))

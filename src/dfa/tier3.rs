@@ -87,6 +87,17 @@ pub(crate) struct Tier3Analysis {
     /// counter breaks: the seed for `counter` at `origin` is applied
     /// when `trigger`'s CInc break path is taken.
     pub(crate) break_seeds: Box<[Tier3BreakSeed]>,
+
+    /// `true` when all counters have fixed-length bodies, enabling the
+    /// range-compressed instance tracking fast path in
+    /// [`Tier3DfaMatcher::step_slow_ranged`].
+    ///
+    /// When this is true, instances at each origin within a counter
+    /// always form a contiguous value range, so they can be represented
+    /// as `(origin, min_val, max_val)` triples instead of individual
+    /// `Instance` structs.  This reduces per-byte cost from
+    /// O(max_count) to O(body_length) per counter.
+    pub(crate) all_counters_rangeable: bool,
 }
 
 /// What happens structurally when a byte is consumed at a given target.
@@ -131,12 +142,14 @@ pub(crate) struct Tier3BreakSeed {
 /// 1. Per-target-state origin actions (what happens when a byte is consumed).
 /// 2. Per-CI-output consuming states (for resolving CI seed pairs).
 /// 3. Global break-triggered seeds (for counter break-path seeding).
+/// 4. Whether all counters are range-compressible (fixed-length bodies).
 ///
 /// Uses only pure DFS — no DFA cache or matcher state is needed.
 pub(crate) fn compute_tier3_analysis(
     states: &[State],
     byte_tables: &[crate::ByteMap],
     state_can_reach_match: &[bool],
+    counter_info: &[(usize, usize, usize)],
 ) -> Tier3Analysis {
     let n = states.len();
 
@@ -238,10 +251,16 @@ pub(crate) fn compute_tier3_analysis(
         })
         .collect();
 
+    // -- Step 5: determine range-compressibility --------------------------------
+    // All counters must have fixed-length bodies (body_byte_length > 0).
+    let all_counters_rangeable =
+        !counter_info.is_empty() && counter_info.iter().all(|&(_, _, bl)| bl > 0);
+
     Tier3Analysis {
         targets: targets_vec.into_boxed_slice(),
         ci_origins: ci_origins_vec.into_boxed_slice(),
         break_seeds: break_seeds.into_boxed_slice(),
+        all_counters_rangeable,
     }
 }
 
@@ -366,6 +385,31 @@ impl OriginAction {
 // Instance tracking
 // ---------------------------------------------------------------------------
 
+/// Merge a `[min_val, max_val]` range into a sorted `Vec<InstanceRange>`.
+///
+/// If the range overlaps or is adjacent to an existing range at the same
+/// origin, the two are fused into one.  Otherwise, the new range is
+/// inserted in origin-sorted order.  This keeps each origin represented
+/// by at most one `InstanceRange`.
+fn insert_range(ranges: &mut Vec<InstanceRange>, origin: StateIdx, min_val: u32, max_val: u32) {
+    debug_assert!(min_val <= max_val);
+    // Linear scan — there are at most `body_byte_length` entries per
+    // counter, which is typically 1-4.
+    for r in ranges.iter_mut() {
+        if r.origin == origin {
+            // Existing range at this origin — extend.
+            r.min_val = r.min_val.min(min_val);
+            r.max_val = r.max_val.max(max_val);
+            return;
+        }
+    }
+    ranges.push(InstanceRange {
+        origin,
+        min_val,
+        max_val,
+    });
+}
+
 /// A single active counter instance.
 #[derive(Clone, Debug)]
 struct Instance {
@@ -373,6 +417,22 @@ struct Instance {
     value: u32,
     /// The NFA consuming state this instance is waiting at.
     origin: StateIdx,
+}
+
+/// A contiguous range of counter values at a single origin.
+///
+/// Represents the set of instances `{(v, origin) | min_val <= v <= max_val}`.
+/// Used by the range-compressed fast path when all counter bodies have fixed
+/// byte-length.  At steady state, each origin within a counter body
+/// accumulates a contiguous range `[0, max-1]`.
+#[derive(Clone, Debug)]
+struct InstanceRange {
+    /// The NFA consuming state these instances are waiting at.
+    origin: StateIdx,
+    /// Minimum counter value (inclusive).
+    min_val: u32,
+    /// Maximum counter value (inclusive).
+    max_val: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1032,6 +1092,13 @@ pub struct Tier3DfaMatcher<'a> {
     current: DfaStateId,
     counters: Vec<Vec<Instance>>,
     next_instances: Vec<Vec<Instance>>,
+    /// Range-compressed instance storage (one `Vec<InstanceRange>` per
+    /// counter).  Used instead of `counters`/`next_instances` when
+    /// [`Tier3Analysis::all_counters_rangeable`] is true.
+    ranged_counters: Vec<Vec<InstanceRange>>,
+    next_ranged: Vec<Vec<InstanceRange>>,
+    /// `true` when range-compressed instance tracking is active.
+    use_ranges: bool,
     ever_matched: bool,
     match_at_end: bool,
     has_live_instances: bool,
@@ -1045,13 +1112,21 @@ impl<'a> Tier3DfaMatcher<'a> {
         regex: &'a Regex,
         analysis: &'a Tier3Analysis,
     ) -> Self {
-        let mut counters: Vec<Vec<Instance>> =
-            (0..regex.num_counters).map(|_| Vec::new()).collect();
-        let next_instances: Vec<Vec<Instance>> =
-            (0..regex.num_counters).map(|_| Vec::new()).collect();
+        let use_ranges = analysis.all_counters_rangeable;
+        let nc = regex.num_counters;
+
+        let mut counters: Vec<Vec<Instance>> = (0..nc).map(|_| Vec::new()).collect();
+        let next_instances: Vec<Vec<Instance>> = (0..nc).map(|_| Vec::new()).collect();
+        let mut ranged_counters: Vec<Vec<InstanceRange>> = (0..nc).map(|_| Vec::new()).collect();
+        let next_ranged: Vec<Vec<InstanceRange>> = (0..nc).map(|_| Vec::new()).collect();
 
         for &(counter, origin, value) in cache.start_seeds.iter() {
-            counters[counter.idx()].push(Instance { value, origin });
+            let ci = counter.idx();
+            if use_ranges {
+                insert_range(&mut ranged_counters[ci], origin, value, value);
+            } else {
+                counters[ci].push(Instance { value, origin });
+            }
         }
 
         let ever_matched = cache.inner.start_is_match;
@@ -1069,6 +1144,9 @@ impl<'a> Tier3DfaMatcher<'a> {
             analysis,
             counters,
             next_instances,
+            ranged_counters,
+            next_ranged,
+            use_ranges,
             prefilter: regex.prefilter,
         }
     }
@@ -1088,8 +1166,11 @@ impl<'a> Tier3DfaMatcher<'a> {
         let mut any_can_break = false;
         // Track which specific counters had at least one break, so that
         // break_seeds can be gated on the triggering counter.
+        // Uses a u64 bitmask — tier 3 patterns have at most a handful of
+        // counters (well under 64), avoiding per-byte heap allocation.
         let num_counters = self.counters.len();
-        let mut counter_broke = vec![false; num_counters];
+        debug_assert!(num_counters <= 64);
+        let mut counter_broke: u64 = 0;
 
         #[allow(clippy::needless_range_loop)]
         for c_idx in 0..num_counters {
@@ -1141,7 +1222,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                         }
                         if do_break {
                             any_can_break = true;
-                            counter_broke[c_idx] = true;
+                            counter_broke |= 1u64 << c_idx;
                             if *break_is_match {
                                 self.ever_matched = true;
                             }
@@ -1206,7 +1287,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         // actually broke.  This prevents premature seeding of downstream
         // counters when adjacent counters share the same byte set.
         for &(trigger, counter, origin, value) in t.break_seeds.iter() {
-            if counter_broke[trigger.idx()] {
+            if counter_broke & (1u64 << trigger.idx()) != 0 {
                 let c_idx = counter.idx();
                 let already = self.counters[c_idx]
                     .iter()
@@ -1221,10 +1302,172 @@ impl<'a> Tier3DfaMatcher<'a> {
         self.has_live_instances = self.counters.iter().any(|c| !c.is_empty());
     }
 
+    /// Range-compressed slow path for counting transitions.
+    ///
+    /// Semantically equivalent to [`step_slow`] but operates on
+    /// `InstanceRange` entries (one per origin per counter) instead of
+    /// individual `Instance` structs.  This reduces per-byte work from
+    /// O(max_count) to O(body_length) per counter.
+    ///
+    /// Only valid when [`Tier3Analysis::all_counters_rangeable`] is true
+    /// (all counter bodies have fixed byte-length).
+    #[inline(never)]
+    fn step_slow_ranged(&mut self, slot: usize) {
+        let t = &self.cache.transitions[slot];
+
+        // Reset next_ranged.
+        for nr in &mut self.next_ranged {
+            nr.clear();
+        }
+        self.match_at_end = false;
+
+        let mut any_can_break = false;
+        let num_counters = self.ranged_counters.len();
+        // Use u64 bitmask — tier 3 patterns have at most a handful of
+        // counters (well under 64).
+        debug_assert!(num_counters <= 64);
+        let mut counter_broke: u64 = 0;
+
+        #[allow(clippy::needless_range_loop)]
+        for c_idx in 0..num_counters {
+            for range in &self.ranged_counters[c_idx] {
+                let action = t
+                    .origin_keys
+                    .iter()
+                    .position(|&k| k == range.origin)
+                    .map(|i| &t.origin_actions[i]);
+
+                match action {
+                    Some(OriginAction::Advance { new_origins }) => {
+                        for &new_o in new_origins.iter() {
+                            insert_range(
+                                &mut self.next_ranged[c_idx],
+                                new_o,
+                                range.min_val,
+                                range.max_val,
+                            );
+                        }
+                    }
+                    Some(OriginAction::Dead) | None => {}
+                    Some(OriginAction::Increment {
+                        advance_origins,
+                        min,
+                        max,
+                        continue_origins,
+                        break_is_match,
+                        break_is_match_at_end,
+                    }) => {
+                        // Advance-or-increment: the range survives at
+                        // advance_origins with the same values.
+                        for &new_o in advance_origins.iter() {
+                            insert_range(
+                                &mut self.next_ranged[c_idx],
+                                new_o,
+                                range.min_val,
+                                range.max_val,
+                            );
+                        }
+
+                        // CInc fires: new values are [min_val+1, max_val+1].
+                        let new_min = range.min_val + 1;
+                        let new_max = range.max_val + 1;
+
+                        // Continue: values in [new_min, min(new_max, max-1)].
+                        let continue_cap = *max - 1; // max counter value that can continue
+                        if new_min <= continue_cap {
+                            let cont_max = new_max.min(continue_cap);
+                            for &new_o in continue_origins.iter() {
+                                insert_range(
+                                    &mut self.next_ranged[c_idx],
+                                    new_o,
+                                    new_min,
+                                    cont_max,
+                                );
+                            }
+                        }
+
+                        // Break: any value >= min triggers break.
+                        // The break range is [max(new_min, *min), new_max].
+                        if new_max >= *min {
+                            any_can_break = true;
+                            counter_broke |= 1u64 << c_idx;
+                            if *break_is_match {
+                                self.ever_matched = true;
+                            }
+                            if *break_is_match_at_end {
+                                self.match_at_end = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Select DFA successor.
+        if t.is_counting && any_can_break {
+            self.current = t.with_break;
+        } else {
+            self.current = t.no_break;
+        }
+        if !t.is_counting {
+            let (m, mae) = if any_can_break {
+                (t.with_break_is_match, t.with_break_is_match_at_end)
+            } else {
+                (t.no_break_is_match, t.no_break_is_match_at_end)
+            };
+            if m {
+                self.ever_matched = true;
+            }
+            if mae {
+                self.match_at_end = true;
+            }
+        } else {
+            if t.no_break_is_match {
+                self.ever_matched = true;
+            }
+            if t.no_break_is_match_at_end {
+                self.match_at_end = true;
+            }
+        }
+
+        // Swap range lists.
+        std::mem::swap(&mut self.ranged_counters, &mut self.next_ranged);
+
+        // Seed new instances as single-value ranges.
+        for &(counter, origin, value) in t.seeds.iter() {
+            insert_range(
+                &mut self.ranged_counters[counter.idx()],
+                origin,
+                value,
+                value,
+            );
+        }
+        // Break seeds gated on the triggering counter.
+        for &(trigger, counter, origin, value) in t.break_seeds.iter() {
+            if counter_broke & (1u64 << trigger.idx()) != 0 {
+                insert_range(
+                    &mut self.ranged_counters[counter.idx()],
+                    origin,
+                    value,
+                    value,
+                );
+            }
+        }
+
+        // Update has_live_instances flag.
+        self.has_live_instances = self.ranged_counters.iter().any(|c| !c.is_empty());
+    }
+
     fn step_from_dead(&mut self, byte: u8) {
         if self.has_live_instances {
-            for c in &mut self.counters {
-                c.clear();
+            if self.use_ranges {
+                for c in &mut self.ranged_counters {
+                    c.clear();
+                }
+            } else {
+                for c in &mut self.counters {
+                    c.clear();
+                }
             }
             self.has_live_instances = false;
         }
@@ -1251,8 +1494,19 @@ impl<'a> Tier3DfaMatcher<'a> {
         }
 
         // Seed instances.
-        for &(counter, origin, value) in trans.seeds.iter() {
-            self.counters[counter.idx()].push(Instance { value, origin });
+        if self.use_ranges {
+            for &(counter, origin, value) in trans.seeds.iter() {
+                insert_range(
+                    &mut self.ranged_counters[counter.idx()],
+                    origin,
+                    value,
+                    value,
+                );
+            }
+        } else {
+            for &(counter, origin, value) in trans.seeds.iter() {
+                self.counters[counter.idx()].push(Instance { value, origin });
+            }
         }
         if !trans.seeds.is_empty() {
             self.has_live_instances = true;
@@ -1337,7 +1591,11 @@ impl<'a> Tier3DfaMatcher<'a> {
                 continue;
             }
 
-            self.step_slow(slot);
+            if self.use_ranges {
+                self.step_slow_ranged(slot);
+            } else {
+                self.step_slow(slot);
+            }
         }
     }
 
