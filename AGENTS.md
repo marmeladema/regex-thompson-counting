@@ -179,6 +179,19 @@ cargo bench --bench memrange -- "no_match"  # filter by name substring
 Compares NEON (aarch64) / SSE2+AVX2 (x86_64) against the scalar fallback.
 Reports throughput in GiB/s.  HTML reports in `target/criterion/`.
 
+Criterion wall-clock benchmarks (pathological pattern, rethoc vs `regex` crate):
+
+```bash
+cargo bench --bench pathological            # run all pathological benchmarks
+cargo bench --bench pathological -- "compile"   # compile time only
+cargo bench --bench pathological -- "match_at_end"  # match-at-end only
+```
+
+Tests `.{0,1000}.{0,1000}.{0,1000}a` — three sequential bounded
+repetitions with wildcard bodies.  Compares compilation time, no-match
+(prefilter-dominated), and match-at-end (actual simulation) across
+sizes up to 64 KB.  HTML reports in `target/criterion/`.
+
 Rebar (comparative benchmarks against `rust/regex`):
 
 All rebar commands run from `bench/rebar/`.  The rebar binary is at

@@ -35,3 +35,7 @@ harness = false
 [[bench]]
 name = "memrange"
 harness = false
+
+[[bench]]
+name = "pathological"
+harness = false
