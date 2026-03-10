@@ -57,6 +57,25 @@ Tiers are selected at compile time based on pattern analysis:
 - **Tier 3**: Conditional transitions. Non-nested counters with variable-length bodies.
 - **Tier 4**: Compiled counter programs. Nested repetitions. Most general DFA tier.
 
+## Design Principles
+
+1. **Precompute at build time.** Everything that can be computed or preprocessed
+   from the NFA structure alone must be done in `RegexBuilder::build()` and
+   stored on the `Regex` struct (e.g. `Tier2Analysis`, `Tier3Analysis`,
+   `counter_info`, `byte_classes`).  Matcher hot paths should never recompute
+   invariant data.
+
+2. **Reuse memory across matches.** Cache and scratch structures (`Tier*DfaCache`,
+   `DfaMemory`, `CounterPool`) are allocated once and reused for every match
+   invocation.  `clear()` / `reset_for_new_match()` methods reset logical state
+   without deallocating.  Avoid allocating in the per-byte matching loop.
+
+3. **Prefer flat data structures during matching.** Nested collections like
+   `Vec<Vec<_>>` or `HashMap<_, Vec<_>>` make memory reuse difficult (inner
+   containers are separately heap-allocated and cannot be bulk-cleared).  Use
+   flat arrays with index ranges (e.g. `body_interior: Box<[u32]>` +
+   `body_ranges: Box<[(usize, usize)]>`) or arena-style pools instead.
+
 ## Code Style
 
 ### Imports
