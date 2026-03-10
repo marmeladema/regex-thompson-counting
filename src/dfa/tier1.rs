@@ -5,9 +5,9 @@
 
 use std::fmt;
 
-use crate::{Prefilter, Regex, State, StateIdx, byte_match_ci, dfa::DfaMemory, is_word_byte};
+use crate::{Prefilter, Regex, State, StateIdx, byte_match_ci, is_word_byte};
 
-use super::DfaStateId;
+use super::{DfaCache, DfaMemory, DfaStateId};
 
 // ---------------------------------------------------------------------------
 // DFA cache (Tier 1)
@@ -25,25 +25,27 @@ use super::DfaStateId;
 /// The cache is **persisted across `matcher()` calls** for the same
 /// `Regex`.  A unique regex ID detects when a different regex is used
 /// and clears the cache.
-pub(crate) struct DfaCache {
-    memory: DfaMemory,
+pub(crate) struct Tier1DfaCache {
+    inner: DfaCache,
+    stride: usize,
     /// Flat transition table: `transitions[state.0 * stride + byte_class]`.
     /// Unpopulated slots contain `DfaStateId::UNPOPULATED`.
     transitions: Vec<DfaStateId>,
 }
 
-impl fmt::Debug for DfaCache {
+impl fmt::Debug for Tier1DfaCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DfaCache")
-            .field("num_states", &self.memory.states.len())
+        f.debug_struct("Tier1DfaCache")
+            .field("num_states", &self.inner.states.len())
             .finish()
     }
 }
 
-impl DfaCache {
-    pub(crate) fn new(num_nfa_states: usize) -> Self {
+impl Tier1DfaCache {
+    pub(crate) fn new() -> Self {
         Self {
-            memory: DfaMemory::new(num_nfa_states),
+            inner: DfaCache::new(),
+            stride: 256,
             transitions: Vec::new(),
         }
     }
@@ -59,8 +61,8 @@ impl DfaCache {
         is_match_at_end: bool,
         prev_was_word: bool,
     ) -> Option<DfaStateId> {
-        let stride = self.memory.stride;
-        self.memory.intern_state(
+        let stride = self.stride;
+        self.inner.intern_state(
             nfa_states,
             deferred_asserts,
             is_match,
@@ -81,8 +83,10 @@ impl DfaCache {
     /// Assert state index is collected in `closure_deferred`.
     ///
     /// Returns `(consuming_states, deferred_asserts, is_match, is_match_at_end)`.
+    #[allow(clippy::too_many_arguments)]
     fn epsilon_closure(
         &mut self,
+        memory: &mut DfaMemory,
         seeds: impl Iterator<Item = StateIdx>,
         regex: &Regex,
         at_start: bool,
@@ -90,7 +94,7 @@ impl DfaCache {
         prev_byte: Option<u8>,
         next_byte: Option<u8>,
     ) -> (Box<[StateIdx]>, Box<[StateIdx]>, bool, bool) {
-        let (is_match, is_match_at_end) = self.memory.epsilon_closure(
+        let (is_match, is_match_at_end) = memory.epsilon_closure(
             seeds,
             regex,
             at_start,
@@ -101,25 +105,31 @@ impl DfaCache {
             |_, _, _, _, _, _| unreachable!(),
         );
 
-        let nfa_states: Box<[StateIdx]> = self.memory.closure_result.as_slice().into();
-        let deferred: Box<[StateIdx]> = self.memory.closure_deferred.as_slice().into();
+        let nfa_states: Box<[StateIdx]> = memory.closure_result.as_slice().into();
+        let deferred: Box<[StateIdx]> = memory.closure_deferred.as_slice().into();
         (nfa_states, deferred, is_match, is_match_at_end)
     }
 
     /// Compute the DFA transition for `(from_state, byte)`, using byte-class
     /// compression (stride < 256).
     #[inline(always)]
-    fn transition(&mut self, from: DfaStateId, byte: u8, regex: &Regex) -> DfaStateId {
+    fn transition(
+        &mut self,
+        memory: &mut DfaMemory,
+        from: DfaStateId,
+        byte: u8,
+        regex: &Regex,
+    ) -> DfaStateId {
         if from == DfaStateId::DEAD {
-            return self.transition_from_dead(byte, regex);
+            return self.transition_from_dead(memory, byte, regex);
         }
         let class = regex.byte_classes[byte as usize] as usize;
-        let slot = from.idx() * self.memory.stride + class;
+        let slot = from.idx() * self.stride + class;
         let cached = self.transitions[slot];
         if cached != DfaStateId::UNPOPULATED {
             return cached;
         }
-        let to = self.populate(from, byte, regex);
+        let to = self.populate(memory, from, byte, regex);
         self.transitions[slot] = to;
         to
     }
@@ -127,16 +137,22 @@ impl DfaCache {
     /// Compute the DFA transition for `(from_state, byte)`, using the
     /// identity mapping (stride=256, no byte-class indirection).
     #[inline(always)]
-    fn transition_direct(&mut self, from: DfaStateId, byte: u8, regex: &Regex) -> DfaStateId {
+    fn transition_direct(
+        &mut self,
+        memory: &mut DfaMemory,
+        from: DfaStateId,
+        byte: u8,
+        regex: &Regex,
+    ) -> DfaStateId {
         if from == DfaStateId::DEAD {
-            return self.transition_from_dead(byte, regex);
+            return self.transition_from_dead(memory, byte, regex);
         }
         let slot = from.idx() * 256 + byte as usize;
         let cached = self.transitions[slot];
         if cached != DfaStateId::UNPOPULATED {
             return cached;
         }
-        let to = self.populate(from, byte, regex);
+        let to = self.populate(memory, from, byte, regex);
         self.transitions[slot] = to;
         to
     }
@@ -144,8 +160,13 @@ impl DfaCache {
     /// Transition from the DEAD state (re-seed from start).
     /// Separated to keep the hot path of `transition()` small.
     #[inline(never)]
-    fn transition_from_dead(&mut self, byte: u8, regex: &Regex) -> DfaStateId {
-        self.populate(DfaStateId::DEAD, byte, regex)
+    fn transition_from_dead(
+        &mut self,
+        memory: &mut DfaMemory,
+        byte: u8,
+        regex: &Regex,
+    ) -> DfaStateId {
+        self.populate(memory, DfaStateId::DEAD, byte, regex)
     }
 
     /// On cache miss: compute the next DFA state.
@@ -154,11 +175,17 @@ impl DfaCache {
     ///          Passing assertions produce extra epsilon-closure targets.
     /// Phase 2: All consuming NFA states in `from` attempt to consume `byte`.
     /// Phase 3: Epsilon closure of (consumed targets + resolved targets + seed).
-    fn populate(&mut self, from: DfaStateId, byte: u8, regex: &Regex) -> DfaStateId {
+    fn populate(
+        &mut self,
+        memory: &mut DfaMemory,
+        from: DfaStateId,
+        byte: u8,
+        regex: &Regex,
+    ) -> DfaStateId {
         let mut targets: Vec<StateIdx> = Vec::new();
 
         if from != DfaStateId::DEAD {
-            let from_state = &self.memory.states[from.idx()];
+            let from_state = &self.inner.states[from.idx()];
 
             // Phase 1: resolve deferred assertions.
             let extra = from_state.resolve_deferred(byte, regex);
@@ -178,6 +205,7 @@ impl DfaCache {
                 let resolved_prev = from_state.prev_byte_representative();
                 let (resolved_consumers, _resolved_deferred, resolved_match, resolved_match_at_end) =
                     self.epsilon_closure(
+                        memory,
                         extra.into_iter(),
                         regex,
                         false,
@@ -188,7 +216,7 @@ impl DfaCache {
                 // These resolved consumers can now consume `byte`.
                 // NOTE: We must re-read from_state after epsilon_closure
                 // because it borrows &mut self.
-                let from_state = &self.memory.states[from.idx()];
+                let from_state = &self.inner.states[from.idx()];
                 for &idx in resolved_consumers.iter() {
                     let target = match regex.states[idx] {
                         State::Byte { byte: b2, out } if byte == b2 => Some(out),
@@ -249,6 +277,7 @@ impl DfaCache {
                 if targets.is_empty() {
                     // No consuming state produced a target.  Re-seed.
                     let (nfa_set, deferred, mut m, mut mae) = self.epsilon_closure(
+                        memory,
                         std::iter::once(regex.start),
                         regex,
                         false,
@@ -273,7 +302,7 @@ impl DfaCache {
 
                 let seeds = targets.into_iter().chain(std::iter::once(regex.start));
                 let (nfa_set, deferred, mut m, mut mae) =
-                    self.epsilon_closure(seeds, regex, false, false, Some(byte), None);
+                    self.epsilon_closure(memory, seeds, regex, false, false, Some(byte), None);
                 m |= resolved_match;
                 mae |= resolved_match_at_end;
                 if nfa_set.is_empty() && deferred.is_empty() && !m && !mae {
@@ -310,6 +339,7 @@ impl DfaCache {
 
         if targets.is_empty() {
             let (nfa_set, deferred, is_match, is_match_at_end) = self.epsilon_closure(
+                memory,
                 std::iter::once(regex.start),
                 regex,
                 false,
@@ -332,7 +362,7 @@ impl DfaCache {
 
         let seeds = targets.into_iter().chain(std::iter::once(regex.start));
         let (nfa_set, deferred, is_match, is_match_at_end) =
-            self.epsilon_closure(seeds, regex, false, false, Some(byte), None);
+            self.epsilon_closure(memory, seeds, regex, false, false, Some(byte), None);
 
         if nfa_set.is_empty() && deferred.is_empty() && !is_match && !is_match_at_end {
             return DfaStateId::DEAD;
@@ -348,31 +378,40 @@ impl DfaCache {
     }
 
     /// Reset the cache for reuse with a new regex.
-    fn clear(&mut self, num_nfa_states: usize, stride: usize) {
-        self.memory.clear(num_nfa_states, stride);
+    fn clear(&mut self, memory: &mut DfaMemory, num_nfa_states: usize, stride: usize) {
+        self.inner.clear();
+        self.stride = stride;
+        memory.clear(num_nfa_states);
         self.transitions.clear();
     }
 
     /// Prepare the cache for use with `regex`.
     #[inline]
-    pub(crate) fn prepare(&mut self, regex: &Regex) {
+    pub(crate) fn prepare(&mut self, memory: &mut DfaMemory, regex: &Regex) {
         let id = regex.id;
-        if self.memory.regex_id == id && self.memory.start_id != DfaStateId::DEAD {
+        if self.inner.regex_id == id && self.inner.start_id != DfaStateId::DEAD {
             return;
         }
-        self.clear(regex.states.len(), regex.num_byte_classes);
-        self.memory.regex_id = id;
+        self.clear(memory, regex.states.len(), regex.num_byte_classes);
+        self.inner.regex_id = id;
 
         // Start state: at_start=true, prev_byte=None, at_end=false.
         // Deferred assertions at start (e.g., `\b` at pos 0) get
         // prev=None → prev_was_word=false.
-        let (nfa_set, deferred, is_match, is_match_at_end) =
-            self.epsilon_closure(std::iter::once(regex.start), regex, true, false, None, None);
+        let (nfa_set, deferred, is_match, is_match_at_end) = self.epsilon_closure(
+            memory,
+            std::iter::once(regex.start),
+            regex,
+            true,
+            false,
+            None,
+            None,
+        );
         let pw = false; // At start, prev is always non-word.
-        self.memory.start_id = self
+        self.inner.start_id = self
             .intern_state(nfa_set, deferred, is_match, is_match_at_end, pw)
             .expect("start state exceeds DFA_MAX_STATES");
-        self.memory.start_is_match = self.memory.states[self.memory.start_id.idx()].is_match;
+        self.inner.start_is_match = self.inner.states[self.inner.start_id.idx()].is_match;
     }
 }
 
@@ -382,7 +421,8 @@ impl DfaCache {
 
 /// Lazy DFA matcher for Tier 1 (counter-free) patterns.
 pub struct DfaMatcher<'a> {
-    cache: &'a mut DfaCache,
+    cache: &'a mut Tier1DfaCache,
+    memory: &'a mut DfaMemory,
     regex: &'a Regex,
     current: DfaStateId,
     ever_matched: bool,
@@ -391,11 +431,16 @@ pub struct DfaMatcher<'a> {
 
 impl<'a> DfaMatcher<'a> {
     #[inline]
-    pub(crate) fn new(cache: &'a mut DfaCache, regex: &'a Regex) -> Self {
+    pub(crate) fn new(
+        cache: &'a mut Tier1DfaCache,
+        memory: &'a mut DfaMemory,
+        regex: &'a Regex,
+    ) -> Self {
         DfaMatcher {
-            current: cache.memory.start_id,
-            ever_matched: cache.memory.start_is_match,
+            current: cache.inner.start_id,
+            ever_matched: cache.inner.start_is_match,
             cache,
+            memory,
             regex,
             prefilter: regex.prefilter,
         }
@@ -403,12 +448,16 @@ impl<'a> DfaMatcher<'a> {
 
     #[inline(always)]
     pub fn step(&mut self, byte: u8) {
-        if self.cache.memory.stride == 256 {
-            self.current = self.cache.transition_direct(self.current, byte, self.regex);
+        if self.cache.stride == 256 {
+            self.current =
+                self.cache
+                    .transition_direct(self.memory, self.current, byte, self.regex);
         } else {
-            self.current = self.cache.transition(self.current, byte, self.regex);
+            self.current = self
+                .cache
+                .transition(self.memory, self.current, byte, self.regex);
         }
-        if self.current != DfaStateId::DEAD && self.cache.memory.states[self.current.idx()].is_match
+        if self.current != DfaStateId::DEAD && self.cache.inner.states[self.current.idx()].is_match
         {
             self.ever_matched = true;
         }
@@ -419,7 +468,7 @@ impl<'a> DfaMatcher<'a> {
         if self.ever_matched {
             return;
         }
-        let start_id = self.cache.memory.start_id;
+        let start_id = self.cache.inner.start_id;
 
         // Prefilter-aware scanning: when the DFA is in the start state and
         // a prefilter is available, use memchr to skip ahead to the next
@@ -447,14 +496,16 @@ impl<'a> DfaMatcher<'a> {
 
     #[inline(always)]
     fn chunk_no_prefilter(&mut self, input: &[u8]) {
-        if self.cache.memory.stride == 256 {
+        if self.cache.stride == 256 {
             for &b in input {
                 if self.ever_matched {
                     return;
                 }
-                self.current = self.cache.transition_direct(self.current, b, self.regex);
+                self.current =
+                    self.cache
+                        .transition_direct(self.memory, self.current, b, self.regex);
                 if self.current != DfaStateId::DEAD
-                    && self.cache.memory.states[self.current.idx()].is_match
+                    && self.cache.inner.states[self.current.idx()].is_match
                 {
                     self.ever_matched = true;
                 }
@@ -464,9 +515,11 @@ impl<'a> DfaMatcher<'a> {
                 if self.ever_matched {
                     return;
                 }
-                self.current = self.cache.transition(self.current, b, self.regex);
+                self.current = self
+                    .cache
+                    .transition(self.memory, self.current, b, self.regex);
                 if self.current != DfaStateId::DEAD
-                    && self.cache.memory.states[self.current.idx()].is_match
+                    && self.cache.inner.states[self.current.idx()].is_match
                 {
                     self.ever_matched = true;
                 }
@@ -502,15 +555,17 @@ impl<'a> DfaMatcher<'a> {
                     return;
                 }
             }
-            if self.cache.memory.stride == 256 {
-                self.current = self
-                    .cache
-                    .transition_direct(self.current, input[i], self.regex);
+            if self.cache.stride == 256 {
+                self.current =
+                    self.cache
+                        .transition_direct(self.memory, self.current, input[i], self.regex);
             } else {
-                self.current = self.cache.transition(self.current, input[i], self.regex);
+                self.current =
+                    self.cache
+                        .transition(self.memory, self.current, input[i], self.regex);
             }
             if self.current != DfaStateId::DEAD
-                && self.cache.memory.states[self.current.idx()].is_match
+                && self.cache.inner.states[self.current.idx()].is_match
             {
                 self.ever_matched = true;
             }
@@ -524,7 +579,7 @@ impl<'a> DfaMatcher<'a> {
             return true;
         }
         if self.current != DfaStateId::DEAD {
-            let state = &self.cache.memory.states[self.current.idx()];
+            let state = &self.cache.inner.states[self.current.idx()];
             if state.is_match_at_end {
                 return true;
             }

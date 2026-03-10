@@ -77,8 +77,8 @@ mod info;
 mod memrange;
 
 use dfa::{
-    DfaCache, DfaMatcher, Tier2DfaCache, Tier2DfaMatcher, Tier3Analysis, Tier3DfaCache,
-    Tier3DfaMatcher, Tier4DfaCache, Tier4DfaMatcher, compute_tier3_analysis,
+    DfaMatcher, DfaMemory, Tier1DfaCache, Tier2DfaCache, Tier2DfaMatcher, Tier3Analysis,
+    Tier3DfaCache, Tier3DfaMatcher, Tier4DfaCache, Tier4DfaMatcher, compute_tier3_analysis,
 };
 pub use info::{
     CounterInfo, ExecutionInfo, MemoryInfo, NfaStateBreakdown, RegexInfo, StartClosureInfo,
@@ -2982,8 +2982,10 @@ pub struct MatcherMemory {
     /// the counter pool.
     ctx_visited: Vec<(StateIdx, CounterCtx)>,
     counter_pool: CounterPool,
+    /// Shared scratch space for epsilon-closure computation (DFA tiers 1–3).
+    dfa_memory: DfaMemory,
     /// Lazy DFA cache (allocated on first use with a DFA-eligible regex).
-    dfa_cache: Option<DfaCache>,
+    dfa_cache: Option<Tier1DfaCache>,
     /// Tier 2 DFA cache (non-nested fixed-length-body counters, differential counters).
     tier2_cache: Option<Tier2DfaCache>,
     /// Tier 3 DFA cache (non-nested counters, conditional transitions).
@@ -3003,19 +3005,15 @@ impl MatcherMemory {
     pub fn matcher<'a>(&'a mut self, regex: &'a Regex) -> AnyMatcher<'a> {
         if regex.dfa_eligible {
             // Tier 1: pure DFA (no counters, simple assertions).
-            let cache = self
-                .dfa_cache
-                .get_or_insert_with(|| DfaCache::new(regex.states.len()));
-            cache.prepare(regex);
-            let dfa = DfaMatcher::new(cache, regex);
+            let cache = self.dfa_cache.get_or_insert_with(Tier1DfaCache::new);
+            cache.prepare(&mut self.dfa_memory, regex);
+            let dfa = DfaMatcher::new(cache, &mut self.dfa_memory, regex);
             AnyMatcher::Dfa(dfa)
         } else if regex.tier2_eligible {
             // Tier 2: DFA + differential counters (non-nested, fixed-length bodies).
-            let cache = self
-                .tier2_cache
-                .get_or_insert_with(|| Tier2DfaCache::new(regex.states.len()));
-            cache.prepare(regex);
-            let dfa = Tier2DfaMatcher::new(cache, regex);
+            let cache = self.tier2_cache.get_or_insert_with(Tier2DfaCache::new);
+            cache.prepare(&mut self.dfa_memory, regex);
+            let dfa = Tier2DfaMatcher::new(cache, &mut self.dfa_memory, regex);
             AnyMatcher::Tier2Dfa(dfa)
         } else if regex.tier3_eligible {
             // Tier 3: DFA + conditional transitions (non-nested counters).
@@ -3023,11 +3021,9 @@ impl MatcherMemory {
                 .tier3_analysis
                 .as_ref()
                 .expect("tier3_analysis must be present for tier 3 patterns");
-            let cache = self
-                .tier3_cache
-                .get_or_insert_with(|| Tier3DfaCache::new(regex.states.len()));
-            cache.prepare(regex, analysis);
-            let dfa = Tier3DfaMatcher::new(cache, regex, analysis);
+            let cache = self.tier3_cache.get_or_insert_with(Tier3DfaCache::new);
+            cache.prepare(&mut self.dfa_memory, regex, analysis);
+            let dfa = Tier3DfaMatcher::new(cache, &mut self.dfa_memory, regex, analysis);
             AnyMatcher::Tier3Dfa(dfa)
         } else if regex.tier4_eligible {
             // Tier 4: DFA + explicit counter contexts.
@@ -3062,11 +3058,9 @@ impl MatcherMemory {
                 if !regex.dfa_eligible {
                     return Err("pattern is not eligible for tier 1 (pure DFA)".into());
                 }
-                let cache = self
-                    .dfa_cache
-                    .get_or_insert_with(|| DfaCache::new(regex.states.len()));
-                cache.prepare(regex);
-                let dfa = DfaMatcher::new(cache, regex);
+                let cache = self.dfa_cache.get_or_insert_with(Tier1DfaCache::new);
+                cache.prepare(&mut self.dfa_memory, regex);
+                let dfa = DfaMatcher::new(cache, &mut self.dfa_memory, regex);
                 Ok(AnyMatcher::Dfa(dfa))
             }
             2 => {
@@ -3075,11 +3069,9 @@ impl MatcherMemory {
                         "pattern is not eligible for tier 2 (differential-counter DFA)".into(),
                     );
                 }
-                let cache = self
-                    .tier2_cache
-                    .get_or_insert_with(|| Tier2DfaCache::new(regex.states.len()));
-                cache.prepare(regex);
-                let dfa = Tier2DfaMatcher::new(cache, regex);
+                let cache = self.tier2_cache.get_or_insert_with(Tier2DfaCache::new);
+                cache.prepare(&mut self.dfa_memory, regex);
+                let dfa = Tier2DfaMatcher::new(cache, &mut self.dfa_memory, regex);
                 Ok(AnyMatcher::Tier2Dfa(dfa))
             }
             3 => {
@@ -3092,11 +3084,9 @@ impl MatcherMemory {
                     .tier3_analysis
                     .as_ref()
                     .expect("tier3_analysis must be present for tier 3 patterns");
-                let cache = self
-                    .tier3_cache
-                    .get_or_insert_with(|| Tier3DfaCache::new(regex.states.len()));
-                cache.prepare(regex, analysis);
-                let dfa = Tier3DfaMatcher::new(cache, regex, analysis);
+                let cache = self.tier3_cache.get_or_insert_with(Tier3DfaCache::new);
+                cache.prepare(&mut self.dfa_memory, regex, analysis);
+                let dfa = Tier3DfaMatcher::new(cache, &mut self.dfa_memory, regex, analysis);
                 Ok(AnyMatcher::Tier3Dfa(dfa))
             }
             4 => {
@@ -4438,10 +4428,11 @@ mod tests {
 
     /// Test a pattern+input via Tier 1 DFA (full-chunk + byte-at-a-time).
     fn test_tier1(pattern: &str, re: &Regex, input: &str, expected: bool) {
-        use crate::dfa::{DfaCache, DfaMatcher};
-        let mut cache = DfaCache::new(re.states.len());
-        cache.prepare(re);
-        let mut d = DfaMatcher::new(&mut cache, re);
+        use crate::dfa::{DfaMatcher, DfaMemory, Tier1DfaCache};
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier1DfaCache::new();
+        cache.prepare(&mut memory, re);
+        let mut d = DfaMatcher::new(&mut cache, &mut memory, re);
         d.chunk(input.as_bytes());
         let actual = d.finish();
         assert_eq!(
@@ -4449,7 +4440,7 @@ mod tests {
             "Tier1 chunk mismatch for `{}` on {:?}: got={}, expected={}",
             pattern, input, actual, expected
         );
-        let mut d = DfaMatcher::new(&mut cache, re);
+        let mut d = DfaMatcher::new(&mut cache, &mut memory, re);
         for &b in input.as_bytes() {
             d.chunk(&[b]);
         }
@@ -4463,10 +4454,11 @@ mod tests {
 
     /// Test a pattern+input via Tier 2 DFA (full-chunk + byte-at-a-time).
     fn test_tier2(pattern: &str, re: &Regex, input: &str, expected: bool) {
-        use crate::dfa::{Tier2DfaCache, Tier2DfaMatcher};
-        let mut cache = Tier2DfaCache::new(re.states.len());
-        cache.prepare(re);
-        let mut d = Tier2DfaMatcher::new(&mut cache, re);
+        use crate::dfa::{DfaMemory, Tier2DfaCache, Tier2DfaMatcher};
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier2DfaCache::new();
+        cache.prepare(&mut memory, re);
+        let mut d = Tier2DfaMatcher::new(&mut cache, &mut memory, re);
         d.chunk(input.as_bytes());
         let actual = d.finish();
         assert_eq!(
@@ -4474,7 +4466,7 @@ mod tests {
             "Tier2 chunk mismatch for `{}` on {:?}: got={}, expected={}",
             pattern, input, actual, expected
         );
-        let mut d = Tier2DfaMatcher::new(&mut cache, re);
+        let mut d = Tier2DfaMatcher::new(&mut cache, &mut memory, re);
         for &b in input.as_bytes() {
             d.chunk(&[b]);
         }
@@ -4488,14 +4480,15 @@ mod tests {
 
     /// Test a pattern+input via Tier 3 DFA (full-chunk + byte-at-a-time).
     fn test_tier3(pattern: &str, re: &Regex, input: &str, expected: bool) {
-        use crate::dfa::{Tier3DfaCache, Tier3DfaMatcher};
+        use crate::dfa::{DfaMemory, Tier3DfaCache, Tier3DfaMatcher};
         let analysis = re
             .tier3_analysis
             .as_ref()
             .expect("tier3_analysis must be present for tier 3 test");
-        let mut cache = Tier3DfaCache::new(re.states.len());
-        cache.prepare(re, analysis);
-        let mut d = Tier3DfaMatcher::new(&mut cache, re, analysis);
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier3DfaCache::new();
+        cache.prepare(&mut memory, re, analysis);
+        let mut d = Tier3DfaMatcher::new(&mut cache, &mut memory, re, analysis);
         d.chunk(input.as_bytes());
         let actual = d.finish();
         assert_eq!(
@@ -4503,7 +4496,7 @@ mod tests {
             "Tier3 chunk mismatch for `{}` on {:?}: got={}, expected={}",
             pattern, input, actual, expected
         );
-        let mut d = Tier3DfaMatcher::new(&mut cache, re, analysis);
+        let mut d = Tier3DfaMatcher::new(&mut cache, &mut memory, re, analysis);
         for &b in input.as_bytes() {
             d.chunk(&[b]);
         }

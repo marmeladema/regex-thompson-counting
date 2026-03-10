@@ -44,11 +44,10 @@
 use std::fmt;
 
 use crate::{
-    AssertKind, CounterIdx, Prefilter, Regex, State, StateIdx, byte_match_ci, dfa::DfaMemory,
-    is_word_byte,
+    AssertKind, CounterIdx, Prefilter, Regex, State, StateIdx, byte_match_ci, is_word_byte,
 };
 
-use super::DfaStateId;
+use super::{DfaCache, DfaMemory, DfaStateId};
 
 // ---------------------------------------------------------------------------
 // Precomputed NFA analysis (built once at regex compile time)
@@ -382,26 +381,26 @@ struct Instance {
 
 /// Lazy DFA cache for Tier 3.
 pub(crate) struct Tier3DfaCache {
-    memory: DfaMemory,
+    inner: DfaCache,
+    stride: usize,
     transitions: Vec<Transition>,
-    closure_seeds: Vec<(CounterIdx, StateIdx)>,
     start_seeds: Box<[(CounterIdx, StateIdx, u32)]>,
 }
 
 impl fmt::Debug for Tier3DfaCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Tier3DfaCache")
-            .field("num_states", &self.memory.states.len())
+            .field("num_states", &self.inner.states.len())
             .finish()
     }
 }
 
 impl Tier3DfaCache {
-    pub(crate) fn new(num_nfa_states: usize) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            memory: DfaMemory::new(num_nfa_states),
+            inner: DfaCache::new(),
+            stride: 256,
             transitions: Vec::new(),
-            closure_seeds: Vec::new(),
             start_seeds: Box::new([]),
         }
     }
@@ -414,8 +413,8 @@ impl Tier3DfaCache {
         is_match_at_end: bool,
         prev_was_word: bool,
     ) -> Option<DfaStateId> {
-        let stride = self.memory.stride;
-        self.memory.intern_state(
+        let stride = self.stride;
+        self.inner.intern_state(
             nfa_states,
             deferred_asserts,
             is_match,
@@ -442,6 +441,7 @@ impl Tier3DfaCache {
     #[allow(clippy::too_many_arguments)]
     fn epsilon_closure(
         &mut self,
+        memory: &mut DfaMemory,
         seeds: impl Iterator<Item = StateIdx>,
         regex: &Regex,
         analysis: &Tier3Analysis,
@@ -452,24 +452,22 @@ impl Tier3DfaCache {
     ) -> ClosureResult {
         let mut encountered_cinc = false;
 
-        self.closure_seeds.clear();
-
-        let (is_match, is_match_at_end) = self.memory.epsilon_closure(
+        let (is_match, is_match_at_end) = memory.epsilon_closure(
             seeds,
             regex,
             at_start,
             false,
             prev_byte,
             next_byte,
-            |memory, counter, out| {
-                memory.closure_stack.push(out);
-                self.closure_seeds.push((counter, out));
+            |mem, counter, out| {
+                mem.closure_stack.push(out);
+                mem.closure_seeds.push((counter, out));
             },
-            |memory, _, out, out1, _, _| {
+            |mem, _, out, out1, _, _| {
                 encountered_cinc = true;
-                memory.closure_stack.push(out);
+                mem.closure_stack.push(out);
                 if follow_break {
-                    memory.closure_stack.push(out1);
+                    mem.closure_stack.push(out1);
                 }
             },
         );
@@ -477,7 +475,7 @@ impl Tier3DfaCache {
         // Resolve CI seed pairs to (counter, consuming_state) pairs
         // using the precomputed ci_origins table.
         let mut seed_instances: Vec<(CounterIdx, StateIdx)> = Vec::new();
-        for &(counter, ci_out) in &self.closure_seeds {
+        for &(counter, ci_out) in &memory.closure_seeds {
             for &c in analysis.ci_origins[ci_out.idx()].iter() {
                 seed_instances.push((counter, c));
             }
@@ -486,8 +484,8 @@ impl Tier3DfaCache {
         seed_instances.dedup();
 
         ClosureResult {
-            nfa_states: self.memory.closure_result.as_slice().into(),
-            deferred_asserts: self.memory.closure_deferred.as_slice().into(),
+            nfa_states: memory.closure_result.as_slice().into(),
+            deferred_asserts: memory.closure_deferred.as_slice().into(),
             is_match,
             is_match_at_end,
             encountered_cinc,
@@ -502,6 +500,7 @@ impl Tier3DfaCache {
     /// Compute the transition for `(from_state, byte)`.
     fn populate(
         &mut self,
+        memory: &mut DfaMemory,
         from: DfaStateId,
         byte: u8,
         regex: &Regex,
@@ -516,13 +515,14 @@ impl Tier3DfaCache {
         let mut resolved_is_match_at_end = false;
 
         if from != DfaStateId::DEAD {
-            let from_state = &self.memory.states[from.idx()];
+            let from_state = &self.inner.states[from.idx()];
 
             // Resolve deferred assertions.
             let extra = from_state.resolve_deferred(byte, regex);
             if !extra.is_empty() {
                 let resolved_prev = from_state.prev_byte_representative();
                 let cr = self.epsilon_closure(
+                    memory,
                     extra.into_iter(),
                     regex,
                     analysis,
@@ -547,7 +547,7 @@ impl Tier3DfaCache {
             }
 
             // Phase 2: consuming states in `from` consume `byte`.
-            let nfa_states = self.memory.states[from.idx()].nfa_states.clone();
+            let nfa_states = self.inner.states[from.idx()].nfa_states.clone();
             for &idx in nfa_states.iter() {
                 if let Some(t) = consume_byte(idx, byte, regex) {
                     targets_per_origin.push((idx, vec![t]));
@@ -562,6 +562,7 @@ impl Tier3DfaCache {
 
         // Probe: full "both" closure to detect CInc and collect seeds.
         let probe = self.epsilon_closure(
+            memory,
             all_targets
                 .iter()
                 .copied()
@@ -609,6 +610,7 @@ impl Tier3DfaCache {
         if is_counting {
             // Two separate closures.
             let cr_nb = self.epsilon_closure(
+                memory,
                 all_targets
                     .iter()
                     .copied()
@@ -727,7 +729,7 @@ impl Tier3DfaCache {
         if id == DfaStateId::DEAD {
             (false, false)
         } else {
-            let s = &self.memory.states[id.idx()];
+            let s = &self.inner.states[id.idx()];
             (s.is_match, s.is_match_at_end)
         }
     }
@@ -769,23 +771,30 @@ impl Tier3DfaCache {
     // Cache management
     // -----------------------------------------------------------------------
 
-    fn clear(&mut self, num_nfa_states: usize, stride: usize) {
-        self.memory.clear(num_nfa_states, stride);
+    fn clear(&mut self, memory: &mut DfaMemory, num_nfa_states: usize, stride: usize) {
+        self.inner.clear();
+        self.stride = stride;
+        memory.clear(num_nfa_states);
         self.transitions.clear();
-        self.closure_seeds.clear();
         self.start_seeds = Box::new([]);
     }
 
     /// Prepare the cache for `regex`.
-    pub(crate) fn prepare(&mut self, regex: &Regex, analysis: &Tier3Analysis) {
+    pub(crate) fn prepare(
+        &mut self,
+        memory: &mut DfaMemory,
+        regex: &Regex,
+        analysis: &Tier3Analysis,
+    ) {
         let id = regex.id;
-        if self.memory.regex_id == id && self.memory.start_id != DfaStateId::DEAD {
+        if self.inner.regex_id == id && self.inner.start_id != DfaStateId::DEAD {
             return;
         }
-        self.clear(regex.states.len(), regex.num_byte_classes);
-        self.memory.regex_id = id;
+        self.clear(memory, regex.states.len(), regex.num_byte_classes);
+        self.inner.regex_id = id;
 
         let cr = self.epsilon_closure(
+            memory,
             std::iter::once(regex.start),
             regex,
             analysis,
@@ -794,7 +803,7 @@ impl Tier3DfaCache {
             None,
             true, // follow_break=true for start closure
         );
-        self.memory.start_id = self
+        self.inner.start_id = self
             .intern_state(
                 cr.nfa_states,
                 cr.deferred_asserts,
@@ -803,9 +812,9 @@ impl Tier3DfaCache {
                 false,
             )
             .expect("start state exceeds DFA_MAX_STATES");
-        self.memory.start_is_match = self.memory.states[self.memory.start_id.idx()].is_match;
-        self.memory.start_is_match_at_end =
-            self.memory.states[self.memory.start_id.idx()].is_match_at_end;
+        self.inner.start_is_match = self.inner.states[self.inner.start_id.idx()].is_match;
+        self.inner.start_is_match_at_end =
+            self.inner.states[self.inner.start_id.idx()].is_match_at_end;
         self.start_seeds = cr
             .seed_instances
             .iter()
@@ -1017,6 +1026,7 @@ fn break_closure(
 /// Tier 3 DFA matcher.
 pub struct Tier3DfaMatcher<'a> {
     cache: &'a mut Tier3DfaCache,
+    memory: &'a mut DfaMemory,
     regex: &'a Regex,
     analysis: &'a Tier3Analysis,
     current: DfaStateId,
@@ -1031,6 +1041,7 @@ pub struct Tier3DfaMatcher<'a> {
 impl<'a> Tier3DfaMatcher<'a> {
     pub(crate) fn new(
         cache: &'a mut Tier3DfaCache,
+        memory: &'a mut DfaMemory,
         regex: &'a Regex,
         analysis: &'a Tier3Analysis,
     ) -> Self {
@@ -1043,16 +1054,17 @@ impl<'a> Tier3DfaMatcher<'a> {
             counters[counter.idx()].push(Instance { value, origin });
         }
 
-        let ever_matched = cache.memory.start_is_match;
-        let match_at_end = cache.memory.start_is_match_at_end;
+        let ever_matched = cache.inner.start_is_match;
+        let match_at_end = cache.inner.start_is_match_at_end;
         let has_live_instances = !cache.start_seeds.is_empty();
 
         Tier3DfaMatcher {
-            current: cache.memory.start_id,
+            current: cache.inner.start_id,
             ever_matched,
             match_at_end,
             has_live_instances,
             cache,
+            memory,
             regex,
             analysis,
             counters,
@@ -1218,9 +1230,13 @@ impl<'a> Tier3DfaMatcher<'a> {
         }
         self.match_at_end = false;
 
-        let trans = self
-            .cache
-            .populate(DfaStateId::DEAD, byte, self.regex, self.analysis);
+        let trans = self.cache.populate(
+            self.memory,
+            DfaStateId::DEAD,
+            byte,
+            self.regex,
+            self.analysis,
+        );
 
         // From DEAD, no instances exist, so use no_break successor.
         self.current = trans.no_break;
@@ -1285,7 +1301,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             }
         };
 
-        let stride = self.cache.memory.stride;
+        let stride = self.cache.stride;
 
         for &b in input {
             if self.ever_matched {
@@ -1305,9 +1321,9 @@ impl<'a> Tier3DfaMatcher<'a> {
             };
             let slot = self.current.idx() * stride + class;
             if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
-                let trans = self
-                    .cache
-                    .populate(self.current, b, self.regex, self.analysis);
+                let trans =
+                    self.cache
+                        .populate(self.memory, self.current, b, self.regex, self.analysis);
                 self.cache.transitions[slot] = trans;
             }
             let t = &self.cache.transitions[slot];
@@ -1343,7 +1359,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         // (computed per-instance in step_slow) correctly reflects whether a
         // specific counter instance actually broke with enough value.
         if self.current != DfaStateId::DEAD {
-            let state = &self.cache.memory.states[self.current.idx()];
+            let state = &self.cache.inner.states[self.current.idx()];
             if state.resolve_deferred_at_end(self.regex) {
                 return true;
             }

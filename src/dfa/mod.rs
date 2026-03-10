@@ -30,7 +30,7 @@ mod tier4;
 
 use ahash::HashMap;
 
-pub(crate) use tier1::{DfaCache, DfaMatcher};
+pub(crate) use tier1::{DfaMatcher, Tier1DfaCache};
 pub(crate) use tier2::{Tier2DfaCache, Tier2DfaMatcher};
 pub(crate) use tier3::{Tier3Analysis, Tier3DfaCache, Tier3DfaMatcher, compute_tier3_analysis};
 pub(crate) use tier4::{Tier4DfaCache, Tier4DfaMatcher};
@@ -45,7 +45,7 @@ const DFA_MAX_STATES: usize = 2048;
 // DFA state table (shared by all tiers)
 // ---------------------------------------------------------------------------
 
-/// Index into the DFA state table ([`DfaMemory::states`]).
+/// Index into the DFA state table ([`DfaCache::states`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct DfaStateId(u32);
 
@@ -147,52 +147,31 @@ impl DfaState {
     }
 }
 
-#[derive(Debug)]
-struct DfaMemory {
-    states: Vec<DfaState>,
-    state_map: HashMap<DfaState, DfaStateId>,
-    stride: usize,
+/// Scratch space for epsilon-closure computation, shared across DFA
+/// tiers 1–3.
+///
+/// All fields are temporary buffers that are cleared at the start of each
+/// [`epsilon_closure`](Self::epsilon_closure) call.  The struct carries no
+/// semantically meaningful state between calls — it exists purely to avoid
+/// repeated heap allocation.
+#[derive(Debug, Default)]
+pub(crate) struct DfaMemory {
     // Scratch space for closure.
-    closure_stack: Vec<StateIdx>,
-    closure_result: Vec<StateIdx>,
-    closure_deferred: Vec<StateIdx>,
-    closure_visited: Vec<bool>,
-    regex_id: u64,
-    start_id: DfaStateId,
-    start_is_match: bool,
-    start_is_match_at_end: bool,
+    pub(super) closure_stack: Vec<StateIdx>,
+    pub(super) closure_result: Vec<StateIdx>,
+    pub(super) closure_deferred: Vec<StateIdx>,
+    pub(super) closure_visited: Vec<bool>,
+    pub(super) closure_seeds: Vec<(CounterIdx, StateIdx)>,
 }
 
 impl DfaMemory {
+    /// Reset the scratch buffers for reuse with a new regex.
     #[inline]
-    pub(crate) fn new(num_nfa_states: usize) -> Self {
-        Self {
-            states: Vec::new(),
-            state_map: HashMap::default(),
-            stride: 256, // default; overwritten by prepare()
-            closure_stack: Vec::new(),
-            closure_result: Vec::new(),
-            closure_deferred: Vec::new(),
-            closure_visited: vec![false; num_nfa_states],
-            regex_id: 0,
-            start_id: DfaStateId::DEAD,
-            start_is_match: false,
-            start_is_match_at_end: false,
-        }
-    }
-
-    /// Reset the cache for reuse with a new regex.
-    #[inline]
-    fn clear(&mut self, num_nfa_states: usize, stride: usize) {
-        self.states.clear();
-        self.state_map.clear();
-        self.stride = stride;
+    pub(super) fn clear(&mut self, num_nfa_states: usize) {
         self.closure_deferred.clear();
         self.closure_visited.clear();
         self.closure_visited.resize(num_nfa_states, false);
-        self.regex_id = 0;
-        self.start_id = DfaStateId::DEAD;
-        self.start_is_match = false;
+        self.closure_seeds.clear();
     }
 
     /// Compute the epsilon closure from a set of NFA seed states.
@@ -222,6 +201,8 @@ impl DfaMemory {
         self.closure_stack.clear();
         self.closure_result.clear();
         self.closure_deferred.clear();
+        self.closure_seeds.clear();
+
         for v in self.closure_visited.iter_mut() {
             *v = false;
         }
@@ -297,6 +278,28 @@ impl DfaMemory {
 
         (is_match, is_match_at_end)
     }
+}
+
+struct DfaCache {
+    states: Vec<DfaState>,
+    state_map: HashMap<DfaState, DfaStateId>,
+    regex_id: u64,
+    start_id: DfaStateId,
+    start_is_match: bool,
+    start_is_match_at_end: bool,
+}
+
+impl DfaCache {
+    fn new() -> Self {
+        Self {
+            states: Vec::new(),
+            state_map: HashMap::default(),
+            regex_id: 0,
+            start_id: DfaStateId::DEAD,
+            start_is_match: false,
+            start_is_match_at_end: false,
+        }
+    }
 
     /// Look up or insert a DFA state for the given sorted NFA state set.
     /// Returns `None` if the state cap ([`DFA_MAX_STATES`]) has been reached
@@ -329,5 +332,16 @@ impl DfaMemory {
         self.states.push(state);
         transition();
         Some(id)
+    }
+
+    /// Reset the cache for reuse with a new regex.
+    #[inline]
+    fn clear(&mut self) {
+        self.states.clear();
+        self.state_map.clear();
+        self.regex_id = 0;
+        self.start_id = DfaStateId::DEAD;
+        self.start_is_match = false;
+        self.start_is_match_at_end = false;
     }
 }
