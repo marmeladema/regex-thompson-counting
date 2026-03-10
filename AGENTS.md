@@ -8,7 +8,7 @@ Rust 2024 edition. Binary: `rethoc`. All source under `src/`.
 ```bash
 cargo build                         # debug build
 cargo build --release               # release build (needed for benchmarks + bless_memory.py)
-cargo test                          # run all 366 tests
+cargo test                          # run all ~382 tests (excludes ignored fuzz tests)
 cargo test test_counting            # run a single test by exact name
 cargo test test_word_boundary       # run tests matching a substring
 cargo test -- --nocapture           # show stdout/stderr from tests
@@ -30,15 +30,20 @@ Does NOT touch `min_tier:` values — those are left alone to catch tier regress
 ## Project Layout
 
 ```
-src/lib.rs          # Core NFA compiler, matcher, counter pool, ALL tests (~9200 lines)
+src/lib.rs          # Core NFA compiler, matcher, counter pool, ALL tests (~9800 lines)
 src/main.rs         # CLI binary `rethoc` (info, match, dot subcommands)
 src/info.rs         # Diagnostic/serialization types (RegexInfo, MemoryInfo, etc.)
 src/memrange.rs     # SIMD byte-range prefilter (SSE2/AVX2/NEON + scalar fallback)
+src/fuzz_gen.rs     # Grammar-aware pattern + input generator for fuzzing
 src/dfa/mod.rs      # Shared DFA infrastructure (DfaMemory, DfaState, epsilon_closure)
 src/dfa/tier1.rs    # Tier 1: Lazy DFA, counter-free patterns
 src/dfa/tier2.rs    # Tier 2: Differential counters, fixed-length bodies (Becchi-style)
 src/dfa/tier3.rs    # Tier 3: Conditional transitions, non-nested variable-length bodies
 src/dfa/tier4.rs    # Tier 4: Counter programs, nested repetitions
+fuzz/Cargo.toml                    # cargo-fuzz workspace configuration
+fuzz/fuzz_targets/fuzz_match.rs    # Fuzz target: oracle differential (rethoc vs regex crate)
+fuzz/fuzz_targets/fuzz_differential.rs  # Fuzz target: cross-tier differential (NFA as oracle)
+fuzz/fuzz_targets/fuzz_compile.rs  # Fuzz target: compilation robustness
 benches/flamegraph.rs      # Callgrind benchmarks (gungraun harness)
 benches/pathological.rs    # Criterion benchmarks: pathological bounded repetitions
 benches/pathological_profile.rs  # Callgrind profile for pathological patterns
@@ -246,3 +251,75 @@ will error for rethoc.
 # Sanity-check (verify correctness without timing)
 ./target/release/rebar measure -f '<filter>' -e '^(rethoc|rust/regex)$' --test
 ```
+
+## Fuzzing
+
+Two complementary approaches share a common grammar-aware pattern generator
+(`src/fuzz_gen.rs`) and the `regex` crate as correctness oracle.
+
+### Pattern Generator (`src/fuzz_gen.rs`)
+
+The generator maps a deterministic byte-seed into a structured AST, then
+renders it to a regex string.  Controlled features:
+
+| Feature | Range | Notes |
+|---------|-------|-------|
+| Atoms | Literals, `.`, byte classes `[a-c]` | From a fixed printable pool |
+| Repetitions | `?`, `*`, `+`, `{n,m}` | Bounded max 50 |
+| Nesting depth | 0–3 | Depth ≥2 exercises Tier 4 |
+| Alternation | 2–4 branches | |
+| Concatenation | 2–5 pieces | |
+| Anchoring | `^...$`, `^...`, `...$`, unanchored | Random per pattern |
+
+**Not generated**: Word boundaries (`\b`, `\B`) are excluded — they trigger
+a known NFA/DFA deferred-assertion edge case under investigation.
+
+Input generation is **pattern-aware**: the AST is walked to produce positive
+candidates with correct literals and valid repeat counts, then mutated to
+create boundary-condition near-misses (truncated, extended, byte-flipped,
+off-by-one on counters).  Fixed edge cases (empty, `\x00`, `\n`, `\xff`,
+repeated chars at counter boundaries) are always included.
+
+### proptest (property-based, in `cargo test`)
+
+Two `#[ignore]`d tests in `src/lib.rs` that run 100 random patterns each:
+
+```bash
+cargo test test_fuzz -- --ignored              # run both fuzz tests (~60-120s)
+cargo test test_fuzz_oracle -- --ignored       # oracle differential only
+cargo test test_fuzz_differential -- --ignored # cross-tier differential only
+```
+
+- **`test_fuzz_oracle`** — generates a pattern + targeted inputs, compiles
+  with both rethoc and the `regex` crate, asserts all tiers agree with the
+  oracle.  Also re-runs with `unroll_limit=0` to exercise counter-based paths.
+- **`test_fuzz_differential_tiers`** — same pattern + inputs, but uses the
+  NFA as oracle instead of the regex crate.  Every eligible DFA tier must
+  agree with the NFA.  Catches tier-specific bugs independently.
+
+Both tests are `#[ignore]` so `cargo test` stays fast (~0.7s for the 380
+data-driven tests).  Run them explicitly when changing the NFA compiler,
+DFA tiers, or counter logic.
+
+### cargo-fuzz (coverage-guided, for deep exploration)
+
+Three libFuzzer targets in `fuzz/fuzz_targets/`:
+
+```bash
+cargo +nightly fuzz run fuzz_match              # oracle differential (rethoc vs regex crate)
+cargo +nightly fuzz run fuzz_differential       # cross-tier differential (NFA as oracle)
+cargo +nightly fuzz run fuzz_compile            # compilation robustness (no panics/hangs)
+
+# Reproduce a crash artifact
+cargo +nightly fuzz run fuzz_match fuzz/artifacts/fuzz_match/<artifact>
+```
+
+- **`fuzz_match`** — the primary target.  For each seed: generate pattern,
+  compile with both engines, test many inputs against all eligible tiers
+  (default unroll + no-unroll), assert agreement with the regex crate.
+- **`fuzz_differential`** — same structure but NFA is the oracle.  Useful
+  for tier-specific bugs without external dependencies.
+- **`fuzz_compile`** — generates patterns and compiles them.  Must not
+  panic, hang, or OOM.  Also exercises `.info()` and `.memory_size()`.
+
+Corpus and artifacts are in `fuzz/corpus/` and `fuzz/artifacts/` (gitignored).
