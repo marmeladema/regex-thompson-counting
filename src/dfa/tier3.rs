@@ -1030,36 +1030,12 @@ impl Tier3DfaCache {
             // Each seed is tagged with the counter whose CInc break leads
             // to it — the seed is only applied when that specific counter's
             // instance actually breaks.
-            let break_seeds = Self::compute_break_seeds(analysis);
-
-            // Remove unconditional seeds that should be break-gated.
             //
-            // A seed appears in both the unconditional list and break_seeds
-            // when the no_break closure reaches a CI node through states
-            // that were introduced by a previous with_break DFA transition
-            // (DFA-state overapproximation).  Such seeds are NOT genuinely
-            // unconditional — they should only fire when the triggering
-            // counter breaks.
-            //
-            // We distinguish genuine unconditional seeds from spurious ones
-            // by checking whether the seed is also present in the start
-            // closure's seeds.  Seeds from the start closure are genuinely
-            // unconditional (they exist from the very first byte, before
-            // any break path could contaminate the DFA state).
-            if !break_seeds.is_empty() {
-                seeds.retain(|s| {
-                    let in_break = break_seeds
-                        .iter()
-                        .any(|bs| bs.1 == s.0 && bs.2 == s.1 && bs.3 == s.2);
-                    if !in_break {
-                        return true; // Not a break seed — keep unconditional.
-                    }
-                    // Keep only if the seed is genuinely unconditional —
-                    // present in the start closure's seeds (before any
-                    // break path could contaminate the DFA state).
-                    self.start_seeds.iter().any(|ss| ss.0 == s.0 && ss.1 == s.1)
-                });
-            }
+            // Break seeds that duplicate unconditional seeds are excluded:
+            // the unconditional seed already fires every time, so the
+            // break-gated duplicate is redundant.  Keeping it would cause
+            // double-seeding when the trigger counter actually breaks.
+            let break_seeds = Self::compute_break_seeds(&seeds, analysis);
 
             // Compute counter-free match-at-end: true if any origin's
             // target reaches `$ → Match` without going through CInc.
@@ -1170,22 +1146,29 @@ impl Tier3DfaCache {
 
     /// Compute break seeds for a counting transition.
     ///
-    /// Returns ALL break seeds from the precomputed
-    /// [`Tier3Analysis::break_seeds`] table, including those that may
-    /// also appear in the unconditional seeds list.  The caller handles
-    /// deduplication: unconditional seeds that also appear as break seeds
-    /// are removed from the unconditional list (unless they are genuinely
-    /// unconditional — present in the start closure's seeds).
+    /// Uses the precomputed [`Tier3Analysis::break_seeds`] table.
+    /// Break seeds already present in the unconditional `seeds` list are
+    /// excluded — the unconditional seed fires every time, making the
+    /// break-gated duplicate redundant.
     ///
-    /// Including ALL precomputed break seeds (not just those reachable from
-    /// the current targets) is safe: at runtime, each break seed is gated
-    /// on `counter_broke[trigger]`, and unreachable triggers never break.
+    /// Including ALL other precomputed break seeds (not just those reachable
+    /// from the current targets) is safe: at runtime, each break seed is
+    /// gated on `counter_broke[trigger]`, and unreachable triggers never
+    /// break.
     fn compute_break_seeds(
+        seeds: &[(CounterIdx, StateIdx, u32)],
         analysis: &Tier3Analysis,
     ) -> Vec<(CounterIdx, CounterIdx, StateIdx, u32)> {
         let mut result: Vec<(CounterIdx, CounterIdx, StateIdx, u32)> = Vec::new();
         for bs in analysis.break_seeds.iter() {
             let entry = (bs.trigger, bs.counter, bs.origin, 0u32);
+            // Skip if this seed is already in the unconditional list.
+            if seeds
+                .iter()
+                .any(|e| e.0 == entry.1 && e.1 == entry.2 && e.2 == entry.3)
+            {
+                continue;
+            }
             if !result
                 .iter()
                 .any(|e| e.0 == entry.0 && e.1 == entry.1 && e.2 == entry.2 && e.3 == entry.3)
@@ -1415,7 +1398,21 @@ fn analyze_target(
 /// Epsilon closure from CInc break targets only.
 ///
 /// Returns `(is_match, is_match_at_end)` — whether `Match` or `$ → Match`
-/// is reachable from the given break-path seeds.
+/// is reachable from the given break-path seeds **without** passing through
+/// another `CounterInstance`.
+///
+/// Stopping at `CounterInstance` is critical for multi-counter patterns:
+/// when counter A breaks, the break path may enter counter B's region
+/// (via CI → body → CInc → break → `$` → `Match`).  But counter B has
+/// not yet accumulated any iterations — its break condition hasn't been
+/// met.  Propagating `break_is_match_at_end` through CI would cause a
+/// false positive: the break of counter A would immediately claim "match
+/// at end" even though counter B's minimum count hasn't been reached.
+///
+/// The runtime counter machinery handles downstream counters precisely:
+/// `break_seeds` creates new counter instances for B when A breaks, and
+/// `post_break_tails` tracks non-counter consuming states for deferred
+/// `$ → Match` detection after additional bytes are consumed.
 fn break_closure(
     break_seeds: &[StateIdx],
     states: &[State],
@@ -1444,7 +1441,11 @@ fn break_closure(
             State::Match => {
                 is_match = true;
             }
-            State::CounterInstance { out, .. } => stack.push(out),
+            // Do NOT follow through CounterInstance — downstream
+            // counters have not accumulated their required count.
+            // Their match paths are handled by break_seeds and
+            // post_break_tails at runtime.
+            State::CounterInstance { .. } => {}
             _ => {}
         }
     }

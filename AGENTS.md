@@ -169,6 +169,12 @@ The macro generates one `#[test]` per entry that compiles the pattern, asserts t
 compares against the `regex` crate as oracle, and exercises ALL eligible tiers (NFA through Tier 4).
 It also re-runs with unrolling disabled to force counter-based execution paths.
 
+**NEVER set `unroll_limit: 0` in test entries.** The macro ALREADY re-runs every
+test with `unroll_limit=0` automatically. Setting it explicitly just skips the
+default-unrolling run and redundantly tests `unroll_limit=0` twice. Use the
+default (omit `unroll_limit` entirely) so both code paths are exercised. The
+`memory` and `min_tier` values should reflect default unrolling.
+
 ### Code Organization
 
 - Struct definition immediately followed by `impl` block (no blank line between them).

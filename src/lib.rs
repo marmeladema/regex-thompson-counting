@@ -9345,6 +9345,58 @@ mod tests {
                 ("zzzzz", false),
             ],
         }
+        // Regression: commit 51ef734 inverted the seed deduplication logic in
+        // tier 3's `compute_break_seeds`, removing unconditional seeds that
+        // duplicated break seeds.  This caused the DFA to go dead on long
+        // multi-segment inputs where the unconditional seed was needed to
+        // restart counter tracking after a break.
+        //
+        // The fix reverts to the original approach: `compute_break_seeds`
+        // excludes break seeds that duplicate unconditional ones (not the
+        // other way around).  The unconditional seed list is never filtered.
+        test_tier3_seed_filtering_revert {
+            pattern: "^(0{8,31}(0+x{6,50}1y?)?(a?a?)?)?$",
+            memory: 1207,
+            min_tier: 2,
+            inputs: [
+                ("", true),
+                ("00000000", true),
+                ("0000000000000000000000000000000", true),
+                ("00000000aa", true),
+                ("0000000000000000000000000000000000000xxxxxx1", true),
+                ("0000000000000000000000000000000000000xxxxxx1y", true),
+                ("0000000", false),
+                ("00000000000000000000000000000000", false),
+                ("xxxx", false),
+                ("aaa", false),
+            ],
+        }
+        // Regression (defense-in-depth): `break_closure()` used to follow
+        // through `CounterInstance` nodes, which meant that for sequential
+        // multi-counter patterns like `.{1,2}.{4,4}$`, counter A's
+        // `break_is_match_at_end` flag would be set to true because the
+        // break closure reached `$ → Match` through counter B's CI → body
+        // → CInc → break → `$` path — even though counter B had not yet
+        // accumulated any iterations.
+        //
+        // The fix stops `break_closure` at `CounterInstance` nodes, so
+        // `break_is_match_at_end` only reflects paths reachable without
+        // entering another counter.  The downstream counter's match paths
+        // are handled by `break_seeds` and `post_break_tails` at runtime.
+        test_tier3_break_closure_stops_at_ci {
+            pattern: "^.{1,2}.{4,4}$",
+            memory: 1098,
+            min_tier: 1,
+            inputs: [
+                ("aaaaa", true),
+                ("aaaaaa", true),
+                ("a", false),
+                ("aa", false),
+                ("aaa", false),
+                ("aaaa", false),
+                ("aaaaaaa", false),
+            ],
+        }
     }
 
     /// Tier 2 encodes counter identity in `u64` bitmasks, so patterns with
