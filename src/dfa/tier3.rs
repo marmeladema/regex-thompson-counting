@@ -93,6 +93,15 @@ pub(crate) struct Tier3Analysis {
     /// instance storage in [`Tier3DfaMatcher`].  Zero when there are
     /// no counters.
     pub(crate) max_body_origins: usize,
+
+    /// Per-consuming-state flag: true if the NFA state's byte-consumption
+    /// target reaches `$ → Match` through epsilon transitions.
+    ///
+    /// Indexed by NFA state index.  Only meaningful for consuming states;
+    /// `false` for all others.  Used by the post-break tail tracker to
+    /// detect match-at-end when a tail's action is `Dead` (its target
+    /// has no further consuming states but may have `$ → Match`).
+    pub(crate) target_is_match_at_end: Box<[bool]>,
 }
 
 /// What happens structurally when a byte is consumed at a given target.
@@ -117,6 +126,10 @@ pub(crate) enum Tier3OriginKind {
         break_is_match: bool,
         /// True if the break path reaches `Match` through `$`.
         break_is_match_at_end: bool,
+        /// Non-counter consuming states on the CInc break path.
+        /// These form the "post-counter tail" that must be tracked
+        /// at runtime to detect `$ → Match` after additional bytes.
+        break_consuming_states: Box<[StateIdx]>,
     },
 }
 
@@ -184,6 +197,56 @@ pub(crate) fn compute_tier3_analysis(
         targets_vec[idx] = analyze_target(target, states, state_can_reach_match);
     }
 
+    // -- Step 2b: populate break_consuming_states (post-pass) ------------------
+    // Now that all targets are known, re-derive each Increment target's
+    // CInc break outputs and compute "true tail" consuming states — those
+    // whose byte-consumption target does NOT lead to another CInc.
+    for idx in 0..n {
+        if let Some(Tier3OriginKind::Increment { .. }) = &targets_vec[idx] {
+            // Re-walk from the consuming state's target (not the consuming
+            // state itself) to find CInc break outputs.
+            let target = match states[StateIdx(idx as u32)] {
+                State::Byte { out, .. }
+                | State::ByteCI { out, .. }
+                | State::ByteClass { out, .. } => out,
+                _ => continue, // ByteTable or non-consuming — skip
+            };
+            let mut cinc_break_outs = Vec::new();
+            let mut stack = vec![target];
+            let mut visited = vec![false; n];
+            while let Some(s) = stack.pop() {
+                let i = s.idx();
+                if visited[i] {
+                    continue;
+                }
+                visited[i] = true;
+                match states[s] {
+                    State::Split { out, out1 } => {
+                        stack.push(out1);
+                        stack.push(out);
+                    }
+                    State::Assert { out, .. } => stack.push(out),
+                    State::CounterInstance { out, .. } => stack.push(out),
+                    State::CounterIncrement { out1, .. } => {
+                        cinc_break_outs.push(out1);
+                    }
+                    _ => {}
+                }
+            }
+            if !cinc_break_outs.is_empty() {
+                let tails = break_consuming_tails(&cinc_break_outs, states, &targets_vec);
+                // Update the Increment with the computed tails.
+                if let Some(Tier3OriginKind::Increment {
+                    break_consuming_states,
+                    ..
+                }) = &mut targets_vec[idx]
+                {
+                    *break_consuming_states = tails.into_boxed_slice();
+                }
+            }
+        }
+    }
+
     // -- Step 3: compute per-CI-output consuming states -----------------------
     let mut ci_origins_vec: Vec<Box<[StateIdx]>> = vec![Box::new([]); n];
     for state in states.iter() {
@@ -208,8 +271,16 @@ pub(crate) fn compute_tier3_analysis(
 
     let mut break_seeds_raw: Vec<(CounterIdx, CounterIdx, StateIdx)> = Vec::new();
     for &(trigger, break_target) in &all_cinc_nodes {
+        // Phase 1: walk epsilon transitions from break target (Split,
+        // Assert, CI) — same as the original code.  Self-referential
+        // seeds (counter == trigger) are allowed here because they
+        // represent the outer loop re-entering the counter body
+        // through epsilon transitions (e.g. `(a{2,3})+`).
         let mut ci_stack = vec![break_target];
         let mut ci_visited = vec![false; n];
+        // Collect consuming states reachable via epsilon from the break
+        // path — these are the "hop points" for phase 2.
+        let mut break_consuming: Vec<StateIdx> = Vec::new();
         while let Some(idx) = ci_stack.pop() {
             let i = idx.idx();
             if ci_visited[i] {
@@ -229,7 +300,61 @@ pub(crate) fn compute_tier3_analysis(
                     ci_stack.push(out);
                 }
                 State::Assert { out, .. } => ci_stack.push(out),
+                State::Byte { .. }
+                | State::ByteCI { .. }
+                | State::ByteClass { .. }
+                | State::ByteTable { .. } => {
+                    break_consuming.push(idx);
+                }
                 _ => {}
+            }
+        }
+
+        // Phase 2: follow consuming states' targets to find CI nodes
+        // reachable after one byte consumption (multi-hop break seeds).
+        // Self-referential seeds (counter == trigger) are EXCLUDED here
+        // because consuming states on the break path entered the DFA
+        // state through a previous with_break closure; re-seeding the
+        // trigger counter at val=0 would create imprecise ranges.
+        for cs in &break_consuming {
+            let target = match states[*cs] {
+                State::Byte { out, .. }
+                | State::ByteCI { out, .. }
+                | State::ByteClass { out, .. } => out,
+                State::ByteTable { .. } => continue,
+                _ => continue,
+            };
+            let mut hop_stack = vec![target];
+            let mut hop_visited = vec![false; n];
+            while let Some(idx) = hop_stack.pop() {
+                let i = idx.idx();
+                if hop_visited[i] {
+                    continue;
+                }
+                hop_visited[i] = true;
+                match states[idx] {
+                    State::CounterInstance { counter, out } => {
+                        // Only add seeds for DIFFERENT counters to
+                        // prevent self-referential re-seeding.
+                        if counter != trigger {
+                            let ci_consuming = consuming_states_from(out, states);
+                            for c in ci_consuming {
+                                break_seeds_raw.push((trigger, counter, c));
+                            }
+                        }
+                        hop_stack.push(out);
+                    }
+                    State::Split { out, out1 } => {
+                        hop_stack.push(out1);
+                        hop_stack.push(out);
+                    }
+                    State::Assert { out, .. } => hop_stack.push(out),
+                    State::CounterIncrement { .. } => {
+                        // Don't follow through another CInc — tier 3
+                        // doesn't support nested counters in break paths.
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -292,11 +417,60 @@ pub(crate) fn compute_tier3_analysis(
         }
     }
 
+    // -- Step 6: compute per-consuming-state target_is_match_at_end ----------
+    // For each consuming NFA state, check if its byte-consumption target
+    // reaches `$ → Match` through epsilon transitions.  This is used by
+    // the post-break tail tracker: when a tail's action is Dead (its target
+    // has no further consuming states), this flag tells us whether the
+    // target state is `$ → Match`.
+    let mut target_mae = vec![false; n];
+    for (i, state) in states.iter().enumerate() {
+        let target = match *state {
+            State::Byte { out, .. } | State::ByteCI { out, .. } | State::ByteClass { out, .. } => {
+                if out != StateIdx::NONE {
+                    Some(out)
+                } else {
+                    None
+                }
+            }
+            // ByteTable targets vary per byte; skip (overapproximation would
+            // be unsound, and the tail tracker won't encounter ByteTable
+            // origins in practice for tier 3 patterns).
+            _ => None,
+        };
+        if let Some(t) = target {
+            // Walk epsilon transitions from the target to find `$ → Match`.
+            let mut estack = vec![t];
+            let mut evisited = vec![false; n];
+            while let Some(eidx) = estack.pop() {
+                let ei = eidx.idx();
+                if evisited[ei] {
+                    continue;
+                }
+                evisited[ei] = true;
+                match states[eidx] {
+                    State::Split { out, out1 } => {
+                        estack.push(out1);
+                        estack.push(out);
+                    }
+                    State::Assert { kind, out } => {
+                        if kind == AssertKind::End && state_can_reach_match[out.idx()] {
+                            target_mae[i] = true;
+                        }
+                    }
+                    State::CounterInstance { out, .. } => estack.push(out),
+                    _ => {}
+                }
+            }
+        }
+    }
+
     Tier3Analysis {
         targets: targets_vec.into_boxed_slice(),
         ci_origins: ci_origins_vec.into_boxed_slice(),
         break_seeds: break_seeds.into_boxed_slice(),
         max_body_origins,
+        target_is_match_at_end: target_mae.into_boxed_slice(),
     }
 }
 
@@ -388,6 +562,8 @@ enum OriginAction {
         break_is_match: bool,
         /// True if the break path reaches match-at-end ($ → Match).
         break_is_match_at_end: bool,
+        /// Non-counter consuming states on the break path (post-counter tail).
+        break_consuming_states: Box<[StateIdx]>,
     },
 }
 
@@ -405,6 +581,7 @@ impl OriginAction {
                 continue_origins,
                 break_is_match,
                 break_is_match_at_end,
+                break_consuming_states,
             } => OriginAction::Increment {
                 advance_origins: advance_origins.clone(),
                 min: *min,
@@ -412,6 +589,7 @@ impl OriginAction {
                 continue_origins: continue_origins.clone(),
                 break_is_match: *break_is_match,
                 break_is_match_at_end: *break_is_match_at_end,
+                break_consuming_states: break_consuming_states.clone(),
             },
         }
     }
@@ -710,7 +888,12 @@ impl Tier3DfaCache {
         let mut resolved_seeds: Vec<(CounterIdx, StateIdx, u32)> = Vec::new();
         let mut resolved_cinc = false;
         let mut resolved_is_match = false;
-        let mut resolved_is_match_at_end = false;
+        // Note: we do NOT track resolved_is_match_at_end here.  That flag
+        // means "the deferred assertion passed mid-stream (with next=byte) and
+        // $ → Match was reachable."  But the assertion was evaluated with
+        // next=Some(byte) — at actual end-of-input, next is None and word-
+        // boundary conditions may flip.  finish() correctly re-evaluates via
+        // resolve_deferred_at_end().
 
         if from != DfaStateId::DEAD {
             let from_state = &self.inner.states[from.idx()];
@@ -736,7 +919,7 @@ impl Tier3DfaCache {
                     .collect();
                 resolved_cinc = cr.encountered_cinc;
                 resolved_is_match = cr.is_match;
-                resolved_is_match_at_end = cr.is_match_at_end;
+                // Discard cr.is_match_at_end — see comment above.
                 for &idx in cr.nfa_states.iter() {
                     if let Some(t) = consume_byte(idx, byte, regex) {
                         targets_per_origin.push((idx, vec![t]));
@@ -845,7 +1028,36 @@ impl Tier3DfaCache {
             // Each seed is tagged with the counter whose CInc break leads
             // to it — the seed is only applied when that specific counter's
             // instance actually breaks.
-            let break_seeds = Self::compute_break_seeds(&seeds, analysis);
+            let break_seeds = Self::compute_break_seeds(analysis);
+
+            // Remove unconditional seeds that should be break-gated.
+            //
+            // A seed appears in both the unconditional list and break_seeds
+            // when the no_break closure reaches a CI node through states
+            // that were introduced by a previous with_break DFA transition
+            // (DFA-state overapproximation).  Such seeds are NOT genuinely
+            // unconditional — they should only fire when the triggering
+            // counter breaks.
+            //
+            // We distinguish genuine unconditional seeds from spurious ones
+            // by checking whether the seed is also present in the start
+            // closure's seeds.  Seeds from the start closure are genuinely
+            // unconditional (they exist from the very first byte, before
+            // any break path could contaminate the DFA state).
+            if !break_seeds.is_empty() {
+                seeds.retain(|s| {
+                    let in_break = break_seeds
+                        .iter()
+                        .any(|bs| bs.1 == s.0 && bs.2 == s.1 && bs.3 == s.2);
+                    if !in_break {
+                        return true; // Not a break seed — keep unconditional.
+                    }
+                    // Keep only if the seed is genuinely unconditional —
+                    // present in the start closure's seeds (before any
+                    // break path could contaminate the DFA state).
+                    self.start_seeds.iter().any(|ss| ss.0 == s.0 && ss.1 == s.1)
+                });
+            }
 
             // Fold resolved deferred assertion matches into both
             // successors' flags.  `resolved_is_match` applies
@@ -854,10 +1066,10 @@ impl Tier3DfaCache {
             Transition {
                 no_break: nb_id,
                 no_break_is_match: nb_m || resolved_is_match,
-                no_break_is_match_at_end: nb_mae || resolved_is_match_at_end,
+                no_break_is_match_at_end: nb_mae,
                 with_break: wb_id,
                 with_break_is_match: wb_m || resolved_is_match,
-                with_break_is_match_at_end: wb_mae || resolved_is_match_at_end,
+                with_break_is_match_at_end: wb_mae,
                 is_counting: true,
                 seeds: seeds.into(),
                 break_seeds: break_seeds.into(),
@@ -884,10 +1096,10 @@ impl Tier3DfaCache {
             Transition {
                 no_break: id,
                 no_break_is_match: m || resolved_is_match,
-                no_break_is_match_at_end: mae || resolved_is_match_at_end,
+                no_break_is_match_at_end: mae,
                 with_break: id,
                 with_break_is_match: m || resolved_is_match,
-                with_break_is_match_at_end: mae || resolved_is_match_at_end,
+                with_break_is_match_at_end: mae,
                 is_counting: false,
                 seeds: seeds.into(),
                 break_seeds: Box::new([]),
@@ -934,27 +1146,22 @@ impl Tier3DfaCache {
 
     /// Compute break seeds for a counting transition.
     ///
-    /// Uses the precomputed [`Tier3Analysis::break_seeds`] table.
-    /// Break seeds already present in the unconditional `seeds` list are
-    /// excluded.
+    /// Returns ALL break seeds from the precomputed
+    /// [`Tier3Analysis::break_seeds`] table, including those that may
+    /// also appear in the unconditional seeds list.  The caller handles
+    /// deduplication: unconditional seeds that also appear as break seeds
+    /// are removed from the unconditional list (unless they are genuinely
+    /// unconditional — present in the start closure's seeds).
     ///
     /// Including ALL precomputed break seeds (not just those reachable from
     /// the current targets) is safe: at runtime, each break seed is gated
     /// on `counter_broke[trigger]`, and unreachable triggers never break.
     fn compute_break_seeds(
-        seeds: &[(CounterIdx, StateIdx, u32)],
         analysis: &Tier3Analysis,
     ) -> Vec<(CounterIdx, CounterIdx, StateIdx, u32)> {
         let mut result: Vec<(CounterIdx, CounterIdx, StateIdx, u32)> = Vec::new();
         for bs in analysis.break_seeds.iter() {
             let entry = (bs.trigger, bs.counter, bs.origin, 0u32);
-            // Skip if this seed is already in the unconditional list.
-            if seeds
-                .iter()
-                .any(|e| e.0 == entry.1 && e.1 == entry.2 && e.2 == entry.3)
-            {
-                continue;
-            }
             if !result
                 .iter()
                 .any(|e| e.0 == entry.0 && e.1 == entry.1 && e.2 == entry.2 && e.3 == entry.3)
@@ -1168,6 +1375,9 @@ fn analyze_target(
             continue_origins: continue_origins.into_boxed_slice(),
             break_is_match,
             break_is_match_at_end,
+            // Populated in a post-pass by compute_tier3_analysis after all
+            // targets are known (break_consuming_tails needs the targets array).
+            break_consuming_states: Box::new([]),
         })
     } else if advance_origins.is_empty() {
         None // Dead.
@@ -1217,6 +1427,52 @@ fn break_closure(
     (is_match, is_match_at_end)
 }
 
+/// Collect consuming NFA states on a CInc break path that are "true tail"
+/// states — their byte-consumption target does NOT lead to another CInc.
+///
+/// These states need runtime tracking to detect deferred `$ → Match` after
+/// additional bytes.  Consuming states whose targets lead to CInc are
+/// handled by the counter instance seeding/tracking machinery instead.
+fn break_consuming_tails(
+    break_seeds: &[StateIdx],
+    states: &[State],
+    targets: &[Option<Tier3OriginKind>],
+) -> Vec<StateIdx> {
+    let mut result = Vec::new();
+    let mut stack: Vec<StateIdx> = break_seeds.to_vec();
+    let mut visited = vec![false; states.len()];
+    while let Some(idx) = stack.pop() {
+        let i = idx.idx();
+        if visited[i] {
+            continue;
+        }
+        visited[i] = true;
+        match states[idx] {
+            State::Split { out, out1 } => {
+                stack.push(out1);
+                stack.push(out);
+            }
+            State::Assert { out, .. } => stack.push(out),
+            State::CounterInstance { out, .. } => stack.push(out),
+            State::Byte { out, .. } | State::ByteCI { out, .. } | State::ByteClass { out, .. } => {
+                // Only include if the target's analysis is NOT Increment.
+                // Increment targets are handled by counter seeding.
+                if !matches!(targets[out.idx()], Some(Tier3OriginKind::Increment { .. })) {
+                    result.push(idx);
+                }
+            }
+            State::ByteTable { table: _ } => {
+                // ByteTable has variable targets; conservatively skip.
+                // Tier 3 patterns with ByteTable post-break tails are rare.
+            }
+            _ => {}
+        }
+    }
+    result.sort_unstable_by_key(|s| s.0);
+    result.dedup();
+    result
+}
+
 // ---------------------------------------------------------------------------
 // Tier 3 Matcher
 // ---------------------------------------------------------------------------
@@ -1240,6 +1496,18 @@ pub struct Tier3DfaMatcher<'a> {
     ever_matched: bool,
     match_at_end: bool,
     has_live_instances: bool,
+    /// NFA consuming states currently active from a counter break path.
+    /// These track the post-counter "tail" (e.g. a trailing `.` or
+    /// literal before `$ → Match`).  Updated each step: each tail is
+    /// advanced through its `OriginAction`.  When a tail's action is
+    /// `Dead` and `target_is_match_at_end` is true, `match_at_end` is set.
+    ///
+    /// This replaces the use of DFA-level `is_match_at_end` for counting
+    /// transitions, which is overly optimistic because the DFA state
+    /// includes post-break states before counters have actually broken.
+    post_break_tails: Vec<StateIdx>,
+    /// Scratch buffer for advancing `post_break_tails` (double-buffered).
+    next_post_break_tails: Vec<StateIdx>,
     prefilter: Prefilter,
 }
 
@@ -1269,6 +1537,8 @@ impl<'a> Tier3DfaMatcher<'a> {
             ever_matched,
             match_at_end,
             has_live_instances,
+            post_break_tails: Vec::new(),
+            next_post_break_tails: Vec::new(),
             cache,
             memory,
             regex,
@@ -1292,6 +1562,50 @@ impl<'a> Tier3DfaMatcher<'a> {
         // Reset next_counters.
         self.next_counters.clear();
         self.match_at_end = false;
+
+        // Advance existing post-break tails through this transition.
+        // Each tail is a consuming NFA state from a previous counter
+        // break.  If it consumed this byte and its target reaches
+        // `$ → Match`, set match_at_end.
+        self.next_post_break_tails.clear();
+        for &pbo in &self.post_break_tails {
+            let action = t
+                .origin_keys
+                .iter()
+                .position(|&k| k == pbo)
+                .map(|i| &t.origin_actions[i]);
+            match action {
+                Some(OriginAction::Advance { new_origins }) => {
+                    for &new_o in new_origins.iter() {
+                        if !self.next_post_break_tails.contains(&new_o) {
+                            self.next_post_break_tails.push(new_o);
+                        }
+                    }
+                }
+                Some(OriginAction::Increment { .. }) => {
+                    // Tail hit a CInc — the post-break path has entered
+                    // a counter body.  Stop tracking: the counter instance
+                    // machinery (seeding + per-instance break checks) handles
+                    // match detection from here.  We must NOT propagate the
+                    // CInc's break_is_match / break_is_match_at_end, because
+                    // the tail has no counter value — it can't know if the
+                    // counter will reach its min.
+                }
+                Some(OriginAction::Dead) => {
+                    // Tail consumed a byte and its target is dead (no
+                    // further consuming states or CInc).  Check whether
+                    // the target reaches `$ → Match` via precomputed flag.
+                    if self.analysis.target_is_match_at_end[pbo.idx()] {
+                        self.match_at_end = true;
+                    }
+                }
+                None => {
+                    // Tail state is not in the transition's origin_keys,
+                    // meaning this NFA state does not accept the current
+                    // byte.  The tail is dead — drop it silently.
+                }
+            }
+        }
 
         let mut any_can_break = false;
         let num_counters = self.counters.num_counters();
@@ -1324,6 +1638,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                         continue_origins,
                         break_is_match,
                         break_is_match_at_end,
+                        break_consuming_states,
                     }) => {
                         // Advance-or-increment: the range survives at
                         // advance_origins with the same values.
@@ -1356,6 +1671,13 @@ impl<'a> Tier3DfaMatcher<'a> {
                             if *break_is_match_at_end {
                                 self.match_at_end = true;
                             }
+                            // Track post-break consuming states for
+                            // subsequent match-at-end detection.
+                            for &new_o in break_consuming_states.iter() {
+                                if !self.next_post_break_tails.contains(&new_o) {
+                                    self.next_post_break_tails.push(new_o);
+                                }
+                            }
                         }
                     }
                 }
@@ -1381,6 +1703,17 @@ impl<'a> Tier3DfaMatcher<'a> {
                 self.match_at_end = true;
             }
         } else {
+            // For counting transitions, propagate no_break match flags.
+            // These are safe: the no_break closure is computed without
+            // following CInc break paths, so its match flags reflect only
+            // paths that don't depend on counter breaks.
+            //
+            // We do NOT propagate with_break flags here (even when
+            // any_can_break) because the with_break DFA state's match flags
+            // are overly optimistic — they include paths where ALL CInc
+            // break paths are followed regardless of actual counter values.
+            // Per-instance break handling above already handles the break
+            // case precisely.
             if t.no_break_is_match {
                 self.ever_matched = true;
             }
@@ -1391,6 +1724,8 @@ impl<'a> Tier3DfaMatcher<'a> {
 
         // Swap range buffers (O(1) — just swaps the flat Vec pointers).
         std::mem::swap(&mut self.counters, &mut self.next_counters);
+        // Swap post-break tail buffers.
+        std::mem::swap(&mut self.post_break_tails, &mut self.next_post_break_tails);
 
         // Seed new instances as single-value ranges.
         for &(counter, origin, value) in t.seeds.iter() {
@@ -1413,6 +1748,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             self.has_live_instances = false;
         }
         self.match_at_end = false;
+        self.post_break_tails.clear();
 
         let trans = self.cache.populate(
             self.memory,
@@ -1512,7 +1848,11 @@ impl<'a> Tier3DfaMatcher<'a> {
             }
             let t = &self.cache.transitions[slot];
 
-            if !t.is_counting && t.seeds.is_empty() && !self.has_live_instances {
+            if !t.is_counting
+                && t.seeds.is_empty()
+                && !self.has_live_instances
+                && self.post_break_tails.is_empty()
+            {
                 self.current = t.no_break;
                 self.match_at_end = t.no_break_is_match_at_end;
                 if t.no_break_is_match {

@@ -139,9 +139,46 @@ impl DfaState {
         for &assert_idx in self.deferred_asserts.iter() {
             if let State::Assert { kind, out } = regex.states[assert_idx]
                 && kind.eval(false, true, prev, None) == AssertEval::Pass
-                && regex.state_can_reach_match[out.idx()]
+                && Self::can_reach_match_at_end(out, prev, regex)
             {
                 return true;
+            }
+        }
+        false
+    }
+
+    /// Follow epsilon transitions from `start` at end-of-input, evaluating
+    /// any assertions encountered.  Returns true if `Match` is reachable
+    /// with all assertions passing.
+    ///
+    /// Unlike the static `state_can_reach_match` precomputation, this
+    /// correctly handles adjacent assertions like `\b\B` which are
+    /// statically reachable but dynamically impossible at the same position.
+    fn can_reach_match_at_end(start: StateIdx, prev: Option<u8>, regex: &Regex) -> bool {
+        let states = &regex.states;
+        let mut stack = vec![start];
+        while let Some(idx) = stack.pop() {
+            // Quick static check: if Match is unreachable from this state
+            // at all, skip it.
+            if !regex.state_can_reach_match[idx.idx()] {
+                continue;
+            }
+            match states[idx] {
+                State::Match => return true,
+                State::Assert { kind, out } => {
+                    if kind.eval(false, true, prev, None) == AssertEval::Pass {
+                        stack.push(out);
+                    }
+                }
+                State::Split { out, out1 } => {
+                    stack.push(out);
+                    stack.push(out1);
+                }
+                State::CounterInstance { out, .. } => {
+                    stack.push(out);
+                }
+                // Consuming states cannot fire at end-of-input.
+                _ => {}
             }
         }
         false

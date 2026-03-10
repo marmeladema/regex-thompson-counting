@@ -668,7 +668,12 @@ impl Tier2DfaCache {
         let mut resolved_cinc = false;
         let mut resolved_cinc_mask: u64 = 0;
         let mut resolved_is_match = false;
-        let mut resolved_is_match_at_end = false;
+        // Note: we do NOT track resolved_is_match_at_end here.  That flag
+        // means "the deferred assertion passed mid-stream (with next=byte) and
+        // $ → Match was reachable."  But the assertion was evaluated with
+        // next=Some(byte) — at actual end-of-input, next is None and word-
+        // boundary conditions may flip.  finish() correctly re-evaluates via
+        // resolve_deferred_at_end() and resolve_deferred_cinc_at_end().
         // Match reachable through CInc break path in Phase 1 resolution.
         // Only valid when any_can_break is true (counter >= min).
         let mut resolved_break_match = false;
@@ -698,7 +703,7 @@ impl Tier2DfaCache {
                 resolved_cinc = cr.encountered_cinc;
                 resolved_cinc_mask = cr.cinc_mask;
                 resolved_is_match = cr.is_match;
-                resolved_is_match_at_end = cr.is_match_at_end;
+                // Discard cr.is_match_at_end — see comment above.
 
                 // If CInc was reached via Phase 1 resolution, check if
                 // the break path (CInc.out1) can reach Match.  This match
@@ -812,10 +817,10 @@ impl Tier2DfaCache {
             Transition {
                 no_break: nb_id,
                 no_break_is_match: nb_m || resolved_is_match,
-                no_break_is_match_at_end: nb_mae || resolved_is_match_at_end,
+                no_break_is_match_at_end: nb_mae,
                 with_break: wb_id,
                 with_break_is_match: wb_m || resolved_is_match || resolved_break_match,
-                with_break_is_match_at_end: wb_mae || resolved_is_match_at_end,
+                with_break_is_match_at_end: wb_mae,
                 is_counting: true,
                 counting_mask,
                 seeds: seed_list.into_boxed_slice(),
@@ -832,10 +837,10 @@ impl Tier2DfaCache {
             Transition {
                 no_break: id,
                 no_break_is_match: m || resolved_is_match,
-                no_break_is_match_at_end: mae || resolved_is_match_at_end,
+                no_break_is_match_at_end: mae,
                 with_break: id,
                 with_break_is_match: m || resolved_is_match,
-                with_break_is_match_at_end: mae || resolved_is_match_at_end,
+                with_break_is_match_at_end: mae,
                 is_counting: false,
                 counting_mask: 0,
                 seeds: seed_list.into_boxed_slice(),
