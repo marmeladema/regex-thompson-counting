@@ -1,22 +1,22 @@
-//! Criterion benchmarks comparing rethoc tiers and the `regex` crate on a
-//! pathological bounded-repetition pattern.
+//! Criterion benchmarks for pathological bounded-repetition patterns.
 //!
-//! Pattern: `.{0,1000}.{0,1000}.{0,1000}a`
+//! # Non-nested pattern (`.{0,1000}.{0,1000}.{0,1000}a`)
 //!
 //! Three sequential bounded repetitions with a wildcard body — this creates
 //! massive NFA state space (~3000 active states) that punishes engines
 //! without efficient counting.  rethoc compiles this to Tier 3 by default
 //! (conditional DFA with 3 counters, 14 NFA states).
 //!
-//! We benchmark four engines:
+//! Benchmarked engines: rethoc/tier3, rethoc/tier4, rethoc/nfa, regex.
 //!
-//! - **rethoc/tier3** — Conditional DFA with range-compressed counters.
-//!   O(body_length) per counter per byte.
-//! - **rethoc/tier4** — Counter-program DFA.  More general but slower on
-//!   this pattern because it tracks full counter contexts.
-//! - **rethoc/nfa** — Pure Thompson NFA simulation (tier 0).  Baseline
-//!   for rethoc without any DFA acceleration.
-//! - **regex** — The `regex` crate (for external comparison).
+//! # Nested pattern (`(.{0,1000}a){0,1000}b`)
+//!
+//! Nested bounded repetition requiring Tier 4.  The inner `.{0,1000}`
+//! counter is nested inside the outer `(...){0,1000}` counter, creating
+//! an O(max_inner × max_outer) context space.  This pattern is not
+//! eligible for Tier 3 (nested counters) or Tier 2 (overlapping bytes).
+//!
+//! Benchmarked engines: rethoc/tier4, regex.
 //!
 //! Run with: `cargo bench --bench pathological`
 
@@ -228,5 +228,68 @@ fn bench_match_at_end(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_compile, bench_no_match, bench_match_at_end);
+// ---------------------------------------------------------------------------
+// Nested pattern benchmarks
+// ---------------------------------------------------------------------------
+
+const NESTED_PATTERN: &str = r"(.{0,1000}a){0,1000}b";
+
+/// Sizes for nested benchmarks.  Tier 4 on this pattern is O(N * max_inner *
+/// max_outer) so only small inputs are practical.
+const NESTED_SIZES: &[usize] = &[256, 1024];
+
+fn bench_nested_match_at_end(c: &mut Criterion) {
+    let hir = parse_hir(NESTED_PATTERN);
+    let rethoc_re = RegexBuilder::default().build(&hir).unwrap();
+
+    // The regex crate cannot compile this nested pattern within its default
+    // 10 MB NFA size limit (or even 100 MB), so we only benchmark rethoc.
+    let regex_re = regex::bytes::RegexBuilder::new(NESTED_PATTERN)
+        .unicode(false)
+        .dot_matches_new_line(true)
+        .size_limit(500 * (1 << 20))
+        .build()
+        .ok();
+
+    let mut group = c.benchmark_group("pathological_nested/match_at_end");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(10));
+
+    for &size in NESTED_SIZES {
+        let mut hay = vec![b'x'; size];
+        hay[size - 1] = b'b';
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // rethoc tier 4 (counter-program DFA)
+        group.bench_with_input(BenchmarkId::new("rethoc/tier4", size), &hay, |b, hay| {
+            let mut mem = MatcherMemory::default();
+            let mut m = mem.matcher_for_tier(&rethoc_re, 4).unwrap();
+            m.chunk(hay);
+            m.finish();
+            b.iter(|| {
+                let mut m = mem.matcher_for_tier(&rethoc_re, 4).unwrap();
+                m.chunk(black_box(hay));
+                black_box(m.finish())
+            })
+        });
+
+        // regex crate (only if it could compile the pattern)
+        if let Some(ref regex_re) = regex_re {
+            group.bench_with_input(BenchmarkId::new("regex", size), &hay, |b, hay| {
+                let _ = regex_re.is_match(hay);
+                b.iter(|| black_box(regex_re.is_match(black_box(hay))))
+            });
+        }
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_compile,
+    bench_no_match,
+    bench_match_at_end,
+    bench_nested_match_at_end,
+);
 criterion_main!(benches);

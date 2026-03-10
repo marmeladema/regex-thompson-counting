@@ -7,7 +7,9 @@
 //! counter program is applied to it.
 
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
+use ahash::HashMapExt;
 use indexmap::IndexSet;
 
 use crate::{
@@ -1088,6 +1090,8 @@ pub struct Tier4DfaMatcher<'a> {
     next_contexts: Vec<(CounterCtx, StateIdx)>,
     /// Scratch space for program execution results (avoids per-step alloc).
     results: Vec<ProgramResult>,
+    /// Scratch map for hash-based context dedup (avoids per-step alloc).
+    dedup_seen: ahash::HashMap<u64, Vec<usize>>,
     /// Whether a match has been found.
     ever_matched: bool,
     /// Whether a match-at-end has been found (current step only).
@@ -1132,7 +1136,8 @@ impl<'a> Tier4DfaMatcher<'a> {
                 }
             }
             // Dedup initial contexts.
-            dedup_contexts(&mut contexts, pool);
+            let mut dedup_seen = ahash::HashMap::new();
+            dedup_contexts(&mut contexts, pool, &mut dedup_seen);
         }
 
         if cache.start_is_match {
@@ -1153,6 +1158,7 @@ impl<'a> Tier4DfaMatcher<'a> {
             contexts,
             next_contexts: Vec::new(),
             results: Vec::new(),
+            dedup_seen: ahash::HashMap::new(),
         }
     }
 
@@ -1320,7 +1326,7 @@ impl<'a> Tier4DfaMatcher<'a> {
 
         // Dedup explicit contexts (skip when ≤1 or no explicit contexts).
         if self.next_contexts.len() > 1 {
-            dedup_contexts(&mut self.next_contexts, self.pool);
+            dedup_contexts(&mut self.next_contexts, self.pool, &mut self.dedup_seen);
         }
 
         std::mem::swap(&mut self.contexts, &mut self.next_contexts);
@@ -1377,8 +1383,44 @@ impl fmt::Debug for Tier4DfaMatcher<'_> {
     }
 }
 
-/// Deduplicate counter contexts by (origin, value).  O(n²) linear scan.
-fn dedup_contexts(contexts: &mut Vec<(CounterCtx, StateIdx)>, pool: &mut CounterPool) {
+/// Compute a content hash of `(origin, active, counter_slots)` for a
+/// context.  Uses `ahash` for fast, high-quality hashing.
+#[inline]
+fn ctx_hash(ctx: &CounterCtx, origin: StateIdx, pool: &CounterPool) -> u64 {
+    let mut h = ahash::AHasher::default();
+    origin.0.hash(&mut h);
+    ctx.active_count().hash(&mut h);
+    pool.slots_of(ctx).hash(&mut h);
+    h.finish()
+}
+
+/// Threshold below which the O(n²) linear scan is faster than the
+/// hash-based approach (avoids HashMap overhead for small context lists).
+const DEDUP_HASH_THRESHOLD: usize = 32;
+
+/// Deduplicate counter contexts by (origin, counter values).
+///
+/// For small lists (≤ [`DEDUP_HASH_THRESHOLD`]), uses a direct O(n²)
+/// pairwise scan.  For larger lists, uses hash-based bucketing for
+/// O(n) expected time.  On hash collision, falls back to full `ctx_eq`
+/// comparison for correctness.
+///
+/// The `seen` map is passed in to avoid per-call allocation; it is
+/// cleared on entry and may retain capacity across calls.
+fn dedup_contexts(
+    contexts: &mut Vec<(CounterCtx, StateIdx)>,
+    pool: &mut CounterPool,
+    seen: &mut ahash::HashMap<u64, Vec<usize>>,
+) {
+    if contexts.len() <= DEDUP_HASH_THRESHOLD {
+        dedup_contexts_linear(contexts, pool);
+    } else {
+        dedup_contexts_hash(contexts, pool, seen);
+    }
+}
+
+/// O(n²) pairwise dedup for small context lists.
+fn dedup_contexts_linear(contexts: &mut Vec<(CounterCtx, StateIdx)>, pool: &mut CounterPool) {
     let mut i = 0;
     while i < contexts.len() {
         let mut dup = false;
@@ -1391,8 +1433,37 @@ fn dedup_contexts(contexts: &mut Vec<(CounterCtx, StateIdx)>, pool: &mut Counter
         if dup {
             let (removed, _) = contexts.swap_remove(i);
             pool.free(removed.into_range());
-            // Don't increment i — the swapped-in element needs checking.
         } else {
+            i += 1;
+        }
+    }
+}
+
+/// Hash-based dedup for large context lists.
+fn dedup_contexts_hash(
+    contexts: &mut Vec<(CounterCtx, StateIdx)>,
+    pool: &mut CounterPool,
+    seen: &mut ahash::HashMap<u64, Vec<usize>>,
+) {
+    seen.clear();
+
+    let mut i = 0;
+    while i < contexts.len() {
+        let hash = ctx_hash(&contexts[i].0, contexts[i].1, pool);
+        let mut dup = false;
+        if let Some(indices) = seen.get(&hash) {
+            for &j in indices {
+                if contexts[i].1 == contexts[j].1 && pool.ctx_eq(&contexts[i].0, &contexts[j].0) {
+                    dup = true;
+                    break;
+                }
+            }
+        }
+        if dup {
+            let (removed, _) = contexts.swap_remove(i);
+            pool.free(removed.into_range());
+        } else {
+            seen.entry(hash).or_default().push(i);
             i += 1;
         }
     }

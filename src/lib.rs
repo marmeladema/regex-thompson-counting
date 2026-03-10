@@ -2863,10 +2863,16 @@ impl CounterPool {
         }
     }
 
-    /// Read the slot values for a context.
+    /// Read the slot values for a context range.
     #[inline]
     fn slots(&self, range: &Range<usize>) -> &[usize] {
         &self.arena[range.start..range.end]
+    }
+
+    /// Read the counter slots for a context.
+    #[inline]
+    pub(crate) fn slots_of(&self, ctx: &CounterCtx) -> &[usize] {
+        self.slots(&ctx.range)
     }
 
     /// Compare two contexts by value through the pool.
@@ -2913,6 +2919,12 @@ impl CounterCtx {
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.active == 0
+    }
+
+    /// Number of active (non-inactive) counter slots.
+    #[inline]
+    pub(crate) fn active_count(&self) -> usize {
+        self.active
     }
 
     /// Get the value of counter `idx`, or `None` if inactive.
