@@ -8956,6 +8956,129 @@ mod tests {
                 ("", false),
             ],
         }
+
+        // ── Variable-length-body range compression ──────────────────────
+        //
+        // Tier 3 uses range-compressed instance tracking (InstanceRange)
+        // for all counters, including those with variable-length bodies.
+        // These tests exercise the multi-origin range-merge path to verify
+        // that insert_range()'s min/max extension never introduces phantom
+        // values.
+        //
+        // The original implementation only enabled range compression for
+        // fixed-length bodies (body_byte_length > 0), where each counter
+        // has exactly one consuming-state origin.  Variable-length bodies
+        // have multiple origins (one per consuming state in the unrolled
+        // body), but the contiguity invariant still holds:
+        //
+        //  - Seeds always inject value 0 at the body entry origin.
+        //  - Advance moves (value, origin_k) → (value, origin_{k+1}),
+        //    preserving contiguity.
+        //  - Continue (CInc) moves (value, origin_last) →
+        //    (value+1, origin_0), where the +1 shift always overlaps or
+        //    extends the range already present at origin_0 (which starts
+        //    from 0 due to seeding).
+        //  - Dead actions kill an entire range at an origin but never
+        //    split it, so surviving ranges remain contiguous.
+        //
+        // Therefore insert_range()'s min/max merge is correct: it never
+        // bridges a gap, because gaps cannot form.
+
+        // Alternation body: `(ab|a)` has 2 consuming states (body lengths
+        // 1 and 2), producing 2 origins.  Tests selective byte matching
+        // where the 'a' origin dies on non-'a' bytes.
+        test_tier3_varlen_alternation_body {
+            pattern: "(ab|a){1,100}c",
+            memory: 729,
+            min_tier: 3,
+            inputs: [
+                ("ac", true),
+                ("abc", true),
+                ("aababc", true),
+                ("aac", true),
+                ("ababababababababababababc", true),
+                ("c", false),
+                ("bc", false),
+                ("xc", false),
+            ],
+        }
+        // Dot-range body: `(.{1,5})` has 5 consuming states → 5 origins.
+        // All bytes match at every origin, so ranges grow uniformly.
+        test_tier3_varlen_dot_range_body {
+            pattern: "(.{1,5}){1,100}z",
+            memory: 1150,
+            min_tier: 3,
+            inputs: [
+                ("az", true),
+                ("abcz", true),
+                ("abcdez", true),
+                ("abcdefz", true),
+                ("z", false),
+            ],
+        }
+        // Mixed-selectivity body: `(a.|b)` has 2 origins — origin 0
+        // (`a` or `b`) is selective, origin 1 (`.` after `a`) matches
+        // any byte.  The 'b' branch bypasses origin 1 entirely.
+        test_tier3_varlen_mixed_selectivity {
+            pattern: "(a.|b){1,50}c",
+            memory: 985,
+            min_tier: 3,
+            inputs: [
+                ("axc", true),
+                ("bc", true),
+                ("axbaxbc", true),
+                ("bbbbbbc", true),
+                ("ababababc", true),
+                ("c", false),
+            ],
+        }
+        // Large variable body with higher count — stress test for
+        // range merge at 10 origins, 1000 max iterations.
+        test_tier3_varlen_large_body_high_count {
+            pattern: ".{0,1000}(.{1,10}){0,1000}c",
+            memory: 1646,
+            min_tier: 3,
+            inputs: [
+                ("c", true),
+                ("xc", true),
+                ("xxxxxxxxxxc", true),
+                ("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxc", true),
+            ],
+        }
+        // Anchored variable body: ensures end-anchor interacts correctly
+        // with multi-origin range tracking.
+        test_tier3_varlen_anchored {
+            pattern: "^(ab|a){2,5}$",
+            memory: 1322,
+            min_tier: 1,
+            inputs: [
+                ("aa", true),
+                ("aba", true),
+                ("aab", true),
+                ("abab", true),
+                ("aabab", true),
+                ("ababab", true),
+                ("a", false),
+                ("ab", false),
+                ("", false),
+            ],
+        }
+        // Two sequential variable-length counters: each tracked
+        // independently with its own set of origin ranges.
+        test_tier3_varlen_two_counters {
+            pattern: "(ab|a){1,50}(xy|x){1,50}z",
+            memory: 928,
+            min_tier: 3,
+            inputs: [
+                ("axz", true),
+                ("abxyz", true),
+                ("aaxxz", true),
+                ("ababxyxyz", true),
+                ("z", false),
+                ("az", false),
+                ("xz", false),
+            ],
+        }
     }
 
     /// Tier 2 encodes counter identity in `u64` bitmasks, so patterns with

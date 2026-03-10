@@ -88,15 +88,16 @@ pub(crate) struct Tier3Analysis {
     /// when `trigger`'s CInc break path is taken.
     pub(crate) break_seeds: Box<[Tier3BreakSeed]>,
 
-    /// `true` when all counters have fixed-length bodies, enabling the
-    /// range-compressed instance tracking fast path in
-    /// [`Tier3DfaMatcher::step_slow_ranged`].
+    /// `true` when range-compressed instance tracking is possible,
+    /// enabling the fast path in [`Tier3DfaMatcher::step_slow_ranged`].
     ///
-    /// When this is true, instances at each origin within a counter
-    /// always form a contiguous value range, so they can be represented
-    /// as `(origin, min_val, max_val)` triples instead of individual
-    /// `Instance` structs.  This reduces per-byte cost from
-    /// O(max_count) to O(body_length) per counter.
+    /// Instances at each origin within a counter always form a
+    /// contiguous value range, so they can be represented as
+    /// `(origin, min_val, max_val)` triples instead of individual
+    /// `Instance` structs.  This holds for both fixed-length and
+    /// variable-length bodies (see the contiguity argument in
+    /// [`analyze`]).  The cost drops from O(max_count) to
+    /// O(num_body_origins) per counter per byte.
     pub(crate) all_counters_rangeable: bool,
 }
 
@@ -252,9 +253,59 @@ pub(crate) fn compute_tier3_analysis(
         .collect();
 
     // -- Step 5: determine range-compressibility --------------------------------
-    // All counters must have fixed-length bodies (body_byte_length > 0).
-    let all_counters_rangeable =
-        !counter_info.is_empty() && counter_info.iter().all(|&(_, _, bl)| bl > 0);
+    //
+    // Range compression replaces the per-instance list `Vec<Instance>` with
+    // a per-origin `Vec<InstanceRange>` where each entry is an
+    // `(origin, min_value, max_value)` triple.  This collapses O(max_count)
+    // work per counter per byte down to O(num_body_origins).
+    //
+    // The original implementation only enabled this for fixed-length bodies
+    // (`body_byte_length > 0`), on the reasoning that fixed-length bodies
+    // produce exactly one origin and therefore trivially maintain a
+    // contiguous value range.  Variable-length bodies have multiple origins
+    // (one per possible body length), and it was unclear whether values at
+    // each origin would remain contiguous.
+    //
+    // **Why the fixed-length restriction was unnecessary:**
+    //
+    // Values at each origin always form a contiguous range [0, k] for some
+    // k, regardless of body length variability.  The argument proceeds by
+    // induction on the byte position in the input:
+    //
+    // 1. **Seed injection**: Every step, the unanchored loop injects a
+    //    fresh seed with value 0 at origin 0 (the body entry point).
+    //    This establishes value 0 at origin 0 on every step.
+    //
+    // 2. **Advance**: When a byte is consumed, an instance at
+    //    `(value, origin_i)` moves to `(value, origin_j)` for each
+    //    `origin_j` reachable from `origin_i` via epsilon closure.
+    //    Since the set of values at `origin_i` is contiguous [a, b]
+    //    by the inductive hypothesis, the set of values arriving at
+    //    `origin_j` from this source is also [a, b].  Multiple
+    //    sources merging at `origin_j` are each contiguous and all
+    //    anchored at 0, so their union is still contiguous.
+    //
+    // 3. **Continue (increment)**: When a counter body completes, the
+    //    instance at `(value, final_origin)` becomes `(value + 1, origin_0)`.
+    //    By the inductive hypothesis, `final_origin` holds [a, b], so
+    //    origin_0 receives [a+1, b+1].  Combined with the seed's
+    //    value 0 already at origin_0 (from step 1), origin_0 now has
+    //    [0, b+1] — still contiguous.
+    //
+    // 4. **Break (counter exhausted)**: When `value + 1 > max`, the
+    //    instance exits the counter entirely.  This removes the top
+    //    of the range but doesn't fragment it.
+    //
+    // The key insight is that all ranges are "anchored at 0" — they always
+    // include value 0 because of the continuous seed injection.  Two ranges
+    // that both start at 0 can never have a gap between them; their union
+    // is simply [0, max(b1, b2)], which `insert_range()` computes via
+    // min/max.
+    //
+    // This enables range compression for patterns like `(.{1,5}){0,100}z`
+    // or `(ab|a){1,50}c`, reducing per-byte cost from O(max_count) to
+    // O(num_origins) — typically single-digit even for complex bodies.
+    let all_counters_rangeable = !counter_info.is_empty();
 
     Tier3Analysis {
         targets: targets_vec.into_boxed_slice(),
@@ -411,7 +462,7 @@ fn insert_range(ranges: &mut Vec<InstanceRange>, origin: StateIdx, min_val: u32,
 }
 
 /// A single active counter instance.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Instance {
     /// Number of completed iterations (0 when freshly seeded at CI).
     value: u32,
@@ -1235,6 +1286,20 @@ impl<'a> Tier3DfaMatcher<'a> {
             }
         }
 
+        // Dedup next_instances to prevent exponential growth.
+        //
+        // When a counter body has multiple origins (variable-length body),
+        // each instance fans out to several advance/continue origins.
+        // Without dedup, duplicate (value, origin) pairs multiply each
+        // step: N dupes × F fan-out = N×F dupes, compounding to O(F^N).
+        // Sort + dedup is O(n log n) with tiny elements (8 bytes each).
+        for ni in &mut self.next_instances {
+            if ni.len() > 1 {
+                ni.sort_unstable_by_key(|inst| (inst.origin.0, inst.value));
+                ni.dedup();
+            }
+        }
+
         // Select DFA successor.
         if t.is_counting && any_can_break {
             self.current = t.with_break;
@@ -1309,8 +1374,9 @@ impl<'a> Tier3DfaMatcher<'a> {
     /// individual `Instance` structs.  This reduces per-byte work from
     /// O(max_count) to O(body_length) per counter.
     ///
-    /// Only valid when [`Tier3Analysis::all_counters_rangeable`] is true
-    /// (all counter bodies have fixed byte-length).
+    /// Only valid when [`Tier3Analysis::all_counters_rangeable`] is true.
+    /// This applies to all patterns with counters, including those with
+    /// variable-length bodies (see the contiguity argument in [`analyze`]).
     #[inline(never)]
     fn step_slow_ranged(&mut self, slot: usize) {
         let t = &self.cache.transitions[slot];
