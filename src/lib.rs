@@ -73,6 +73,7 @@ use ahash::HashMap;
 static NEXT_REGEX_ID: AtomicU64 = AtomicU64::new(1);
 
 mod dfa;
+pub mod fuzz_gen;
 mod info;
 mod memrange;
 
@@ -9591,5 +9592,251 @@ mod tests {
                 test_tier3(pattern, &re, &input, expected);
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Proptest: fuzz-style property-based tests
+    // -----------------------------------------------------------------------
+
+    /// Shared helper: compile a pattern with both engines and test many
+    /// inputs, comparing the oracle (`regex` crate) against every eligible
+    /// rethoc tier.
+    fn fuzz_oracle_and_tiers(pattern: &str, inputs: &[Vec<u8>]) {
+        // Parse with regex-syntax in byte mode.
+        use regex_syntax::ast::parse::ParserBuilder;
+        use regex_syntax::hir::translate::TranslatorBuilder;
+
+        let ast = match ParserBuilder::new().build().parse(pattern) {
+            Ok(a) => a,
+            Err(_) => return, // unparseable — skip
+        };
+        let hir = match TranslatorBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .dot_matches_new_line(true)
+            .build()
+            .translate(pattern, &ast)
+        {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        // Compile with rethoc.
+        let mut builder = RegexBuilder::default();
+        let re = match builder.build(&hir) {
+            Ok(r) => r,
+            Err(_) => return, // unsupported construct — skip
+        };
+
+        // Compile with the regex crate oracle.
+        let full = format!("(?s-u){}", pattern);
+        let oracle = match regex::bytes::Regex::new(&full) {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+
+        let mut memory = MatcherMemory::default();
+
+        for input in inputs {
+            let expected = oracle.is_match(input);
+
+            // Test the default (highest-eligible) tier via chunk().
+            let mut matcher = memory.matcher(&re);
+            matcher.chunk(input);
+            let actual = matcher.finish();
+            assert_eq!(
+                actual,
+                expected,
+                "oracle mismatch (default tier) for pattern `{}` on input {:?} (len={}): \
+                 ours={}, oracle={}",
+                pattern,
+                &input[..input.len().min(80)],
+                input.len(),
+                actual,
+                expected
+            );
+
+            // Test NFA (always available).
+            let mut m = memory.nfa_matcher(&re);
+            m.chunk(input);
+            let nfa_result = m.finish();
+            assert_eq!(
+                nfa_result,
+                expected,
+                "NFA mismatch for pattern `{}` on input {:?} (len={}): \
+                 nfa={}, oracle={}",
+                pattern,
+                &input[..input.len().min(80)],
+                input.len(),
+                nfa_result,
+                expected
+            );
+
+            // Test each eligible DFA tier.
+            for tier in 1..=4u8 {
+                if let Ok(mut m) = memory.matcher_for_tier(&re, tier) {
+                    m.chunk(input);
+                    let tier_result = m.finish();
+                    assert_eq!(
+                        tier_result,
+                        expected,
+                        "Tier {} mismatch for pattern `{}` on input {:?} (len={}): \
+                         tier{}={}, oracle={}",
+                        tier,
+                        pattern,
+                        &input[..input.len().min(80)],
+                        input.len(),
+                        tier,
+                        tier_result,
+                        expected
+                    );
+                }
+            }
+        }
+
+        // Second pass: recompile with unrolling disabled to exercise
+        // counter-based code paths.
+        builder.max_unroll_states(0);
+        if let Ok(re_no_unroll) = builder.build(&hir) {
+            for input in inputs {
+                let expected = oracle.is_match(input);
+
+                let mut matcher = memory.matcher(&re_no_unroll);
+                matcher.chunk(input);
+                let actual = matcher.finish();
+                assert_eq!(
+                    actual,
+                    expected,
+                    "oracle mismatch (no-unroll) for pattern `{}` on input {:?} (len={}): \
+                     ours={}, oracle={}",
+                    pattern,
+                    &input[..input.len().min(80)],
+                    input.len(),
+                    actual,
+                    expected
+                );
+
+                for tier in 0..=4u8 {
+                    if let Ok(mut m) = memory.matcher_for_tier(&re_no_unroll, tier) {
+                        m.chunk(input);
+                        let tier_result = m.finish();
+                        assert_eq!(
+                            tier_result,
+                            expected,
+                            "Tier {} mismatch (no-unroll) for pattern `{}` on input {:?} \
+                             (len={}): tier{}={}, oracle={}",
+                            tier,
+                            pattern,
+                            &input[..input.len().min(80)],
+                            input.len(),
+                            tier,
+                            tier_result,
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Default number of proptest cases per fuzz test.  Each case generates
+    /// one pattern and ~50-80 targeted inputs, so 100 cases ≈ 5000-8000
+    /// individual match comparisons.  For deeper exploration use `cargo-fuzz`.
+    ///
+    /// Run these tests explicitly with:
+    /// ```sh
+    /// cargo test test_fuzz -- --ignored
+    /// ```
+    const FUZZ_PROPTEST_CASES: u32 = 100;
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(FUZZ_PROPTEST_CASES))]
+
+        /// Oracle differential: generated pattern × many pattern-aware inputs.
+        ///
+        /// For each generated pattern, produces targeted inputs from the
+        /// pattern AST (positive candidates, near-miss mutations, edge cases)
+        /// plus random fuzzer-supplied bytes.  Compiles with both rethoc and
+        /// the `regex` crate, then asserts all tiers agree with the oracle.
+        #[test]
+        #[ignore]
+        fn test_fuzz_oracle(
+            pattern_seed in proptest::collection::vec(proptest::num::u8::ANY, 0..64),
+            extra_bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..128),
+        ) {
+            use crate::fuzz_gen::{FuzzRng, generate_pattern, generate_inputs};
+
+            let (pattern, ast) = generate_pattern(&mut FuzzRng::new(&pattern_seed));
+            let mut inputs = generate_inputs(&mut FuzzRng::new(&extra_bytes), &ast);
+
+            // Also add the raw extra bytes as one more input.
+            inputs.push(extra_bytes);
+
+            fuzz_oracle_and_tiers(&pattern, &inputs);
+        }
+
+        /// Cross-tier differential: NFA is the oracle, all eligible DFA
+        /// tiers must agree.  Does not require the `regex` crate — useful
+        /// for finding tier-specific bugs independently.
+        #[test]
+        #[ignore]
+        fn test_fuzz_differential_tiers(
+            pattern_seed in proptest::collection::vec(proptest::num::u8::ANY, 0..64),
+            extra_bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..128),
+        ) {
+            use crate::fuzz_gen::{FuzzRng, generate_pattern, generate_inputs};
+
+            let (pattern, ast) = generate_pattern(&mut FuzzRng::new(&pattern_seed));
+            let inputs = generate_inputs(&mut FuzzRng::new(&extra_bytes), &ast);
+
+            // Parse and compile.
+            let hir = match parse_hir_bytes_fallible(&pattern) {
+                Some(h) => h,
+                None => return Ok(()),
+            };
+            let mut builder = RegexBuilder::default();
+            let re = match builder.build(&hir) {
+                Ok(r) => r,
+                Err(_) => return Ok(()),
+            };
+
+            let mut memory = MatcherMemory::default();
+
+            for input in &inputs {
+                // NFA result is the oracle.
+                let mut m = memory.nfa_matcher(&re);
+                m.chunk(input);
+                let nfa_result = m.finish();
+
+                for tier in 1..=4u8 {
+                    if let Ok(mut m) = memory.matcher_for_tier(&re, tier) {
+                        m.chunk(input);
+                        let tier_result = m.finish();
+                        assert_eq!(
+                            tier_result, nfa_result,
+                            "Tier {tier} disagrees with NFA for pattern `{pattern}` \
+                             on input {:?} (len={}): tier{tier}={tier_result}, nfa={nfa_result}",
+                            &input[..input.len().min(80)], input.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fallible HIR parse in byte mode — returns `None` if the pattern
+    /// is rejected by `regex-syntax`.
+    fn parse_hir_bytes_fallible(pattern: &str) -> Option<Hir> {
+        use regex_syntax::ast::parse::ParserBuilder;
+        use regex_syntax::hir::translate::TranslatorBuilder;
+
+        let ast = ParserBuilder::new().build().parse(pattern).ok()?;
+        TranslatorBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .dot_matches_new_line(true)
+            .build()
+            .translate(pattern, &ast)
+            .ok()
     }
 }

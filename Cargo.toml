@@ -12,6 +12,7 @@ path = "src/main.rs"
 criterion = { version = "0.8", features = ["html_reports"] }
 gungraun = "0.17.2"
 itertools = "0.10"
+proptest = "1"
 regex = "1"
 
 [dependencies]

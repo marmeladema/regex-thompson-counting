@@ -1,0 +1,35 @@
+[package]
+name = "regex-thompson-counting-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+regex = "1"
+regex-syntax = "0.8.9"
+
+[dependencies.regex-thompson-counting]
+path = ".."
+
+# Prevent this from interfering with workspaces.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_match"
+path = "fuzz_targets/fuzz_match.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_differential"
+path = "fuzz_targets/fuzz_differential.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_compile"
+path = "fuzz_targets/fuzz_compile.rs"
+doc = false

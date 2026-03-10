@@ -11,3 +11,10 @@ Cargo.lock
 
 # Benchmark workspace (not committed)
 /bench/
+
+# Proptest regression files (machine-specific, regenerated on failure)
+proptest-regressions/
+
+# Cargo-fuzz artifacts and corpus
+fuzz/artifacts/
+fuzz/corpus/
