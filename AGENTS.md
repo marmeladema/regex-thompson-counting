@@ -8,7 +8,7 @@ Rust 2024 edition. Binary: `rethoc`. All source under `src/`.
 ```bash
 cargo build                         # debug build
 cargo build --release               # release build (needed for benchmarks + bless_memory.py)
-cargo test                          # run all 348 tests
+cargo test                          # run all 366 tests
 cargo test test_counting            # run a single test by exact name
 cargo test test_word_boundary       # run tests matching a substring
 cargo test -- --nocapture           # show stdout/stderr from tests
@@ -39,8 +39,10 @@ src/dfa/tier1.rs    # Tier 1: Lazy DFA, counter-free patterns
 src/dfa/tier2.rs    # Tier 2: Differential counters, fixed-length bodies (Becchi-style)
 src/dfa/tier3.rs    # Tier 3: Conditional transitions, non-nested variable-length bodies
 src/dfa/tier4.rs    # Tier 4: Counter programs, nested repetitions
-benches/flamegraph.rs  # Callgrind benchmarks (gungraun harness)
-scripts/bless_memory.py  # Update memory assertions in match_tests!
+benches/flamegraph.rs      # Callgrind benchmarks (gungraun harness)
+benches/pathological.rs    # Criterion benchmarks: pathological bounded repetitions
+benches/pathological_profile.rs  # Callgrind profile for pathological patterns
+scripts/bless_memory.py    # Update memory assertions in match_tests!
 ```
 
 All tests are inline in `src/lib.rs` (`#[cfg(test)] mod tests`) and `src/memrange.rs`.
@@ -61,7 +63,7 @@ Tiers are selected at compile time based on pattern analysis:
 
 Three groups separated by blank lines, in this order:
 1. Standard library (`use std::...`)
-2. Third-party crates (`regex_syntax`, `ahash`, `indexmap`, `serde`, `memchr`)
+2. Third-party crates (`regex_syntax`, `ahash`, `hashbrown`, `indexmap`, `serde`, `memchr`)
 3. Crate-internal (`mod`, `use crate::`, `use super::`, `pub use`)
 
 No wildcard imports in production code. `use super::*` is acceptable only in test modules.
@@ -187,10 +189,16 @@ cargo bench --bench pathological -- "compile"   # compile time only
 cargo bench --bench pathological -- "match_at_end"  # match-at-end only
 ```
 
-Tests `.{0,1000}.{0,1000}.{0,1000}a` — three sequential bounded
-repetitions with wildcard bodies.  Compares compilation time, no-match
-(prefilter-dominated), and match-at-end (actual simulation) across
-sizes up to 64 KB.  HTML reports in `target/criterion/`.
+Two pattern groups:
+
+- **Non-nested**: `.{0,1000}.{0,1000}.{0,1000}a` — three sequential bounded
+  repetitions with wildcard bodies.  Compares compilation time, no-match
+  (prefilter-dominated), and match-at-end (actual simulation) across
+  rethoc tiers (tier3/tier4/nfa) and the `regex` crate, sizes up to 64 KB.
+- **Nested**: `(.{0,1000}a){0,1000}b` — nested bounded repetitions
+  (Tier 4 only).  Sizes limited to 256 and 1024 bytes.
+
+HTML reports in `target/criterion/`.
 
 Rebar (comparative benchmarks against `rust/regex`):
 

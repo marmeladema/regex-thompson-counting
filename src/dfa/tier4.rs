@@ -6,14 +6,12 @@
 //! (the consuming state it is waiting at) so that only the relevant
 //! counter program is applied to it.
 
-use std::fmt;
-use std::hash::{Hash, Hasher};
-
-use ahash::HashMapExt;
 use indexmap::IndexSet;
+use std::fmt;
 
 use crate::{
-    AssertKind, CounterCtx, CounterIdx, CounterPool, Regex, State, StateIdx, byte_match_ci,
+    AssertKind, CounterCtx, CounterIdx, CounterPool, CtxDedupTable, Regex, State, StateIdx,
+    byte_match_ci,
 };
 
 use super::{DfaState, DfaStateId, DfaStateRef};
@@ -120,7 +118,7 @@ enum TraceEndFrame {
 enum ProgramResult {
     /// The context survives with updated counter values at the given
     /// NFA consuming state.
-    Continue(CounterCtx, StateIdx),
+    Continue(StateIdx, CounterCtx),
     /// A match was found (directly reachable).
     Match,
     /// A match is reachable at end-of-input (`$`).
@@ -146,7 +144,7 @@ fn execute_program(
     for op in ops {
         match op {
             CounterOp::EmitContinue { origin } => {
-                results.push(ProgramResult::Continue(ctx.clone(pool), *origin));
+                results.push(ProgramResult::Continue(*origin, ctx.clone(pool)));
             }
             CounterOp::EmitMatch => {
                 results.push(ProgramResult::Match);
@@ -201,7 +199,7 @@ fn execute_program(
                     if let [CounterOp::EmitContinue { origin }] = on_continue.as_slice() {
                         let mut result = ctx.clone(pool);
                         result.set(*counter, new_val, pool);
-                        results.push(ProgramResult::Continue(result, *origin));
+                        results.push(ProgramResult::Continue(*origin, result));
                     } else {
                         let mut child = ctx.clone(pool);
                         child.set(*counter, new_val, pool);
@@ -213,7 +211,7 @@ fn execute_program(
                     if let [CounterOp::EmitContinue { origin }] = on_break.as_slice() {
                         let mut result = ctx.clone(pool);
                         result.set(*counter, new_val, pool);
-                        results.push(ProgramResult::Continue(result, *origin));
+                        results.push(ProgramResult::Continue(*origin, result));
                     } else if let [CounterOp::EmitMatch] = on_break.as_slice() {
                         results.push(ProgramResult::Match);
                     } else if let [CounterOp::EmitMatchAtEnd] = on_break.as_slice() {
@@ -261,7 +259,7 @@ fn try_execute_inplace(
             // Only continue fires.
             if let [CounterOp::EmitContinue { origin }] = on_continue.as_slice() {
                 ctx.set(*counter, new_val, pool);
-                return Some(ProgramResult::Continue(CounterCtx::new(), *origin));
+                return Some(ProgramResult::Continue(*origin, CounterCtx::new()));
                 // ^ dummy ctx — caller will use the mutated `ctx` directly
             }
         } else if do_break && !do_continue {
@@ -1085,13 +1083,16 @@ pub struct Tier4DfaMatcher<'a> {
     /// Active counter contexts, each paired with its NFA origin.
     /// Does NOT include implicit "seed" contexts — those are tracked
     /// separately via `seed_origins` to avoid redundant alloc/free.
-    contexts: Vec<(CounterCtx, StateIdx)>,
+    contexts: Vec<(StateIdx, CounterCtx)>,
     /// Scratch space for new contexts during step (avoids realloc).
-    next_contexts: Vec<(CounterCtx, StateIdx)>,
+    next_contexts: Vec<(StateIdx, CounterCtx)>,
     /// Scratch space for program execution results (avoids per-step alloc).
     results: Vec<ProgramResult>,
-    /// Scratch map for hash-based context dedup (avoids per-step alloc).
-    dedup_seen: ahash::HashMap<u64, Vec<usize>>,
+    /// Scratch table for hash-based context dedup.  Indices point into
+    /// `contexts` / `next_contexts` during [`dedup_contexts`] calls.
+    /// Cleared at the start of each dedup pass; retains capacity across
+    /// steps.
+    dedup_seen: CtxDedupTable,
     /// Whether a match has been found.
     ever_matched: bool,
     /// Whether a match-at-end has been found (current step only).
@@ -1130,13 +1131,13 @@ impl<'a> Tier4DfaMatcher<'a> {
             execute_program(start_prog, &fresh, pool, &mut results);
             for r in results {
                 match r {
-                    ProgramResult::Continue(ctx, origin) => contexts.push((ctx, origin)),
+                    ProgramResult::Continue(origin, ctx) => contexts.push((origin, ctx)),
                     ProgramResult::Match => ever_matched = true,
                     ProgramResult::MatchAtEnd => match_at_end = true,
                 }
             }
             // Dedup initial contexts.
-            let mut dedup_seen = ahash::HashMap::new();
+            let mut dedup_seen = CtxDedupTable::new();
             dedup_contexts(&mut contexts, pool, &mut dedup_seen);
         }
 
@@ -1158,7 +1159,7 @@ impl<'a> Tier4DfaMatcher<'a> {
             contexts,
             next_contexts: Vec::new(),
             results: Vec::new(),
-            dedup_seen: ahash::HashMap::new(),
+            dedup_seen: CtxDedupTable::new(),
         }
     }
 
@@ -1219,8 +1220,8 @@ impl<'a> Tier4DfaMatcher<'a> {
                     execute_program(prog, &fresh, self.pool, &mut self.results);
                     for r in self.results.drain(..) {
                         match r {
-                            ProgramResult::Continue(new_ctx, new_origin) => {
-                                self.next_contexts.push((new_ctx, new_origin));
+                            ProgramResult::Continue(new_origin, new_ctx) => {
+                                self.next_contexts.push((new_origin, new_ctx));
                             }
                             ProgramResult::Match => {
                                 self.ever_matched = true;
@@ -1239,11 +1240,11 @@ impl<'a> Tier4DfaMatcher<'a> {
         // --- Phase 2: Process explicit (non-seed) contexts ---
         if origin_table.is_empty() {
             // All contexts die — free them in bulk.
-            for (ctx, _) in self.contexts.drain(..) {
+            for (_, ctx) in self.contexts.drain(..) {
                 self.pool.free(ctx.into_range());
             }
         } else {
-            for (mut ctx, ctx_origin) in self.contexts.drain(..) {
+            for (ctx_origin, mut ctx) in self.contexts.drain(..) {
                 // Find the program for this context's origin NFA state.
                 let prog_idx = if origin_table.len() == 1 {
                     let (origin, idx) = origin_table[0];
@@ -1263,8 +1264,8 @@ impl<'a> Tier4DfaMatcher<'a> {
                     // Fast path: single Increment with one active branch.
                     if let Some(result) = try_execute_inplace(prog, &mut ctx, self.pool) {
                         match result {
-                            ProgramResult::Continue(_, new_origin) => {
-                                self.next_contexts.push((ctx, new_origin));
+                            ProgramResult::Continue(new_origin, _) => {
+                                self.next_contexts.push((new_origin, ctx));
                                 continue;
                             }
                             ProgramResult::Match => {
@@ -1279,8 +1280,8 @@ impl<'a> Tier4DfaMatcher<'a> {
                         execute_program(prog, &ctx, self.pool, &mut self.results);
                         for r in self.results.drain(..) {
                             match r {
-                                ProgramResult::Continue(new_ctx, new_origin) => {
-                                    self.next_contexts.push((new_ctx, new_origin));
+                                ProgramResult::Continue(new_origin, new_ctx) => {
+                                    self.next_contexts.push((new_origin, new_ctx));
                                 }
                                 ProgramResult::Match => {
                                     self.ever_matched = true;
@@ -1310,8 +1311,8 @@ impl<'a> Tier4DfaMatcher<'a> {
                 execute_program(seed_prog, &fresh, self.pool, &mut self.results);
                 for r in self.results.drain(..) {
                     match r {
-                        ProgramResult::Continue(new_ctx, new_origin) => {
-                            self.next_contexts.push((new_ctx, new_origin));
+                        ProgramResult::Continue(new_origin, new_ctx) => {
+                            self.next_contexts.push((new_origin, new_ctx));
                         }
                         ProgramResult::Match => {
                             self.ever_matched = true;
@@ -1346,7 +1347,7 @@ impl<'a> Tier4DfaMatcher<'a> {
     pub fn finish(mut self) -> bool {
         if self.ever_matched {
             // Free remaining contexts.
-            for (ctx, _) in self.contexts.drain(..) {
+            for (_, ctx) in self.contexts.drain(..) {
                 self.pool.free(ctx.into_range());
             }
             return true;
@@ -1354,13 +1355,13 @@ impl<'a> Tier4DfaMatcher<'a> {
 
         // Check if any active context can match at end-of-input.
         if self.match_at_end {
-            for (ctx, _) in self.contexts.drain(..) {
+            for (_, ctx) in self.contexts.drain(..) {
                 self.pool.free(ctx.into_range());
             }
             return true;
         }
 
-        for (ctx, _) in self.contexts.drain(..) {
+        for (_, ctx) in self.contexts.drain(..) {
             self.pool.free(ctx.into_range());
         }
         false
@@ -1383,34 +1384,23 @@ impl fmt::Debug for Tier4DfaMatcher<'_> {
     }
 }
 
-/// Compute a content hash of `(origin, active, counter_slots)` for a
-/// context.  Uses `ahash` for fast, high-quality hashing.
-#[inline]
-fn ctx_hash(ctx: &CounterCtx, origin: StateIdx, pool: &CounterPool) -> u64 {
-    let mut h = ahash::AHasher::default();
-    origin.0.hash(&mut h);
-    ctx.active_count().hash(&mut h);
-    pool.slots_of(ctx).hash(&mut h);
-    h.finish()
-}
-
 /// Threshold below which the O(n²) linear scan is faster than the
-/// hash-based approach (avoids HashMap overhead for small context lists).
+/// hash-based approach (avoids hash table overhead for small context lists).
 const DEDUP_HASH_THRESHOLD: usize = 32;
 
 /// Deduplicate counter contexts by (origin, counter values).
 ///
 /// For small lists (≤ [`DEDUP_HASH_THRESHOLD`]), uses a direct O(n²)
-/// pairwise scan.  For larger lists, uses hash-based bucketing for
-/// O(n) expected time.  On hash collision, falls back to full `ctx_eq`
-/// comparison for correctness.
+/// pairwise scan.  For larger lists, uses [`CtxDedupTable`] for O(n)
+/// expected time.  On hash collision, falls back to full
+/// [`CounterPool::ctx_eq`] comparison for correctness.
 ///
-/// The `seen` map is passed in to avoid per-call allocation; it is
-/// cleared on entry and may retain capacity across calls.
+/// The `seen` table is passed in to avoid per-call allocation; it is
+/// cleared on entry and retains capacity across calls.
 fn dedup_contexts(
-    contexts: &mut Vec<(CounterCtx, StateIdx)>,
+    contexts: &mut Vec<(StateIdx, CounterCtx)>,
     pool: &mut CounterPool,
-    seen: &mut ahash::HashMap<u64, Vec<usize>>,
+    seen: &mut CtxDedupTable,
 ) {
     if contexts.len() <= DEDUP_HASH_THRESHOLD {
         dedup_contexts_linear(contexts, pool);
@@ -1420,18 +1410,18 @@ fn dedup_contexts(
 }
 
 /// O(n²) pairwise dedup for small context lists.
-fn dedup_contexts_linear(contexts: &mut Vec<(CounterCtx, StateIdx)>, pool: &mut CounterPool) {
+fn dedup_contexts_linear(contexts: &mut Vec<(StateIdx, CounterCtx)>, pool: &mut CounterPool) {
     let mut i = 0;
     while i < contexts.len() {
         let mut dup = false;
         for j in 0..i {
-            if contexts[i].1 == contexts[j].1 && pool.ctx_eq(&contexts[i].0, &contexts[j].0) {
+            if contexts[i].0 == contexts[j].0 && pool.ctx_eq(&contexts[i].1, &contexts[j].1) {
                 dup = true;
                 break;
             }
         }
         if dup {
-            let (removed, _) = contexts.swap_remove(i);
+            let (_, removed) = contexts.swap_remove(i);
             pool.free(removed.into_range());
         } else {
             i += 1;
@@ -1441,29 +1431,23 @@ fn dedup_contexts_linear(contexts: &mut Vec<(CounterCtx, StateIdx)>, pool: &mut 
 
 /// Hash-based dedup for large context lists.
 fn dedup_contexts_hash(
-    contexts: &mut Vec<(CounterCtx, StateIdx)>,
+    contexts: &mut Vec<(StateIdx, CounterCtx)>,
     pool: &mut CounterPool,
-    seen: &mut ahash::HashMap<u64, Vec<usize>>,
+    seen: &mut CtxDedupTable,
 ) {
     seen.clear();
 
     let mut i = 0;
     while i < contexts.len() {
-        let hash = ctx_hash(&contexts[i].0, contexts[i].1, pool);
-        let mut dup = false;
-        if let Some(indices) = seen.get(&hash) {
-            for &j in indices {
-                if contexts[i].1 == contexts[j].1 && pool.ctx_eq(&contexts[i].0, &contexts[j].0) {
-                    dup = true;
-                    break;
-                }
-            }
-        }
+        let hash = pool.ctx_hash(&contexts[i].1, contexts[i].0);
+        let dup = seen.find(hash, |j| {
+            contexts[i].0 == contexts[j].0 && pool.ctx_eq(&contexts[i].1, &contexts[j].1)
+        });
         if dup {
-            let (removed, _) = contexts.swap_remove(i);
+            let (_, removed) = contexts.swap_remove(i);
             pool.free(removed.into_range());
         } else {
-            seen.entry(hash).or_default().push(i);
+            seen.insert(hash, i);
             i += 1;
         }
     }

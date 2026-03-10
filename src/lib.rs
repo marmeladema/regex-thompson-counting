@@ -2881,6 +2881,20 @@ impl CounterPool {
         a.active == b.active && self.slots(&a.range) == self.slots(&b.range)
     }
 
+    /// Compute a content hash of `(state, active_count, counter_slots)`.
+    ///
+    /// Used by [`CtxDedupTable`] for O(1) amortized dedup of
+    /// `(StateIdx, CounterCtx)` pairs.
+    #[inline]
+    pub(crate) fn ctx_hash(&self, ctx: &CounterCtx, state: StateIdx) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = ahash::AHasher::default();
+        state.0.hash(&mut h);
+        ctx.active_count().hash(&mut h);
+        self.slots_of(ctx).hash(&mut h);
+        h.finish()
+    }
+
     /// Reset the pool for a new match (keeps allocated memory).
     pub(crate) fn clear(&mut self) {
         self.arena.clear();
@@ -2980,6 +2994,84 @@ impl CounterCtx {
 }
 
 // ---------------------------------------------------------------------------
+// Context dedup table
+// ---------------------------------------------------------------------------
+
+/// Hash table for O(1) amortized dedup of `(StateIdx, CounterCtx)` pairs.
+///
+/// Wraps a flat [`hashbrown::HashTable`] storing `(hash, index)` pairs
+/// where *index* refers to an element in an external backing
+/// `Vec<(StateIdx, CounterCtx)>` owned by the caller.  The table is
+/// purely an index structure — it does not own the contexts themselves.
+///
+/// Used by:
+/// - **NFA** ([`NfaMatcher`]): indices point into `ctx_visited`.
+/// - **Tier 4** ([`Tier4DfaMatcher`](crate::dfa::tier4::Tier4DfaMatcher)):
+///   indices point into the `contexts` vec during dedup.
+///
+/// # Invariants
+///
+/// 1. **Hash consistency** — each entry's stored hash must have been
+///    computed by [`CounterPool::ctx_hash`] over the same
+///    `(StateIdx, CounterCtx)` that the index refers to.
+/// 2. **Insert-after-find** — [`insert`](Self::insert) must only be
+///    called after [`find`](Self::find) returned `false` for the same
+///    hash (i.e. the entry is known to be unique).
+/// 3. **Lockstep clearing** — the table **must** be
+///    [`clear`](Self::clear)ed whenever the backing store is drained or
+///    invalidated, so that stale indices are never probed.  In the NFA
+///    this is enforced by [`NfaMatcher::free_ctx_visited`]; in Tier 4
+///    by calling `clear()` at the top of [`dedup_contexts_hash`].
+/// 4. **Index validity** — stored indices must remain valid for the
+///    lifetime of the lookup.  In Tier 4's `swap_remove` dedup pattern,
+///    this holds because only indices `< i` are stored and `swap_remove`
+///    only moves elements from positions `≥ i`.
+#[derive(Debug, Default)]
+pub(crate) struct CtxDedupTable {
+    table: hashbrown::HashTable<(u64, usize)>,
+}
+
+impl CtxDedupTable {
+    /// Create an empty dedup table.
+    pub(crate) fn new() -> Self {
+        Self {
+            table: hashbrown::HashTable::new(),
+        }
+    }
+
+    /// Remove all entries, retaining allocated capacity for reuse.
+    #[inline]
+    pub(crate) fn clear(&mut self) {
+        self.table.clear();
+    }
+
+    /// Probe the table for an entry matching `hash` whose backing-store
+    /// index satisfies `eq`.
+    ///
+    /// `eq` receives the stored index and should return `true` only when
+    /// the indexed element is equal to the query element (typically via
+    /// [`CounterPool::ctx_eq`]).
+    #[inline]
+    pub(crate) fn find(&self, hash: u64, mut eq: impl FnMut(usize) -> bool) -> bool {
+        self.table
+            .find(hash, |&(h, idx)| h == hash && eq(idx))
+            .is_some()
+    }
+
+    /// Insert a new unique entry.
+    ///
+    /// # Safety contract (debug-only)
+    ///
+    /// The caller must have verified via [`find`](Self::find) that no
+    /// matching entry exists.  Violating this adds a duplicate, which
+    /// wastes space but does not cause unsoundness.
+    #[inline]
+    pub(crate) fn insert(&mut self, hash: u64, index: usize) {
+        self.table.insert_unique(hash, (hash, index), |&(h, _)| h);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Matcher (NFA simulation)
 
 /// Reusable memory for [`Matcher`].  Create once, call
@@ -2996,14 +3088,20 @@ pub struct MatcherMemory {
     /// Explicit work stack used by [`Matcher::addstate`] to avoid
     /// recursive epsilon-closure traversal.
     addstack: Vec<AddStateOp>,
-    /// Context-aware dedup for threads with non-empty counter contexts.
-    /// Cleared at each step.  Entries are referenced by index from
-    /// [`ctx_visited_map`](Self::ctx_visited_map) for hash-based lookup.
+    /// Backing store for context-aware dedup of threads with non-empty
+    /// counter contexts.  Deep-cloned snapshots of `(state, ctx)` are
+    /// appended here during epsilon closure so that later visits to the
+    /// same `(state, counter_values)` can be detected and pruned.
+    ///
+    /// **Must be cleared in lockstep with [`ctx_visited_map`](Self::ctx_visited_map).**
+    /// See [`NfaMatcher::free_ctx_visited`].
     ctx_visited: Vec<(StateIdx, CounterCtx)>,
     /// Hash-based index into [`ctx_visited`](Self::ctx_visited) for O(1)
-    /// amortized dedup.  Maps `nfa_ctx_hash(state, ctx) → [indices]`.
-    /// Cleared alongside `ctx_visited` at each step; retains capacity.
-    ctx_visited_map: ahash::HashMap<u64, Vec<usize>>,
+    /// amortized dedup.  Retains capacity across steps.
+    ///
+    /// **Must be cleared in lockstep with [`ctx_visited`](Self::ctx_visited).**
+    /// See [`NfaMatcher::free_ctx_visited`].
+    ctx_visited_map: CtxDedupTable,
     counter_pool: CounterPool,
     /// Shared scratch space for epsilon-closure computation (DFA tiers 1–3).
     dfa_memory: DfaMemory,
@@ -3236,19 +3334,6 @@ impl<'a> fmt::Debug for AnyMatcher<'a> {
     }
 }
 
-/// Compute a content hash of `(state, active, counter_slots)` for a
-/// counter context at a given NFA state.  Uses `ahash` for fast,
-/// high-quality hashing.
-#[inline]
-fn nfa_ctx_hash(ctx: &CounterCtx, state: StateIdx, pool: &CounterPool) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = ahash::AHasher::default();
-    state.0.hash(&mut h);
-    ctx.active_count().hash(&mut h);
-    pool.slots_of(ctx).hash(&mut h);
-    h.finish()
-}
-
 /// Runs a Thompson NFA simulation with per-thread counter contexts.
 #[derive(Debug)]
 pub struct NfaMatcher<'a> {
@@ -3268,10 +3353,12 @@ pub struct NfaMatcher<'a> {
     nlist: &'a mut Vec<(StateIdx, CounterCtx)>,
     /// Explicit work stack for iterative epsilon-closure traversal.
     addstack: &'a mut Vec<AddStateOp>,
-    /// Context-aware dedup for threads with non-empty counter contexts.
+    /// Backing store for context-aware dedup (see [`MatcherMemory::ctx_visited`]).
+    /// **Cleared in lockstep with `ctx_visited_map`** via [`free_ctx_visited`](Self::free_ctx_visited).
     ctx_visited: &'a mut Vec<(StateIdx, CounterCtx)>,
     /// Hash-based index into `ctx_visited` for O(1) amortized dedup.
-    ctx_visited_map: &'a mut ahash::HashMap<u64, Vec<usize>>,
+    /// **Cleared in lockstep with `ctx_visited`** via [`free_ctx_visited`](Self::free_ctx_visited).
+    ctx_visited_map: &'a mut CtxDedupTable,
 
     /// The NFA start state index.
     start: StateIdx,
@@ -3312,6 +3399,9 @@ enum AddStateOp {
 
 impl<'a> NfaMatcher<'a> {
     /// Drain `ctx_visited` and return all arena slots to the pool.
+    ///
+    /// Also clears `ctx_visited_map` to maintain the lockstep invariant
+    /// (see [`CtxDedupTable`]).
     #[inline]
     fn free_ctx_visited(&mut self) {
         for (_, ctx) in self.ctx_visited.drain(..) {
@@ -3377,15 +3467,11 @@ impl<'a> NfaMatcher<'a> {
                     } else {
                         // Hash-based lookup with full value comparison on
                         // collision.  O(1) amortized instead of O(K²).
-                        let hash = nfa_ctx_hash(&ctx, idx, self.counter_pool);
-                        let already_seen = if let Some(indices) = self.ctx_visited_map.get(&hash) {
-                            indices.iter().any(|&j| {
-                                let (s, c) = &self.ctx_visited[j];
-                                *s == idx && self.counter_pool.ctx_eq(c, &ctx)
-                            })
-                        } else {
-                            false
-                        };
+                        let hash = self.counter_pool.ctx_hash(&ctx, idx);
+                        let already_seen = self.ctx_visited_map.find(hash, |j| {
+                            let (s, c) = &self.ctx_visited[j];
+                            *s == idx && self.counter_pool.ctx_eq(c, &ctx)
+                        });
                         if already_seen {
                             self.counter_pool.free(ctx.range);
                             continue;
@@ -3394,10 +3480,7 @@ impl<'a> NfaMatcher<'a> {
                         // entry is independent of later mutations to ctx.
                         let record_idx = self.ctx_visited.len();
                         self.ctx_visited.push((idx, ctx.clone(self.counter_pool)));
-                        self.ctx_visited_map
-                            .entry(hash)
-                            .or_default()
-                            .push(record_idx);
+                        self.ctx_visited_map.insert(hash, record_idx);
                         ctx
                     };
 
@@ -3523,8 +3606,10 @@ impl<'a> NfaMatcher<'a> {
                 {
                     if !any_expanded {
                         self.listid += 1;
-                        // Inline free_ctx_visited: can't call &mut self
-                        // method while self.clist[i] is borrowed.
+                        // Inline free_ctx_visited (can't call &mut self
+                        // method while self.clist[i] is borrowed).
+                        // Must clear both ctx_visited and ctx_visited_map
+                        // in lockstep — see CtxDedupTable invariant #3.
                         for (_, c) in self.ctx_visited.drain(..) {
                             self.counter_pool.free(c.range);
                         }

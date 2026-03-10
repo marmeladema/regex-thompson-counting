@@ -16,6 +16,7 @@ regex = "1"
 
 [dependencies]
 ahash = "0.8"
+hashbrown = "0.16"
 indexmap = "2"
 memchr = "2.8.0"
 regex-syntax = "0.8.9"
