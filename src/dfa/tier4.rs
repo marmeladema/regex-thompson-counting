@@ -6,8 +6,9 @@
 //! (the consuming state it is waiting at) so that only the relevant
 //! counter program is applied to it.
 
-use std::collections::HashMap;
 use std::fmt;
+
+use indexmap::IndexSet;
 
 use crate::{
     AssertKind, CounterCtx, CounterIdx, CounterPool, Regex, State, StateIdx, byte_match_ci,
@@ -328,10 +329,9 @@ impl CountingTransition {
 /// the set of NFA consuming states, ignoring counter values.  Counter
 /// values live in a separate side-channel of `CounterCtx` entries.
 pub(crate) struct Tier4DfaCache {
-    /// Append-only table of DFA states.
-    states: Vec<DfaState>,
-    /// Reverse lookup: canonical `DfaState → DfaStateId`.
-    state_map: HashMap<DfaState, DfaStateId>,
+    /// Append-only, deduplicated table of DFA states.  Acts as both the
+    /// state table (index → state) and the reverse lookup (state → index).
+    states: IndexSet<DfaState, ahash::RandomState>,
     /// Flat transition table: indexed by `state.0 * stride + byte_class`.
     /// Unpopulated slots have `origin_table == OriginTableIdx::NONE`.
     transitions: Vec<CountingTransition>,
@@ -393,8 +393,7 @@ impl fmt::Debug for Tier4DfaCache {
 impl Tier4DfaCache {
     pub(crate) fn new(num_nfa_states: usize) -> Self {
         Self {
-            states: Vec::new(),
-            state_map: HashMap::default(),
+            states: IndexSet::default(),
             transitions: Vec::new(),
             programs: Vec::new(),
             origin_program_tables: Vec::new(),
@@ -431,17 +430,14 @@ impl Tier4DfaCache {
             is_match_at_end,
             prev_was_word: false,
         };
-        if let Some(&id) = self.state_map.get(&state) {
-            return id;
+        let (idx, inserted) = self.states.insert_full(state);
+        if inserted {
+            self.transitions.resize(
+                self.states.len() * self.stride,
+                CountingTransition::UNPOPULATED,
+            );
         }
-        let id = DfaStateId(self.states.len() as u32);
-        self.state_map.insert(state.clone(), id);
-        self.states.push(state);
-        self.transitions.resize(
-            self.states.len() * self.stride,
-            CountingTransition::UNPOPULATED,
-        );
-        id
+        DfaStateId(idx as u32)
     }
 
     /// Store a counter program and return its index.
@@ -985,7 +981,6 @@ impl Tier4DfaCache {
     /// Reset the cache.
     fn clear(&mut self, num_nfa_states: usize, stride: usize) {
         self.states.clear();
-        self.state_map.clear();
         self.transitions.clear();
         self.programs.clear();
         self.origin_program_tables.clear();

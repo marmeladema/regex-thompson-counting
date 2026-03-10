@@ -28,7 +28,7 @@ mod tier2;
 mod tier3;
 mod tier4;
 
-use ahash::HashMap;
+use indexmap::IndexSet;
 
 pub(crate) use tier1::{DfaMatcher, Tier1DfaCache};
 pub(crate) use tier2::{Tier2DfaCache, Tier2DfaMatcher};
@@ -281,8 +281,7 @@ impl DfaMemory {
 }
 
 struct DfaCache {
-    states: Vec<DfaState>,
-    state_map: HashMap<DfaState, DfaStateId>,
+    states: IndexSet<DfaState, ahash::RandomState>,
     regex_id: u64,
     start_id: DfaStateId,
     start_is_match: bool,
@@ -292,8 +291,7 @@ struct DfaCache {
 impl DfaCache {
     fn new() -> Self {
         Self {
-            states: Vec::new(),
-            state_map: HashMap::default(),
+            states: IndexSet::default(),
             regex_id: 0,
             start_id: DfaStateId::DEAD,
             start_is_match: false,
@@ -321,24 +319,21 @@ impl DfaCache {
             is_match_at_end,
             prev_was_word,
         };
-        if let Some(&id) = self.state_map.get(&state) {
-            return Some(id);
+        if let Some(idx) = self.states.get_index_of(&state) {
+            return Some(DfaStateId(idx as u32));
         }
         if self.states.len() >= DFA_MAX_STATES {
             return None;
         }
-        let id = DfaStateId(self.states.len() as u32);
-        self.state_map.insert(state.clone(), id);
-        self.states.push(state);
+        let (idx, _) = self.states.insert_full(state);
         transition();
-        Some(id)
+        Some(DfaStateId(idx as u32))
     }
 
     /// Reset the cache for reuse with a new regex.
     #[inline]
     fn clear(&mut self) {
         self.states.clear();
-        self.state_map.clear();
         self.regex_id = 0;
         self.start_id = DfaStateId::DEAD;
         self.start_is_match = false;
