@@ -265,14 +265,12 @@ renders it to a regex string.  Controlled features:
 | Feature | Range | Notes |
 |---------|-------|-------|
 | Atoms | Literals, `.`, byte classes `[a-c]` | From a fixed printable pool |
+| Assertions | `\b`, `\B` | ~18% of atoms; zero-width, no repetition |
 | Repetitions | `?`, `*`, `+`, `{n,m}` | Bounded max 50 |
 | Nesting depth | 0–3 | Depth ≥2 exercises Tier 4 |
 | Alternation | 2–4 branches | |
 | Concatenation | 2–5 pieces | |
 | Anchoring | `^...$`, `^...`, `...$`, unanchored | Random per pattern |
-
-**Not generated**: Word boundaries (`\b`, `\B`) are excluded — they trigger
-a known NFA/DFA deferred-assertion edge case under investigation.
 
 Input generation is **pattern-aware**: the AST is walked to produce positive
 candidates with correct literals and valid repeat counts, then mutated to

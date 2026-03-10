@@ -201,7 +201,7 @@ impl Tier1DfaCache {
                 // Mini epsilon closure: find consuming states reachable
                 // from the resolved assertion outputs.
                 let resolved_prev = from_state.prev_byte_representative();
-                let (resolved_match, resolved_match_at_end) = Self::epsilon_closure(
+                let (resolved_match, _resolved_match_at_end) = Self::epsilon_closure(
                     memory,
                     extra.into_iter(),
                     regex,
@@ -268,9 +268,22 @@ impl Tier1DfaCache {
                 }
 
                 // Phase 3: epsilon closure of all targets + re-seed.
+                //
+                // Note: we deliberately discard `_resolved_match_at_end`.
+                // That flag means "the deferred assertion passed mid-stream
+                // (with next=byte) and $ → Match was reachable."  But the
+                // assertion was evaluated in a mid-stream context — at actual
+                // end-of-input, `next` is `None` and the word-boundary
+                // condition may flip.  For unanchored patterns, the re-seed
+                // ensures that the deferred assertion is re-introduced in
+                // every state, so `finish()` → `resolve_deferred_at_end()`
+                // correctly re-evaluates it at end-of-input.  For anchored
+                // patterns, the re-seed produces nothing (because `^` fails
+                // after position 0), which is correct — the assertions
+                // shouldn't fire at non-start positions.
                 if targets.is_empty() {
                     // No consuming state produced a target.  Re-seed.
-                    let (mut m, mut mae) = Self::epsilon_closure(
+                    let (mut m, mae) = Self::epsilon_closure(
                         memory,
                         std::iter::once(regex.start),
                         regex,
@@ -280,7 +293,6 @@ impl Tier1DfaCache {
                         None,
                     );
                     m |= resolved_match;
-                    mae |= resolved_match_at_end;
                     if memory.closure_result.is_empty()
                         && memory.closure_deferred.is_empty()
                         && !m
@@ -299,10 +311,9 @@ impl Tier1DfaCache {
                 }
 
                 let seeds = targets.into_iter().chain(std::iter::once(regex.start));
-                let (mut m, mut mae) =
+                let (mut m, mae) =
                     Self::epsilon_closure(memory, seeds, regex, false, false, Some(byte), None);
                 m |= resolved_match;
-                mae |= resolved_match_at_end;
                 if memory.closure_result.is_empty()
                     && memory.closure_deferred.is_empty()
                     && !m

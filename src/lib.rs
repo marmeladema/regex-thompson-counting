@@ -6545,6 +6545,56 @@ mod tests {
             min_tier: 1,
             inputs: [("", true), (" ", true), ("a", false)],
         }
+        // Regression: `\B$` on word-char inputs.  At end-of-input after a
+        // word char, `\B` should fail (prev=word, next=EOI=non-word →
+        // boundary, so non-boundary assertion fails).
+        test_word_boundary_b_neg_end_of_word {
+            pattern: r#"\B$"#,
+            memory: 595,
+            min_tier: 1,
+            inputs: [
+                ("zzz", false),
+                ("a", false),
+                ("abc", false),
+                ("z", false),
+                ("", true),
+                ("  ", true),
+                (" ", true),
+            ],
+        }
+        // Regression: `^\B$` can only match the empty string at a position
+        // that is simultaneously start-of-input, end-of-input, and a
+        // non-word-boundary.  Empty input: prev=SOI(non-word),
+        // next=EOI(non-word) → same class → \B passes.  Non-empty inputs
+        // cannot satisfy both ^ and $ at the same position.
+        test_word_boundary_b_neg_anchored {
+            pattern: r#"^\B$"#,
+            memory: 628,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("\x00", false),
+                ("a", false),
+                (" ", false),
+                ("\n", false),
+            ],
+        }
+        // Regression: `^\b$` can only match the empty string at a position
+        // that is both start/end-of-input and a word boundary.  At
+        // SOI=EOI, prev=non-word, next=non-word → same class → \b fails.
+        // So `^\b$` never matches any input.
+        test_word_boundary_b_pos_anchored {
+            pattern: r#"^\b$"#,
+            memory: 628,
+            min_tier: 1,
+            inputs: [
+                ("", false),
+                ("a", false),
+                (" ", false),
+                ("ab", false),
+                ("\x00", false),
+            ],
+        }
         test_word_boundary_mixed {
             pattern: r#"\bfoo\B"#,
             memory: 694,

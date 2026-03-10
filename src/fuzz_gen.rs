@@ -112,11 +112,10 @@ pub enum PatternNode {
     AnchorStart,
     /// End-of-input anchor `$`.
     AnchorEnd,
-    // NOTE: Word boundary assertions (\b, \B) are intentionally excluded
-    // from generation.  They are zero-width assertions that trigger known
-    // tier disagreements between the NFA and DFA when adjacent to optional
-    // content.  They can be added back once the deferred-assertion edge
-    // case is investigated separately.
+    /// Word boundary assertion `\b`.
+    WordBoundary,
+    /// Non-word-boundary assertion `\B`.
+    NotWordBoundary,
 }
 
 /// The kind of repetition applied to a sub-expression.
@@ -213,7 +212,13 @@ fn gen_piece(rng: &mut FuzzRng<'_>, depth: usize) -> PatternNode {
     // Don't apply repetitions to zero-width assertions — patterns like
     // `^{3}` are degenerate (a zero-width assertion repeated N times is
     // semantically identical to the assertion once).
-    let is_zero_width = matches!(base, PatternNode::AnchorStart | PatternNode::AnchorEnd);
+    let is_zero_width = matches!(
+        base,
+        PatternNode::AnchorStart
+            | PatternNode::AnchorEnd
+            | PatternNode::WordBoundary
+            | PatternNode::NotWordBoundary
+    );
 
     // ~60% chance of adding a repetition operator (but not to assertions)
     if !is_zero_width && rng.chance(60) {
@@ -227,18 +232,23 @@ fn gen_piece(rng: &mut FuzzRng<'_>, depth: usize) -> PatternNode {
     }
 }
 
-/// Generate a leaf atom (always byte-consuming — no zero-width assertions).
+/// Generate a leaf atom.
+///
+/// Mostly byte-consuming atoms (literals, dots, classes), but with a small
+/// chance (~10%) of producing a zero-width word boundary assertion (`\b`
+/// or `\B`).  These are important for exercising the DFA deferred assertion
+/// machinery but should stay rare to avoid degenerate patterns.
 fn gen_atom(rng: &mut FuzzRng<'_>) -> PatternNode {
-    match rng.choose(5) {
-        // Literal byte from pool
-        0..=2 => {
+    match rng.choose(11) {
+        // Literal byte from pool (6/11 ≈ 55%)
+        0..=5 => {
             let idx = rng.choose(LITERAL_POOL.len());
             PatternNode::Literal(LITERAL_POOL[idx])
         }
-        // Dot
-        3 => PatternNode::Dot,
-        // Byte class [lo-hi]
-        _ => {
+        // Dot (2/11 ≈ 18%)
+        6 | 7 => PatternNode::Dot,
+        // Byte class [lo-hi] (1/11 ≈ 9%)
+        8 => {
             let num_ranges = rng.range(1, 3);
             let mut ranges = Vec::with_capacity(num_ranges);
             for _ in 0..num_ranges {
@@ -249,6 +259,10 @@ fn gen_atom(rng: &mut FuzzRng<'_>) -> PatternNode {
             }
             PatternNode::Class(ranges)
         }
+        // Word boundary \b (1/11 ≈ 9%)
+        9 => PatternNode::WordBoundary,
+        // Non-word-boundary \B (1/11 ≈ 9%)
+        _ => PatternNode::NotWordBoundary,
     }
 }
 
@@ -325,6 +339,8 @@ fn render_node(node: &PatternNode, out: &mut String) {
         }
         PatternNode::AnchorStart => out.push('^'),
         PatternNode::AnchorEnd => out.push('$'),
+        PatternNode::WordBoundary => out.push_str("\\b"),
+        PatternNode::NotWordBoundary => out.push_str("\\B"),
     }
 }
 
@@ -492,8 +508,11 @@ fn gen_matching_input(rng: &mut FuzzRng<'_>, node: &PatternNode, out: &mut Vec<u
                 gen_matching_input(rng, body, out);
             }
         }
-        // Anchors don't produce bytes.
-        PatternNode::AnchorStart | PatternNode::AnchorEnd => {}
+        // Anchors and word boundaries don't produce bytes.
+        PatternNode::AnchorStart
+        | PatternNode::AnchorEnd
+        | PatternNode::WordBoundary
+        | PatternNode::NotWordBoundary => {}
     }
 }
 
