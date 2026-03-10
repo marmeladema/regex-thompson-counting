@@ -203,16 +203,12 @@ pub(crate) fn compute_tier3_analysis(
     // whose byte-consumption target does NOT lead to another CInc.
     for idx in 0..n {
         if let Some(Tier3OriginKind::Increment { .. }) = &targets_vec[idx] {
-            // Re-walk from the consuming state's target (not the consuming
-            // state itself) to find CInc break outputs.
-            let target = match states[StateIdx(idx as u32)] {
-                State::Byte { out, .. }
-                | State::ByteCI { out, .. }
-                | State::ByteClass { out, .. } => out,
-                _ => continue, // ByteTable or non-consuming — skip
-            };
+            // Walk from the target state itself (not a consuming state's
+            // `out`) through epsilon transitions to find CInc break outputs.
+            // `idx` is already the post-consumption target — it may be a
+            // CInc directly, or reachable through Split/Assert/CI chains.
             let mut cinc_break_outs = Vec::new();
-            let mut stack = vec![target];
+            let mut stack = vec![StateIdx(idx as u32)];
             let mut visited = vec![false; n];
             while let Some(s) = stack.pop() {
                 let i = s.idx();
@@ -509,6 +505,12 @@ struct Transition {
     /// Parallel arrays: `origin_keys[i]` → `origin_actions[i]`.
     origin_keys: Box<[StateIdx]>,
     origin_actions: Box<[OriginAction]>,
+    /// True if any origin's byte-consumption target reaches `$ → Match`
+    /// without going through a CInc node.  This is the "counter-free"
+    /// subset of `no_break_is_match_at_end` — safe to propagate even for
+    /// counting transitions, because the `$ → Match` path doesn't depend
+    /// on any counter reaching its minimum.
+    counter_free_match_at_end: bool,
 }
 
 impl Transition {
@@ -524,8 +526,8 @@ impl Transition {
             seeds: Box::new([]),
             break_seeds: Box::new([]),
             origin_keys: Box::new([]),
-
             origin_actions: Box::new([]),
+            counter_free_match_at_end: false,
         }
     }
 }
@@ -1059,6 +1061,20 @@ impl Tier3DfaCache {
                 });
             }
 
+            // Compute counter-free match-at-end: true if any origin's
+            // target reaches `$ → Match` without going through CInc.
+            // Such paths are safe to propagate even for counting
+            // transitions — the `$ → Match` doesn't depend on any
+            // counter reaching its minimum.
+            let counter_free_mae =
+                origin_keys
+                    .iter()
+                    .zip(origin_actions.iter())
+                    .any(|(&origin, action)| {
+                        matches!(action, OriginAction::Dead)
+                            && analysis.target_is_match_at_end[origin.idx()]
+                    });
+
             // Fold resolved deferred assertion matches into both
             // successors' flags.  `resolved_is_match` applies
             // unconditionally (the DFA state that was transitioned FROM
@@ -1075,6 +1091,7 @@ impl Tier3DfaCache {
                 break_seeds: break_seeds.into(),
                 origin_keys: origin_keys.into_boxed_slice(),
                 origin_actions: origin_actions.into_boxed_slice(),
+                counter_free_match_at_end: counter_free_mae,
             }
         } else {
             // Non-counting: both successors are the same.  All seeds are
@@ -1105,6 +1122,7 @@ impl Tier3DfaCache {
                 break_seeds: Box::new([]),
                 origin_keys: origin_keys.into_boxed_slice(),
                 origin_actions: origin_actions.into_boxed_slice(),
+                counter_free_match_at_end: false, // Not used for non-counting transitions.
             }
         }
     }
@@ -1703,10 +1721,29 @@ impl<'a> Tier3DfaMatcher<'a> {
                 self.match_at_end = true;
             }
         } else {
-            // For counting transitions, propagate no_break match flags.
-            // These are safe: the no_break closure is computed without
-            // following CInc break paths, so its match flags reflect only
-            // paths that don't depend on counter breaks.
+            // For counting transitions, propagate `no_break_is_match`
+            // and `counter_free_match_at_end`, but NOT the full
+            // `no_break_is_match_at_end`.
+            //
+            // The no_break DFA state may contain consuming states that
+            // arrived via *previous* counter breaks (e.g., state 7 in
+            // `^.{2,3}.{2,3}.$` is reachable after counter 0 breaks).
+            // The full no_break closure's `is_match_at_end` includes
+            // `$ → Match` paths from those post-break states, but those
+            // paths are only valid when the relevant downstream counter
+            // has also reached its minimum.  Propagating the full flag
+            // would bypass per-instance counter checks, causing false
+            // positives at boundary lengths.
+            //
+            // `counter_free_match_at_end` is the safe subset: it only
+            // includes `$ → Match` from origins whose target does NOT
+            // go through any CInc (Dead actions with target_is_match_at_end).
+            // These paths are always valid regardless of counter state.
+            //
+            // Counter-dependent `$ → Match` paths are handled precisely
+            // by per-instance break checks (`break_is_match_at_end`) and
+            // the `post_break_tails` mechanism (target_is_match_at_end
+            // gated on actual counter breaks).
             //
             // We do NOT propagate with_break flags here (even when
             // any_can_break) because the with_break DFA state's match flags
@@ -1717,7 +1754,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             if t.no_break_is_match {
                 self.ever_matched = true;
             }
-            if t.no_break_is_match_at_end {
+            if t.counter_free_match_at_end {
                 self.match_at_end = true;
             }
         }

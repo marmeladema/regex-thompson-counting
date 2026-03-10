@@ -9259,6 +9259,64 @@ mod tests {
                 ("xz", false),
             ],
         }
+
+        // ── break_consuming_states fix regression tests ──────────────────
+        //
+        // These exercise the post-break tail tracker in tier 3, which
+        // detects `$ → Match` from consuming states on the CInc break
+        // path.  Before the fix, the break_consuming_states field was
+        // always empty because step 2b tried to extract the consuming
+        // state's `out` from the target state itself (which may be a CInc
+        // or other epsilon node, not a consuming state).
+
+        // Single counter with trailing literal: the break path from CInc
+        // leads to `b`, then `$ → Match`.  Only the post-break tail
+        // tracker detects this when counter 0 breaks.
+        test_tier3_post_break_tail_literal {
+            pattern: "^a.{3}b$",
+            memory: 1032,
+            min_tier: 1,
+            inputs: [
+                ("a123b", true),
+                ("a___b", true),
+                ("axxxb", true),
+                ("a12b", false),
+                ("a1234b", false),
+                ("a123c", false),
+                ("", false),
+            ],
+        }
+        // Single counter with trailing wildcard: break leads to `.` then
+        // `$ → Match`.
+        test_tier3_post_break_tail_wildcard {
+            pattern: "^.{3,5}.$",
+            memory: 1131,
+            min_tier: 1,
+            inputs: [
+                ("abcd", true),
+                ("abcde", true),
+                ("abcdef", true),
+                ("abc", false),
+                ("abcdefg", false),
+                ("", false),
+            ],
+        }
+        // Counter followed by two literals: break tail must advance
+        // through the two-hop path `b → c → $ → Match`.
+        test_tier3_post_break_tail_two_hop {
+            pattern: "^.{2,4}bc$",
+            memory: 1131,
+            min_tier: 1,
+            inputs: [
+                ("aabc", true),
+                ("aaabc", true),
+                ("aaaabc", true),
+                ("abc", false),
+                ("aaaaabc", false),
+                ("aabb", false),
+                ("", false),
+            ],
+        }
     }
 
     /// Tier 2 encodes counter identity in `u64` bitmasks, so patterns with
