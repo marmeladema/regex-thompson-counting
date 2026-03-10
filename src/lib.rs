@@ -2997,9 +2997,13 @@ pub struct MatcherMemory {
     /// recursive epsilon-closure traversal.
     addstack: Vec<AddStateOp>,
     /// Context-aware dedup for threads with non-empty counter contexts.
-    /// Cleared at each step.  Linear scan with value comparison through
-    /// the counter pool.
+    /// Cleared at each step.  Entries are referenced by index from
+    /// [`ctx_visited_map`](Self::ctx_visited_map) for hash-based lookup.
     ctx_visited: Vec<(StateIdx, CounterCtx)>,
+    /// Hash-based index into [`ctx_visited`](Self::ctx_visited) for O(1)
+    /// amortized dedup.  Maps `nfa_ctx_hash(state, ctx) → [indices]`.
+    /// Cleared alongside `ctx_visited` at each step; retains capacity.
+    ctx_visited_map: ahash::HashMap<u64, Vec<usize>>,
     counter_pool: CounterPool,
     /// Shared scratch space for epsilon-closure computation (DFA tiers 1–3).
     dfa_memory: DfaMemory,
@@ -3131,6 +3135,7 @@ impl MatcherMemory {
         self.nlist.clear();
         self.addstack.clear();
         self.ctx_visited.clear();
+        self.ctx_visited_map.clear();
         self.counter_pool.clear();
         self.counter_pool.num_counters = regex.num_counters;
 
@@ -3144,6 +3149,7 @@ impl MatcherMemory {
             nlist: &mut self.nlist,
             addstack: &mut self.addstack,
             ctx_visited: &mut self.ctx_visited,
+            ctx_visited_map: &mut self.ctx_visited_map,
             start: regex.start,
             start_closure: &regex.start_closure,
             at_start: true,
@@ -3230,6 +3236,19 @@ impl<'a> fmt::Debug for AnyMatcher<'a> {
     }
 }
 
+/// Compute a content hash of `(state, active, counter_slots)` for a
+/// counter context at a given NFA state.  Uses `ahash` for fast,
+/// high-quality hashing.
+#[inline]
+fn nfa_ctx_hash(ctx: &CounterCtx, state: StateIdx, pool: &CounterPool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = ahash::AHasher::default();
+    state.0.hash(&mut h);
+    ctx.active_count().hash(&mut h);
+    pool.slots_of(ctx).hash(&mut h);
+    h.finish()
+}
+
 /// Runs a Thompson NFA simulation with per-thread counter contexts.
 #[derive(Debug)]
 pub struct NfaMatcher<'a> {
@@ -3250,8 +3269,9 @@ pub struct NfaMatcher<'a> {
     /// Explicit work stack for iterative epsilon-closure traversal.
     addstack: &'a mut Vec<AddStateOp>,
     /// Context-aware dedup for threads with non-empty counter contexts.
-    /// Linear scan with value comparison through the counter pool.
     ctx_visited: &'a mut Vec<(StateIdx, CounterCtx)>,
+    /// Hash-based index into `ctx_visited` for O(1) amortized dedup.
+    ctx_visited_map: &'a mut ahash::HashMap<u64, Vec<usize>>,
 
     /// The NFA start state index.
     start: StateIdx,
@@ -3297,6 +3317,7 @@ impl<'a> NfaMatcher<'a> {
         for (_, ctx) in self.ctx_visited.drain(..) {
             self.counter_pool.free(ctx.range);
         }
+        self.ctx_visited_map.clear();
     }
 
     /// Compute the initial state list by following all epsilon transitions
@@ -3330,8 +3351,8 @@ impl<'a> NfaMatcher<'a> {
     ///
     /// Dedup strategy:
     /// - Empty context: fast path via `lastlist`/`listid` (O(1) per state).
-    /// - Non-empty context: linear scan of `ctx_visited` with value
-    ///   comparison through the counter pool.
+    /// - Non-empty context: hash-based lookup via `ctx_visited_map` with
+    ///   full value comparison on collision through the counter pool.
     #[inline]
     fn addstate(&mut self, idx: StateIdx, ctx: CounterCtx, next_byte: Option<u8>) {
         self.addstack.clear();
@@ -3354,18 +3375,29 @@ impl<'a> NfaMatcher<'a> {
                         self.lastlist[i] = self.listid;
                         ctx
                     } else {
-                        // Linear scan with value comparison through the pool.
-                        let already_seen = self
-                            .ctx_visited
-                            .iter()
-                            .any(|(s, c)| *s == idx && self.counter_pool.ctx_eq(c, &ctx));
+                        // Hash-based lookup with full value comparison on
+                        // collision.  O(1) amortized instead of O(K²).
+                        let hash = nfa_ctx_hash(&ctx, idx, self.counter_pool);
+                        let already_seen = if let Some(indices) = self.ctx_visited_map.get(&hash) {
+                            indices.iter().any(|&j| {
+                                let (s, c) = &self.ctx_visited[j];
+                                *s == idx && self.counter_pool.ctx_eq(c, &ctx)
+                            })
+                        } else {
+                            false
+                        };
                         if already_seen {
                             self.counter_pool.free(ctx.range);
                             continue;
                         }
                         // Record for future dedup.  Deep-clone so the dedup
                         // entry is independent of later mutations to ctx.
+                        let record_idx = self.ctx_visited.len();
                         self.ctx_visited.push((idx, ctx.clone(self.counter_pool)));
+                        self.ctx_visited_map
+                            .entry(hash)
+                            .or_default()
+                            .push(record_idx);
                         ctx
                     };
 
@@ -3496,6 +3528,7 @@ impl<'a> NfaMatcher<'a> {
                         for (_, c) in self.ctx_visited.drain(..) {
                             self.counter_pool.free(c.range);
                         }
+                        self.ctx_visited_map.clear();
                         debug_assert!(
                             self.nlist.is_empty(),
                             "nlist must be empty before assert expansion"
