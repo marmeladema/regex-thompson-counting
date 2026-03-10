@@ -297,6 +297,126 @@ impl Transition {
 }
 
 // ---------------------------------------------------------------------------
+// Tier 2 analysis (precomputed at build time)
+// ---------------------------------------------------------------------------
+
+/// Precomputed NFA analysis for Tier 2 patterns.
+///
+/// Built once at regex compile time by [`compute_tier2_analysis`],
+/// stored on the [`Regex`] struct, and shared by all matchers.
+#[derive(Debug)]
+pub(crate) struct Tier2Analysis {
+    /// Flat array of NFA consuming-state indices that are in the "interior"
+    /// of each counter body (body positions 1..L-1 for a body of length L).
+    /// For L=1 counters, there are no interior states.
+    ///
+    /// Used to detect when a DFA successor has in-progress body instances:
+    /// if the successor contains any interior state for counter `c`, then
+    /// counter `c`'s instances should survive.  Otherwise, old instances
+    /// should be cleared (only re-seeded first-byte instances remain).
+    body_interior: Box<[u32]>,
+    /// Per-counter `(start, end)` range into [`body_interior`](Self::body_interior).
+    body_ranges: Box<[(usize, usize)]>,
+}
+
+impl Tier2Analysis {
+    /// Returns the sorted slice of interior NFA state indices for counter
+    /// `ci`.  Empty for L=1 counters.
+    fn interior(&self, ci: usize) -> &[u32] {
+        let (start, end) = self.body_ranges[ci];
+        &self.body_interior[start..end]
+    }
+}
+
+/// Precompute body interior data for all counters in a Tier 2 pattern.
+///
+/// For each counter, identifies the set of NFA consuming states that are
+/// in the "interior" of the counter body — i.e., reachable from the body
+/// entry but not among the first consuming states.  These are body
+/// positions 1..L-1 for a body of length L.
+pub(crate) fn compute_tier2_analysis(
+    states: &[State],
+    byte_tables: &[crate::ByteMap],
+    num_counters: usize,
+) -> Tier2Analysis {
+    let mut per_counter: Vec<Vec<u32>> = vec![Vec::new(); num_counters];
+
+    for s in states.iter() {
+        if let State::CounterInstance { counter, out } = s {
+            let ci = counter.idx();
+            // Find "first" consuming states: reachable from CI.out
+            // through epsilon states only.
+            let first = consuming_states_from(*out, states);
+            let first_set: std::collections::HashSet<u32> = first.iter().map(|s| s.0).collect();
+
+            // Walk the entire body from CI.out, following consuming
+            // states through their successors, to find all consuming
+            // states.
+            let mut all_body_consuming: Vec<u32> = Vec::new();
+            let mut stack: Vec<StateIdx> = vec![*out];
+            let mut visited = vec![false; states.len()];
+            while let Some(idx) = stack.pop() {
+                let i = idx.idx();
+                if visited[i] {
+                    continue;
+                }
+                visited[i] = true;
+                match states[idx] {
+                    State::CounterIncrement { counter: c, .. } if c == *counter => {
+                        // End of body for this counter — don't follow further.
+                    }
+                    State::Split { out, out1 } => {
+                        stack.push(out1);
+                        stack.push(out);
+                    }
+                    State::Assert { out, .. } | State::CounterInstance { out, .. } => {
+                        stack.push(out);
+                    }
+                    State::Byte { out, .. }
+                    | State::ByteCI { out, .. }
+                    | State::ByteClass { out, .. } => {
+                        all_body_consuming.push(idx.0);
+                        // Follow through the successor to find more body states.
+                        stack.push(out);
+                    }
+                    State::ByteTable { table } => {
+                        all_body_consuming.push(idx.0);
+                        for &succ in byte_tables[table.idx()].0.iter() {
+                            if succ != StateIdx::NONE {
+                                stack.push(succ);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Interior = all body consuming states minus the first states.
+            let mut interior: Vec<u32> = all_body_consuming
+                .into_iter()
+                .filter(|s| !first_set.contains(s))
+                .collect();
+            interior.sort_unstable();
+            interior.dedup();
+            per_counter[ci] = interior;
+        }
+    }
+
+    // Flatten into a single Vec with (start, end) ranges.
+    let mut flat: Vec<u32> = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(num_counters);
+    for v in per_counter {
+        let start = flat.len();
+        flat.extend(v);
+        ranges.push((start, flat.len()));
+    }
+    Tier2Analysis {
+        body_interior: flat.into_boxed_slice(),
+        body_ranges: ranges.into_boxed_slice(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tier 2 DFA cache
 // ---------------------------------------------------------------------------
 
@@ -306,16 +426,6 @@ pub(crate) struct Tier2DfaCache {
     stride: usize,
     transitions: Vec<Transition>,
     start_seeds: Box<[(CounterIdx, u32)]>,
-    /// Per-counter: set of NFA consuming state indices that are in the
-    /// "interior" of the counter body (i.e., body positions 1..L-1 for
-    /// a body of length L).  For L=1, this is empty.
-    ///
-    /// Used to detect when a DFA successor has in-progress body instances:
-    /// if the successor contains any interior state for counter `c`, then
-    /// counter `c`'s instances should survive.  Otherwise, old instances
-    /// should be cleared (only re-seeded first-byte instances remain).
-    counter_body_interior: Vec<u32>,
-    counter_body_ranges: Vec<(usize, usize)>,
     /// Shared arena for delta linked-list nodes across all counters.
     delta_pool: DeltaPool,
     /// Flat array of differential counters for all phases of all counters.
@@ -343,8 +453,6 @@ impl Tier2DfaCache {
             stride: 256,
             transitions: Vec::new(),
             start_seeds: Box::new([]),
-            counter_body_interior: Vec::new(),
-            counter_body_ranges: Vec::new(),
             delta_pool: DeltaPool::new(),
             phases: Vec::new(),
             counter_meta: Vec::new(),
@@ -552,6 +660,7 @@ impl Tier2DfaCache {
         from: DfaStateId,
         byte: u8,
         regex: &Regex,
+        analysis: &Tier2Analysis,
     ) -> Transition {
         let mut targets: Vec<StateIdx> = Vec::new();
 
@@ -697,7 +806,8 @@ impl Tier2DfaCache {
 
             // For counting transitions, compute counter_reset for all
             // counters EXCEPT those firing CInc (managed by increment logic).
-            let counter_reset = self.compute_counter_reset(&probe.nfa_states, counting_mask);
+            let counter_reset =
+                self.compute_counter_reset(analysis, &probe.nfa_states, counting_mask);
 
             Transition {
                 no_break: nb_id,
@@ -717,7 +827,7 @@ impl Tier2DfaCache {
 
             // For non-counting transitions, compute counter_reset for
             // all counters.
-            let counter_reset = self.compute_counter_reset(&probe.nfa_states, 0);
+            let counter_reset = self.compute_counter_reset(analysis, &probe.nfa_states, 0);
 
             Transition {
                 no_break: id,
@@ -739,10 +849,15 @@ impl Tier2DfaCache {
     /// For each counter NOT in `skip_mask`, check if the successor's NFA
     /// states contain any "body interior" states.  If they don't, the
     /// counter's instances should be cleared (the body was interrupted).
-    fn compute_counter_reset(&self, successor_nfa_states: &[StateIdx], skip_mask: u64) -> u64 {
+    fn compute_counter_reset(
+        &self,
+        analysis: &Tier2Analysis,
+        successor_nfa_states: &[StateIdx],
+        skip_mask: u64,
+    ) -> u64 {
         let mut mask: u64 = 0;
-        for (ci, &(start, end)) in self.counter_body_ranges.iter().enumerate() {
-            let interior = &self.counter_body_interior[start..end];
+        for ci in 0..analysis.body_ranges.len() {
+            let interior = analysis.interior(ci);
             if (skip_mask >> ci) & 1 != 0 {
                 continue;
             }
@@ -801,8 +916,6 @@ impl Tier2DfaCache {
         memory.clear(num_nfa_states);
         self.transitions.clear();
         self.start_seeds = Box::new([]);
-        self.counter_body_interior.clear();
-        self.counter_body_ranges.clear();
         self.delta_pool.reset();
         self.phases.clear();
         self.counter_meta.clear();
@@ -817,14 +930,6 @@ impl Tier2DfaCache {
         }
         self.clear(memory, regex.states.len(), regex.num_byte_classes);
         self.inner.regex_id = id;
-
-        // Precompute body interior consuming states for each counter.
-        // For a counter with body length L, the interior states are all
-        // consuming states reachable from the body entry that are NOT the
-        // first consuming state (i.e., body positions 1..L-1).
-        let (flat, ranges) = compute_body_interiors(regex);
-        self.counter_body_interior = flat;
-        self.counter_body_ranges = ranges;
 
         let cr = self.epsilon_closure(
             memory,
@@ -890,92 +995,6 @@ struct ClosureResult {
 // ---------------------------------------------------------------------------
 // Free functions
 // ---------------------------------------------------------------------------
-
-/// For each counter, compute the set of NFA consuming-state indices that
-/// are in the "interior" of the counter body (body positions 1..L-1).
-///
-/// For a body of length L, the "first" consuming states are those reachable
-/// from CI.out through epsilon states.  The "interior" states are all other
-/// consuming states reachable within the body BEFORE CInc.
-///
-/// For L=1, there are no interior states (only the first consuming state).
-fn compute_body_interiors(regex: &Regex) -> (Vec<u32>, Vec<(usize, usize)>) {
-    let states = &regex.states;
-    let byte_tables = &regex.byte_tables;
-    let num_counters = regex.num_counters;
-    let mut per_counter: Vec<Vec<u32>> = vec![Vec::new(); num_counters];
-
-    for s in states.iter() {
-        if let State::CounterInstance { counter, out } = s {
-            let ci = counter.idx();
-            // Find "first" consuming states: reachable from CI.out
-            // through epsilon states only.
-            let first = consuming_states_from(*out, states);
-            let first_set: std::collections::HashSet<u32> = first.iter().map(|s| s.0).collect();
-
-            // Walk the entire body from CI.out, following consuming
-            // states through their successors, to find all consuming
-            // states.
-            let mut all_body_consuming: Vec<u32> = Vec::new();
-            let mut stack: Vec<StateIdx> = vec![*out];
-            let mut visited = vec![false; states.len()];
-            while let Some(idx) = stack.pop() {
-                let i = idx.idx();
-                if visited[i] {
-                    continue;
-                }
-                visited[i] = true;
-                match states[idx] {
-                    State::CounterIncrement { counter: c, .. } if c == *counter => {
-                        // End of body for this counter — don't follow further.
-                    }
-                    State::Split { out, out1 } => {
-                        stack.push(out1);
-                        stack.push(out);
-                    }
-                    State::Assert { out, .. } | State::CounterInstance { out, .. } => {
-                        stack.push(out);
-                    }
-                    State::Byte { out, .. }
-                    | State::ByteCI { out, .. }
-                    | State::ByteClass { out, .. } => {
-                        all_body_consuming.push(idx.0);
-                        // Follow through the successor to find more body states.
-                        stack.push(out);
-                    }
-                    State::ByteTable { table } => {
-                        all_body_consuming.push(idx.0);
-                        for &succ in byte_tables[table.idx()].0.iter() {
-                            if succ != StateIdx::NONE {
-                                stack.push(succ);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            // Interior = all body consuming states minus the first states.
-            let mut interior: Vec<u32> = all_body_consuming
-                .into_iter()
-                .filter(|s| !first_set.contains(s))
-                .collect();
-            interior.sort_unstable();
-            interior.dedup();
-            per_counter[ci] = interior;
-        }
-    }
-
-    // Flatten into a single Vec with (start, end) ranges.
-    let mut flat: Vec<u32> = Vec::new();
-    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(num_counters);
-    for v in per_counter {
-        let start = flat.len();
-        flat.extend(v);
-        ranges.push((start, flat.len()));
-    }
-    (flat, ranges)
-}
 
 fn consume_byte(idx: StateIdx, byte: u8, regex: &Regex) -> Option<StateIdx> {
     match regex.states[idx] {
@@ -1057,6 +1076,7 @@ pub struct Tier2DfaMatcher<'a> {
     cache: &'a mut Tier2DfaCache,
     memory: &'a mut DfaMemory,
     regex: &'a Regex,
+    analysis: &'a Tier2Analysis,
     current: DfaStateId,
     ever_matched: bool,
     match_at_end: bool,
@@ -1070,6 +1090,7 @@ impl<'a> Tier2DfaMatcher<'a> {
         cache: &'a mut Tier2DfaCache,
         memory: &'a mut DfaMemory,
         regex: &'a Regex,
+        analysis: &'a Tier2Analysis,
     ) -> Self {
         // O(1) reset: clears the delta pool and phases vec.
         // Phases are lazily repopulated on the first slow-path byte.
@@ -1105,6 +1126,7 @@ impl<'a> Tier2DfaMatcher<'a> {
             cache,
             memory,
             regex,
+            analysis,
             prefilter: regex.prefilter,
         }
     }
@@ -1115,9 +1137,9 @@ impl<'a> Tier2DfaMatcher<'a> {
         let class = self.regex.byte_classes[byte as usize] as usize;
         let slot = self.current.idx() * self.cache.stride + class;
         if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
-            let trans = self
-                .cache
-                .populate(self.memory, self.current, byte, self.regex);
+            let trans =
+                self.cache
+                    .populate(self.memory, self.current, byte, self.regex, self.analysis);
             self.cache.transitions[slot] = trans;
         }
         slot
@@ -1128,9 +1150,9 @@ impl<'a> Tier2DfaMatcher<'a> {
     fn ensure_transition_direct(&mut self, byte: u8) -> usize {
         let slot = self.current.idx() * 256 + byte as usize;
         if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
-            let trans = self
-                .cache
-                .populate(self.memory, self.current, byte, self.regex);
+            let trans =
+                self.cache
+                    .populate(self.memory, self.current, byte, self.regex, self.analysis);
             self.cache.transitions[slot] = trans;
         }
         slot
@@ -1270,9 +1292,13 @@ impl<'a> Tier2DfaMatcher<'a> {
         }
         self.match_at_end = false;
 
-        let trans = self
-            .cache
-            .populate(self.memory, DfaStateId::DEAD, byte, self.regex);
+        let trans = self.cache.populate(
+            self.memory,
+            DfaStateId::DEAD,
+            byte,
+            self.regex,
+            self.analysis,
+        );
         self.current = trans.no_break;
 
         if !trans.is_counting {
