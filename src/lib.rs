@@ -9317,6 +9317,34 @@ mod tests {
                 ("", false),
             ],
         }
+
+        // ── counter_free_match_at_end Advance-action fix ─────────────────
+        //
+        // The counter break path's target may have BOTH consuming states
+        // (action = Advance) AND an epsilon path to `$ → Match`.  Before
+        // the fix, `counter_free_match_at_end` only checked Dead actions
+        // (targets with no consuming states), missing the Advance case.
+        // Input "zzz": `.{0,2}` consumes 2, `.` consumes 1, `a?` skips,
+        // reaching `$` — but tier 3 incorrectly reported NO MATCH because
+        // the Advance-action origin's `target_is_match_at_end` was ignored.
+        test_tier3_counter_free_mae_advance {
+            pattern: "^(.{0,2}.a?)?$",
+            memory: 1131,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("z", true),
+                ("zz", true),
+                ("zzz", true),
+                ("zzza", true),
+                ("za", true),
+                ("zza", true),
+                ("a", true),
+                ("aa", true),
+                ("zzzz", false),
+                ("zzzzz", false),
+            ],
+        }
     }
 
     /// Tier 2 encodes counter identity in `u64` bitmasks, so patterns with

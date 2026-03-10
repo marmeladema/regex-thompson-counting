@@ -1066,12 +1066,18 @@ impl Tier3DfaCache {
             // Such paths are safe to propagate even for counting
             // transitions — the `$ → Match` doesn't depend on any
             // counter reaching its minimum.
+            //
+            // We check all non-Increment origins (Dead and Advance).
+            // Dead means the target has no consuming states at all;
+            // Advance means the target has consuming states but may
+            // ALSO reach `$ → Match` via epsilon transitions.  In both
+            // cases, the `$ → Match` path doesn't cross any CInc.
             let counter_free_mae =
                 origin_keys
                     .iter()
                     .zip(origin_actions.iter())
                     .any(|(&origin, action)| {
-                        matches!(action, OriginAction::Dead)
+                        !matches!(action, OriginAction::Increment { .. })
                             && analysis.target_is_match_at_end[origin.idx()]
                     });
 
