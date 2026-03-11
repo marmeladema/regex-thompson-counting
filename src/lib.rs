@@ -9614,6 +9614,26 @@ mod tests {
                 ("", false),
             ],
         }
+        // Regression: post_break_tails Advance action did not check
+        // target_is_match_at_end.  When a post-break tail's target has
+        // BOTH consuming states (producing Advance) AND `$ → Match`, the
+        // match_at_end flag was never set.  E.g. `^.{7,23}.a?$` on 8 a's:
+        // counter breaks at 7, `.` consumes byte 8, target has `a?$` which
+        // includes both `Byte('a')` (Advance) and `$ → Match`.  Without
+        // the fix, finish() missed the `$ → Match` path.
+        test_tier3_post_break_advance_mae {
+            pattern: "^.{7,23}.a?$",
+            memory: 1082,
+            min_tier: 2,
+            inputs: [
+                ("aaaaaaaa", true),    // len=8: min+1, match via $ after .
+                ("aaaaaaaaa", true),   // len=9
+                ("aaaaaaa", false),    // len=7: too short (need 7+1=8 min)
+                ("aaaaaaaaaaaaaaaaaaaaaaaa", true),   // len=23: max-1
+                ("aaaaaaaaaaaaaaaaaaaaaaaaa", true),  // len=24: max
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaa", false), // len=26: too long
+            ],
+        }
         // Regression: commit 51ef734 inverted the seed deduplication logic in
         // tier 3's `compute_break_seeds`, removing unconditional seeds that
         // duplicated break seeds.  This caused the DFA to go dead on long

@@ -1899,6 +1899,14 @@ impl<'a> Tier3DfaMatcher<'a> {
                             self.next_post_break_tails.push(new_o);
                         }
                     }
+                    // The target may also have `$ → Match` alongside
+                    // consuming states (e.g. `^.{7,23}.a?$` where the
+                    // post-break `.` target includes both `Byte('a')` and
+                    // `$ → Match`).  Set match_at_end so finish() works
+                    // when no further bytes arrive to advance the tails.
+                    if self.analysis.target_is_match_at_end[pbo.idx()] {
+                        self.match_at_end = true;
+                    }
                 }
                 Some(OriginAction::Increment { .. }) => {
                     // Tail hit a CInc — the post-break path has entered
