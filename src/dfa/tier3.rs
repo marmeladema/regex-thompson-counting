@@ -103,6 +103,15 @@ pub(crate) struct Tier3Analysis {
     /// detect match-at-end when a tail's action is `Dead` (its target
     /// has no further consuming states but may have `$ → Match`).
     pub(crate) target_is_match_at_end: Box<[bool]>,
+
+    /// Per-NFA-state flag: true if the state is reachable from the start
+    /// state by following only CInc *continue* paths (not break paths).
+    ///
+    /// Used by `counter_free_match_at_end` to distinguish consuming
+    /// states that are always present (no counter break required) from
+    /// states that only enter the DFA state after a counter breaks.
+    /// Only the former can contribute to counter-free match-at-end.
+    pub(crate) reachable_without_break: Box<[bool]>,
 }
 
 /// What happens structurally when a byte is consumed at a given target.
@@ -165,6 +174,7 @@ pub(crate) fn compute_tier3_analysis(
     states: &[State],
     byte_tables: &[crate::ByteMap],
     state_can_reach_match: &[bool],
+    start: StateIdx,
 ) -> Tier3Analysis {
     let n = states.len();
 
@@ -469,12 +479,68 @@ pub(crate) fn compute_tier3_analysis(
         }
     }
 
+    // -- Step 7: compute reachable_without_break --------------------------------
+    // Transitive closure from start following ALL paths EXCEPT CInc break
+    // paths.  Mark consuming states reachable without any counter break.
+    // States only reachable via CInc break paths are counter-dependent
+    // and should NOT contribute to counter_free_match_at_end.
+    //
+    // Unlike a single epsilon closure, this walk also follows consuming
+    // states' `.out` targets so that multi-byte chains (e.g. unrolled
+    // `[0-9]{1,3}\.[0-9]{1,3}...`) are fully traversed.  The `visited`
+    // array ensures each state is processed at most once.
+    let mut rwb = vec![false; n];
+    {
+        let mut visited = vec![false; n];
+        let mut stack = vec![start];
+        while let Some(idx) = stack.pop() {
+            let i = idx.idx();
+            if i >= n || visited[i] {
+                continue;
+            }
+            visited[i] = true;
+            match states[idx] {
+                State::Split { out, out1 } => {
+                    stack.push(out1);
+                    stack.push(out);
+                }
+                State::Assert { out, .. } => stack.push(out),
+                State::CounterInstance { out, .. } => stack.push(out),
+                State::CounterIncrement { out, .. } => {
+                    // Follow only the continue path (out), NOT the break
+                    // path (out1).  States behind out1 are counter-dependent.
+                    stack.push(out);
+                }
+                State::Byte { out, .. }
+                | State::ByteCI { out, .. }
+                | State::ByteClass { out, .. } => {
+                    rwb[i] = true;
+                    // Follow .out to reach consuming states deeper in the
+                    // NFA graph (e.g. unrolled repetition chains).
+                    stack.push(out);
+                }
+                State::ByteTable { table } => {
+                    rwb[i] = true;
+                    // ByteTable dispatches to multiple targets — push all
+                    // non-NONE entries.
+                    for &target in &byte_tables[table].0 {
+                        if target != StateIdx::NONE {
+                            stack.push(target);
+                        }
+                    }
+                }
+                State::Match => {}
+            }
+        }
+    }
+
     Tier3Analysis {
         targets: targets_vec.into_boxed_slice(),
         ci_origins: ci_origins_vec.into_boxed_slice(),
         break_seeds: break_seeds.into_boxed_slice(),
         max_body_origins,
         target_is_match_at_end: target_mae.into_boxed_slice(),
+        reachable_without_break: rwb.into_boxed_slice(),
     }
 }
 
@@ -526,6 +592,14 @@ struct Transition {
     /// counting transitions, because the `$ → Match` path doesn't depend
     /// on any counter reaching its minimum.
     counter_free_match_at_end: bool,
+    /// True if the no-break closure's `is_match_at_end` comes from
+    /// counter-free paths (targets of `reachable_without_break` origins,
+    /// or epsilon `$ → Match` paths from the start state).
+    ///
+    /// Used in `finish()` instead of the raw DFA state's `is_match_at_end`,
+    /// which may include `$ → Match` from counter-dependent origins that
+    /// entered the DFA state via previous counter breaks (Bug 13).
+    nb_counter_free_mae: bool,
 }
 
 impl Transition {
@@ -544,6 +618,7 @@ impl Transition {
             origin_keys: Box::new([]),
             origin_actions: Box::new([]),
             counter_free_match_at_end: false,
+            nb_counter_free_mae: false,
         }
     }
 }
@@ -1039,6 +1114,42 @@ impl Tier3DfaCache {
             let (nb_m, nb_mae) = self.match_flags(nb_id);
             let (wb_m, wb_mae) = self.match_flags(wb_id);
 
+            // Compute counter-free no-break is_match_at_end.  The full
+            // nb_mae includes `$ → Match` from ALL origins (including those
+            // that entered the DFA state via previous counter breaks).
+            // For finish() we need a version filtered to only counter-free
+            // origins (reachable_without_break) to avoid false positives
+            // (Bug 13).
+            let nb_counter_free_mae = if nb_mae {
+                // Filter targets to only those from counter-free origins.
+                let cf_targets: Vec<StateIdx> = targets_per_origin
+                    .iter()
+                    .filter(|(origin, _)| analysis.reachable_without_break[origin.idx()])
+                    .flat_map(|(_, ts)| ts.iter().copied())
+                    .collect();
+                if cf_targets.is_empty() && !analysis.reachable_without_break[regex.start.idx()] {
+                    // No counter-free seeds at all.
+                    false
+                } else {
+                    let cr_cf = self.epsilon_closure(
+                        memory,
+                        cf_targets
+                            .iter()
+                            .copied()
+                            .chain(std::iter::once(regex.start)),
+                        regex,
+                        analysis,
+                        false,
+                        Some(byte),
+                        None,
+                        false,
+                    );
+                    cr_cf.is_match_at_end
+                }
+            } else {
+                false
+            };
+
             // Build pre_seeds: resolved seeds on counting transitions whose
             // origin had an Increment action (L=1 body consumed on this
             // transition via deferred assertion resolution).
@@ -1083,10 +1194,17 @@ impl Tier3DfaCache {
             let break_seeds = Self::compute_break_seeds(&seeds, analysis);
 
             // Compute counter-free match-at-end: true if any origin's
-            // target reaches `$ → Match` without going through CInc.
-            // Such paths are safe to propagate even for counting
-            // transitions — the `$ → Match` doesn't depend on any
-            // counter reaching its minimum.
+            // target reaches `$ → Match` without going through CInc,
+            // AND the origin itself is reachable from the start state
+            // without following any CInc break path.
+            //
+            // The second condition (reachable_without_break) is critical
+            // for multi-counter patterns: an origin like Byte('a') in
+            // `^c{2,12}.{6,6}(a?)?$` enters the DFA state only after
+            // both counters break.  Its `$ → Match` path is locally
+            // counter-free, but the origin is counter-dependent.
+            // Propagating match_at_end from it would bypass per-instance
+            // counter checks, causing false positives (Bug 13).
             //
             // We check all non-Increment origins (Dead and Advance).
             // Dead means the target has no consuming states at all;
@@ -1100,6 +1218,7 @@ impl Tier3DfaCache {
                     .any(|(&origin, action)| {
                         !matches!(action, OriginAction::Increment { .. })
                             && analysis.target_is_match_at_end[origin.idx()]
+                            && analysis.reachable_without_break[origin.idx()]
                     });
 
             // Fold resolved deferred assertion matches into both
@@ -1120,6 +1239,7 @@ impl Tier3DfaCache {
                 origin_keys: origin_keys.into_boxed_slice(),
                 origin_actions: origin_actions.into_boxed_slice(),
                 counter_free_match_at_end: counter_free_mae,
+                nb_counter_free_mae,
             }
         } else {
             // Non-counting: both successors are the same.  All seeds are
@@ -1138,6 +1258,36 @@ impl Tier3DfaCache {
                 }
             }
 
+            // Compute counter-free no-break mae for non-counting
+            // transitions (same logic as counting case above).
+            let nb_counter_free_mae = if mae {
+                let cf_targets: Vec<StateIdx> = targets_per_origin
+                    .iter()
+                    .filter(|(origin, _)| analysis.reachable_without_break[origin.idx()])
+                    .flat_map(|(_, ts)| ts.iter().copied())
+                    .collect();
+                if cf_targets.is_empty() && !analysis.reachable_without_break[regex.start.idx()] {
+                    false
+                } else {
+                    let cr_cf = self.epsilon_closure(
+                        memory,
+                        cf_targets
+                            .iter()
+                            .copied()
+                            .chain(std::iter::once(regex.start)),
+                        regex,
+                        analysis,
+                        false,
+                        Some(byte),
+                        None,
+                        false,
+                    );
+                    cr_cf.is_match_at_end
+                }
+            } else {
+                false
+            };
+
             Transition {
                 no_break: id,
                 no_break_is_match: m || resolved_is_match,
@@ -1152,6 +1302,7 @@ impl Tier3DfaCache {
                 origin_keys: origin_keys.into_boxed_slice(),
                 origin_actions: origin_actions.into_boxed_slice(),
                 counter_free_match_at_end: false, // Not used for non-counting transitions.
+                nb_counter_free_mae,
             }
         }
     }
@@ -1642,6 +1793,11 @@ pub struct Tier3DfaMatcher<'a> {
     /// resolution.  Counter-dependent `$ → Match` through deferred
     /// assertions is handled by per-instance `break_is_match_at_end`.
     no_break_current: DfaStateId,
+    /// Counter-free subset of the no-break DFA state's `is_match_at_end`.
+    /// Only includes `$ → Match` from targets of `reachable_without_break`
+    /// origins.  Used in `finish()` instead of the raw DFA state flag
+    /// to avoid false positives from counter-dependent origins (Bug 13).
+    last_nb_counter_free_mae: bool,
     /// Range-compressed instance storage — flat per-counter slots.
     counters: RangeCounters,
     /// Scratch buffer for the next step (double-buffered with `counters`).
@@ -1693,6 +1849,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         Tier3DfaMatcher {
             current: cache.inner.start_id,
             no_break_current: cache.inner.start_id,
+            last_nb_counter_free_mae: cache.inner.start_is_match_at_end,
             ever_matched,
             match_at_end,
             has_live_instances,
@@ -1868,6 +2025,7 @@ impl<'a> Tier3DfaMatcher<'a> {
 
         // Select DFA successor.
         self.no_break_current = t.no_break;
+        self.last_nb_counter_free_mae = t.nb_counter_free_mae;
         if t.is_counting && any_can_break {
             self.current = t.with_break;
         } else {
@@ -1963,6 +2121,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         // From DEAD, no instances exist, so use no_break successor.
         self.current = trans.no_break;
         self.no_break_current = trans.no_break;
+        self.last_nb_counter_free_mae = trans.nb_counter_free_mae;
 
         if !trans.is_counting {
             if trans.no_break_is_match {
@@ -2059,7 +2218,11 @@ impl<'a> Tier3DfaMatcher<'a> {
             {
                 self.current = t.no_break;
                 self.no_break_current = t.no_break;
-                self.match_at_end = t.no_break_is_match_at_end;
+                self.last_nb_counter_free_mae = t.nb_counter_free_mae;
+                // Use the counter-free filtered flag instead of the raw
+                // no_break_is_match_at_end, which may include `$ → Match`
+                // from counter-dependent origins (Bug 13).
+                self.match_at_end = t.nb_counter_free_mae;
                 if t.no_break_is_match {
                     self.ever_matched = true;
                 }
@@ -2101,21 +2264,24 @@ impl<'a> Tier3DfaMatcher<'a> {
         // pure `$ → Match` break path, per-instance `break_is_match_at_end`
         // in step_slow already sets `match_at_end` (checked above).
         //
-        // Counter-free match-at-end and deferred assertions: check the
-        // no-break DFA state (computed with follow_break=false, so it
-        // contains NO CInc break paths — only counter-free epsilon paths).
+        // Counter-free match-at-end: use the transition's filtered flag
+        // instead of the raw DFA state's `is_match_at_end`.  The raw flag
+        // includes `$ → Match` from ALL targets in the no-break closure,
+        // including targets from counter-dependent origins that entered
+        // the DFA state via previous counter breaks.  The filtered flag
+        // only includes `$ → Match` from targets of `reachable_without_break`
+        // origins, which are genuinely counter-free.
         //
-        // The no-break state's `is_match_at_end` is safe to check here
-        // because it only reflects `$ → Match` paths that don't cross any
-        // CInc node.  This catches cases like `(0{2,2}|1*)$` on "0" where
-        // the start closure's `1* → $ → Match` path is counter-free but
-        // wasn't captured by `counter_free_match_at_end` (which only looks
-        // at byte-consuming origins, not epsilon paths in the target state).
+        // This catches cases like `(0{2,2}|1*)$` on "0" where the start
+        // closure's `1* → $ → Match` path is counter-free, but avoids
+        // false positives from patterns like `^c{2,12}.{6,6}(a?)?$` on
+        // "ccca" where the `(a?)?$` suffix is counter-dependent (Bug 13).
+        if self.last_nb_counter_free_mae {
+            return true;
+        }
+        // Deferred assertions from the no-break state.
         if self.no_break_current != DfaStateId::DEAD {
             let state = &self.cache.inner.states[self.no_break_current.idx()];
-            if state.is_match_at_end {
-                return true;
-            }
             if state.resolve_deferred_at_end(self.regex) {
                 return true;
             }
