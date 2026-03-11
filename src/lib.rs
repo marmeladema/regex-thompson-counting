@@ -9936,6 +9936,25 @@ mod tests {
             ],
         }
 
+        // Regression: false positive on anchored optional group with \B
+        // assertion inside the body.  Resolved seeds from break-path
+        // deferred assertions in with_break DFA states were treated as
+        // unconditional, suppressing the corresponding break-gated seed
+        // and causing the seed to fire on every transition — even when
+        // the triggering counter didn't break (Bug 14).
+        test_tier3_optional_anchored_false_positive {
+            pattern: r"^(a?.{2,2}\Bx{2,2})?$",
+            memory: 1163,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("xxxx", true),
+                ("xxxxxx", false),
+                ("xxxxxxxx", false),
+                ("xxxxxxxxxx", false),
+                ("xxxxx", false),
+            ],
+        }
     }
 
     /// Tier 2 encodes counter identity in `u64` bitmasks, so patterns with

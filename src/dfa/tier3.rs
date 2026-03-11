@@ -1460,6 +1460,12 @@ impl Tier3DfaCache {
             // Build pre_seeds: resolved seeds on counting transitions whose
             // origin had an Increment action (L=1 body consumed on this
             // transition via deferred assertion resolution).
+            //
+            // Resolved seeds that correspond to a break-gated seed
+            // (analysis.break_seeds) are excluded — they should only fire
+            // when the triggering counter actually breaks, not
+            // unconditionally on every transition from the with_break DFA
+            // state.  The break_seeds mechanism handles them instead.
             let pre_seeds: Vec<(CounterIdx, StateIdx, u32)> = resolved_seeds
                 .iter()
                 .filter(|rs| {
@@ -1468,6 +1474,9 @@ impl Tier3DfaCache {
                         .position(|&k| k == rs.1)
                         .is_some_and(|pos| {
                             matches!(origin_actions[pos], Some(Tier3OriginKind::Increment { .. }))
+                        })
+                        && !analysis.break_seeds.iter().any(|bs| {
+                            bs.counter == rs.0 && bs.origin == rs.1
                         })
                 })
                 .cloned()
@@ -1481,10 +1490,23 @@ impl Tier3DfaCache {
                 .iter()
                 .map(|&(c, s)| (c, s, 0u32))
                 .collect();
-            // Only merge resolved seeds that are NOT pre_seeds.
+            // Only merge resolved seeds that are NOT pre_seeds AND that
+            // don't correspond to a break-gated seed.  Resolved seeds
+            // from deferred assertions in with_break DFA states may come
+            // from counter break paths (e.g. CInc-0 break → \B → CI-1);
+            // treating them as unconditional would suppress the
+            // corresponding break_seed and fire the seed on every
+            // transition from the with_break state, even when the
+            // triggering counter didn't actually break (Bug 14).
             for s in &resolved_seeds {
                 let is_pre = pre_seeds.iter().any(|p| p.0 == s.0 && p.1 == s.1);
-                if !is_pre && !seeds.iter().any(|e| e.0 == s.0 && e.1 == s.1 && e.2 == s.2) {
+                let is_break_gated = analysis.break_seeds.iter().any(|bs| {
+                    bs.counter == s.0 && bs.origin == s.1
+                });
+                if !is_pre
+                    && !is_break_gated
+                    && !seeds.iter().any(|e| e.0 == s.0 && e.1 == s.1 && e.2 == s.2)
+                {
                     seeds.push(*s);
                 }
             }
