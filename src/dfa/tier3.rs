@@ -2051,10 +2051,21 @@ impl<'a> Tier3DfaMatcher<'a> {
         // pure `$ → Match` break path, per-instance `break_is_match_at_end`
         // in step_slow already sets `match_at_end` (checked above).
         //
-        // Counter-free deferred assertions: resolve from the no-break DFA
-        // state.
+        // Counter-free match-at-end and deferred assertions: check the
+        // no-break DFA state (computed with follow_break=false, so it
+        // contains NO CInc break paths — only counter-free epsilon paths).
+        //
+        // The no-break state's `is_match_at_end` is safe to check here
+        // because it only reflects `$ → Match` paths that don't cross any
+        // CInc node.  This catches cases like `(0{2,2}|1*)$` on "0" where
+        // the start closure's `1* → $ → Match` path is counter-free but
+        // wasn't captured by `counter_free_match_at_end` (which only looks
+        // at byte-consuming origins, not epsilon paths in the target state).
         if self.no_break_current != DfaStateId::DEAD {
             let state = &self.cache.inner.states[self.no_break_current.idx()];
+            if state.is_match_at_end {
+                return true;
+            }
             if state.resolve_deferred_at_end(self.regex) {
                 return true;
             }

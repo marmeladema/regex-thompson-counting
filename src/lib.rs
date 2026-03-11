@@ -6734,6 +6734,34 @@ mod tests {
             ],
         }
         // ---------------------------------------------------------------
+        // Bug 8: Tier 3 no_break DFA state is_match_at_end not checked
+        // in finish().
+        //
+        // Pattern `(0{2,2}|1*)$` on "0": the 1* branch can match zero
+        // times at EOI (1*$), but after processing "0" (which activates
+        // the counter but doesn't reach min=2), Tier 3's finish() didn't
+        // check is_match_at_end on the no_break DFA state.  The per-
+        // transition counter_free_match_at_end only looks at byte-
+        // consuming origins, missing epsilon paths (like 1* → $ → Match)
+        // in the target state's start closure.  Fixed by checking
+        // no_break_current.is_match_at_end in finish().
+        // ---------------------------------------------------------------
+        test_tier3_counter_alt_epsilon_mae {
+            pattern: r#"(0{2,2}|1*)$"#,
+            memory: 743,
+            min_tier: 1,
+            inputs: [
+                ("0", true),
+                ("00", true),
+                ("1", true),
+                ("10", true),
+                ("x", true),
+                ("", true),
+                ("000", true),
+            ],
+        }
+
+        // ---------------------------------------------------------------
         // Regression: adjacent \b\B assertions in resolve_deferred_at_end.
         //
         // resolve_deferred_at_end checked each deferred assertion
