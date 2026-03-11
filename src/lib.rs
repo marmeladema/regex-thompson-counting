@@ -9805,15 +9805,19 @@ mod tests {
                 ("aaaaa", false),       // len=5: too short
             ],
         }
-        // Regression: commit 51ef734 inverted the seed deduplication logic in
-        // tier 3's `compute_break_seeds`, removing unconditional seeds that
-        // duplicated break seeds.  This caused the DFA to go dead on long
-        // multi-segment inputs where the unconditional seed was needed to
-        // restart counter tracking after a break.
+        // Regression: counter-free seed filtering in tier 3 must NOT remove
+        // unconditional seeds whose downstream counter is only reachable via
+        // a CInc break path, when the post-break tail mechanism is the only
+        // way to seed that counter.  The Bug 15 fix (counter-free closure
+        // filtering) removes counter-dependent seeds from the unconditional
+        // list, but the post-break tail CInc handoff compensates: when a
+        // post-break tail consumes a byte and hits a CInc, it seeds the
+        // downstream counter directly into the next buffer.
         //
-        // The fix reverts to the original approach: `compute_break_seeds`
-        // excludes break seeds that duplicate unconditional ones (not the
-        // other way around).  The unconditional seed list is never filtered.
+        // This test ensures the handoff works: counter 1 (`x{6,50}`) is
+        // only reachable after counter 0 (`0{8,31}`) breaks.  The post-break
+        // tail [6] (Byte 'x') hits CInc-1 on the first 'x' and seeds
+        // counter 1 at value 1.
         test_tier3_seed_filtering_revert {
             pattern: "^(0{8,31}(0+x{6,50}1y?)?(a?a?)?)?$",
             memory: 1239,
@@ -9828,6 +9832,35 @@ mod tests {
                 ("0000000", false),
                 ("00000000000000000000000000000000", false),
                 ("xxxx", false),
+                ("aaa", false),
+            ],
+        }
+        // Regression (Bug 15): counter-dependent unconditional seeds in
+        // tier 3 caused false positives when the seed's CI was only
+        // reachable from counter-dependent origins but the seed origin's
+        // byte class overlapped with counter-free origins.  Pattern
+        // `^(.{6,39}.0?.{8,8}a?)?$` with 50 'a's: counter 1 (`.{8,8}`)
+        // was seeded unconditionally on every byte, allowing it to
+        // break at position 49 even though no valid NFA path exists
+        // (max total = 39 + 1 + 8 + 1 = 49 < 50).
+        //
+        // Fix: filter unconditional seeds to only those in the
+        // counter-free no-break closure (seeds from
+        // `reachable_without_break` origins only).  Counter-dependent
+        // seeds are handled by break_seeds + post-break tail CInc
+        // handoff.
+        test_tier3_counter_dep_seed_false_positive {
+            pattern: "^(.{6,39}.0?.{8,8}a?)?$",
+            memory: 1461,
+            min_tier: 2,
+            inputs: [
+                ("", true),
+                ("aaaaaaaaaaaaaaaa", true),   // 16: 6+1+8+1=16
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true), // 49: 39+1+8+1
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false), // 50: exceeds max
+                ("aaaaaaaaaaaaaaa", true),    // 15: 6+1+8+0=15
+                ("aaaaaaaaaaaaaa", false),    // 14: too short (min is 6+1+8=15)
+                ("aaaaaaa0aaaaaaaa", true),   // 16: 6+1(.)+1(0)+8=16
                 ("aaa", false),
             ],
         }

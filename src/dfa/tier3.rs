@@ -150,6 +150,8 @@ pub(crate) enum Tier3OriginKind {
     /// Epsilon closure from the target reached CInc.  Counter is
     /// incremented; min/max determine continue vs. break.
     Increment {
+        /// The counter being incremented.
+        counter: CounterIdx,
         /// Consuming states reachable WITHOUT going through CInc.
         advance_origins: Box<[StateIdx]>,
         min: u32,
@@ -1475,19 +1477,56 @@ impl Tier3DfaCache {
                         .is_some_and(|pos| {
                             matches!(origin_actions[pos], Some(Tier3OriginKind::Increment { .. }))
                         })
-                        && !analysis.break_seeds.iter().any(|bs| {
-                            bs.counter == rs.0 && bs.origin == rs.1
-                        })
+                        && !analysis
+                            .break_seeds
+                            .iter()
+                            .any(|bs| bs.counter == rs.0 && bs.origin == rs.1)
                 })
                 .cloned()
                 .collect();
 
-            // Unconditional seeds: reachable without following CInc break
-            // paths (from the no_break closure).  Resolved seeds that became
-            // pre_seeds are excluded to avoid double-seeding.
+            // Unconditional seeds: seeds that are reachable from
+            // counter-free origins only.  When the DFA state includes
+            // counter-dependent NFA states (from a previous with_break
+            // closure), the no-break closure `cr_nb` may produce seeds
+            // from CI nodes that are structurally reachable but
+            // semantically counter-dependent (Bug 15).
+            //
+            // To distinguish truly unconditional seeds from
+            // counter-dependent ones, we run a separate counter-free
+            // no-break closure from only `reachable_without_break`
+            // origins (analogous to `counter_free_nb_mae` for
+            // match-at-end).  Seeds appearing in that closure are
+            // unconditional; seeds in `cr_nb` but NOT in the
+            // counter-free closure are counter-dependent and left for
+            // the break_seeds mechanism and the post-break tail
+            // CInc handoff (which seeds the counter when a
+            // post-break tail consumes a byte and reaches CInc).
+            let counter_free_seeds: Box<[(CounterIdx, StateIdx)]> = {
+                let cf_targets: Vec<StateIdx> = targets_per_origin
+                    .iter()
+                    .filter(|(origin, _)| analysis.reachable_without_break[origin.idx()])
+                    .flat_map(|(_, ts)| ts.iter().copied())
+                    .collect();
+                let cr_cf_nb = self.epsilon_closure(
+                    memory,
+                    cf_targets
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(regex.start)),
+                    regex,
+                    analysis,
+                    false,
+                    Some(byte),
+                    None,
+                    false, // follow_break=false
+                );
+                cr_cf_nb.seed_instances
+            };
             let mut seeds: Vec<(CounterIdx, StateIdx, u32)> = cr_nb
                 .seed_instances
                 .iter()
+                .filter(|si| counter_free_seeds.iter().any(|cf| cf == *si))
                 .map(|&(c, s)| (c, s, 0u32))
                 .collect();
             // Only merge resolved seeds that are NOT pre_seeds AND that
@@ -1500,9 +1539,10 @@ impl Tier3DfaCache {
             // triggering counter didn't actually break (Bug 14).
             for s in &resolved_seeds {
                 let is_pre = pre_seeds.iter().any(|p| p.0 == s.0 && p.1 == s.1);
-                let is_break_gated = analysis.break_seeds.iter().any(|bs| {
-                    bs.counter == s.0 && bs.origin == s.1
-                });
+                let is_break_gated = analysis
+                    .break_seeds
+                    .iter()
+                    .any(|bs| bs.counter == s.0 && bs.origin == s.1);
                 if !is_pre
                     && !is_break_gated
                     && !seeds.iter().any(|e| e.0 == s.0 && e.1 == s.1 && e.2 == s.2)
@@ -1871,7 +1911,7 @@ fn analyze_target(
     // - Consuming states reached without crossing CInc → advance_origins.
     // - CInc encountered → record (min, max, continue_out, break_out).
     let mut advance_origins = Vec::new();
-    let mut found_cinc: Option<(usize, usize)> = None;
+    let mut found_cinc: Option<(CounterIdx, usize, usize)> = None;
     let mut cinc_continue_outs = Vec::new();
     let mut cinc_break_outs = Vec::new();
 
@@ -1891,13 +1931,13 @@ fn analyze_target(
             State::Assert { out, .. } => stack.push(out),
             State::CounterInstance { out, .. } => stack.push(out),
             State::CounterIncrement {
+                counter,
                 min,
                 max,
                 out,
                 out1,
-                ..
             } => {
-                found_cinc = Some((min, max));
+                found_cinc = Some((counter, min, max));
                 cinc_continue_outs.push(out);
                 cinc_break_outs.push(out1);
             }
@@ -1911,7 +1951,7 @@ fn analyze_target(
         }
     }
 
-    if let Some((min, max)) = found_cinc {
+    if let Some((counter, min, max)) = found_cinc {
         advance_origins.sort_unstable_by_key(|s| s.0);
         advance_origins.dedup();
 
@@ -1930,6 +1970,7 @@ fn analyze_target(
         let bc = break_closure(&cinc_break_outs, states, can_reach_match);
 
         Some(Tier3OriginKind::Increment {
+            counter,
             advance_origins: advance_origins.into_boxed_slice(),
             min: min as u32,
             max: max as u32,
@@ -2241,10 +2282,59 @@ macro_rules! step_slow_impl {
                             self.match_at_end = true;
                         }
                     }
-                    Some(Some(Tier3OriginKind::Increment { .. })) => {
-                        // Tail hit a CInc — stop tracking.  The counter
-                        // instance machinery handles match detection from
-                        // here.
+                    Some(Some(Tier3OriginKind::Increment {
+                        counter,
+                        advance_origins: _,
+                        min,
+                        max,
+                        continue_origins,
+                        break_is_match,
+                        break_is_match_at_end,
+                        break_deferred_asserts,
+                        break_consuming_states,
+                    })) => {
+                        // Tail hit a CInc — hand off to the counter
+                        // instance machinery.  The post-break tail
+                        // consumed this byte, entering the CInc for the
+                        // first time (value 0 → incremented to 1).
+                        //
+                        // Insert the continued instance directly into
+                        // `$next` to avoid double-counting: the counter
+                        // loop (below) processes `$current`, and we
+                        // don't want this byte to be counted twice.
+                        //
+                        // This handoff is needed when counter-dependent
+                        // unconditional seeds are filtered out (Bug 15
+                        // fix): the post-break tail is the only way
+                        // the downstream counter gets its first instance.
+                        let pbt_value: u32 = 0;
+                        // Check continue (value after increment < max).
+                        if pbt_value + 1 < *max {
+                            for &new_o in continue_origins.iter() {
+                                self.$next.seed(counter.idx(), new_o, pbt_value + 1);
+                            }
+                        }
+                        // Check break (value after increment >= min).
+                        if pbt_value + 1 >= *min {
+                            if *break_is_match {
+                                self.ever_matched = true;
+                            }
+                            if *break_is_match_at_end {
+                                self.match_at_end = true;
+                            }
+                            if !break_deferred_asserts.is_empty() {
+                                for &da in break_deferred_asserts.iter() {
+                                    if !self.verified_deferred_asserts.contains(&da) {
+                                        self.verified_deferred_asserts.push(da);
+                                    }
+                                }
+                            }
+                            for &new_o in break_consuming_states.iter() {
+                                if !self.next_post_break_tails.contains(&new_o) {
+                                    self.next_post_break_tails.push(new_o);
+                                }
+                            }
+                        }
                     }
                     Some(None) => {
                         // `None` (dead) target.  Check $ → Match via precomputed flag.
@@ -2286,6 +2376,7 @@ macro_rules! step_slow_impl {
                         }
                         None => {}
                         Some(Tier3OriginKind::Increment {
+                            counter: _,
                             advance_origins,
                             min,
                             max,
