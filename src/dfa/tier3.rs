@@ -44,10 +44,11 @@
 use std::fmt;
 
 use crate::{
-    AssertKind, CounterIdx, Prefilter, Regex, State, StateIdx, byte_match_ci, is_word_byte,
+    AssertEval, AssertKind, CounterIdx, Prefilter, Regex, State, StateIdx, byte_match_ci,
+    is_word_byte,
 };
 
-use super::{DfaCache, DfaMemory, DfaStateId};
+use super::{DfaCache, DfaMemory, DfaState, DfaStateId};
 
 // ---------------------------------------------------------------------------
 // Precomputed NFA analysis (built once at regex compile time)
@@ -126,6 +127,13 @@ pub(crate) enum Tier3OriginKind {
         break_is_match: bool,
         /// True if the break path reaches `Match` through `$`.
         break_is_match_at_end: bool,
+        /// Deferred assertion NFA state indices on the break path to
+        /// `$ → Match`.  Non-empty when the break path includes
+        /// assertions like `\b` or `\B` before reaching `$ → Match`.
+        /// These must be evaluated at end-of-input before confirming
+        /// the match.  Empty when `break_is_match_at_end` comes from
+        /// a pure `$ → Match` path (no deferred assertions).
+        break_deferred_asserts: Box<[StateIdx]>,
         /// Non-counter consuming states on the CInc break path.
         /// These form the "post-counter tail" that must be tracked
         /// at runtime to detect `$ → Match` after additional bytes.
@@ -564,6 +572,10 @@ enum OriginAction {
         break_is_match: bool,
         /// True if the break path reaches match-at-end ($ → Match).
         break_is_match_at_end: bool,
+        /// Deferred assertion NFA state indices on the break path to
+        /// `$ → Match`.  These must be evaluated at end-of-input before
+        /// confirming the match.  Empty for pure `$ → Match` paths.
+        break_deferred_asserts: Box<[StateIdx]>,
         /// Non-counter consuming states on the break path (post-counter tail).
         break_consuming_states: Box<[StateIdx]>,
     },
@@ -583,6 +595,7 @@ impl OriginAction {
                 continue_origins,
                 break_is_match,
                 break_is_match_at_end,
+                break_deferred_asserts,
                 break_consuming_states,
             } => OriginAction::Increment {
                 advance_origins: advance_origins.clone(),
@@ -591,6 +604,7 @@ impl OriginAction {
                 continue_origins: continue_origins.clone(),
                 break_is_match: *break_is_match,
                 break_is_match_at_end: *break_is_match_at_end,
+                break_deferred_asserts: break_deferred_asserts.clone(),
                 break_consuming_states: break_consuming_states.clone(),
             },
         }
@@ -1372,16 +1386,16 @@ fn analyze_target(
 
         // Break match flags: walk from CInc break outputs through epsilon
         // transitions to find Match / ($ → Match).
-        let (break_is_match, break_is_match_at_end) =
-            break_closure(&cinc_break_outs, states, can_reach_match);
+        let bc = break_closure(&cinc_break_outs, states, can_reach_match);
 
         Some(Tier3OriginKind::Increment {
             advance_origins: advance_origins.into_boxed_slice(),
             min: min as u32,
             max: max as u32,
             continue_origins: continue_origins.into_boxed_slice(),
-            break_is_match,
-            break_is_match_at_end,
+            break_is_match: bc.is_match,
+            break_is_match_at_end: bc.is_match_at_end,
+            break_deferred_asserts: bc.deferred_asserts,
             // Populated in a post-pass by compute_tier3_analysis after all
             // targets are known (break_consuming_tails needs the targets array).
             break_consuming_states: Box::new([]),
@@ -1413,43 +1427,104 @@ fn analyze_target(
 /// `break_seeds` creates new counter instances for B when A breaks, and
 /// `post_break_tails` tracks non-counter consuming states for deferred
 /// `$ → Match` detection after additional bytes are consumed.
+/// Result of walking the CInc break-path epsilon closure.
+struct BreakClosureResult {
+    /// True if `Match` is directly reachable without going through any
+    /// deferred assertion (\b, \B, etc.).
+    is_match: bool,
+    /// True if `$ → Match` is reachable without going through any
+    /// deferred assertion.  At runtime, this fires unconditionally when
+    /// the counter breaks with enough value.
+    is_match_at_end: bool,
+    /// Deferred assertion NFA state indices found on break paths.
+    ///
+    /// These are assertions (e.g. `\b`, `\B`) encountered while walking
+    /// epsilon transitions from CInc break outputs.  They may lead to
+    /// either `Match` directly (e.g. `\b → Match`) or to `$ → Match`
+    /// (e.g. `\b → $ → Match`).
+    ///
+    /// At runtime, when the counter breaks with enough value, these are
+    /// stored in `verified_deferred_asserts` and evaluated at end-of-input
+    /// in `finish()` using `can_reach_match_at_end()`, which handles both
+    /// `Match` and `$ → Match` paths.
+    deferred_asserts: Box<[StateIdx]>,
+}
+
 fn break_closure(
     break_seeds: &[StateIdx],
     states: &[State],
     can_reach_match: &[bool],
-) -> (bool, bool) {
+) -> BreakClosureResult {
     let mut is_match = false;
     let mut is_match_at_end = false;
-    let mut stack: Vec<StateIdx> = break_seeds.to_vec();
-    let mut visited = vec![false; states.len()];
-    while let Some(idx) = stack.pop() {
+    let mut deferred_asserts = Vec::new();
+
+    // Walk epsilon transitions from break seeds.
+    //
+    // Track whether we've passed through a deferred assertion to
+    // correctly attribute `Match` and `$ → Match` discoveries:
+    // - Pure paths (no deferred assertion): set is_match / is_match_at_end
+    // - Paths through deferred assertions: record the assertion indices
+    //   for runtime evaluation; don't set the static flags.
+    let mut stack: Vec<(StateIdx, bool)> = break_seeds.iter().map(|&s| (s, false)).collect();
+
+    let n = states.len();
+    let mut visited_pure = vec![false; n];
+    let mut visited_deferred = vec![false; n];
+
+    while let Some((idx, through_deferred)) = stack.pop() {
         let i = idx.idx();
+        let visited = if through_deferred {
+            &mut visited_deferred
+        } else {
+            &mut visited_pure
+        };
         if visited[i] {
             continue;
         }
         visited[i] = true;
+
         match states[idx] {
             State::Split { out, out1 } => {
-                stack.push(out1);
-                stack.push(out);
+                stack.push((out1, through_deferred));
+                stack.push((out, through_deferred));
             }
             State::Assert { kind, out } => {
-                if kind == AssertKind::End && can_reach_match[out.idx()] {
-                    is_match_at_end = true;
+                if kind == AssertKind::End {
+                    if !through_deferred && can_reach_match[out.idx()] {
+                        // Pure $ → Match — safe to fire unconditionally.
+                        is_match_at_end = true;
+                    }
+                    // $ → Match through a deferred assertion is handled
+                    // by the deferred_asserts list + finish() evaluation.
+                } else if can_reach_match[out.idx()] {
+                    // Deferred assertion (\b, \B, etc.).  Record it and
+                    // follow through to find Match or $ → Match beyond.
+                    deferred_asserts.push(idx);
+                    stack.push((out, true));
                 }
             }
             State::Match => {
-                is_match = true;
+                if !through_deferred {
+                    is_match = true;
+                }
+                // Match through a deferred assertion: handled by the
+                // deferred_asserts list + finish() evaluation.
             }
             // Do NOT follow through CounterInstance — downstream
             // counters have not accumulated their required count.
-            // Their match paths are handled by break_seeds and
-            // post_break_tails at runtime.
             State::CounterInstance { .. } => {}
             _ => {}
         }
     }
-    (is_match, is_match_at_end)
+
+    deferred_asserts.sort_unstable_by_key(|s| s.0);
+    deferred_asserts.dedup();
+    BreakClosureResult {
+        is_match,
+        is_match_at_end,
+        deferred_asserts: deferred_asserts.into_boxed_slice(),
+    }
 }
 
 /// Collect consuming NFA states on a CInc break path that are "true tail"
@@ -1514,6 +1589,19 @@ pub struct Tier3DfaMatcher<'a> {
     regex: &'a Regex,
     analysis: &'a Tier3Analysis,
     current: DfaStateId,
+    /// The no-break DFA state from the last transition.  Used in `finish()`
+    /// to resolve deferred assertions at end-of-input.
+    ///
+    /// The with-break DFA state includes deferred assertions (e.g. `\b`,
+    /// `\B`) from ALL CInc break paths — including counters that haven't
+    /// reached their minimum.  `resolve_deferred_at_end` on the with-break
+    /// state would evaluate those assertions and follow through to
+    /// `$ → Match`, causing false positives.  The no-break state only
+    /// includes deferred assertions reachable without this transition's
+    /// counter breaks, which is the counter-free subset safe for EOI
+    /// resolution.  Counter-dependent `$ → Match` through deferred
+    /// assertions is handled by per-instance `break_is_match_at_end`.
+    no_break_current: DfaStateId,
     /// Range-compressed instance storage — flat per-counter slots.
     counters: RangeCounters,
     /// Scratch buffer for the next step (double-buffered with `counters`).
@@ -1533,6 +1621,11 @@ pub struct Tier3DfaMatcher<'a> {
     post_break_tails: Vec<StateIdx>,
     /// Scratch buffer for advancing `post_break_tails` (double-buffered).
     next_post_break_tails: Vec<StateIdx>,
+    /// Deferred assertion NFA states from counter break paths that fired
+    /// during the last `step_slow()`.  These are assertions (e.g. `\b`)
+    /// on the path to `$ → Match` from a counter that actually broke with
+    /// enough value.  Evaluated in `finish()` at end-of-input.
+    verified_deferred_asserts: Vec<StateIdx>,
     prefilter: Prefilter,
 }
 
@@ -1559,11 +1652,13 @@ impl<'a> Tier3DfaMatcher<'a> {
 
         Tier3DfaMatcher {
             current: cache.inner.start_id,
+            no_break_current: cache.inner.start_id,
             ever_matched,
             match_at_end,
             has_live_instances,
             post_break_tails: Vec::new(),
             next_post_break_tails: Vec::new(),
+            verified_deferred_asserts: Vec::new(),
             cache,
             memory,
             regex,
@@ -1587,6 +1682,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         // Reset next_counters.
         self.next_counters.clear();
         self.match_at_end = false;
+        self.verified_deferred_asserts.clear();
 
         // Advance existing post-break tails through this transition.
         // Each tail is a consuming NFA state from a previous counter
@@ -1663,6 +1759,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                         continue_origins,
                         break_is_match,
                         break_is_match_at_end,
+                        break_deferred_asserts,
                         break_consuming_states,
                     }) => {
                         // Advance-or-increment: the range survives at
@@ -1694,7 +1791,18 @@ impl<'a> Tier3DfaMatcher<'a> {
                                 self.ever_matched = true;
                             }
                             if *break_is_match_at_end {
+                                // Pure $ → Match (no deferred assertions).
                                 self.match_at_end = true;
+                            }
+                            if !break_deferred_asserts.is_empty() {
+                                // Break path has deferred assertions (\b, \B,
+                                // etc.) that may lead to Match or $ → Match.
+                                // Record them for evaluation in finish().
+                                for &da in break_deferred_asserts.iter() {
+                                    if !self.verified_deferred_asserts.contains(&da) {
+                                        self.verified_deferred_asserts.push(da);
+                                    }
+                                }
                             }
                             // Track post-break consuming states for
                             // subsequent match-at-end detection.
@@ -1710,6 +1818,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         }
 
         // Select DFA successor.
+        self.no_break_current = t.no_break;
         if t.is_counting && any_can_break {
             self.current = t.with_break;
         } else {
@@ -1804,6 +1913,7 @@ impl<'a> Tier3DfaMatcher<'a> {
 
         // From DEAD, no instances exist, so use no_break successor.
         self.current = trans.no_break;
+        self.no_break_current = trans.no_break;
 
         if !trans.is_counting {
             if trans.no_break_is_match {
@@ -1898,6 +2008,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                 && self.post_break_tails.is_empty()
             {
                 self.current = t.no_break;
+                self.no_break_current = t.no_break;
                 self.match_at_end = t.no_break_is_match_at_end;
                 if t.no_break_is_match {
                     self.ever_matched = true;
@@ -1926,10 +2037,47 @@ impl<'a> Tier3DfaMatcher<'a> {
         // break chain leads to `$ → Match`.  Only `self.match_at_end`
         // (computed per-instance in step_slow) correctly reflects whether a
         // specific counter instance actually broke with enough value.
-        if self.current != DfaStateId::DEAD {
-            let state = &self.cache.inner.states[self.current.idx()];
+        //
+        // We use `no_break_current` (the no-break DFA state from the last
+        // transition) for deferred assertion resolution.  The with-break
+        // state includes deferred assertions from ALL CInc break paths
+        // (e.g. `\b` after counter 1's CInc break in `.{6,39}.{7,31}\b$`).
+        // Those assertions fire here even when the counter never reached
+        // its minimum, causing false positives.  The no-break state only
+        // includes deferred assertions reachable without this transition's
+        // counter breaks — the counter-free subset safe for EOI resolution.
+        //
+        // For counters that actually broke with enough value and had a
+        // pure `$ → Match` break path, per-instance `break_is_match_at_end`
+        // in step_slow already sets `match_at_end` (checked above).
+        //
+        // Counter-free deferred assertions: resolve from the no-break DFA
+        // state.
+        if self.no_break_current != DfaStateId::DEAD {
+            let state = &self.cache.inner.states[self.no_break_current.idx()];
             if state.resolve_deferred_at_end(self.regex) {
                 return true;
+            }
+        }
+        // Counter-dependent deferred assertions: evaluate assertions from
+        // counter break paths that actually broke with enough value.  These
+        // are NFA Assert state indices (e.g. \b, \B) on the path to
+        // `$ → Match` from a counter whose break condition was met.
+        //
+        // We use the with-break DFA state (`self.current`) for prev_byte
+        // context, since the current DFA state reflects the actual match
+        // position (including break paths that fired).
+        if !self.verified_deferred_asserts.is_empty() && self.current != DfaStateId::DEAD {
+            let state = &self.cache.inner.states[self.current.idx()];
+            let prev = state.prev_byte_representative();
+            for &assert_idx in &self.verified_deferred_asserts {
+                if let State::Assert { kind, out } = self.regex.states[assert_idx] {
+                    if kind.eval(false, true, prev, None) == AssertEval::Pass
+                        && DfaState::can_reach_match_at_end(out, prev, self.regex)
+                    {
+                        return true;
+                    }
+                }
             }
         }
         false

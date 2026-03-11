@@ -6698,6 +6698,42 @@ mod tests {
             ],
         }
         // ---------------------------------------------------------------
+        // Regression: deferred assertions on counter break paths.
+        //
+        // The with-break DFA state includes deferred assertions from ALL
+        // CInc break paths, including counters that haven't reached their
+        // minimum.  resolve_deferred_at_end on the with-break state would
+        // evaluate those assertions at EOI, causing false positives.
+        //
+        // Fix: use no_break_current for counter-free deferred assertions,
+        // and verified_deferred_asserts for break-path deferred assertions
+        // from counters that actually broke with enough value.
+        // ---------------------------------------------------------------
+
+        // Two counters + trailing \b: min total = 6+7 = 13.
+        // 12 chars: NO MATCH (too short).
+        // 13 chars: MATCH (\b passes at word→end).
+        test_tier3_multi_counter_deferred_break {
+            pattern: r#"^.{6,39}.{7,31}\b$"#,
+            memory: 1100,
+            min_tier: 3,
+            inputs: [
+                ("aaaaaaaaaaaa", false),
+                ("aaaaaaaaaaaaa", true),
+                ("aaaaaaaaaaaaaaa", true),
+            ],
+        }
+        // Same pattern with \B instead: \B fails at word→end.
+        test_tier3_multi_counter_deferred_break_neg {
+            pattern: r#"^.{6,39}.{7,31}\B$"#,
+            memory: 1100,
+            min_tier: 3,
+            inputs: [
+                ("aaaaaaaaaaaaa", false),
+                ("aaaaaaaaaaaaaaa", false),
+            ],
+        }
+        // ---------------------------------------------------------------
         // Regression: adjacent \b\B assertions in resolve_deferred_at_end.
         //
         // resolve_deferred_at_end checked each deferred assertion

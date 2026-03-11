@@ -154,7 +154,7 @@ impl DfaState {
     /// Unlike the static `state_can_reach_match` precomputation, this
     /// correctly handles adjacent assertions like `\b\B` which are
     /// statically reachable but dynamically impossible at the same position.
-    fn can_reach_match_at_end(start: StateIdx, prev: Option<u8>, regex: &Regex) -> bool {
+    pub(super) fn can_reach_match_at_end(start: StateIdx, prev: Option<u8>, regex: &Regex) -> bool {
         let states = &regex.states;
         let mut stack = vec![start];
         while let Some(idx) = stack.pop() {
