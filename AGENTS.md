@@ -3,6 +3,31 @@
 Thompson NFA regex engine with multi-tier counting DFA acceleration.
 Rust 2024 edition. Binary: `rethoc`. All source under `src/`.
 
+## Key Engine Properties
+
+These properties are fundamental invariants that must be considered in
+**every** bug fix, feature addition, and code change:
+
+1. **Streaming.** The engine processes input via `chunk(&[u8])` calls —
+   callers may split input across arbitrarily many chunks.  All matcher
+   state (DFA state, counter contexts, deferred assertions, match flags)
+   must survive across chunk boundaries.  Never assume the full input is
+   available in a single slice.  Test multi-chunk scenarios when adding
+   or modifying matcher logic.
+
+2. **Untrusted patterns.** The regex pattern is attacker-controlled.
+   Compilation must not panic, hang, or use unbounded memory.  All
+   compile-time limits (`MAX_COUNTERS`, `max_repetition`, `DFA_MAX_STATES`,
+   etc.) exist to bound resource usage.  New pattern features must have
+   corresponding limits.  The `fuzz_compile` target exercises this.
+
+3. **Untrusted input.** The input payload is attacker-controlled.
+   Matching must run in time proportional to the input length (no
+   backtracking, no exponential blowup).  Per-byte work must be bounded
+   by the pattern's compiled structure, not by input content.  This is
+   the core guarantee of the Thompson NFA approach.  The `fuzz_match`
+   and `fuzz_differential` targets exercise this.
+
 ## Build / Test / Lint
 
 ```bash
@@ -191,13 +216,13 @@ default (omit `unroll_limit` entirely) so both code paths are exercised. The
 
 ```bash
 cargo run --release -- info '<pattern>'                 # NFA states, memory, tier, counters
-cargo run --release -- --format json info '<pattern>'   # JSON output (for scripting)
+cargo run --release -- info --format json '<pattern>'   # JSON output (for scripting)
 cargo run --release -- match '<pattern>' 'input' ...    # match testing (literal strings, not files)
 cargo run --release -- match --debug '<pattern>' 'input' # step-by-step NFA trace
 cargo run --release -- dot '<pattern>'                  # Graphviz DOT output
-cargo run --release -- --tier 2 match '<pattern>' 'input' # force a specific tier
-cargo run --release -- --unroll-limit 0 info '<pattern>'  # disable unrolling (force counters)
-cargo run --release -- --unroll-limit 0 match '<pattern>' 'input' # match with counters only
+cargo run --release -- match --tier 2 '<pattern>' 'input' # force a specific tier
+cargo run --release -- info --unroll-limit 0 '<pattern>'  # disable unrolling (force counters)
+cargo run --release -- match --unroll-limit 0 '<pattern>' 'input' # match with counters only
 ```
 
 ## Benchmarks
@@ -271,6 +296,22 @@ will error for rethoc.
 Two complementary approaches share a common grammar-aware pattern generator
 (`src/fuzz_gen.rs`) and the `regex` crate as correctness oracle.
 
+### Bug-Fix Workflow
+
+When fuzzing discovers bugs, follow this discipline:
+
+1. **One bug at a time.** Investigate, fix, and test one bug before moving
+   to the next.
+2. **Commit each fix separately.** Each bug fix gets its own commit with a
+   descriptive message.  Always ask for confirmation before committing.
+3. **Add a regression test** as an entry in the `match_tests!` macro (not a
+   handwritten test function).  The macro automatically tests all eligible
+   tiers and re-runs with `unroll_limit=0`.
+4. **Run the full test suite** (`cargo test`) after each fix to ensure no
+   regressions.
+5. **Commit infrastructure improvements separately** from bug fixes (e.g.
+   fuzz target enhancements, new scripts).
+
 ### Pattern Generator (`src/fuzz_gen.rs`)
 
 The generator maps a deterministic byte-seed into a structured AST, then
@@ -322,6 +363,11 @@ cargo +nightly fuzz run fuzz_match              # oracle differential (rethoc vs
 cargo +nightly fuzz run fuzz_differential       # cross-tier differential (NFA as oracle)
 cargo +nightly fuzz run fuzz_compile            # compilation robustness (no panics/hangs)
 
+# Useful flags
+cargo +nightly fuzz run fuzz_match -- -timeout=10   # per-input timeout (seconds)
+cargo +nightly fuzz run fuzz_match -- -jobs=4       # parallel fuzzing (4 workers)
+cargo +nightly fuzz run fuzz_match -- -runs=100000  # stop after N iterations
+
 # Reproduce a crash artifact
 cargo +nightly fuzz run fuzz_match fuzz/artifacts/fuzz_match/<artifact>
 ```
@@ -335,3 +381,28 @@ cargo +nightly fuzz run fuzz_match fuzz/artifacts/fuzz_match/<artifact>
   panic, hang, or OOM.  Also exercises `.info()` and `.memory_size()`.
 
 Corpus and artifacts are in `fuzz/corpus/` and `fuzz/artifacts/` (gitignored).
+
+### Decoding Fuzz Seeds
+
+The `fuzz_match` and `fuzz_differential` targets split the seed in half:
+first half drives pattern generation, second half drives input generation.
+Both `generate_pattern` and `generate_inputs` from `src/fuzz_gen.rs` are
+`pub` functions.  To decode a crash artifact:
+
+```rust
+use regex_thompson_counting::fuzz_gen::{generate_pattern, generate_inputs, FuzzRng};
+let data: &[u8] = &[/* seed bytes */];
+let mid = data.len() / 2;
+let (pattern, ast) = generate_pattern(&mut FuzzRng::new(&data[..mid]));
+let inputs = generate_inputs(&mut FuzzRng::new(&data[mid..]), &ast);
+```
+
+### When to Fuzz
+
+- After any change to the NFA compiler, DFA tiers, or counter logic.
+- After fixing a bug found by fuzzing (to confirm the fix and find
+  related bugs).
+- Periodically during development to catch regressions early.
+
+Start with `fuzz_match` (most coverage), then `fuzz_differential` (catches
+tier-specific bugs), then `fuzz_compile` (robustness).
