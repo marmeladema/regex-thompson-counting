@@ -272,7 +272,17 @@ struct Transition {
     is_counting: bool,
     /// Bitmask: bit `i` set means counter `i` fires CInc at this transition.
     counting_mask: u64,
-    /// Whether new counter instances should be seeded at this transition.
+    /// Seeds to apply BEFORE counter_increment.
+    ///
+    /// These come from Phase 1 deferred-assertion resolution on counting
+    /// transitions where the resolved path consumed the L=1 counter body
+    /// (initial_value > 0).  The seed must be visible to the increment
+    /// so the counter can break on this very transition.
+    pre_seeds: Box<[(CounterIdx, u32)]>,
+    /// Seeds to apply AFTER counter_increment and counter_reset.
+    ///
+    /// Probe seeds (initial_value = 0) that start new counter instances
+    /// for subsequent transitions.
     seeds: Box<[(CounterIdx, u32)]>,
     /// Bitmask: bit `i` set means counter `i` has NO body-progress NFA
     /// states in the DFA successor (only re-seeded first-byte states).
@@ -291,6 +301,7 @@ impl Transition {
             with_break_is_match_at_end: false,
             is_counting: false,
             counting_mask: 0,
+            pre_seeds: Box::new([]),
             seeds: Box::new([]),
             counter_reset: 0,
         }
@@ -721,19 +732,19 @@ impl Tier2DfaCache {
                         mask &= mask - 1;
                         if regex.counter_break_can_match[ci] {
                             for s in regex.states.iter() {
-                                if let State::CounterIncrement { counter, out1, .. } = *s {
-                                    if counter.idx() == ci {
-                                        let (direct, _at_end) =
-                                            break_path_match_kind(out1, &regex.states);
-                                        if direct {
-                                            resolved_break_match = true;
-                                        }
-                                        // _at_end is intentionally ignored:
-                                        // $ cannot pass mid-stream (Phase 1
-                                        // always has a next byte).  EOI
-                                        // break-through-$ is handled by
-                                        // resolve_deferred_cinc_at_end().
+                                if let State::CounterIncrement { counter, out1, .. } = *s
+                                    && counter.idx() == ci
+                                {
+                                    let (direct, _at_end) =
+                                        break_path_match_kind(out1, &regex.states);
+                                    if direct {
+                                        resolved_break_match = true;
                                     }
+                                    // _at_end is intentionally ignored:
+                                    // $ cannot pass mid-stream (Phase 1
+                                    // always has a next byte).  EOI
+                                    // break-through-$ is handled by
+                                    // resolve_deferred_cinc_at_end().
                                 }
                             }
                         }
@@ -777,12 +788,15 @@ impl Tier2DfaCache {
             0
         };
 
-        // For resolved seeds on a counting transition with L=1 body,
-        // the seed's body byte was consumed on this very transition
-        // (resolved assert -> CI -> body(L=1) -> consume -> CInc).
-        // Since seeding happens after CInc processing in step_slow,
-        // the seed misses its first increment.  Set initial_value=1.
-        if is_counting {
+        // On counting transitions, resolved seeds from L=1 bodies need
+        // special handling: they must be placed BEFORE counter_increment
+        // (as pre_seeds) so the counter is non-empty when increment fires.
+        // The value stays 0 — the increment itself provides the +1.
+        //
+        // On non-counting transitions, resolved seeds with L=1 bodies
+        // go to regular post-seeds with value 1 (since there's no
+        // increment to provide the +1).
+        if !is_counting {
             for s in &mut resolved_seeds {
                 let ci = s.0.idx();
                 let (_, _, body_len) = regex.counter_info(ci);
@@ -792,22 +806,26 @@ impl Tier2DfaCache {
             }
         }
 
-        // Compute seed list.  Resolved seeds take priority (higher
-        // initial value) over probe seeds for the same counter.
+        // Build the post-seed list from probe seeds and (for non-counting
+        // transitions) resolved seeds.
         let mut seed_list: Vec<(CounterIdx, u32)> = probe
             .seed_instances
             .iter()
             .map(|&(c, _s)| (c, 0u32))
             .collect();
-        for s in &resolved_seeds {
-            // If there is already a probe seed for this counter with
-            // a lower initial value, replace it.
-            if let Some(existing) = seed_list.iter_mut().find(|e| e.0 == s.0) {
-                existing.1 = existing.1.max(s.1);
-            } else {
-                seed_list.push(*s);
+        if !is_counting {
+            // For non-counting transitions, resolved seeds (with value 1
+            // for L=1 bodies) are the only seeds.  Merge them in.
+            for s in &resolved_seeds {
+                if let Some(existing) = seed_list.iter_mut().find(|e| e.0 == s.0) {
+                    existing.1 = existing.1.max(s.1);
+                } else {
+                    seed_list.push(*s);
+                }
             }
         }
+        // For counting transitions, resolved L=1 seeds go to pre_seeds
+        // (built below), NOT to seed_list.  This avoids double-seeding.
         seed_list.sort_by_key(|&(c, _)| c.idx());
         seed_list.dedup();
 
@@ -832,6 +850,31 @@ impl Tier2DfaCache {
             let counter_reset =
                 self.compute_counter_reset(analysis, &probe.nfa_states, counting_mask);
 
+            // On counting transitions, resolved seeds from deferred
+            // assertions need two special treatments:
+            //
+            // 1. Pre-seed: For L=1 counter bodies, the resolved path
+            //    consumed the body byte on this transition.  The seed
+            //    must be placed BEFORE counter_increment so the counter
+            //    is non-empty when increment fires.  Value stays 0
+            //    because increment provides the +1.
+            //
+            // 2. Skip reset: The counter must NOT be cleared by
+            //    counter_reset on this transition, because the
+            //    pre-seeded instance represents valid work from the
+            //    resolved assertion path.
+            let mut resolved_body_mask: u64 = 0;
+            let mut pre_seed_list: Vec<(CounterIdx, u32)> = Vec::new();
+            for &(counter, _val) in &resolved_seeds {
+                let ci = counter.idx();
+                let (_, _, body_len) = regex.counter_info(ci);
+                if body_len == 1 {
+                    resolved_body_mask |= 1u64 << ci;
+                    pre_seed_list.push((counter, 0));
+                }
+            }
+            let counter_reset = counter_reset & !resolved_body_mask;
+
             Transition {
                 no_break: nb_id,
                 no_break_is_match: nb_m || resolved_is_match,
@@ -841,6 +884,7 @@ impl Tier2DfaCache {
                 with_break_is_match_at_end: wb_mae,
                 is_counting: true,
                 counting_mask,
+                pre_seeds: pre_seed_list.into_boxed_slice(),
                 seeds: seed_list.into_boxed_slice(),
                 counter_reset,
             }
@@ -886,6 +930,7 @@ impl Tier2DfaCache {
                 with_break_is_match_at_end: mae,
                 is_counting: false,
                 counting_mask: 0,
+                pre_seeds: Box::new([]),
                 seeds: seed_list.into_boxed_slice(),
                 counter_reset,
             }
@@ -1323,7 +1368,8 @@ impl<'a> Tier2DfaMatcher<'a> {
         let t = &self.cache.transitions[slot];
 
         // Fast path: non-counting, no seeds, no live counters.
-        if !t.is_counting && t.seeds.is_empty() && !self.has_live_counters {
+        if !t.is_counting && t.pre_seeds.is_empty() && t.seeds.is_empty() && !self.has_live_counters
+        {
             self.current = t.no_break;
             self.match_at_end = t.no_break_is_match_at_end;
             if t.no_break_is_match {
@@ -1345,6 +1391,7 @@ impl<'a> Tier2DfaMatcher<'a> {
         let with_break_is_match = t.with_break_is_match;
         let with_break_is_match_at_end = t.with_break_is_match_at_end;
         let counter_reset = t.counter_reset;
+        let num_pre_seeds = t.pre_seeds.len();
         let num_seeds = t.seeds.len();
         // `t` borrow ends here (NLL: last use was t.seeds.len()).
 
@@ -1354,6 +1401,19 @@ impl<'a> Tier2DfaMatcher<'a> {
 
         self.match_at_end = false;
         let mut any_can_break = false;
+
+        // Apply pre_seeds BEFORE counter_increment.
+        // These are resolved seeds (initial_value > 0) from Phase 1
+        // deferred-assertion resolution on L=1 counter bodies.  The seed
+        // must be visible to the increment so the counter can break on
+        // this very transition.
+        for si in 0..num_pre_seeds {
+            let (counter, initial_value) = self.cache.transitions[slot].pre_seeds[si];
+            let c_idx = counter.idx();
+            if c_idx < self.cache.counter_meta.len() {
+                self.cache.seed_counter(c_idx, initial_value);
+            }
+        }
 
         if is_counting {
             // Process ALL counters that fire CInc on this transition.

@@ -499,11 +499,18 @@ struct Transition {
     with_break_is_match_at_end: bool,
     /// True if this transition crosses a CInc node.
     is_counting: bool,
+    /// Seeds applied BEFORE counter increment.
+    ///
+    /// From Phase 1 deferred-assertion resolution on counting transitions
+    /// with L=1 counter bodies.  The resolved path consumed the body byte,
+    /// so the counter must be non-empty when increment fires.  Value is 0
+    /// because the increment itself provides the +1.
+    pre_seeds: Box<[(CounterIdx, StateIdx, u32)]>,
     /// New counter instances from CI nodes reachable WITHOUT following
-    /// any CInc break path (always applied).
+    /// any CInc break path (always applied after counter increment).
     /// The third element is the initial counter value (0 for fresh seeds,
-    /// 1 for seeds from resolved deferred assertions whose origin already
-    /// consumed the resolving byte through a CInc increment).
+    /// 1 for seeds from resolved deferred assertions on non-counting
+    /// transitions whose origin already consumed the resolving byte).
     seeds: Box<[(CounterIdx, StateIdx, u32)]>,
     /// Additional seeds reachable only through CInc break paths.
     /// Each entry is `(trigger, counter, origin, initial_value)`:
@@ -531,6 +538,7 @@ impl Transition {
             with_break_is_match: false,
             with_break_is_match_at_end: false,
             is_counting: false,
+            pre_seeds: Box::new([]),
             seeds: Box::new([]),
             break_seeds: Box::new([]),
             origin_keys: Box::new([]),
@@ -992,14 +1000,18 @@ impl Tier3DfaCache {
             origin_actions.push(action);
         }
 
-        // Compute seed initial values.  Resolved deferred seeds whose
-        // origin consumed the byte and had an Increment action start at
-        // value 1 (the resolving byte already counted as one iteration).
-        for rs in &mut resolved_seeds {
-            if let Some(pos) = origin_keys.iter().position(|&k| k == rs.1)
-                && matches!(origin_actions[pos], OriginAction::Increment { .. })
-            {
-                rs.2 = 1;
+        // Compute seed initial values for non-counting transitions.
+        // For counting transitions, resolved seeds on L=1 bodies go to
+        // pre_seeds (value 0) — the increment provides the +1.
+        // For non-counting transitions, bump to value 1 since there's
+        // no increment to provide the +1.
+        if !is_counting {
+            for rs in &mut resolved_seeds {
+                if let Some(pos) = origin_keys.iter().position(|&k| k == rs.1)
+                    && matches!(origin_actions[pos], OriginAction::Increment { .. })
+                {
+                    rs.2 = 1;
+                }
             }
         }
 
@@ -1027,15 +1039,34 @@ impl Tier3DfaCache {
             let (nb_m, nb_mae) = self.match_flags(nb_id);
             let (wb_m, wb_mae) = self.match_flags(wb_id);
 
+            // Build pre_seeds: resolved seeds on counting transitions whose
+            // origin had an Increment action (L=1 body consumed on this
+            // transition via deferred assertion resolution).
+            let pre_seeds: Vec<(CounterIdx, StateIdx, u32)> = resolved_seeds
+                .iter()
+                .filter(|rs| {
+                    origin_keys
+                        .iter()
+                        .position(|&k| k == rs.1)
+                        .is_some_and(|pos| {
+                            matches!(origin_actions[pos], OriginAction::Increment { .. })
+                        })
+                })
+                .cloned()
+                .collect();
+
             // Unconditional seeds: reachable without following CInc break
-            // paths (from the no_break closure) plus resolved deferred seeds.
+            // paths (from the no_break closure).  Resolved seeds that became
+            // pre_seeds are excluded to avoid double-seeding.
             let mut seeds: Vec<(CounterIdx, StateIdx, u32)> = cr_nb
                 .seed_instances
                 .iter()
                 .map(|&(c, s)| (c, s, 0u32))
                 .collect();
+            // Only merge resolved seeds that are NOT pre_seeds.
             for s in &resolved_seeds {
-                if !seeds.iter().any(|e| e.0 == s.0 && e.1 == s.1 && e.2 == s.2) {
+                let is_pre = pre_seeds.iter().any(|p| p.0 == s.0 && p.1 == s.1);
+                if !is_pre && !seeds.iter().any(|e| e.0 == s.0 && e.1 == s.1 && e.2 == s.2) {
                     seeds.push(*s);
                 }
             }
@@ -1083,6 +1114,7 @@ impl Tier3DfaCache {
                 with_break_is_match: wb_m || resolved_is_match,
                 with_break_is_match_at_end: wb_mae,
                 is_counting: true,
+                pre_seeds: pre_seeds.into(),
                 seeds: seeds.into(),
                 break_seeds: break_seeds.into(),
                 origin_keys: origin_keys.into_boxed_slice(),
@@ -1114,6 +1146,7 @@ impl Tier3DfaCache {
                 with_break_is_match: m || resolved_is_match,
                 with_break_is_match_at_end: mae,
                 is_counting: false,
+                pre_seeds: Box::new([]),
                 seeds: seeds.into(),
                 break_seeds: Box::new([]),
                 origin_keys: origin_keys.into_boxed_slice(),
@@ -1728,6 +1761,15 @@ impl<'a> Tier3DfaMatcher<'a> {
             }
         }
 
+        // Apply pre_seeds BEFORE counter increment.
+        // These are resolved seeds from Phase 1 deferred-assertion resolution
+        // on counting transitions with L=1 bodies.  The counter must be
+        // non-empty when the increment fires so the break condition can
+        // be evaluated on this very transition.
+        for &(counter, origin, value) in t.pre_seeds.iter() {
+            self.counters.insert(counter.idx(), origin, value, value);
+        }
+
         let mut any_can_break = false;
         let num_counters = self.counters.num_counters();
         // Use u64 bitmask — tier 3 patterns have at most a handful of
@@ -2003,6 +2045,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             let t = &self.cache.transitions[slot];
 
             if !t.is_counting
+                && t.pre_seeds.is_empty()
                 && t.seeds.is_empty()
                 && !self.has_live_instances
                 && self.post_break_tails.is_empty()
@@ -2082,12 +2125,11 @@ impl<'a> Tier3DfaMatcher<'a> {
             let state = &self.cache.inner.states[self.current.idx()];
             let prev = state.prev_byte_representative();
             for &assert_idx in &self.verified_deferred_asserts {
-                if let State::Assert { kind, out } = self.regex.states[assert_idx] {
-                    if kind.eval(false, true, prev, None) == AssertEval::Pass
-                        && DfaState::can_reach_match_at_end(out, prev, self.regex)
-                    {
-                        return true;
-                    }
+                if let State::Assert { kind, out } = self.regex.states[assert_idx]
+                    && kind.eval(false, true, prev, None) == AssertEval::Pass
+                    && DfaState::can_reach_match_at_end(out, prev, self.regex)
+                {
+                    return true;
                 }
             }
         }

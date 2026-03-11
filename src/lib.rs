@@ -7258,6 +7258,53 @@ mod tests {
                 ("", false),
             ],
         }
+        // Bug 10: deferred assertion BEFORE counter body with L=1.
+        // When \b resolves via Phase 1, the resolved path reaches CI → body
+        // → CInc on the same transition.  The counter must be pre-seeded
+        // before increment so the counter is non-empty when CInc fires.
+        test_deferred_assert_before_counter_1 {
+            pattern: r"\b.{1,2}",
+            memory: 933,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("ab", true),
+                ("abc", true),   // unanchored, 3 chars still match (prefix)
+                (" ", false),    // \b fails: non-word→non-word
+                ("", false),
+            ],
+        }
+        test_deferred_assert_before_counter_2 {
+            pattern: r"^(\b.{1,34}?)?$",
+            memory: 1033,
+            min_tier: 2,
+            inputs: [
+                ("a", true),
+                ("", true),     // optional group matches empty
+                ("abcdef", true),
+                (" ", false),   // \b fails: non-word start
+            ],
+        }
+        test_deferred_assert_before_counter_3 {
+            pattern: r"^(\b((.{1,34}|a?))?)?$",
+            memory: 1165,
+            min_tier: 2,
+            inputs: [
+                ("x", true),
+                ("a", true),
+                ("", true),
+            ],
+        }
+        test_deferred_assert_before_counter_4 {
+            pattern: r"^(\B.{1,34}?)?$",
+            memory: 1033,
+            min_tier: 2,
+            inputs: [
+                ("\x00", true), // \B: non-word→non-word
+                ("", true),     // optional matches empty
+                ("a", false),   // \B fails: non-word→word
+            ],
+        }
         // Deferred assertion patterns (migrated from standalone tests)
         test_non_word_boundary_inside_word {
             pattern: r#"\Boo\B"#,
