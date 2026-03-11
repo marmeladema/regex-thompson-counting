@@ -1696,6 +1696,13 @@ impl RegexBuilder {
                 let max = rep.max.map_or(usize::MAX, |m| m as usize);
                 assert!(min <= max);
 
+                // {0,0} matches exactly zero times — semantically Empty.
+                // Don't emit anything; callers (Concat, Alternation, build)
+                // already handle missing fragments.
+                if max == 0 {
+                    return Ok(());
+                }
+
                 // Reject repetitions exceeding the compile-time cap.
                 if max != usize::MAX && max > self.max_repetition {
                     return Err(Error::RepetitionTooLarge(max, self.max_repetition));
@@ -1704,20 +1711,29 @@ impl RegexBuilder {
                 // Special-case common quantifiers to avoid counter overhead.
                 if min == 0 && max == 1 {
                     // `?`
+                    let before = self.postfix.len();
                     self.hir2postfix(&rep.sub)?;
-                    self.postfix.push(RegexHirNode::RepeatZeroOne);
+                    if self.postfix.len() > before {
+                        self.postfix.push(RegexHirNode::RepeatZeroOne);
+                    }
                     return Ok(());
                 }
                 if min == 0 && max == usize::MAX {
                     // `*`
+                    let before = self.postfix.len();
                     self.hir2postfix(&rep.sub)?;
-                    self.postfix.push(RegexHirNode::RepeatZeroPlus);
+                    if self.postfix.len() > before {
+                        self.postfix.push(RegexHirNode::RepeatZeroPlus);
+                    }
                     return Ok(());
                 }
                 if min == 1 && max == usize::MAX {
                     // `+`
+                    let before = self.postfix.len();
                     self.hir2postfix(&rep.sub)?;
-                    self.postfix.push(RegexHirNode::RepeatOnePlus);
+                    if self.postfix.len() > before {
+                        self.postfix.push(RegexHirNode::RepeatOnePlus);
+                    }
                     return Ok(());
                 }
 
@@ -1736,20 +1752,28 @@ impl RegexBuilder {
                     self.postfix.push(RegexHirNode::RepeatZeroOne);
                 } else if min > 0 {
                     let counter = self.next_counter()?;
+                    let before = self.postfix.len();
                     self.hir2postfix(&rep.sub)?;
-                    self.postfix
-                        .push(RegexHirNode::CounterLoop { counter, min, max });
+                    if self.postfix.len() > before {
+                        self.postfix
+                            .push(RegexHirNode::CounterLoop { counter, min, max });
+                    }
+                    // else: body is empty — repetition of nothing is nothing.
                 } else {
                     // {0,max}: lower to (body{1,max})? — the `?` wrapping
                     // provides the zero-match path.
                     let counter = self.next_counter()?;
+                    let before = self.postfix.len();
                     self.hir2postfix(&rep.sub)?;
-                    self.postfix.push(RegexHirNode::CounterLoop {
-                        counter,
-                        min: 1,
-                        max,
-                    });
-                    self.postfix.push(RegexHirNode::RepeatZeroOne);
+                    if self.postfix.len() > before {
+                        self.postfix.push(RegexHirNode::CounterLoop {
+                            counter,
+                            min: 1,
+                            max,
+                        });
+                        self.postfix.push(RegexHirNode::RepeatZeroOne);
+                    }
+                    // else: body is empty — repetition of nothing is nothing.
                 }
                 Ok(())
             }
@@ -7303,6 +7327,22 @@ mod tests {
                 ("\x00", true), // \B: non-word→non-word
                 ("", true),     // optional matches empty
                 ("a", false),   // \B fails: non-word→word
+            ],
+        }
+        // Bug 11 (fuzz): {0,0} repetition nested in another repetition
+        // caused a fragment-stack underflow panic during compilation.
+        // The inner {0,0} produces Empty (no postfix output), but the
+        // outer ? / * pushed RepeatZeroOne expecting a fragment.
+        test_zero_zero_rep_nested {
+            pattern: r"^(.{0,0}?)?((a?a?)?(a?a?)?)?$",
+            memory: 974,
+            min_tier: 1,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("aa", true),
+                ("aaaa", true),
+                ("b", false),
             ],
         }
         // Deferred assertion patterns (migrated from standalone tests)
