@@ -1531,9 +1531,16 @@ fn break_closure(
                     // $ → Match through a deferred assertion is handled
                     // by the deferred_asserts list + finish() evaluation.
                 } else if can_reach_match[out.idx()] {
-                    // Deferred assertion (\b, \B, etc.).  Record it and
-                    // follow through to find Match or $ → Match beyond.
-                    deferred_asserts.push(idx);
+                    if !through_deferred {
+                        // First deferred assertion on this path — record
+                        // it as the entry point.  Subsequent assertions
+                        // deeper in the chain (e.g. \B → \b → $) are
+                        // evaluated dynamically by can_reach_match_at_end
+                        // when this entry point is checked in finish().
+                        deferred_asserts.push(idx);
+                    }
+                    // Follow through regardless, so we detect Match /
+                    // $ → Match reachability from deeper in the chain.
                     stack.push((out, true));
                 }
             }

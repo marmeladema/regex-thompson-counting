@@ -7345,6 +7345,23 @@ mod tests {
                 ("b", false),
             ],
         }
+        // Bug 12 (fuzz): Tier 3 false positive on contradictory adjacent
+        // assertions \B\b after counter break.  break_closure() recorded
+        // BOTH assertions as independent entries in deferred_asserts, so
+        // \b was evaluated without \B gating it.  Fix: only record the
+        // first (entry-point) assertion; deeper ones are handled by
+        // can_reach_match_at_end().
+        test_contradictory_adjacent_asserts {
+            pattern: r"^.{10,31}\B\b$",
+            memory: 1033,
+            min_tier: 2,
+            inputs: [
+                ("yyyyyyyyyy0aaaaaaaaaaaaaaaaa", false), // \B\b always fails
+                ("aaaaaaaaaa", false),
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false), // 31 chars
+                ("", false),
+            ],
+        }
         // Deferred assertion patterns (migrated from standalone tests)
         test_non_word_boundary_inside_word {
             pattern: r#"\Boo\B"#,
