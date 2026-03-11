@@ -16,7 +16,8 @@
 use std::fmt;
 
 use crate::{
-    AssertEval, CounterIdx, Prefilter, Regex, State, StateIdx, byte_match_ci, is_word_byte,
+    AssertEval, AssertKind, CounterIdx, Prefilter, Regex, State, StateIdx, byte_match_ci,
+    is_word_byte,
 };
 
 use super::{DfaCache, DfaMemory, DfaState, DfaStateId};
@@ -706,18 +707,35 @@ impl Tier2DfaCache {
                 // Discard cr.is_match_at_end — see comment above.
 
                 // If CInc was reached via Phase 1 resolution, check if
-                // the break path (CInc.out1) can reach Match.  This match
-                // is conditional on the counter meeting min.
+                // the break path (CInc.out1) can reach Match directly
+                // (without going through $ or end-line assertions).
+                //
+                // Phase 1 fires mid-stream (we have a next byte), so $
+                // cannot pass at the break position.  Paths through $
+                // are handled at actual end-of-input by
+                // resolve_deferred_cinc_at_end() in finish().
                 if cr.encountered_cinc {
-                    // Check if any counter reached via Phase 1 resolution
-                    // has a break path that can reach Match.
                     let mut mask = cr.cinc_mask;
                     while mask != 0 {
                         let ci = mask.trailing_zeros() as usize;
                         mask &= mask - 1;
                         if regex.counter_break_can_match[ci] {
-                            resolved_break_match = true;
-                            break;
+                            for s in regex.states.iter() {
+                                if let State::CounterIncrement { counter, out1, .. } = *s {
+                                    if counter.idx() == ci {
+                                        let (direct, _at_end) =
+                                            break_path_match_kind(out1, &regex.states);
+                                        if direct {
+                                            resolved_break_match = true;
+                                        }
+                                        // _at_end is intentionally ignored:
+                                        // $ cannot pass mid-stream (Phase 1
+                                        // always has a next byte).  EOI
+                                        // break-through-$ is handled by
+                                        // resolve_deferred_cinc_at_end().
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -833,6 +851,31 @@ impl Tier2DfaCache {
             // For non-counting transitions, compute counter_reset for
             // all counters.
             let counter_reset = self.compute_counter_reset(analysis, &probe.nfa_states, 0);
+
+            // Counters reachable from deferred assertions (for pre-reset
+            // snapshot in step_inner).
+            let dcm = deferred_cinc_mask(&probe.deferred_asserts, &regex.states);
+
+            // For L=1 counter bodies with deferred assertions gating
+            // CInc, the probe can't see through the deferred assertion
+            // to find CI → body seeds.  If counter_reset will clear
+            // the counter AND dcm shows CInc is behind a deferred
+            // assertion, inject a seed so the counter is re-populated
+            // after clearing.  This allows the counter to accumulate
+            // across transitions where the assertion always defers.
+            let needs_deferred_seed = dcm & counter_reset;
+            if needs_deferred_seed != 0 {
+                let mut mask = needs_deferred_seed;
+                while mask != 0 {
+                    let ci = mask.trailing_zeros() as usize;
+                    mask &= mask - 1;
+                    let counter = CounterIdx(ci as u8);
+                    if !seed_list.iter().any(|s| s.0 == counter) {
+                        seed_list.push((counter, 0));
+                    }
+                }
+                seed_list.sort_by_key(|&(c, _)| c.idx());
+            }
 
             Transition {
                 no_break: id,
@@ -1066,6 +1109,96 @@ fn find_cinc_counters(targets: &[StateIdx], states: &[State]) -> u64 {
                 State::Assert { out, .. } => stack.push(out),
                 State::CounterInstance { out, .. } => stack.push(out),
                 _ => {}
+            }
+        }
+    }
+    mask
+}
+
+/// Walk from `start` through epsilon states on the CInc break path
+/// (CInc.out1) and determine how `Match` is reachable:
+///
+/// Returns `(direct, at_end)`:
+/// - `direct`: `Match` is reachable without going through `$` / end-line
+///   assertions — this fires mid-stream.
+/// - `at_end`: `Match` is reachable only through `$` / `(?m:$)` /
+///   `(?Rm:$)` — this fires only at end-of-input.
+///
+/// Both can be true if there are multiple paths.
+fn break_path_match_kind(start: StateIdx, states: &[State]) -> (bool, bool) {
+    let mut direct = false;
+    let mut at_end = false;
+    // Stack entries: (state, through_end_assert)
+    let mut stack: Vec<(StateIdx, bool)> = vec![(start, false)];
+    let mut visited = vec![[false; 2]; states.len()];
+    while let Some((idx, through_end)) = stack.pop() {
+        let i = idx.idx();
+        let te = through_end as usize;
+        if visited[i][te] {
+            continue;
+        }
+        visited[i][te] = true;
+        match states[idx] {
+            State::Match => {
+                if through_end {
+                    at_end = true;
+                } else {
+                    direct = true;
+                }
+            }
+            State::Split { out, out1 } => {
+                stack.push((out, through_end));
+                stack.push((out1, through_end));
+            }
+            State::Assert { kind, out } => {
+                let is_end_like = matches!(
+                    kind,
+                    AssertKind::End | AssertKind::EndLF | AssertKind::EndCRLF
+                );
+                stack.push((out, through_end || is_end_like));
+            }
+            State::CounterInstance { out, .. } => {
+                stack.push((out, through_end));
+            }
+            // Consuming states and CInc: stop walking.
+            _ => {}
+        }
+    }
+    (direct, at_end)
+}
+
+/// Compute a bitmask of counters reachable via CInc from deferred
+/// assertions in a closure result.  When a deferred assertion gates
+/// the path to CInc, the transition is classified as non-counting
+/// (CInc not in the epsilon closure).  But the counter should NOT be
+/// reset — the body just consumed a byte on this transition, and the
+/// CInc is merely deferred behind the assertion.
+fn deferred_cinc_mask(deferred: &[StateIdx], states: &[State]) -> u64 {
+    let mut mask: u64 = 0;
+    let mut visited = vec![false; states.len()];
+    for &assert_idx in deferred {
+        // Start from the assert's output (the assertion itself is
+        // already known to be deferred).
+        if let State::Assert { out, .. } = states[assert_idx] {
+            let mut stack = vec![out];
+            while let Some(idx) = stack.pop() {
+                let i = idx.idx();
+                if visited[i] {
+                    continue;
+                }
+                visited[i] = true;
+                match states[idx] {
+                    State::CounterIncrement { counter, .. } => {
+                        mask |= 1u64 << counter.idx();
+                    }
+                    State::Split { out, out1 } => {
+                        stack.push(out1);
+                        stack.push(out);
+                    }
+                    State::Assert { out, .. } => stack.push(out),
+                    State::CounterInstance { out, .. } => stack.push(out),
+                    _ => {}
+                }
             }
         }
     }
@@ -1489,10 +1622,6 @@ impl<'a> Tier2DfaMatcher<'a> {
                                         return true;
                                     }
                                 }
-                            }
-                            // min=0: always breakable even with no live instances.
-                            if min == 0 {
-                                return true;
                             }
                         }
                         State::Split { out, out1 } => {

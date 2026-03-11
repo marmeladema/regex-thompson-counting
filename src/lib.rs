@@ -7202,6 +7202,47 @@ mod tests {
                 ("", false),
             ],
         }
+        // Bug 9: deferred \B inside counter body with L=1.  The deferred
+        // assertion gates the path to CInc; counter_reset clears the counter
+        // because the "interior" set is empty.  Seed injection re-populates
+        // the counter.  The break path goes through $ → Match, which must
+        // only fire at actual EOI (not mid-stream via match_at_end).
+        test_counter_body_non_word_boundary_1 {
+            pattern: r"^(.\B){1,2}$",
+            memory: 1032,
+            min_tier: 1,
+            inputs: [
+                (" ", true),    // 1 non-word: \B passes at EOI
+                ("  ", true),   // 2 non-words: \B passes between them and at EOI
+                ("ab", false),  // 2 word chars: \B passes between a/b, but fails at b/EOI
+                ("a", false),   // 1 word char: \B fails at a/EOI (word→non-word)
+                ("", false),
+            ],
+        }
+        test_counter_body_non_word_boundary_2 {
+            pattern: r"^(.\B){2,3}$",
+            memory: 1098,
+            min_tier: 1,
+            inputs: [
+                ("  ", true),
+                ("   ", true),
+                ("ab", false),
+                ("abc", false),
+                (" ", false),   // too short (min=2)
+                ("", false),
+            ],
+        }
+        test_counter_body_non_word_boundary_3 {
+            pattern: r"^(.\B){1,12}$",
+            memory: 1000,
+            min_tier: 2,
+            inputs: [
+                (" ", true),
+                ("    ", true),
+                ("ab", false),
+                ("", false),
+            ],
+        }
         // Multi-counter with deferred assertion in body → NFA simulator
         // (break path through deferred assert can't be followed in probe closure)
         test_multi_counter_deferred_body {
