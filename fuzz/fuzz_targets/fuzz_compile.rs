@@ -17,8 +17,47 @@ use libfuzzer_sys::fuzz_target;
 use regex_thompson_counting::fuzz_gen::{generate_pattern, FuzzRng};
 use regex_thompson_counting::RegexBuilder;
 
+use std::cell::RefCell;
+
+thread_local! {
+    static CURRENT_PATTERN: RefCell<String> = RefCell::new(String::new());
+    static CURRENT_PHASE: RefCell<String> = RefCell::new(String::new());
+    static HOOK_INSTALLED: RefCell<bool> = RefCell::new(false);
+}
+
+fn install_panic_hook() {
+    HOOK_INSTALLED.with(|h| {
+        if !*h.borrow() {
+            *h.borrow_mut() = true;
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                CURRENT_PATTERN.with(|p| {
+                    CURRENT_PHASE.with(|ph| {
+                        let pat = p.borrow();
+                        let phase = ph.borrow();
+                        eprintln!("\n╔══════════════════════════════════════════════════");
+                        eprintln!("║ FUZZ CRASH");
+                        eprintln!("║ Pattern: `{}`", *pat);
+                        eprintln!("║ Phase:   {}", *phase);
+                        eprintln!("╚══════════════════════════════════════════════════\n");
+                    });
+                });
+                prev(info);
+            }));
+        }
+    });
+}
+
+fn set_phase(phase: &str) {
+    CURRENT_PHASE.with(|p| *p.borrow_mut() = phase.to_string());
+}
+
 fuzz_target!(|data: &[u8]| {
+    install_panic_hook();
+
     let (pattern, _ast) = generate_pattern(&mut FuzzRng::new(data));
+
+    CURRENT_PATTERN.with(|p| *p.borrow_mut() = pattern.clone());
 
     let hir = match parse_hir_bytes(&pattern) {
         Some(h) => h,
@@ -26,9 +65,11 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let mut builder = RegexBuilder::default();
+    set_phase("compilation (default unroll)");
     match builder.build(&hir) {
         Ok(re) => {
             // These must not panic.
+            set_phase("info/memory_size (default unroll)");
             let _ = re.memory_size();
             let _ = re.info();
             let _ = re.min_tier();
@@ -39,9 +80,11 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // Also try with unrolling disabled.
+    set_phase("compilation (no-unroll)");
     builder.max_unroll_states(0);
     match builder.build(&hir) {
         Ok(re) => {
+            set_phase("info/memory_size (no-unroll)");
             let _ = re.memory_size();
             let _ = re.info();
             let _ = re.min_tier();

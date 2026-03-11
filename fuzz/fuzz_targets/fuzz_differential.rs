@@ -16,12 +16,71 @@ use libfuzzer_sys::fuzz_target;
 use regex_thompson_counting::fuzz_gen::{generate_inputs, generate_pattern, FuzzRng};
 use regex_thompson_counting::{MatcherMemory, RegexBuilder};
 
+use std::cell::RefCell;
+
+thread_local! {
+    static CURRENT_PATTERN: RefCell<String> = RefCell::new(String::new());
+    static CURRENT_INPUT: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+    static CURRENT_PHASE: RefCell<String> = RefCell::new(String::new());
+    static HOOK_INSTALLED: RefCell<bool> = RefCell::new(false);
+}
+
+fn install_panic_hook() {
+    HOOK_INSTALLED.with(|h| {
+        if !*h.borrow() {
+            *h.borrow_mut() = true;
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                CURRENT_PATTERN.with(|p| {
+                    CURRENT_PHASE.with(|ph| {
+                        CURRENT_INPUT.with(|inp| {
+                            let pat = p.borrow();
+                            let phase = ph.borrow();
+                            let input = inp.borrow();
+                            eprintln!("\n╔══════════════════════════════════════════════════");
+                            eprintln!("║ FUZZ CRASH");
+                            eprintln!("║ Pattern: `{}`", *pat);
+                            eprintln!("║ Phase:   {}", *phase);
+                            if !input.is_empty() {
+                                if let Ok(s) = std::str::from_utf8(&input) {
+                                    eprintln!("║ Input:   {:?} (len={})", s, input.len());
+                                } else {
+                                    eprintln!("║ Input:   {:?} (len={})", *input, input.len());
+                                }
+                            }
+                            eprintln!("╚══════════════════════════════════════════════════\n");
+                        });
+                    });
+                });
+                prev(info);
+            }));
+        }
+    });
+}
+
+fn set_phase(phase: &str) {
+    CURRENT_PHASE.with(|p| *p.borrow_mut() = phase.to_string());
+}
+
+fn set_input(input: &[u8]) {
+    CURRENT_INPUT.with(|i| {
+        let mut v = i.borrow_mut();
+        v.clear();
+        v.extend_from_slice(input);
+    });
+}
+
 fuzz_target!(|data: &[u8]| {
+    install_panic_hook();
+
     let mid = data.len() / 2;
     let (pattern_seed, input_seed) = data.split_at(mid);
 
     let (pattern, ast) = generate_pattern(&mut FuzzRng::new(pattern_seed));
     let inputs = generate_inputs(&mut FuzzRng::new(input_seed), &ast);
+
+    CURRENT_PATTERN.with(|p| *p.borrow_mut() = pattern.clone());
+    CURRENT_INPUT.with(|i| i.borrow_mut().clear());
 
     let hir = match parse_hir_bytes(&pattern) {
         Some(h) => h,
@@ -29,6 +88,7 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let mut builder = RegexBuilder::default();
+    set_phase("compilation (default unroll)");
     let re = match builder.build(&hir) {
         Ok(r) => r,
         Err(_) => return,
@@ -37,7 +97,10 @@ fuzz_target!(|data: &[u8]| {
     let mut memory = MatcherMemory::default();
 
     for input in &inputs {
+        set_input(input);
+
         // NFA is the ground truth.
+        set_phase("match (NFA)");
         let mut m = match memory.matcher_for_tier(&re, 0) {
             Ok(m) => m,
             Err(_) => continue,
@@ -47,6 +110,7 @@ fuzz_target!(|data: &[u8]| {
 
         for tier in 1..=4u8 {
             if let Ok(mut m) = memory.matcher_for_tier(&re, tier) {
+                set_phase(&format!("match (Tier {})", tier));
                 m.chunk(input);
                 let tier_result = m.finish();
                 assert_eq!(
@@ -66,33 +130,42 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // Second pass: no unrolling.
+    set_phase("compilation (no-unroll)");
+    set_input(&[]);
     builder.max_unroll_states(0);
-    if let Ok(re_no_unroll) = builder.build(&hir) {
-        for input in &inputs {
-            let mut m = match memory.matcher_for_tier(&re_no_unroll, 0) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            m.chunk(input);
-            let nfa_result = m.finish();
+    let re_no_unroll = match builder.build(&hir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
 
-            for tier in 1..=4u8 {
-                if let Ok(mut m) = memory.matcher_for_tier(&re_no_unroll, tier) {
-                    m.chunk(input);
-                    let tier_result = m.finish();
-                    assert_eq!(
-                        tier_result,
-                        nfa_result,
-                        "Tier {} disagrees with NFA (no-unroll) for `{}` on input len={}: \
-                         tier{}={}, nfa={}",
-                        tier,
-                        pattern,
-                        input.len(),
-                        tier,
-                        tier_result,
-                        nfa_result
-                    );
-                }
+    for input in &inputs {
+        set_input(input);
+
+        set_phase("match (no-unroll NFA)");
+        let mut m = match memory.matcher_for_tier(&re_no_unroll, 0) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        m.chunk(input);
+        let nfa_result = m.finish();
+
+        for tier in 1..=4u8 {
+            if let Ok(mut m) = memory.matcher_for_tier(&re_no_unroll, tier) {
+                set_phase(&format!("match (no-unroll Tier {})", tier));
+                m.chunk(input);
+                let tier_result = m.finish();
+                assert_eq!(
+                    tier_result,
+                    nfa_result,
+                    "Tier {} disagrees with NFA (no-unroll) for `{}` on input len={}: \
+                     tier{}={}, nfa={}",
+                    tier,
+                    pattern,
+                    input.len(),
+                    tier,
+                    tier_result,
+                    nfa_result
+                );
             }
         }
     }
