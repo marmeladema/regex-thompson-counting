@@ -169,6 +169,12 @@ The macro generates one `#[test]` per entry that compiles the pattern, asserts t
 compares against the `regex` crate as oracle, and exercises ALL eligible tiers (NFA through Tier 4).
 It also re-runs with unrolling disabled to force counter-based execution paths.
 
+**Key implication for debugging:** A test entry with `min_tier: 1` and a simple pattern like
+`\b\w{3,5}\b` will be tested on Tier 1 with default unrolling, BUT ALSO on Tier 2/3 when the
+macro re-runs with `unroll_limit=0` (which forces counter-based execution, promoting the pattern
+to higher tiers). So a Tier 3 bug can cause failures in tests whose `min_tier` is 1. When you
+see "Tier3 chunk mismatch" in a test failure, it's the `unroll_limit=0` re-run that failed.
+
 **NEVER set `unroll_limit: 0` in test entries.** The macro ALREADY re-runs every
 test with `unroll_limit=0` automatically. Setting it explicitly just skips the
 default-unrolling run and redundantly tests `unroll_limit=0` twice. Use the
@@ -190,6 +196,8 @@ cargo run --release -- match '<pattern>' 'input' ...    # match testing (literal
 cargo run --release -- match --debug '<pattern>' 'input' # step-by-step NFA trace
 cargo run --release -- dot '<pattern>'                  # Graphviz DOT output
 cargo run --release -- --tier 2 match '<pattern>' 'input' # force a specific tier
+cargo run --release -- --unroll-limit 0 info '<pattern>'  # disable unrolling (force counters)
+cargo run --release -- --unroll-limit 0 match '<pattern>' 'input' # match with counters only
 ```
 
 ## Benchmarks

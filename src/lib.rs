@@ -4566,15 +4566,15 @@ mod tests {
     }
 
     /// Test a pattern+input via the NFA simulator (full-chunk + byte-at-a-time).
-    fn test_nfa(pattern: &str, re: &Regex, input: &str, expected: bool) {
+    fn test_nfa(pattern: &str, re: &Regex, input: &str, expected: bool, unroll: usize) {
         let mut memory = MatcherMemory::default();
         let mut m = memory.nfa_matcher(re);
         m.chunk(input.as_bytes());
         let actual = m.finish();
         assert_eq!(
             actual, expected,
-            "NFA chunk mismatch for `{}` on {:?}: got={}, expected={}",
-            pattern, input, actual, expected
+            "NFA chunk mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
+            pattern, input, unroll, actual, expected
         );
         let mut m = memory.nfa_matcher(re);
         for &b in input.as_bytes() {
@@ -4583,13 +4583,13 @@ mod tests {
         let actual = m.finish();
         assert_eq!(
             actual, expected,
-            "NFA single-byte mismatch for `{}` on {:?}: got={}, expected={}",
-            pattern, input, actual, expected
+            "NFA single-byte mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
+            pattern, input, unroll, actual, expected
         );
     }
 
     /// Test a pattern+input via Tier 1 DFA (full-chunk + byte-at-a-time).
-    fn test_tier1(pattern: &str, re: &Regex, input: &str, expected: bool) {
+    fn test_tier1(pattern: &str, re: &Regex, input: &str, expected: bool, unroll: usize) {
         use crate::dfa::{DfaMatcher, DfaMemory, Tier1DfaCache};
         let mut memory = DfaMemory::default();
         let mut cache = Tier1DfaCache::new();
@@ -4599,8 +4599,8 @@ mod tests {
         let actual = d.finish();
         assert_eq!(
             actual, expected,
-            "Tier1 chunk mismatch for `{}` on {:?}: got={}, expected={}",
-            pattern, input, actual, expected
+            "Tier1 chunk mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
+            pattern, input, unroll, actual, expected
         );
         let mut d = DfaMatcher::new(&mut cache, &mut memory, re);
         for &b in input.as_bytes() {
@@ -4609,13 +4609,13 @@ mod tests {
         let actual = d.finish();
         assert_eq!(
             actual, expected,
-            "Tier1 single-byte mismatch for `{}` on {:?}: got={}, expected={}",
-            pattern, input, actual, expected
+            "Tier1 single-byte mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
+            pattern, input, unroll, actual, expected
         );
     }
 
     /// Test a pattern+input via Tier 2 DFA (full-chunk + byte-at-a-time).
-    fn test_tier2(pattern: &str, re: &Regex, input: &str, expected: bool) {
+    fn test_tier2(pattern: &str, re: &Regex, input: &str, expected: bool, unroll: usize) {
         use crate::dfa::{DfaMemory, Tier2DfaCache, Tier2DfaMatcher};
         let analysis = re
             .tier2_analysis
@@ -4629,8 +4629,8 @@ mod tests {
         let actual = d.finish();
         assert_eq!(
             actual, expected,
-            "Tier2 chunk mismatch for `{}` on {:?}: got={}, expected={}",
-            pattern, input, actual, expected
+            "Tier2 chunk mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
+            pattern, input, unroll, actual, expected
         );
         let mut d = Tier2DfaMatcher::new(&mut cache, &mut memory, re, analysis);
         for &b in input.as_bytes() {
@@ -4639,13 +4639,13 @@ mod tests {
         let actual = d.finish();
         assert_eq!(
             actual, expected,
-            "Tier2 single-byte mismatch for `{}` on {:?}: got={}, expected={}",
-            pattern, input, actual, expected
+            "Tier2 single-byte mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
+            pattern, input, unroll, actual, expected
         );
     }
 
     /// Test a pattern+input via Tier 3 DFA (full-chunk + byte-at-a-time).
-    fn test_tier3(pattern: &str, re: &Regex, input: &str, expected: bool) {
+    fn test_tier3(pattern: &str, re: &Regex, input: &str, expected: bool, unroll: usize) {
         use crate::dfa::{DfaMemory, Tier3DfaCache, Tier3DfaMatcher};
         let analysis = re
             .tier3_analysis
@@ -4659,8 +4659,8 @@ mod tests {
         let actual = d.finish();
         assert_eq!(
             actual, expected,
-            "Tier3 chunk mismatch for `{}` on {:?}: got={}, expected={}",
-            pattern, input, actual, expected
+            "Tier3 chunk mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
+            pattern, input, unroll, actual, expected
         );
         let mut d = Tier3DfaMatcher::new(&mut cache, &mut memory, re, analysis);
         for &b in input.as_bytes() {
@@ -4669,13 +4669,13 @@ mod tests {
         let actual = d.finish();
         assert_eq!(
             actual, expected,
-            "Tier3 single-byte mismatch for `{}` on {:?}: got={}, expected={}",
-            pattern, input, actual, expected
+            "Tier3 single-byte mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
+            pattern, input, unroll, actual, expected
         );
     }
 
-    /// Test a pattern+input via Tier 3 DFA (full-chunk + byte-at-a-time).
-    fn test_tier4(pattern: &str, re: &Regex, input: &str, expected: bool) {
+    /// Test a pattern+input via Tier 4 DFA (full-chunk + byte-at-a-time).
+    fn test_tier4(pattern: &str, re: &Regex, input: &str, expected: bool, unroll: usize) {
         use crate::dfa::{Tier4DfaCache, Tier4DfaMatcher};
         let mut cache = Tier4DfaCache::new(re.states.len());
         cache.prepare(re);
@@ -4689,8 +4689,8 @@ mod tests {
         let actual = d.finish();
         assert_eq!(
             actual, expected,
-            "Tier4 chunk mismatch for `{}` on {:?}: got={}, expected={}",
-            pattern, input, actual, expected
+            "Tier4 chunk mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
+            pattern, input, unroll, actual, expected
         );
         pool.clear();
         pool.num_counters = re.num_counters;
@@ -4701,8 +4701,8 @@ mod tests {
         let actual = d.finish();
         assert_eq!(
             actual, expected,
-            "Tier4 single-byte mismatch for `{}` on {:?}: got={}, expected={}",
-            pattern, input, actual, expected
+            "Tier4 single-byte mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
+            pattern, input, unroll, actual, expected
         );
     }
 
@@ -4713,6 +4713,7 @@ mod tests {
         re: &Regex,
         oracle: &regex::bytes::Regex,
         inputs: &[(&str, bool)],
+        unroll: usize,
     ) {
         for &(input, expected_hint) in inputs {
             let expected = oracle.is_match(input.as_bytes());
@@ -4720,25 +4721,25 @@ mod tests {
             // Sanity-check the hint against the oracle.
             assert_eq!(
                 expected, expected_hint,
-                "Oracle/hint mismatch for `{}` on {:?}: oracle={}, hint={}",
-                pattern, input, expected, expected_hint
+                "Oracle/hint mismatch for `{}` on {:?} (unroll={}): oracle={}, hint={}",
+                pattern, input, unroll, expected, expected_hint
             );
 
             // Always test NFA.
-            test_nfa(pattern, re, input, expected);
+            test_nfa(pattern, re, input, expected, unroll);
 
             // Test each DFA tier the regex is actually eligible for.
             if re.dfa_eligible {
-                test_tier1(pattern, re, input, expected);
+                test_tier1(pattern, re, input, expected, unroll);
             }
             if re.tier2_eligible {
-                test_tier2(pattern, re, input, expected);
+                test_tier2(pattern, re, input, expected, unroll);
             }
             if re.tier3_eligible {
-                test_tier3(pattern, re, input, expected);
+                test_tier3(pattern, re, input, expected, unroll);
             }
             if re.tier4_eligible {
-                test_tier4(pattern, re, input, expected);
+                test_tier4(pattern, re, input, expected, unroll);
             }
         }
     }
@@ -4774,12 +4775,12 @@ mod tests {
         let oracle = regex::bytes::Regex::new(&full).expect("regex crate should parse pattern");
 
         // Run with the configured unroll limit.
-        test_all_tiers(pattern, &re, &oracle, inputs);
+        test_all_tiers(pattern, &re, &oracle, inputs, unroll_limit);
 
         // Run again with unrolling disabled to exercise counter-based tiers.
         if unroll_limit > 0 {
             let re_no_unroll = build_regex_with_unroll(pattern, 0);
-            test_all_tiers(pattern, &re_no_unroll, &oracle, inputs);
+            test_all_tiers(pattern, &re_no_unroll, &oracle, inputs, 0);
         }
 
         // Assert memory size matches the compiled regex.
@@ -9859,8 +9860,8 @@ mod tests {
         for n in 0..130 {
             let input: String = "a".repeat(n);
             let expected = oracle.is_match(input.as_bytes());
-            test_nfa(pattern, &re, &input, expected);
-            test_tier3(pattern, &re, &input, expected);
+            test_nfa(pattern, &re, &input, expected, 0);
+            test_tier3(pattern, &re, &input, expected, 0);
         }
     }
 
@@ -9876,9 +9877,9 @@ mod tests {
         for n in 0..70 {
             let input: String = "a".repeat(n);
             let expected = oracle.is_match(input.as_bytes());
-            test_nfa(pattern, &re, &input, expected);
+            test_nfa(pattern, &re, &input, expected, DEFAULT_MAX_UNROLL_STATES);
             if re.tier3_eligible {
-                test_tier3(pattern, &re, &input, expected);
+                test_tier3(pattern, &re, &input, expected, DEFAULT_MAX_UNROLL_STATES);
             }
         }
     }
