@@ -9864,6 +9864,72 @@ mod tests {
                 ("aaa", false),
             ],
         }
+        // Regression (Bug 16): deferred assertions (`\b`, `\B`) before
+        // counter bodies with L>1 caused false negatives in Tier 2 and
+        // Tier 3.  Phase 1 of `populate()` resolves the assertion and
+        // consumes the first body byte, but the resulting seed was
+        // misaligned:
+        //
+        // - Tier 2 (differential phases): the seed was placed as a
+        //   post-advance_all_phases seed, off by one phase.  Fix: use
+        //   pre_seeds (applied before advance) for correct alignment.
+        //
+        // - Tier 3 (per-instance): the seed's origin was the consumed
+        //   NFA state, which no longer appears in subsequent transitions'
+        //   origin_keys.  Fix: remap the seed's origin to the post-
+        //   consumption target.
+        //
+        // L=1 bodies were already handled correctly (pre_seeds in
+        // counting, value bump in non-counting).  This test covers L=2
+        // (Tier 2), L=6 (Tier 2), and L=6..16 (Tier 3).
+        test_deferred_assert_before_counter_l2_body {
+            pattern: r"^...\B(ee){6,40}$",
+            memory: 1164,
+            min_tier: 2,
+            inputs: [
+                ("aaaeeeeeeeeeeee", true),     // 3 + 12 = 15 (6 iterations of ee)
+                ("aaaeeeeeeeeeeeeeeeeeeee", true), // 3 + 20 = 23 (10 iterations)
+                ("aaaeeeeeeeee", false),        // 3 + 8 = 11 (4 iterations, below min)
+                ("aaae", false),                // too short
+                ("   eeeeeeeeeeee", false),     // \B fails: space→e is word boundary
+                ("aaaeeeeeeeeeeeee", false),    // 3 + 13: odd e count, can't fill (ee) body
+            ],
+        }
+        test_deferred_assert_before_counter_l6_body {
+            pattern: r"^...\Be{6,6}{6,40}$",
+            memory: 1296,
+            min_tier: 2,
+            inputs: [
+                ("aaaeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", true), // 3+36=39 (6 iters)
+                ("aaaeeeeeeeeeeeeeeeee", false), // 3+16: not multiple of body_len*min
+                ("aaa", false),
+                ("   eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", false), // \B fails
+            ],
+        }
+        test_deferred_assert_before_counter_varlen_body {
+            pattern: r"^...\Be{6,16}{6,40}$",
+            memory: 1956,
+            min_tier: 3,
+            inputs: [
+                ("aaaeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", true), // 3+36=39
+                ("aaaaaaaaaaaaaaaaaaaaa", false), // 21: all 'a', body is 'e'-only
+                ("aaa", false),
+                ("   eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", false), // \B fails
+            ],
+        }
+        test_deferred_assert_before_counter_two_counters {
+            pattern: r"^.{3,5}\Be{6,16}{6,40}c{6,33}$",
+            memory: 2188,
+            min_tier: 3,
+            inputs: [
+                // 3 a's + 36 e's + 6 c's = 45: min scenario (3 prefix, 6*6 e body, 6 c's)
+                ("aaaeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeecccccc", true),
+                // 5 a's + 36 e's + 6 c's = 47
+                ("aaaaaeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeecccccc", true),
+                ("aaa", false),
+                ("aaaeeeeeecccccc", false), // not enough e iterations
+            ],
+        }
         // Regression (defense-in-depth): `break_closure()` used to follow
         // through `CounterInstance` nodes, which meant that for sequential
         // multi-counter patterns like `.{1,2}.{4,4}$`, counter A's

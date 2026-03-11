@@ -1326,6 +1326,9 @@ impl Tier3DfaCache {
         let mut resolved_seeds: Vec<(CounterIdx, StateIdx, u32)> = Vec::new();
         let mut resolved_cinc = false;
         let mut resolved_is_match = false;
+        // Map from resolved seed origin → post-consumption target.
+        // Used to remap L>1 seeds to the correct body position (Bug 16).
+        let mut resolved_body_targets: Vec<(StateIdx, StateIdx)> = Vec::new();
         // Note: we do NOT track resolved_is_match_at_end here.  That flag
         // means "the deferred assertion passed mid-stream (with next=byte) and
         // $ → Match was reachable."  But the assertion was evaluated with
@@ -1358,9 +1361,14 @@ impl Tier3DfaCache {
                 resolved_cinc = cr.encountered_cinc;
                 resolved_is_match = cr.is_match;
                 // Discard cr.is_match_at_end — see comment above.
+                //
+                // Phase 1 consumes the resolved closure's NFA states
+                // against `byte`.  Build a map from seed origin → target
+                // for later remapping of resolved seeds (Bug 16).
                 for &idx in cr.nfa_states.iter() {
                     if let Some(t) = consume_byte(idx, byte, regex) {
                         targets_per_origin.push((idx, vec![t]));
+                        resolved_body_targets.push((idx, t));
                     }
                 }
             }
@@ -1537,17 +1545,35 @@ impl Tier3DfaCache {
             // corresponding break_seed and fire the seed on every
             // transition from the with_break state, even when the
             // triggering counter didn't actually break (Bug 14).
+            //
+            // For L>1 bodies: the resolved seed's origin is the first
+            // body byte (consuming state from the resolved closure).
+            // Phase 1 already consumed that byte, so the instance has
+            // advanced one position into the body.  Remap the seed's
+            // origin to the post-consumption TARGET so it appears in
+            // the next transition's origin_keys.  Without remapping,
+            // the instance would be at a stale origin and get dropped
+            // by the counter loop (Bug 16).
             for s in &resolved_seeds {
                 let is_pre = pre_seeds.iter().any(|p| p.0 == s.0 && p.1 == s.1);
                 let is_break_gated = analysis
                     .break_seeds
                     .iter()
                     .any(|bs| bs.counter == s.0 && bs.origin == s.1);
-                if !is_pre
-                    && !is_break_gated
-                    && !seeds.iter().any(|e| e.0 == s.0 && e.1 == s.1 && e.2 == s.2)
-                {
-                    seeds.push(*s);
+                if !is_pre && !is_break_gated {
+                    // Remap origin if Phase 1 consumed this seed's
+                    // origin byte (Bug 16).
+                    let remapped_origin = resolved_body_targets
+                        .iter()
+                        .find(|&&(from, _)| from == s.1)
+                        .map_or(s.1, |&(_, to)| to);
+                    let rs = (s.0, remapped_origin, s.2);
+                    if !seeds
+                        .iter()
+                        .any(|e| e.0 == rs.0 && e.1 == rs.1 && e.2 == rs.2)
+                    {
+                        seeds.push(rs);
+                    }
                 }
             }
 
@@ -1621,9 +1647,20 @@ impl Tier3DfaCache {
                 .iter()
                 .map(|&(c, s)| (c, s, 0u32))
                 .collect();
+            // Merge resolved seeds with origin remapping for L>1
+            // bodies (Bug 16): Phase 1 consumed the first body byte,
+            // so the seed should start at the post-consumption target.
             for s in &resolved_seeds {
-                if !seeds.iter().any(|e| e.0 == s.0 && e.1 == s.1 && e.2 == s.2) {
-                    seeds.push(*s);
+                let remapped_origin = resolved_body_targets
+                    .iter()
+                    .find(|&&(from, _)| from == s.1)
+                    .map_or(s.1, |&(_, to)| to);
+                let rs = (s.0, remapped_origin, s.2);
+                if !seeds
+                    .iter()
+                    .any(|e| e.0 == rs.0 && e.1 == rs.1 && e.2 == rs.2)
+                {
+                    seeds.push(rs);
                 }
             }
 

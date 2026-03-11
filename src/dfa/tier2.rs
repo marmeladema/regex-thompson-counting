@@ -794,48 +794,15 @@ impl Tier2DfaCache {
             0
         };
 
-        // On counting transitions, resolved seeds from L=1 bodies need
-        // special handling: they must be placed BEFORE counter_increment
-        // (as pre_seeds) so the counter is non-empty when increment fires.
-        // The value stays 0 — the increment itself provides the +1.
-        //
-        // On non-counting transitions, resolved seeds with L=1 bodies
-        // go to regular post-seeds with value 1 (since there's no
-        // increment to provide the +1).
-        if !is_counting {
-            for s in &mut resolved_seeds {
-                let ci = s.0.idx();
-                let (_, _, body_len) = regex.counter_info(ci);
-                if body_len == 1 {
-                    s.1 = 1;
-                }
-            }
-        }
-
-        // Build the post-seed list from probe seeds and (for non-counting
-        // transitions) resolved seeds.
+        // Build the post-seed list from probe seeds.
         let mut seed_list: Vec<(CounterIdx, u32)> = probe
             .seed_instances
             .iter()
             .map(|&(c, _s)| (c, 0u32))
             .collect();
-        if !is_counting && resolved_body_consumed {
-            // For non-counting transitions where Phase 1 consumed the
-            // first body byte (L>1: CInc not yet reached, but body
-            // started), merge resolved seeds.  Without body consumption,
-            // the seeds are speculative and would cause false positives
-            // (the counter would be seeded on a byte that doesn't match
-            // the body — see Bug 14).
-            for s in &resolved_seeds {
-                if let Some(existing) = seed_list.iter_mut().find(|e| e.0 == s.0) {
-                    existing.1 = existing.1.max(s.1);
-                } else {
-                    seed_list.push(*s);
-                }
-            }
-        }
-        // For counting transitions, resolved L=1 seeds go to pre_seeds
-        // (built below), NOT to seed_list.  This avoids double-seeding.
+        // Resolved seeds from deferred-assertion resolution are NOT
+        // merged into seed_list.  They go to pre_seeds (built below)
+        // for correct phase alignment — see the pre_seed comment.
         seed_list.sort_by_key(|&(c, _)| c.idx());
         seed_list.dedup();
 
@@ -860,21 +827,25 @@ impl Tier2DfaCache {
             let counter_reset =
                 self.compute_counter_reset(analysis, &probe.nfa_states, counting_mask);
 
-            // On counting transitions, resolved seeds from deferred
-            // assertions need two special treatments — but ONLY when
-            // the body was actually consumed by Phase 1 (i.e. the
-            // deferred assertion resolved AND the body byte matched):
+            // Resolved seeds from deferred assertions must be pre_seeds
+            // (applied BEFORE advance_all_phases) to get the correct
+            // Tier 2 phase alignment.  Phase 1 already consumed one
+            // body byte, so the instance must be placed one phase
+            // ahead of what seed_counter's default targeting computes.
+            // Pre-seed timing achieves this: active_phase has not yet
+            // been advanced for this byte, so the target phase is
+            // effectively shifted by -1 relative to a post-advance
+            // seed.
             //
-            // 1. Pre-seed: For L=1 counter bodies, the resolved path
-            //    consumed the body byte on this transition.  The seed
-            //    must be placed BEFORE counter_increment so the counter
-            //    is non-empty when increment fires.  Value stays 0
-            //    because increment provides the +1.
+            // For L=1 bodies: the seed goes to pre_seeds with value 0;
+            // the counter_increment on this transition provides the +1.
+            // For L>1 bodies: the seed goes to pre_seeds with value 0;
+            // the next CInc (after the remaining L-1 body bytes) will
+            // provide the increment.
             //
-            // 2. Skip reset: The counter must NOT be cleared by
-            //    counter_reset on this transition, because the
-            //    pre-seeded instance represents valid work from the
-            //    resolved assertion path.
+            // Skip reset: the counter must NOT be cleared by
+            // counter_reset, because the pre-seeded instance
+            // represents valid work from the resolved assertion path.
             //
             // When the body was NOT consumed (e.g. `\B {7,12}` on `!`),
             // the resolved seeds are speculative and must be discarded
@@ -884,11 +855,8 @@ impl Tier2DfaCache {
             if resolved_body_consumed {
                 for &(counter, _val) in &resolved_seeds {
                     let ci = counter.idx();
-                    let (_, _, body_len) = regex.counter_info(ci);
-                    if body_len == 1 {
-                        resolved_body_mask |= 1u64 << ci;
-                        pre_seed_list.push((counter, 0));
-                    }
+                    resolved_body_mask |= 1u64 << ci;
+                    pre_seed_list.push((counter, 0));
                 }
             }
             let counter_reset = counter_reset & !resolved_body_mask;
@@ -913,6 +881,20 @@ impl Tier2DfaCache {
             // For non-counting transitions, compute counter_reset for
             // all counters.
             let counter_reset = self.compute_counter_reset(analysis, &probe.nfa_states, 0);
+
+            // Resolved seeds from deferred assertions go to pre_seeds
+            // for correct phase alignment (same rationale as counting
+            // transitions — see comment above).
+            let mut resolved_body_mask: u64 = 0;
+            let mut pre_seed_list: Vec<(CounterIdx, u32)> = Vec::new();
+            if resolved_body_consumed {
+                for &(counter, _val) in &resolved_seeds {
+                    let ci = counter.idx();
+                    resolved_body_mask |= 1u64 << ci;
+                    pre_seed_list.push((counter, 0));
+                }
+            }
+            let counter_reset = counter_reset & !resolved_body_mask;
 
             // Counters reachable from deferred assertions (for pre-reset
             // snapshot in step_inner).
@@ -948,7 +930,7 @@ impl Tier2DfaCache {
                 with_break_is_match_at_end: mae,
                 is_counting: false,
                 counting_mask: 0,
-                pre_seeds: Box::new([]),
+                pre_seeds: pre_seed_list.into_boxed_slice(),
                 seeds: seed_list.into_boxed_slice(),
                 counter_reset,
             }
