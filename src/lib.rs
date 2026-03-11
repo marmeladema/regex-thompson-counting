@@ -2187,7 +2187,47 @@ impl RegexBuilder {
                     }
                     false
                 }
-                !has_nesting(states)
+                // Check for counter self-loops: CInc.out1 (break) can
+                // reach CI for the same counter.  This happens with
+                // patterns like `(.{6,9})+` where the `+` wraps a counted
+                // repetition.  After break, CI is re-entered, creating
+                // overlapping instances for the same counter from different
+                // repetition rounds.  The differential counter model
+                // (tier 2) and per-instance tracking (tier 3) cannot
+                // handle this correctly — instances accumulate and
+                // spuriously satisfy the break condition.
+                fn has_self_loop(states: &[State]) -> bool {
+                    for s in states.iter() {
+                        if let State::CounterIncrement { counter, out1, .. } = *s {
+                            // Walk from break path looking for CI of same counter.
+                            let mut stack = vec![out1];
+                            let mut visited = vec![false; states.len()];
+                            while let Some(idx) = stack.pop() {
+                                let i = idx.idx();
+                                if i >= states.len() || visited[i] {
+                                    continue;
+                                }
+                                visited[i] = true;
+                                match states[idx] {
+                                    State::CounterInstance { counter: c, .. } if c == counter => {
+                                        return true;
+                                    }
+                                    State::Split { out, out1 } => {
+                                        stack.push(out1);
+                                        stack.push(out);
+                                    }
+                                    State::Assert { out, .. } => stack.push(out),
+                                    State::CounterInstance { out, .. } => {
+                                        stack.push(out);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    false
+                }
+                !has_nesting(states) && !has_self_loop(states)
             };
 
         // Tier 3 eligibility: non-nested counters WITHOUT deferred assertions
@@ -9632,6 +9672,79 @@ mod tests {
                 ("aaaaaaaaaaaaaaaaaaaaaaaa", true),   // len=23: max-1
                 ("aaaaaaaaaaaaaaaaaaaaaaaaa", true),  // len=24: max
                 ("aaaaaaaaaaaaaaaaaaaaaaaaaa", false), // len=26: too long
+            ],
+        }
+        // Regression: counter self-loop — `(.{6,9})+` wraps a counted
+        // repetition in a `+` quantifier.  With unroll_limit=0, the CInc
+        // break path reaches CI for the same counter, creating overlapping
+        // instances that spuriously satisfy the break condition.  The fix
+        // rejects such patterns from tier 2/3 (demoted to tier 4).
+        test_counter_self_loop_possessive_plus {
+            pattern: "^.{6,9}++$",
+            memory: 1345,
+            min_tier: 1,
+            inputs: [
+                ("aaaaaa", true),       // len=6: one rep of 6
+                ("aaaaaaaaa", true),    // len=9: one rep of 9
+                ("aaaaaaaaaaaa", true), // len=12: two reps of 6
+                ("aaaaaaaaaa", false),  // len=10: no valid split
+                ("aaaaaaaaaaa", false), // len=11: no valid split
+                ("aaaaa", false),       // len=5: too short
+            ],
+        }
+        // Same self-loop via {6,9}+ parsed as possessive (one-or-more).
+        test_counter_self_loop_possessive {
+            pattern: "^.{6,9}+$",
+            memory: 1312,
+            min_tier: 1,
+            inputs: [
+                ("aaaaaa", true),       // len=6
+                ("aaaaaaaaa", true),    // len=9
+                ("aaaaaaaaaaaa", true), // len=12: 6+6
+                ("aaaaaaaaaaaaaaa", true), // len=15: 6+9 or 7+8
+                ("aaaaaaaaaa", false),  // len=10: no valid split
+                ("aaaaaaaaaaa", false), // len=11: no valid split
+                ("aaaaa", false),       // len=5: too short
+            ],
+        }
+        // Same self-loop via * wrapping counted repetition.
+        test_counter_self_loop_star {
+            pattern: "^.{6,9}*$",
+            memory: 1312,
+            min_tier: 1,
+            inputs: [
+                ("", true),             // len=0: zero reps
+                ("aaaaaa", true),       // len=6
+                ("aaaaaaaaa", true),    // len=9
+                ("aaaaaaaaaaaa", true), // len=12: 6+6
+                ("aaaaaaaaaa", false),  // len=10: no valid split
+                ("aaaaa", false),       // len=5: too short
+            ],
+        }
+        // Same self-loop via +* wrapping counted repetition.
+        test_counter_self_loop_plus_star {
+            pattern: "^.{6,9}+*$",
+            memory: 1345,
+            min_tier: 1,
+            inputs: [
+                ("", true),             // len=0: * allows zero reps
+                ("aaaaaa", true),       // len=6
+                ("aaaaaaaaaaaa", true), // len=12: 6+6
+                ("aaaaaaaaaa", false),  // len=10: no valid split
+                ("aaaaa", false),       // len=5: too short
+            ],
+        }
+        // Same self-loop, unanchored.  Since unanchored, any input
+        // with >= 6 chars matches (a 6-9 substring always exists).
+        test_counter_self_loop_unanchored {
+            pattern: ".{6,9}+",
+            memory: 1246,
+            min_tier: 1,
+            inputs: [
+                ("aaaaaa", true),       // len=6: exact match
+                ("aaaaaaaaaa", true),   // len=10: substring of 6-9 exists
+                ("aaaaaaaaaaaa", true), // len=12
+                ("aaaaa", false),       // len=5: too short
             ],
         }
         // Regression: commit 51ef734 inverted the seed deduplication logic in
