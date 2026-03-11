@@ -689,6 +689,11 @@ impl Tier2DfaCache {
         // Match reachable through CInc break path in Phase 1 resolution.
         // Only valid when any_can_break is true (counter >= min).
         let mut resolved_break_match = false;
+        // Whether Phase 1 resolution actually produced consuming targets
+        // (the first counter body byte was consumed on this transition).
+        // When false, resolved_seeds are speculative and should NOT be
+        // used on non-counting transitions (the body byte doesn't match).
+        let mut resolved_body_consumed = false;
 
         if from != DfaStateId::DEAD {
             let from_state = &self.inner.states[from.idx()];
@@ -753,6 +758,7 @@ impl Tier2DfaCache {
                 for &idx in cr.nfa_states.iter() {
                     if let Some(t) = consume_byte(idx, byte, regex) {
                         targets.push(t);
+                        resolved_body_consumed = true;
                     }
                 }
             }
@@ -813,9 +819,13 @@ impl Tier2DfaCache {
             .iter()
             .map(|&(c, _s)| (c, 0u32))
             .collect();
-        if !is_counting {
-            // For non-counting transitions, resolved seeds (with value 1
-            // for L=1 bodies) are the only seeds.  Merge them in.
+        if !is_counting && resolved_body_consumed {
+            // For non-counting transitions where Phase 1 consumed the
+            // first body byte (L>1: CInc not yet reached, but body
+            // started), merge resolved seeds.  Without body consumption,
+            // the seeds are speculative and would cause false positives
+            // (the counter would be seeded on a byte that doesn't match
+            // the body — see Bug 14).
             for s in &resolved_seeds {
                 if let Some(existing) = seed_list.iter_mut().find(|e| e.0 == s.0) {
                     existing.1 = existing.1.max(s.1);
@@ -851,7 +861,9 @@ impl Tier2DfaCache {
                 self.compute_counter_reset(analysis, &probe.nfa_states, counting_mask);
 
             // On counting transitions, resolved seeds from deferred
-            // assertions need two special treatments:
+            // assertions need two special treatments — but ONLY when
+            // the body was actually consumed by Phase 1 (i.e. the
+            // deferred assertion resolved AND the body byte matched):
             //
             // 1. Pre-seed: For L=1 counter bodies, the resolved path
             //    consumed the body byte on this transition.  The seed
@@ -863,14 +875,20 @@ impl Tier2DfaCache {
             //    counter_reset on this transition, because the
             //    pre-seeded instance represents valid work from the
             //    resolved assertion path.
+            //
+            // When the body was NOT consumed (e.g. `\B {7,12}` on `!`),
+            // the resolved seeds are speculative and must be discarded
+            // to avoid false positives (Bug 14).
             let mut resolved_body_mask: u64 = 0;
             let mut pre_seed_list: Vec<(CounterIdx, u32)> = Vec::new();
-            for &(counter, _val) in &resolved_seeds {
-                let ci = counter.idx();
-                let (_, _, body_len) = regex.counter_info(ci);
-                if body_len == 1 {
-                    resolved_body_mask |= 1u64 << ci;
-                    pre_seed_list.push((counter, 0));
+            if resolved_body_consumed {
+                for &(counter, _val) in &resolved_seeds {
+                    let ci = counter.idx();
+                    let (_, _, body_len) = regex.counter_info(ci);
+                    if body_len == 1 {
+                        resolved_body_mask |= 1u64 << ci;
+                        pre_seed_list.push((counter, 0));
+                    }
                 }
             }
             let counter_reset = counter_reset & !resolved_body_mask;
