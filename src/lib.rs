@@ -2242,7 +2242,16 @@ impl RegexBuilder {
         // inside counter bodies.  Tier 3 cannot handle deferred assertions in
         // counter bodies because it lacks the Phase 1 deferred resolution that
         // tier 2 has.
-        let tier3_eligible = non_nested_eligible && !has_deferred_in_counter_body;
+        //
+        // Also limited to MAX_TIER2_COUNTERS (64) counters: tier 3 uses a
+        // `u64` bitmask (`counter_broke`) to gate break-seeds, so counter
+        // indices ≥ 64 would alias lower indices and corrupt seeding.
+        // TODO: support >64 counters by replacing the `u64` bitmask with a
+        // wider representation (e.g. `[u64; 4]` for 256 counters), or by
+        // lowering MAX_COUNTERS to 64 globally.
+        let tier3_eligible = non_nested_eligible
+            && !has_deferred_in_counter_body
+            && self.counters.len() <= MAX_TIER2_COUNTERS;
 
         // Compute per-counter info: (min, max, body_byte_length).
         // body_byte_length is the fixed number of bytes consumed per iteration,
@@ -9538,6 +9547,26 @@ mod tests {
                 ("xz", false),
             ],
         }
+        // Variable-length body behind a consuming prefix: the `+` loop
+        // inside `a+{9,28}` makes `advance_origins` and `continue_origins`
+        // overlap at the same NFA state.  Per-instance tracking must dedup
+        // `advance` and `insert_continued` calls to prevent exponential
+        // instance growth that silently drops high-value entries when the
+        // flat buffer fills up.  (Bug: InstanceCounters advance/continue
+        // lacked dedup, causing the counter to never reach its minimum.)
+        test_tier3_varlen_plus_body_dedup {
+            pattern: ".a+{9,28}",
+            memory: 999,
+            min_tier: 3,
+            inputs: [
+                ("aaaaaaaaaa", true),      // 10 a's: . + a+{9} (each a+ = 1 a)
+                ("baaaaaaaaaa", true),     // b + 10 a's
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true), // 48 a's
+                ("ba", false),
+                ("baa", false),
+                ("baaaaaaaa", false),      // b + 8 a's: only 8 iterations, need 9
+            ],
+        }
 
         // ── break_consuming_states fix regression tests ──────────────────
         //
@@ -9660,6 +9689,27 @@ mod tests {
                 ("aa", false),
                 ("a", false),
                 ("", false),
+            ],
+        }
+        // Regression: counter_free_nb_mae early-return guard used
+        // `reachable_without_break[regex.start.idx()]` to decide whether
+        // the re-seeded start state could contribute a counter-free
+        // `$ → Match`.  But reachable_without_break only marks *consuming*
+        // states; the start state (a Split) was never marked, so the guard
+        // bailed out and returned false.  For patterns like `(X.{n,m})?$`
+        // where the `?`-skip directly reaches `$`, the match_at_end flag
+        // was overwritten to false on every byte, causing false negatives.
+        test_tier3_counter_free_mae_optional_skip {
+            pattern: "([b-ed-ie-f].{4,43})?$",
+            memory: 1288,
+            min_tier: 2,
+            inputs: [
+                ("zzz", true),       // optional group skipped, $ matches at end
+                ("", true),          // empty input, $ matches
+                ("b12345", true),    // group matches: b + 5 chars ≥ 4
+                ("d1234", true),     // group matches: d + 4 chars = 4
+                ("a", true),         // 'a' not in class, group skipped, $ matches
+                ("bbb", true),       // too short for body, group skipped, $ matches
             ],
         }
         // Regression: post_break_tails Advance action did not check
@@ -9848,6 +9898,44 @@ mod tests {
                 ("caaaaaaab", false),
             ],
         }
+
+        // Regression: the `a+` self-loop causes `advance_origins` and
+        // `continue_origins` to contain the same NFA state.  Without
+        // dedup in `InstanceCounters::advance` / `insert_continued`,
+        // entries doubled every byte (1→2→4→8→…), overflowed the
+        // fixed-stride buffer, and silently dropped high-value instances
+        // — producing false negatives on long inputs.
+        test_tier3_instance_dedup_self_loop {
+            pattern: r".a+{9,28}",
+            memory: 999,
+            min_tier: 3,
+            inputs: [
+                ("aaaaaaaaa", false),
+                ("aaaaaaaaaa", true),
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true),
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true),
+            ],
+        }
+
+        // Regression: `counter_free_nb_mae` had an early-return guard
+        // that checked `reachable_without_break[start]`, but the start
+        // state (a Split) is never consuming and thus never appears in
+        // `reachable_without_break`.  This blocked the counter-free
+        // `$ → Match` path for optional groups, producing false negatives
+        // when the optional group didn't match but `$` should have.
+        // The `?` makes every input match via the empty-to-`$` path.
+        test_tier3_counter_free_mae_optional_group {
+            pattern: r"([b-e].+{4,43})?$",
+            memory: 1321,
+            min_tier: 3,
+            inputs: [
+                ("zzz", true),
+                ("", true),
+                ("baaa", true),
+                ("xyz123", true),
+            ],
+        }
+
     }
 
     /// Tier 2 encodes counter identity in `u64` bitmasks, so patterns with
@@ -9889,8 +9977,12 @@ mod tests {
             "65-counter pattern should NOT be tier 2 eligible"
         );
         assert!(
-            re65.tier3_eligible,
-            "65-counter pattern should fall to tier 3"
+            !re65.tier3_eligible,
+            "65-counter pattern should NOT be tier 3 eligible (u64 bitmask limit)"
+        );
+        assert!(
+            re65.tier4_eligible,
+            "65-counter pattern should fall to tier 4"
         );
     }
 

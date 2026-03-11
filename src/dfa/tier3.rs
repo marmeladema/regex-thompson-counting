@@ -908,13 +908,15 @@ impl CounterStorage for InstanceCounters {
 
     #[inline]
     fn advance(&mut self, ci: usize, entry: &Instance, new_origin: StateIdx) {
-        self.push(
-            ci,
-            Instance {
-                value: entry.value,
-                origin: new_origin,
-            },
-        );
+        if !self.contains(ci, entry.value, new_origin) {
+            self.push(
+                ci,
+                Instance {
+                    value: entry.value,
+                    origin: new_origin,
+                },
+            );
+        }
     }
 
     #[inline]
@@ -929,13 +931,15 @@ impl CounterStorage for InstanceCounters {
 
     #[inline]
     fn insert_continued(&mut self, ci: usize, entry: &Instance, new_origin: StateIdx, _max: u32) {
-        self.push(
-            ci,
-            Instance {
-                value: entry.value + 1,
-                origin: new_origin,
-            },
-        );
+        if !self.contains(ci, entry.value + 1, new_origin) {
+            self.push(
+                ci,
+                Instance {
+                    value: entry.value + 1,
+                    origin: new_origin,
+                },
+            );
+        }
     }
 }
 
@@ -1045,7 +1049,24 @@ struct RangeCounters {
 impl RangeCounters {
     /// Create a new `RangeCounters` for `num_counters` counters with
     /// the given stride (max origins per counter body).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `stride > 255`.  The per-counter entry count is stored
+    /// as `u8` for compactness (one byte of overhead per counter instead
+    /// of eight).  A stride of 256+ would overflow the `u8` count on
+    /// insertion.  In practice this requires ≥256 distinct consuming NFA
+    /// states inside a single counter body, which is unreachable for any
+    /// realistic pattern — alternations of single bytes compile to one
+    /// `ByteClass`, and even deeply nested multi-byte alternations
+    /// rarely exceed a handful of consuming positions.
     fn new(num_counters: usize, stride: usize) -> Self {
+        assert!(
+            stride <= u8::MAX as usize,
+            "RangeCounters: stride {} exceeds u8::MAX (255); the pattern has \
+             too many consuming NFA states in a single counter body",
+            stride,
+        );
         let total = num_counters * stride;
         let mut data = Vec::with_capacity(total);
         // Fill with dummy entries — only `counts[i]` entries are live.
@@ -1595,9 +1616,16 @@ impl Tier3DfaCache {
             .filter(|(origin, _)| analysis.reachable_without_break[origin.idx()])
             .flat_map(|(_, ts)| ts.iter().copied())
             .collect();
-        if cf_targets.is_empty() && !analysis.reachable_without_break[regex.start.idx()] {
-            return false;
-        }
+        // Note: we intentionally do NOT bail out when cf_targets is empty.
+        // The re-seeded `regex.start` is always counter-free (it represents
+        // the unanchored match restart, not a counter break), so its epsilon
+        // closure may contribute `$ → Match` even when no counter-free
+        // consuming origins exist.  The previous guard checked
+        // `reachable_without_break[regex.start.idx()]`, but that array only
+        // marks *consuming* states; the start state (typically a Split) is
+        // never marked, causing false negatives for patterns like
+        // `([b-ed-ie-f].{4,43})?$` where the `?`-skip to `$` is the only
+        // counter-free path to Match.
         let cr_cf = self.epsilon_closure(
             memory,
             cf_targets
