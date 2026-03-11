@@ -84,7 +84,12 @@ Tiers are selected at compile time based on pattern analysis:
 - **Tier 0 (NFA)**: Pure Thompson simulation. Fallback for CRLF assertions or zero-width counter bodies.
 - **Tier 1**: Standard lazy DFA. Counter-free patterns. Supports deferred assertions (`\b`, `\B`, `EndLF`).
 - **Tier 2**: Becchi-style differential counters. Non-nested, fixed-length-body repetitions. O(1) per byte.
-- **Tier 3**: Conditional transitions. Non-nested counters with variable-length bodies.
+- **Tier 3**: Conditional transitions. Non-nested counters with variable-length
+  bodies. Two sub-paths selected at compile time: **range-compressed**
+  (O(num\_origins) per byte) when all `CounterInstance` nodes are
+  epsilon-reachable from the start state, otherwise **per-instance** fallback
+  (O(live\_instances) per byte). Patterns with `^`, consuming prefixes, or
+  assertions blocking re-seeding use the per-instance path.
 - **Tier 4**: Compiled counter programs. Nested repetitions. Most general DFA tier.
 
 ## Design Principles

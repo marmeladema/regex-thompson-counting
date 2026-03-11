@@ -984,7 +984,15 @@ impl Regex {
         } else if self.tier2_eligible {
             "Tier 2: Differential-counter DFA (fixed-length bodies, O(1) counters)"
         } else if self.tier3_eligible {
-            "Tier 3: Conditional DFA (non-nested counters, per-counter instances)"
+            if self
+                .tier3_analysis
+                .as_ref()
+                .is_some_and(|a| a.all_counters_rangeable)
+            {
+                "Tier 3: Conditional DFA (non-nested counters, range-compressed)"
+            } else {
+                "Tier 3: Conditional DFA (non-nested counters, per-instance)"
+            }
         } else if self.tier4_eligible {
             "Tier 4: Counting DFA (flat table + counter programs)"
         } else {
