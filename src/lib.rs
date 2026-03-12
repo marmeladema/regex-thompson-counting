@@ -10562,6 +10562,32 @@ mod tests {
             ],
         }
 
+        // -- Bug 34 regression: deferred asserts lost on None target in post_break_tails --
+        // Pattern `^1{2,30}c{9,48}y\b$` has two counters.  When c1 breaks,
+        // the break path goes to state 7 (Byte('y')), which is tracked as
+        // a post_break_tail.  When 'y' is consumed, state 7's target is
+        // state 8 (Assert(\b)), which leads only to Assert($) → Match.
+        // analyze_target returns None for state 8 (no consuming states),
+        // so the action is None.  The post_break_tails code's Some(None)
+        // arm was not depositing target_deferred_asserts, losing the \b
+        // assertion → false negative at EOI.
+        //
+        // Fix: deposit target_deferred_asserts in the Some(None) arm.
+        test_tier3_tail_none_target_deferred_asserts {
+            pattern: r"^1{2,30}c{9,48}y\b$",
+            memory: 973,
+            min_tier: 2,
+            inputs: [
+                ("1111111cccccccccccccy", true),    // 7 ones + 13 c's + y: Bug 34 crash case
+                ("11ccccccccccy", true),             // 2 ones + 10 c's + y
+                ("1111111ccccccccccy", true),        // 7 ones + 10 c's + y
+                ("1ccccccccccy", false),             // 1 one (< min 2)
+                ("11ccccccccy", false),              // 2 ones + 8 c's (< min 9)
+                ("", false),
+                ("1111111cccccccccccccy ", false),   // trailing space breaks \b
+            ],
+        }
+
         // -- Bug 31 regression: chained assertions in target_deferred_asserts --
         // Pattern has `.\b\B` after counter break.  State 4's target epsilon
         // path goes through \b@5 then \B@6.  If target_deferred_asserts

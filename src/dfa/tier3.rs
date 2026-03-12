@@ -2620,9 +2620,18 @@ macro_rules! step_slow_impl {
                         }
                     }
                     Some(None) => {
-                        // `None` (dead) target — byte not accepted by
-                        // this tail, but check precomputed match flags
-                        // (Bug 25: direct Match; Bug 29: shared helper).
+                        // `None` target — the tail consumed this byte
+                        // but the post-consumption epsilon path has no
+                        // consuming states or CInc (only asserts and/or
+                        // Match).  Still need to deposit deferred asserts
+                        // (Bug 34: `y\b$` after counter break was lost
+                        // because analyze_target returned None for the
+                        // assert-only path).
+                        for &da in self.analysis.target_deferred_asserts[pbo.idx()].iter() {
+                            if !self.verified_deferred_asserts.contains(&da) {
+                                self.verified_deferred_asserts.push(da);
+                            }
+                        }
                         check_tail_match_flags!(self, pbo);
                     }
                     None => {
