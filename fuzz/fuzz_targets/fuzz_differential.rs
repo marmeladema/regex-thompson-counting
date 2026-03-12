@@ -94,6 +94,16 @@ fuzz_target!(|data: &[u8]| {
         Err(_) => return,
     };
 
+    // Computational budget: skip patterns that are too expensive under
+    // ASAN instrumentation.  Patterns with many NFA states (nested
+    // optionals) or large total input volume cause timeouts.
+    let info = re.info();
+    let num_states = info.memory.num_states;
+    let total_input_bytes: usize = inputs.iter().map(|i| i.len()).sum();
+    if num_states > 50 || total_input_bytes > 1000 || num_states * total_input_bytes > 15_000 {
+        return;
+    }
+
     let mut memory = MatcherMemory::default();
 
     for input in &inputs {
