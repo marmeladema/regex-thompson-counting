@@ -10506,6 +10506,29 @@ mod tests {
             ],
         }
 
+        // -- Bug 31 regression: chained assertions in target_deferred_asserts --
+        // Pattern has `.\b\B` after counter break.  State 4's target epsilon
+        // path goes through \b@5 then \B@6.  If target_deferred_asserts
+        // deposits both independently, \B passes alone at EOI (non-word →
+        // non-word), giving a false positive even though \b fails.
+        //
+        // Fix: target_deferred_asserts records only the FIRST assert on each
+        // path (here: \b@5).  `resolve_verified_deferred_asserts` evaluates
+        // \b@5 first, and only calls `can_reach_match_at_end(\b.out)` if it
+        // passes, which properly handles the downstream \B chain.
+        test_tier3_chained_assert_target_deferred {
+            pattern: r"^.{7,7}(.\b\Ba?(a?a?)?)?$",
+            memory: 1557,
+            min_tier: 1,
+            inputs: [
+                ("cy1aacc", true),              // 7 chars, optional group empty, $ matches
+                ("cy1aacc ", false),             // 8 chars: .=space, \b fails (space→EOI both non-word)
+                ("abcdefg", true),              // exactly 7, optional group empty
+                ("abcdefgh", false),            // 8 chars: .=h, \b fails (h→EOI: word→non-word passes)
+                                                // but \B requires same category → fails.  \b\B always false.
+            ],
+        }
+
         // -- Bug 30 regression: contaminated no_break_current deferred asserts --
         // When c0 (.{0,44}) breaks, the DFA state inherits state 8 (Byte 'f')
         // from c1's break path.  State 8→9 (\b) ends up as a deferred assert

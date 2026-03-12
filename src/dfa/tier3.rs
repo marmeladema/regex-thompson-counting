@@ -626,13 +626,19 @@ pub(crate) fn compute_tier3_analysis(
 
     // -- Step 6c: compute per-consuming-state target_deferred_asserts -----------
     // For each consuming NFA state, walk epsilon transitions from its target
-    // and collect non-End Assert state indices.  These are assertions that
-    // lie on the path from the byte-consumption target to further consuming
-    // states or Match but are NOT `Assert(End)` (which is already handled
-    // by `target_is_match_at_end`).
+    // and collect the FIRST non-End Assert state indices on each reachable
+    // path.  These are the "entry-point" assertions that
+    // `resolve_verified_deferred_asserts` will evaluate at runtime; subsequent
+    // chained assertions (e.g. `\b → \B`) are handled by the downstream
+    // `can_reach_match_at_end` / `can_reach_match_mid` walk that follows
+    // the assert's `out` edge.
     //
-    // This walk follows through Assert states (unlike Steps 6a/6b) to reach
-    // what lies beyond them, collecting the Assert indices along the way.
+    // IMPORTANT: the walk does NOT follow through non-End Assert states
+    // (Bug 31).  Following through would record every assert in a chain
+    // independently, causing `resolve_verified_deferred_asserts` to evaluate
+    // them as if they were on separate paths — a chain like `\b → \B`
+    // (contradictory) would spuriously match because `\B` alone can pass.
+    //
     // Used by the post-break tail tracker to deposit these into
     // `verified_deferred_asserts` when a tail advances through the state
     // (Bug 30).
@@ -663,13 +669,17 @@ pub(crate) fn compute_tier3_analysis(
                         estack.push(out1);
                         estack.push(out);
                     }
-                    State::Assert { kind, out } => {
-                        // Record non-End asserts as deferred; follow
-                        // through to discover what lies beyond.
+                    State::Assert { kind, .. } => {
+                        // Record non-End asserts but do NOT follow `out`.
+                        // Subsequent chained asserts are evaluated by
+                        // `can_reach_match_at_end` / `can_reach_match_mid`
+                        // at runtime (they walk from the assert's `out`).
+                        // End asserts are handled by target_is_match_at_end.
                         if kind != AssertKind::End {
                             asserts.push(eidx);
                         }
-                        estack.push(out);
+                        // Do NOT push `out` — stop the walk here for this
+                        // path.  See Bug 31 comment above.
                     }
                     State::CounterInstance { out, .. } => estack.push(out),
                     _ => {}
