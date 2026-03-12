@@ -1799,9 +1799,77 @@ impl<'a> Tier2DfaMatcher<'a> {
 
 impl fmt::Debug for Tier2DfaMatcher<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Tier2DfaMatcher")
-            .field("current", &self.current)
-            .field("ever_matched", &self.ever_matched)
-            .finish()
+        let mut s = f.debug_struct("Tier2DfaMatcher");
+        s.field("current", &self.current);
+        if self.current != DfaStateId::DEAD {
+            let state = &self.cache.inner.states[self.current.idx()];
+            s.field("nfa_states", &state.nfa_states);
+            s.field("is_match", &state.is_match);
+            s.field("is_match_at_end", &state.is_match_at_end);
+        }
+        s.field("ever_matched", &self.ever_matched)
+            .field("match_at_end", &self.match_at_end)
+            .field("has_live_counters", &self.has_live_counters);
+        s.finish()
+    }
+}
+
+impl fmt::Display for Tier2DfaMatcher<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.current == DfaStateId::DEAD {
+            write!(f, "DFA[T2] state=DEAD matched={}", self.ever_matched)?;
+            if self.has_live_counters {
+                write!(f, " live_counters")?;
+            }
+            return Ok(());
+        }
+        let state = &self.cache.inner.states[self.current.idx()];
+        write!(
+            f,
+            "DFA[T2] state={} nfa={{{}}} matched={}",
+            self.current.0,
+            state
+                .nfa_states
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            self.ever_matched,
+        )?;
+        if state.is_match {
+            write!(f, " is_match")?;
+        }
+        if self.match_at_end {
+            write!(f, " mae")?;
+        }
+        // Counter summary: show per-counter active phase info.
+        if self.has_live_counters && !self.cache.counter_meta.is_empty() {
+            write!(f, " counters=[")?;
+            for (ci, meta) in self.cache.counter_meta.iter().enumerate() {
+                if ci > 0 {
+                    write!(f, ", ")?;
+                }
+                // Find the active phase's DiffCounter.
+                let phase_idx = meta.phase_start + meta.active_phase;
+                if phase_idx < self.cache.phases.len() {
+                    let dc = &self.cache.phases[phase_idx];
+                    if dc.count > 0 {
+                        write!(
+                            f,
+                            "c{ci}: {} inst oldest={} youngest={}",
+                            dc.count,
+                            dc.oldest,
+                            dc.youngest()
+                        )?;
+                    } else {
+                        write!(f, "c{ci}: idle")?;
+                    }
+                } else {
+                    write!(f, "c{ci}: idle")?;
+                }
+            }
+            write!(f, "]")?;
+        }
+        Ok(())
     }
 }

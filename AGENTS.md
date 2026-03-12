@@ -311,14 +311,51 @@ When fuzzing discovers bugs, follow this discipline:
 
 1. **One bug at a time.** Investigate, fix, and test one bug before moving
    to the next.
-2. **Commit each fix separately.** Each bug fix gets its own commit with a
+2. **Reproduce with `--debug`.** Use the CLI to trace matcher state
+   byte-by-byte:
+   ```bash
+   # Default tier (may unroll counters away):
+   cargo run --release -- match --debug --chunk-size 1 '<pattern>' '<input>'
+   # Force counter-based execution (no unrolling) — essential when the
+   # bug is in a counter tier:
+   cargo run --release -- match --debug --chunk-size 1 --unroll-limit 0 '<pattern>' '<input>'
+   # Force a specific tier (0=NFA, 1-4=DFA tiers):
+   cargo run --release -- match --debug --chunk-size 1 --tier 3 '<pattern>' '<input>'
+   # Combine: force tier 3 without unrolling:
+   cargo run --release -- match --debug --chunk-size 1 --tier 3 --unroll-limit 0 '<pattern>' '<input>'
+   ```
+   The `[init]` line prints full `Debug` (struct fields, NFA states, cache
+   details).  Each subsequent `[after chunk ...]` line prints compact
+   `Display` output:  DFA state ID, NFA state set, match flags, and
+   tier-specific counter/context summaries.  Tier 3 shows multi-line
+   counter entries (origins, ranges) and post-break tails.  Compare the
+   NFA oracle (`--tier 0`) against a DFA tier to pinpoint where they
+   diverge.
+3. **Commit each fix separately.** Each bug fix gets its own commit with a
    descriptive message.  Always ask for confirmation before committing.
-3. **Add a regression test** as an entry in the `match_tests!` macro (not a
+4. **Add a regression test** as an entry in the `match_tests!` macro (not a
    handwritten test function).  The macro automatically tests all eligible
    tiers and re-runs with `unroll_limit=0`.
-4. **Run the full test suite** (`cargo test`) after each fix to ensure no
+5. **Run the full test suite** (`cargo test`) after each fix to ensure no
    regressions.
-5. **Commit infrastructure improvements separately** from bug fixes (e.g.
+6. **Write a post-mortem.**  After each fix, create a Markdown file in
+   `docs/bugs/` (e.g. `docs/bugs/001-tier3-range-merge.md`) documenting:
+   - **Bug summary** — pattern, input, expected vs actual, affected tier(s).
+   - **Root cause** — what went wrong and why.
+   - **Investigation narrative** — how you found it: which CLI commands,
+     which `--debug` output lines revealed the divergence, what hypotheses
+     were tested and ruled out.
+   - **What was hard** — what made the investigation slow or confusing
+     (e.g. misleading output, missing information in traces, state that
+     was difficult to inspect).
+   - **Tooling ideas** — concrete suggestions for CLI improvements, new
+     `--debug` output fields, dump enhancements, or new scripts that
+     would have shortened the investigation.
+
+   These post-mortems accumulate into a knowledge base that drives future
+   tooling improvements and helps onboard new contributors to the
+   debugging workflow.
+7. **Commit infrastructure improvements separately** from bug fixes (e.g.
    fuzz target enhancements, new scripts).
 
 ### Pattern Generator (`src/fuzz_gen.rs`)

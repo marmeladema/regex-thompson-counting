@@ -639,9 +639,58 @@ impl<'a> DfaMatcher<'a> {
 
 impl fmt::Debug for DfaMatcher<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DfaMatcher")
-            .field("current", &self.current)
-            .field("ever_matched", &self.ever_matched)
-            .finish()
+        let mut s = f.debug_struct("DfaMatcher");
+        s.field("current", &self.current);
+        if self.current != DfaStateId::DEAD {
+            let state = &self.cache.inner.states[self.current.idx()];
+            s.field("nfa_states", &state.nfa_states);
+            s.field("is_match", &state.is_match);
+            s.field("is_match_at_end", &state.is_match_at_end);
+            if !state.deferred_asserts.is_empty() {
+                s.field("deferred_asserts", &state.deferred_asserts);
+            }
+        }
+        s.field("ever_matched", &self.ever_matched);
+        s.finish()
+    }
+}
+
+impl fmt::Display for DfaMatcher<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.current == DfaStateId::DEAD {
+            return write!(f, "DFA[T1] state=DEAD matched={}", self.ever_matched);
+        }
+        let state = &self.cache.inner.states[self.current.idx()];
+        write!(
+            f,
+            "DFA[T1] state={} nfa={{{}}} matched={}",
+            self.current.0,
+            state
+                .nfa_states
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            self.ever_matched,
+        )?;
+        if state.is_match {
+            write!(f, " is_match")?;
+        }
+        if state.is_match_at_end {
+            write!(f, " mae")?;
+        }
+        if !state.deferred_asserts.is_empty() {
+            write!(
+                f,
+                " deferred=[{}]",
+                state
+                    .deferred_asserts
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )?;
+        }
+        Ok(())
     }
 }

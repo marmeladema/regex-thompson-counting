@@ -1376,11 +1376,58 @@ impl<'a> Tier4DfaMatcher<'a> {
 
 impl fmt::Debug for Tier4DfaMatcher<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Tier4DfaMatcher")
-            .field("current", &self.current)
-            .field("num_contexts", &self.contexts.len())
-            .field("ever_matched", &self.ever_matched)
-            .finish()
+        let mut s = f.debug_struct("Tier4DfaMatcher");
+        s.field("current", &self.current);
+        if self.current != DfaStateId::DEAD {
+            let st = &self.cache.states[self.current.idx()];
+            s.field("nfa_states", &st.nfa_states);
+            s.field("is_match", &st.is_match);
+            s.field("is_match_at_end", &st.is_match_at_end);
+        }
+        s.field("num_contexts", &self.contexts.len());
+        s.field("match_at_end", &self.match_at_end);
+        s.field("seed_origins_idx", &self.seed_origins_idx);
+        s.field("ever_matched", &self.ever_matched);
+        s.finish()
+    }
+}
+
+impl fmt::Display for Tier4DfaMatcher<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.current == DfaStateId::DEAD {
+            return write!(f, "DFA[T4] state=DEAD matched={}", self.ever_matched);
+        }
+        let state = &self.cache.states[self.current.idx()];
+        write!(
+            f,
+            "DFA[T4] state={} nfa={{{}}} matched={}",
+            self.current.0,
+            state
+                .nfa_states
+                .iter()
+                .map(|s: &StateIdx| s.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            self.ever_matched,
+        )?;
+        if state.is_match {
+            write!(f, " is_match")?;
+        }
+        if state.is_match_at_end {
+            write!(f, " mae")?;
+        }
+        write!(f, " contexts={}", self.contexts.len())?;
+        // Summarise non-empty contexts.
+        if !self.contexts.is_empty() {
+            let non_empty = self.contexts.iter().filter(|(_, c)| !c.is_empty()).count();
+            if non_empty > 0 {
+                write!(f, " ({non_empty} with active counters)")?;
+            }
+        }
+        if self.seed_origins_idx.is_some() {
+            write!(f, " +seed")?;
+        }
+        Ok(())
     }
 }
 

@@ -339,7 +339,7 @@ fn run_match(
                 // Feed entire input at once.
                 matcher.chunk(bytes);
                 if debug {
-                    eprintln!("[after chunk({:?})] {:#?}", input, matcher);
+                    eprintln!("[after chunk({:?})] {}", input, matcher);
                 }
             }
             Some(cs) => {
@@ -349,7 +349,7 @@ fn run_match(
                     if debug {
                         let chunk_str = String::from_utf8_lossy(chunk);
                         eprintln!(
-                            "[after chunk #{} {:?} (bytes {}..{})] {:#?}",
+                            "[after chunk #{} {:?} (bytes {}..{})] {}",
                             i,
                             chunk_str,
                             i * cs,

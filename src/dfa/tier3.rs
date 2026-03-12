@@ -2327,7 +2327,6 @@ macro_rules! step_slow_impl {
             self.match_at_end = false;
             self.verified_deferred_asserts.clear();
 
-
             // Advance existing post-break tails through this transition.
             // Each tail is a consuming NFA state from a previous counter
             // break.  If it consumed this byte and its target reaches
@@ -2499,8 +2498,7 @@ macro_rules! step_slow_impl {
             // be in the DFA state before those downstream counters have
             // actually reached their minimums.
             self.no_break_current = t.no_break;
-            let from_contaminated = self.current_has_break_extras
-                && self.regex.num_counters > 1;
+            let from_contaminated = self.current_has_break_extras && self.regex.num_counters > 1;
             self.last_nb_counter_free_mae = if from_contaminated {
                 self.clean_counter_free_mae(t)
             } else {
@@ -2838,8 +2836,8 @@ impl<'a> Tier3DfaMatcher<'a> {
                 && !self.has_live_instances
                 && self.post_break_tails.is_empty()
             {
-                let from_contaminated = self.current_has_break_extras
-                    && self.regex.num_counters > 1;
+                let from_contaminated =
+                    self.current_has_break_extras && self.regex.num_counters > 1;
                 self.current = t.no_break;
                 self.no_break_current = t.no_break;
                 let cf_mae = if from_contaminated {
@@ -2953,9 +2951,125 @@ impl<'a> Tier3DfaMatcher<'a> {
 
 impl fmt::Debug for Tier3DfaMatcher<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Tier3DfaMatcher")
-            .field("current", &self.current)
+        let mut s = f.debug_struct("Tier3DfaMatcher");
+        s.field("current", &self.current);
+        if self.current != DfaStateId::DEAD {
+            let state = &self.cache.inner.states[self.current.idx()];
+            s.field("nfa_states", &state.nfa_states);
+            s.field("is_match", &state.is_match);
+            s.field("is_match_at_end", &state.is_match_at_end);
+        }
+        s.field("no_break_current", &self.no_break_current)
             .field("ever_matched", &self.ever_matched)
-            .finish()
+            .field("match_at_end", &self.match_at_end)
+            .field("has_live_instances", &self.has_live_instances)
+            .field("current_has_break_extras", &self.current_has_break_extras)
+            .field("clean_nb", &self.clean_nb)
+            .field("post_break_tails_len", &self.post_break_tails.len())
+            .field(
+                "verified_deferred_asserts_len",
+                &self.verified_deferred_asserts.len(),
+            )
+            .field("use_ranges", &self.use_ranges);
+        s.finish()
+    }
+}
+
+impl fmt::Display for Tier3DfaMatcher<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.current == DfaStateId::DEAD {
+            write!(f, "DFA[T3] state=DEAD matched={}", self.ever_matched)?;
+            if self.has_live_instances {
+                write!(f, " live")?;
+            }
+            return Ok(());
+        }
+        let state = &self.cache.inner.states[self.current.idx()];
+        write!(
+            f,
+            "DFA[T3] state={} nfa={{{}}} matched={}",
+            self.current.0,
+            state
+                .nfa_states
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            self.ever_matched,
+        )?;
+        if state.is_match {
+            write!(f, " is_match")?;
+        }
+        if self.match_at_end {
+            write!(f, " mae")?;
+        }
+        if self.current_has_break_extras {
+            write!(f, " break_extras")?;
+        }
+        // Counter summary.
+        if self.has_live_instances {
+            if self.use_ranges {
+                let rc = &self.ranged_counters;
+                for ci in 0..rc.num_counters() {
+                    let entries = rc.entries(ci);
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    let count = entries.len();
+                    write!(f, "\n  c{ci}: {count} range(s) [")?;
+                    for (j, entry) in entries.iter().enumerate() {
+                        if j > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(
+                            f,
+                            "origin:{}={}-{}",
+                            entry.origin, entry.min_val, entry.max_val
+                        )?;
+                    }
+                    write!(f, "]")?;
+                }
+            } else {
+                let ic = &self.inst_counters;
+                for ci in 0..ic.num_counters() {
+                    let entries = ic.entries(ci);
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    let count = entries.len();
+                    write!(f, "\n  c{ci}: {count} inst [")?;
+                    for (j, entry) in entries.iter().enumerate() {
+                        if j > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}@{}", entry.origin, entry.value)?;
+                    }
+                    write!(f, "]")?;
+                }
+            }
+        }
+        if !self.post_break_tails.is_empty() {
+            write!(
+                f,
+                "\n  tails: [{}]",
+                self.post_break_tails
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )?;
+        }
+        if !self.verified_deferred_asserts.is_empty() {
+            write!(
+                f,
+                "\n  deferred: [{}]",
+                self.verified_deferred_asserts
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )?;
+        }
+        Ok(())
     }
 }

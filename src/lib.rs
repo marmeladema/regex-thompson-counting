@@ -3456,6 +3456,18 @@ impl<'a> fmt::Debug for AnyMatcher<'a> {
     }
 }
 
+impl<'a> fmt::Display for AnyMatcher<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Dfa(d) => fmt::Display::fmt(d, f),
+            Self::Tier2Dfa(d) => fmt::Display::fmt(d, f),
+            Self::Tier3Dfa(d) => fmt::Display::fmt(d, f),
+            Self::Tier4Dfa(d) => fmt::Display::fmt(d, f),
+            Self::Nfa(n) => fmt::Display::fmt(n, f),
+        }
+    }
+}
+
 /// Runs a Thompson NFA simulation with per-thread counter contexts.
 #[derive(Debug)]
 pub struct NfaMatcher<'a> {
@@ -3517,6 +3529,34 @@ enum AddStateOp {
     /// Push this state + context to `nlist` after its epsilon successors
     /// are handled.  Only used for consuming and Assert states.
     PostPush(StateIdx, CounterCtx),
+}
+
+impl fmt::Display for NfaMatcher<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "NFA threads={} nfa={{{}}} matched={}",
+            self.clist.len(),
+            self.clist
+                .iter()
+                .map(|(s, _)| s.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            self.ever_matched,
+        )?;
+        if self.at_start {
+            write!(f, " at_start")?;
+        }
+        if self.has_assert {
+            write!(f, " has_assert")?;
+        }
+        // Show non-empty counter contexts.
+        let with_ctx = self.clist.iter().filter(|(_, c)| !c.is_empty()).count();
+        if with_ctx > 0 {
+            write!(f, " ({with_ctx} with counters)")?;
+        }
+        Ok(())
+    }
 }
 
 impl<'a> NfaMatcher<'a> {
