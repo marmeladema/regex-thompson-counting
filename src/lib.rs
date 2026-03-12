@@ -9930,6 +9930,41 @@ mod tests {
                 ("aaaeeeeeecccccc", false), // not enough e iterations
             ],
         }
+        // Regression (Bug 17): `\b` deferred assertion at the start state
+        // gates a Split → CI-0 (optional counter body) / CI-1 (required
+        // counter body).  CI-1's seed at its first body byte appears in
+        // `analysis.break_seeds` because CInc-0's break path also reaches
+        // CI-1.  Before the fix, the Bug 14 filter incorrectly excluded
+        // this seed as break-gated even though the origin was
+        // reachable_without_break (i.e., unconditionally reachable from
+        // start).  The fix checks reachable_without_break before
+        // classifying resolved seeds as break-gated.
+        test_deferred_assert_rwb_break_seed {
+            pattern: r"^\b(b{2,8})?.{9,9}$",
+            memory: 1724,
+            min_tier: 1,
+            inputs: [
+                ("aaaaaaaaa", true),       // \b satisfied, (b{2,8})? zero iters, .{9,9} matches
+                ("bbaaaaaaaaa", true),      // \b, bb matches b{2,8}, then 9 a's
+                ("bbbbbbbbaaaaaaaaa", true), // \b, 8 b's, then 9 a's
+                ("bbbbbbbbb", true),        // \b, 2 b's from counter, then 7+2? Let NFA decide
+                ("aaaaaaaab", true),        // 9 chars, .{9,9} matches
+                ("aaaaaaaa", false),        // only 8 chars
+                ("aaaaaaaaaa", false),      // 10 chars, too many
+                (" aaaaaaaaa", false),      // \b fails at pos 0: prev=None + space = no boundary; also 10 chars
+            ],
+        }
+        test_deferred_assert_rwb_break_seed_star {
+            pattern: r"^\b(b{2,8}b)*.{9,9}$",
+            memory: 1757,
+            min_tier: 1,
+            inputs: [
+                ("aaaaaaaaa", true),        // zero iters of (b{2,8}b)*, .{9,9}
+                ("bbbaaaaaaa", false),       // 3 b's + 8 a's = 11, too many for .{9,9}
+                ("12345678a", true),         // .{9,9}
+                ("12345678", false),         // 8 chars
+            ],
+        }
         // Regression (defense-in-depth): `break_closure()` used to follow
         // through `CounterInstance` nodes, which meant that for sequential
         // multi-counter patterns like `.{1,2}.{4,4}$`, counter A's

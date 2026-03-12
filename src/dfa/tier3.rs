@@ -1485,10 +1485,15 @@ impl Tier3DfaCache {
                         .is_some_and(|pos| {
                             matches!(origin_actions[pos], Some(Tier3OriginKind::Increment { .. }))
                         })
-                        && !analysis
-                            .break_seeds
-                            .iter()
-                            .any(|bs| bs.counter == rs.0 && bs.origin == rs.1)
+                        // Exclude break-gated seeds UNLESS the origin is
+                        // reachable_without_break — meaning it's also
+                        // unconditionally reachable from the start state
+                        // (Bug 17).
+                        && !analysis.break_seeds.iter().any(|bs| {
+                            bs.counter == rs.0
+                                && bs.origin == rs.1
+                                && !analysis.reachable_without_break[rs.1.idx()]
+                        })
                 })
                 .cloned()
                 .collect();
@@ -1556,10 +1561,16 @@ impl Tier3DfaCache {
             // by the counter loop (Bug 16).
             for s in &resolved_seeds {
                 let is_pre = pre_seeds.iter().any(|p| p.0 == s.0 && p.1 == s.1);
-                let is_break_gated = analysis
-                    .break_seeds
-                    .iter()
-                    .any(|bs| bs.counter == s.0 && bs.origin == s.1);
+                // A resolved seed is break-gated only when it appears
+                // in analysis.break_seeds AND its origin is NOT
+                // reachable_without_break.  If the origin IS reachable
+                // without break, the seed is unconditionally reachable
+                // even though it also appears on a break path (Bug 17).
+                let is_break_gated = analysis.break_seeds.iter().any(|bs| {
+                    bs.counter == s.0
+                        && bs.origin == s.1
+                        && !analysis.reachable_without_break[s.1.idx()]
+                });
                 if !is_pre && !is_break_gated {
                     // Remap origin if Phase 1 consumed this seed's
                     // origin byte (Bug 16).
