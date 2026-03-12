@@ -10402,6 +10402,28 @@ mod tests {
                 ("xxxxxxxxxx", false),           // 10 x's but no trailing 'f'
             ],
         }
+
+        // Bug 26: Tier 3 false negative — counter-break deferred asserts
+        // not resolved mid-input.
+        //
+        // Pattern `.{2,38}c{4,10}\B` has a `\B` assertion gated behind
+        // c1's break path.  When c1 breaks with count >= 4, the deferred
+        // assert `\B` is emitted but was only evaluated at end-of-input.
+        // At end-of-input, `\B` fails (prev='c' word, next=end non-word).
+        // Mid-input with a following word char (e.g. 'a'), `\B` should
+        // pass (prev='c' word, next='a' word → non-boundary).
+        test_tier3_counter_break_deferred_assert_mid_input {
+            pattern: r".{2,38}c{4,10}\B",
+            memory: 1542,
+            min_tier: 2,
+            inputs: [
+                ("cccccca", true),              // 6c + a: c1 breaks, \B(c,a) passes
+                ("cccccc1", true),              // 6c + digit: \B(c,1) passes
+                ("cccc ", false),               // 4c + space: \B(c, ) fails (boundary)
+                ("ccccc", false),               // 5c at EOI: \B(c,end) fails
+                ("ccc", false),                 // 3c: c0 min=2 ok but c1 min=4 not reached
+            ],
+        }
     }
 
     /// Tier 2 encodes counter identity in `u64` bitmasks, so patterns with

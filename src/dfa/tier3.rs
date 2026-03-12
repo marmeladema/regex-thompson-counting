@@ -2869,6 +2869,29 @@ impl<'a> Tier3DfaMatcher<'a> {
                 return;
             }
 
+            // Resolve counter-break deferred asserts from the PREVIOUS
+            // step (Bug 26).  These asserts (e.g. `\B → Match`) were
+            // emitted when a counter broke but need the NEXT byte to
+            // evaluate word-boundary conditions.  The DFA state's own
+            // deferred_asserts are resolved during transition population
+            // (resolve_deferred), but counter-break asserts are runtime-
+            // only and live in verified_deferred_asserts.
+            if !self.verified_deferred_asserts.is_empty()
+                && self.current != DfaStateId::DEAD
+            {
+                let state = &self.cache.inner.states[self.current.idx()];
+                let prev = state.prev_byte_representative();
+                for &assert_idx in &self.verified_deferred_asserts {
+                    if let State::Assert { kind, out } = self.regex.states[assert_idx]
+                        && kind.eval(false, false, prev, Some(b)) == AssertEval::Pass
+                        && Self::can_reach_match_mid(out, prev, Some(b), self.regex)
+                    {
+                        self.ever_matched = true;
+                        break;
+                    }
+                }
+            }
+
             // --- Inline fast path ---
             if self.current == DfaStateId::DEAD {
                 self.step_from_dead(b);
@@ -2968,6 +2991,47 @@ impl<'a> Tier3DfaMatcher<'a> {
                 self.step_slow_instances(slot);
             }
         }
+    }
+
+    /// Walk epsilon transitions from `start` mid-input (not at end-of-input),
+    /// evaluating any assertions encountered with `prev` and `next`.  Returns
+    /// true if `Match` is reachable with all assertions passing.
+    ///
+    /// Similar to [`DfaState::can_reach_match_at_end`] but uses `at_end=false`
+    /// and `next=Some(byte)` for mid-input assertion evaluation.  This correctly
+    /// rejects paths through `$` or `\B` that only pass at end-of-input.
+    fn can_reach_match_mid(
+        start: StateIdx,
+        prev: Option<u8>,
+        next: Option<u8>,
+        regex: &Regex,
+    ) -> bool {
+        let states = &regex.states;
+        let mut stack = vec![start];
+        while let Some(idx) = stack.pop() {
+            if !regex.state_can_reach_match[idx.idx()] {
+                continue;
+            }
+            match states[idx] {
+                State::Match => return true,
+                State::Assert { kind, out } => {
+                    if kind.eval(false, false, prev, next) == AssertEval::Pass {
+                        stack.push(out);
+                    }
+                }
+                State::Split { out, out1 } => {
+                    stack.push(out);
+                    stack.push(out1);
+                }
+                State::CounterInstance { out, .. } => {
+                    stack.push(out);
+                }
+                // Consuming states don't fire here — the assert resolution
+                // is about reaching Match through epsilon transitions only.
+                _ => {}
+            }
+        }
+        false
     }
 
     pub fn finish(self) -> bool {
