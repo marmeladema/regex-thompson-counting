@@ -2281,6 +2281,15 @@ pub struct Tier3DfaMatcher<'a> {
     /// on the path to `$ → Match` from a counter that actually broke with
     /// enough value.  Evaluated in `finish()` at end-of-input.
     verified_deferred_asserts: Vec<StateIdx>,
+    /// True when the current DFA state (`self.current`) was reached via a
+    /// `with_break` transition and may contain NFA consuming states that
+    /// entered through a counter break path.  When true, the precomputed
+    /// `counter_free_match_at_end` and `nb_counter_free_mae` flags on
+    /// transitions FROM this state are unreliable — they may include
+    /// `$ → Match` paths from origins that are statically
+    /// `reachable_without_break` but entered this DFA state via a counter
+    /// break (Bug 19).
+    current_has_break_extras: bool,
     prefilter: Prefilter,
 }
 
@@ -2477,11 +2486,32 @@ macro_rules! step_slow_impl {
 
             // Select DFA successor.
             self.no_break_current = t.no_break;
-            self.last_nb_counter_free_mae = t.nb_counter_free_mae;
+            // When the FROM state was reached via a with_break transition
+            // and the pattern has ≥2 counters, origins from downstream
+            // counter break chains may be in the DFA state before those
+            // downstream counters have actually reached their minimums.
+            // The precomputed `counter_free_match_at_end` flag uses the
+            // static `reachable_without_break` property, which can't
+            // detect this dynamic contamination (Bug 19).
+            //
+            // With only 1 counter, any break-path origin is valid once
+            // the single counter breaks — no multi-counter chain issue.
+            // Use `clean_counter_free_mae()` (which restricts to origins
+            // also in the no-break FROM state) only for multi-counter
+            // patterns to avoid false negatives (Bug 20/21).
+            let from_contaminated = self.current_has_break_extras
+                && self.regex.num_counters > 1;
+            self.last_nb_counter_free_mae = if from_contaminated {
+                self.clean_counter_free_mae(t)
+            } else {
+                t.nb_counter_free_mae
+            };
             if t.is_counting && any_can_break {
                 self.current = t.with_break;
+                self.current_has_break_extras = true;
             } else {
                 self.current = t.no_break;
+                self.current_has_break_extras = false;
             }
             if !t.is_counting {
                 let (m, mae) = if any_can_break {
@@ -2505,7 +2535,12 @@ macro_rules! step_slow_impl {
                 if t.no_break_is_match {
                     self.ever_matched = true;
                 }
-                if t.counter_free_match_at_end {
+                let cf_mae = if from_contaminated {
+                    self.clean_counter_free_mae(t)
+                } else {
+                    t.counter_free_match_at_end
+                };
+                if cf_mae {
                     self.match_at_end = true;
                 }
             }
@@ -2571,6 +2606,11 @@ impl<'a> Tier3DfaMatcher<'a> {
             post_break_tails: Vec::new(),
             next_post_break_tails: Vec::new(),
             verified_deferred_asserts: Vec::new(),
+            // The start state may include NFA states from break paths
+            // (the start closure is computed with follow_break=true), but
+            // these are freshly seeded — not from a previous counter break.
+            // Treat the start state as uncontaminated.
+            current_has_break_extras: false,
             cache,
             memory,
             regex,
@@ -2585,6 +2625,43 @@ impl<'a> Tier3DfaMatcher<'a> {
 
     step_slow_impl!(step_slow_ranged, ranged_counters, next_ranged);
     step_slow_impl!(step_slow_instances, inst_counters, next_instances);
+
+    /// Check whether `counter_free_match_at_end` is trustworthy when the
+    /// FROM state was reached via a `with_break` transition (contaminated).
+    ///
+    /// When contaminated, some origins in the FROM state entered via counter
+    /// breaks — they are NOT genuinely counter-free even though they may be
+    /// statically `reachable_without_break`.  To avoid false positives
+    /// (Bug 19), we restrict the check to origins that are also present in
+    /// the no-break version of the FROM state (`self.no_break_current`).
+    ///
+    /// Returns `true` only if at least one origin satisfies all three
+    /// conditions:
+    /// 1. Present in the no-break FROM state's `nfa_states`
+    /// 2. `reachable_without_break[origin]` is true
+    /// 3. `target_is_match_at_end[origin]` is true
+    /// 4. The origin's action is NOT an `Increment` (counter-free path)
+    ///
+    /// This preserves legitimate counter-free match-at-end paths (Bug 20:
+    /// `^(.{0,2}|d+)$` on "ddd" where the `d+` exit to `$ → Match` is
+    /// genuinely counter-free) while blocking false positives from origins
+    /// that entered the DFA state only through counter breaks.
+    #[inline]
+    fn clean_counter_free_mae(&self, t: &Transition) -> bool {
+        if self.no_break_current == DfaStateId::DEAD {
+            return false;
+        }
+        let nb_nfa = &self.cache.inner.states[self.no_break_current.idx()].nfa_states;
+        t.origin_keys
+            .iter()
+            .zip(t.origin_actions.iter())
+            .any(|(&origin, action)| {
+                !matches!(action, Some(Tier3OriginKind::Increment { .. }))
+                    && self.analysis.target_is_match_at_end[origin.idx()]
+                    && self.analysis.reachable_without_break[origin.idx()]
+                    && nb_nfa.contains(&origin)
+            })
+    }
 
     fn step_from_dead(&mut self, byte: u8) {
         if self.has_live_instances {
@@ -2610,6 +2687,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         self.current = trans.no_break;
         self.no_break_current = trans.no_break;
         self.last_nb_counter_free_mae = trans.nb_counter_free_mae;
+        self.current_has_break_extras = false;
 
         if !trans.is_counting {
             if trans.no_break_is_match {
@@ -2714,11 +2792,24 @@ impl<'a> Tier3DfaMatcher<'a> {
             {
                 self.current = t.no_break;
                 self.no_break_current = t.no_break;
-                self.last_nb_counter_free_mae = t.nb_counter_free_mae;
-                // Use the counter-free filtered flag instead of the raw
-                // no_break_is_match_at_end, which may include `$ → Match`
-                // from counter-dependent origins (Bug 13).
-                self.match_at_end = t.nb_counter_free_mae;
+                // When the FROM state was reached via a with_break
+                // transition and the pattern has ≥2 counters,
+                // downstream counter break chains may produce origins
+                // that haven't met their counters' minimums (Bug 19).
+                // Use `clean_counter_free_mae()` to restrict to origins
+                // also in the no-break FROM state.  With 1 counter,
+                // break-path origins are valid (Bug 20/21).
+                let cf_mae = if self.current_has_break_extras
+                    && self.regex.num_counters > 1
+                {
+                    self.clean_counter_free_mae(t)
+                } else {
+                    t.nb_counter_free_mae
+                };
+                self.last_nb_counter_free_mae = cf_mae;
+                self.match_at_end = cf_mae;
+                // No counter broke → successor is no_break → not contaminated.
+                self.current_has_break_extras = false;
                 if t.no_break_is_match {
                     self.ever_matched = true;
                 }

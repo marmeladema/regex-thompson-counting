@@ -9997,6 +9997,103 @@ mod tests {
                 ("aaaaaaa", false),    // too many
             ],
         }
+        // Bug 19: Tier 3 false positive from counter_free_match_at_end on
+        // with_break DFA states.  When counter 0 breaks, the with_break
+        // closure follows CInc-0 break → CI-1 → ... → CInc-1 break → the
+        // optional suffix's consuming state (Byte 'a').  This state is
+        // statically `reachable_without_break` (via the initial Split that
+        // skips the optional counter group), so `counter_free_match_at_end`
+        // fires.  But the suffix state entered the DFA state via a counter
+        // break, not via the counter-free path.  The fix tracks whether the
+        // current DFA state was reached via a with_break transition and
+        // suppresses `counter_free_match_at_end` in that case.
+        //
+        // Minimal reproducer: 2 chained counters needing 20+ chars with a
+        // counter-free suffix `a?$`, tested on 12 chars (too short for the
+        // counters to complete).
+        test_tier3_with_break_counter_free_mae_false_positive {
+            pattern: r"^(.{10,40}{2,2})?a?$",
+            memory: 1198,
+            min_tier: 3,
+            inputs: [
+                ("", true),             // optional group skips, a? skips, $ matches
+                ("a", true),            // optional group skips, a? matches 'a', $ matches
+                ("aa", false),          // optional group can't complete, suffix too short
+                ("aaaaaaaaa", false),   // 9 chars — counter 0 can't break (needs 10)
+                ("aaaaaaaaaaaa", false), // 12 chars — counter 0 breaks, counter 1 can't complete
+                ("aaaaaaaaaaaaaaaaaaa", false), // 19 chars — still short of 20
+                ("aaaaaaaaaaaaaaaaaaaa", true), // 20 chars — both counters complete exactly
+                ("aaaaaaaaaaaaaaaaaaaaa", true), // 21 chars — counters + suffix 'a'
+            ],
+        }
+        // Same pattern shape as Bug 19 but with 8 chained counters (the
+        // original fuzz artifact).
+        test_tier3_with_break_counter_free_mae_8_counters {
+            pattern: r"^(.{7,40}{8,8})?a?$",
+            memory: 1798,
+            min_tier: 3,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("aa", false),
+                // 44 chars — need 56 minimum (8 × 7)
+                ("aad0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false),
+                // 55 chars — still 1 short of 56
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false),
+                // 56 chars — exactly 8 × 7, counters complete
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true),
+            ],
+        }
+        // Bug 20 regression test: The Bug 19 fix must NOT suppress
+        // legitimate counter-free match-at-end paths.  In `^(.{0,2}|d+)$`,
+        // the `d+` loop exits to `$ → Match` through a Split — this path
+        // is genuinely counter-free (no CInc involved).  When the `.{0,2}`
+        // counter breaks, the with_break DFA state includes both the `d+`
+        // loop state (Byte 'd') and the counter's break-path states.  The
+        // `d+` origin is also in the no-break DFA state (entered via the
+        // initial Split), so `clean_counter_free_mae()` correctly preserves
+        // it while the Bug 19 fix blocks origins that entered only via
+        // counter breaks.
+        test_tier3_clean_counter_free_mae_preserves_legit {
+            pattern: r"^(.{0,2}|d+)$",
+            memory: 1130,
+            min_tier: 1,
+            inputs: [
+                ("", true),        // optional .{0,2} matches empty via 0-count
+                ("d", true),       // d+ matches, or .{0,2} matches 1 char
+                ("dd", true),      // d+ matches, or .{0,2} matches 2 chars
+                ("ddd", true),     // d+ matches 3 'd's → $ → Match
+                ("dddddd", true),  // d+ matches 6 'd's
+                ("a", true),       // .{0,2} matches 1 char
+                ("ab", true),      // .{0,2} matches 2 chars
+                ("abc", false),    // too long for .{0,2}, not all 'd' for d+
+                ("dda", false),    // d+ fails (non-d), .{0,2} only covers 2
+            ],
+        }
+        // Bug 21 regression test: With a single counter (.{0,36} → {1,36}),
+        // the counter's break path leads into an unrolled c chain → suffix.
+        // When the counter breaks, the with_break DFA state includes suffix
+        // origins (Byte 'e', Byte 'a' variants).  These origins are NOT in
+        // the no-break DFA state, but with a single counter their presence
+        // is valid — the counter DID break.  The Bug 19 fix must not
+        // suppress `counter_free_mae` for single-counter patterns, or this
+        // gives a false negative.
+        test_tier3_single_counter_break_path_mae {
+            pattern: r"^.{0,36}c{2,12}e?((a?a?)?(a?a?)?)?$",
+            memory: 2187,
+            min_tier: 2,
+            inputs: [
+                ("cc", true),       // .{0,36} = "", c{2,12} = "cc"
+                ("ccc", true),      // .{0,36} = "", c{2,12} = "ccc"
+                ("cce", true),      // .{0,36} = "", c{2,12} = "cc", e? = "e"
+                ("c", false),       // c{2,12} needs at least 2
+                ("e", false),       // no 'c' prefix
+                ("cccccccccccccc", true),  // 14 c's: .{0,36} eats 2, c{2,12} eats 12
+                ("acccc", true),    // .{0,36} = "a", c{2,12} = "cccc"
+                ("accea", true),    // .{0,36} = "a", c{2,12} = "cc", e? = "e", suffix = "a"
+            ],
+        }
+
         // Regression (defense-in-depth): `break_closure()` used to follow
         // through `CounterInstance` nodes, which meant that for sequential
         // multi-counter patterns like `.{1,2}.{4,4}$`, counter A's
