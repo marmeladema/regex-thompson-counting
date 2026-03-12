@@ -19,164 +19,139 @@ c2 for `.{3,28}`).  Each repetition copy has the NFA structure:
 ByteClass → Split(optional '1') → Assert(\B) → CI(counter) → body → CInc
 ```
 
-Two independent mechanisms contributed to the false positive:
+The `with_break` DFA state includes NFA states from both the no-break path
+and all counter break paths.  The break path from c0's CInc crosses a
+consuming state (state 8, the prefix ByteClass for the second repetition)
+before reaching `\B → CI(c1) → c1 body`.  Because the break path crosses
+a consuming state, the `break_seeds` epsilon walk (which only follows
+non-consuming states) does NOT produce a break_seed entry for c1.
 
-### Problem 1: `analyze_target` follows assertion states unconditionally
+The `with_break` DFA state stores `\B` as a deferred assertion.  During
+`populate()`, the deferred assertion is resolved: if `\B` passes between
+the previous byte and the transition byte, the resolved closure produces
+seeds for c1 and c2 (via the epsilon path through `\B → CI → body`).
 
-The `analyze_target()` function performs a DFS from a target state to find
-consuming states (advance origins) and check `is_match_at_end`.  Its
-`State::Assert` arm followed all assertion kinds unconditionally:
+These `resolved_seeds` were merged into the transition's unconditional
+`seeds` array.  The existing `is_break_gated` check (Bug 17) only filters
+resolved seeds that appear in `analysis.break_seeds` — but there IS no
+break_seeds entry (the epsilon walk stopped at the consuming state).  So
+the resolved c1/c2 seeds passed the filter and became unconditional seeds
+on the transition.
 
-```rust
-State::Assert { out, .. } => stack.push(out),
-```
+Result: c1 and c2 were seeded on EVERY transition from the `with_break`
+state, not just when c0 actually broke.  This gave c2 enough extra
+counting steps to reach its minimum on short inputs where the NFA
+correctly reports no match.
 
-This meant consuming states *behind* a `\B` assertion were included in
-`advance_origins`.  The tail mechanism used these origins to seed downstream
-counters (c1 from c0's break, c2 from c1's break) without any assertion
-gating.  The seeded counters counted freely regardless of whether `\B`
-would actually pass.
-
-### Problem 2: `finish()` accepted `match_at_end` without EOI assertion check
-
-When counter c2 reached value 3 (≥ min 3) and `break_is_match_at_end`
-fired, it set `self.match_at_end = true`.  In `finish()`, this flag was
-accepted unconditionally:
-
-```rust
-if self.match_at_end {
-    return true;
-}
-```
-
-The `\B` assertion passes mid-input (between two word characters — no word
-boundary), so counter seeding appeared valid during matching.  But at
-end-of-input, `\B` *fails* (there IS a word boundary after the last 'a').
-The `match_at_end` check ran before `resolve_verified_deferred_asserts`,
-so the match was accepted without verifying that `\B` holds at EOI.
-
-### Combined effect
-
-c0 counted through the body, broke, and the tail mechanism seeded c1
-through the assertion-gated path (Problem 1).  c1 counted and broke,
-seeding c2 the same way.  c2 reached value 3 and set `match_at_end`
-(via `break_is_match_at_end`).  `finish()` returned true without checking
-whether `\B` passes at EOI (Problem 2).
+For the 10-a input: the pattern requires 3 reps × (1 prefix byte +
+3 body bytes) = 12 bytes minimum.  With 10 bytes it's impossible, but
+the over-seeding gave c2 count 3 (≥ min) and `break_is_match_at_end`
+fired.
 
 ## Fix
 
-Two complementary changes:
-
-### Fix 1: `analyze_target` — block non-End Assert states
-
-Changed the `State::Assert` arm to only follow `AssertKind::End` (`$`):
-
-```rust
-State::Assert { kind, out } => {
-    if kind == AssertKind::End {
-        stack.push(out);
-    }
-}
-```
-
-Non-End assertions (`\b`, `\B`) are deferred assertions resolved at DFA
-transition time.  Consuming states behind them are already handled by the
-DFA's epsilon closure and deferred assertion resolution.  Including them
-in `advance_origins` caused the tail mechanism to bypass assertion checking.
-
-`$` (End) is still followed because it leads to `Match` (handled by
-`advance_is_match_at_end`) and any consuming states after `$` should still
-be discovered.
-
-### Fix 2: `finish()` — re-evaluate deferred asserts at EOI
-
-When `match_at_end` is true and `verified_deferred_asserts` is non-empty,
-re-evaluate each verified deferred assertion with EOI context (`is_end=true`,
-`next_byte=None`) before accepting:
+Broadened the `is_break_gated` check for resolved seeds in `populate()`:
+a resolved seed is now break-gated whenever its origin is NOT in
+`reachable_without_break`, regardless of whether it appears in
+`analysis.break_seeds`.
 
 ```rust
-if self.match_at_end {
-    if self.verified_deferred_asserts.is_empty() {
-        return true;
-    }
-    let any_pass = self.verified_deferred_asserts.iter().any(|&assert_idx| {
-        if let State::Assert { kind, out } = self.regex.states[assert_idx] {
-            kind.eval(false, true, prev, None) == AssertEval::Pass
-                && DfaState::can_reach_match_at_end(out, prev, self.regex)
-        } else {
-            false
-        }
-    });
-    if any_pass {
-        return true;
-    }
-}
+// Before (Bug 17):
+let is_break_gated = analysis.break_seeds.iter().any(|bs| {
+    bs.counter == s.0 && bs.origin == s.1
+        && !analysis.reachable_without_break[s.1.idx()]
+});
+
+// After (Bug 40):
+let is_break_gated = !analysis.reachable_without_break[s.1.idx()];
 ```
 
-This is a safety net: even if Problem 1's fix prevents most assertion-gated
-seeding, the EOI check catches any remaining cases where `match_at_end` was
-set through an assertion-gated path that doesn't hold at end-of-input.
+Origins only reachable through CInc break paths are counter-break-
+dependent by definition.  The old check missed cases where the break
+path crosses a consuming state (no `break_seeds` entry), but the
+resolved seed from deferred assertion resolution still reached the
+downstream counter.
 
-When `verified_deferred_asserts` is empty, `match_at_end` is accepted
-unconditionally (no assertion-gated paths involved).
+The same fix was applied to the `pre_seeds` filter (resolved seeds
+on L=1 bodies for counting transitions).
+
+The tail mechanism (`post_break_tails` + tail-to-counter handoff)
+correctly handles the actual seeding with proper byte timing: the
+tail consumes the prefix byte, advances through `\B` (depositing it
+as a verified deferred assert), and seeds the downstream counter on
+the next byte.
 
 ## Investigation narrative
 
 1. The `fuzz_match` fuzzer found the crash artifact.  Decoded the seed to
-   get pattern `^((.1?\B.{3,28}){3,3}|(a?a?)?)$` and input `"aaaaaaaaaa"`.
+   get pattern `^((.1?\B.{3,28}){3,3}|(a?a?)?)$` and input
+   `"aaaaaaaaaaaa"` (12 a's).
 
-2. Confirmed the disagreement:
-   ```
-   cargo run --release -- match --tier 0 '<pattern>' 'aaaaaaaaaa'  → NO MATCH
-   cargo run --release -- match --tier 3 '<pattern>' 'aaaaaaaaaa'  → MATCH (wrong)
-   ```
+2. Confirmed the disagreement: Tier 3 said NO MATCH for 10 a's (should be
+   NO MATCH — false positive on unfixed code) and also found that 12 a's
+   SHOULD match (3 reps × 4 bytes = 12).
 
-3. Used `--debug --chunk-size 1` to trace byte-by-byte.  The Tier 3 trace
-   showed counters c0/c1/c2 all reaching their minimum value and
-   `match_at_end` being set.  The NFA trace showed no active states
-   surviving past the first few bytes because `\B` fails at relevant
-   positions.
+3. First attempted fix: blocking non-End Assert traversal in
+   `analyze_target()` and `break_consuming_tails()`.  This prevented the
+   tail mechanism from crossing `\B`.  Fixed the 10-a false positive but
+   introduced a false negative on 12 a's — the tail mechanism was the ONLY
+   way to seed c1/c2 (break_seeds was empty, resolved_seeds were filtered).
 
-4. Examined the `analyze_target` code and found the unconditional
-   `State::Assert { out, .. } => stack.push(out)` — this included
-   consuming states behind `\B` in advance origins.
+4. Second attempted fix: re-evaluating deferred asserts at EOI in
+   `finish()` before accepting `match_at_end`.  Wrong because
+   `verified_deferred_asserts` are assertions that passed mid-input and
+   don't need to pass at EOI — `match_at_end` from a counter break is
+   valid if the assertion passed when the counter was counting.
 
-5. Examined `finish()` and found `match_at_end` was checked before any
-   deferred assertion verification.
+5. Traced the seeding path: DFA `populate()` → `resolve_deferred()` →
+   `resolved_seeds` → merged into `seeds`.  The `is_break_gated` check
+   used `analysis.break_seeds` which was empty (break path crosses
+   consuming state 8, epsilon walk didn't find CI).  So resolved c1/c2
+   seeds became unconditional.
 
-6. Applied both fixes and verified the pattern returns NO MATCH on all
-   tiers.
+6. Correct fix: broadened `is_break_gated` to check `reachable_without_break`
+   directly.  This subsumes the old `analysis.break_seeds` check and
+   correctly identifies all counter-break-dependent seeds.
+
+7. Verified: NFA and Tier 3 agree on all inputs 0-19 a's.  The fuzz artifact
+   no longer crashes.  All 456 tests pass.
 
 ## What was hard
 
-- The pattern has complex structure: outer `{3,3}` unrolled into three
-  counter copies, each with an optional literal `1?`, a `\B` assertion,
-  and a variable-length `.{3,28}` body.  Plus an alternation with `(a?a?)?`.
-  Understanding which NFA states correspond to which counters required
-  careful examination of the `dump` output.
+- **Three failed fix attempts before finding the correct one.**  The
+  first two fixes targeted the wrong mechanism (tail traversal and
+  finish() assertion re-evaluation).  The root cause was in the seed
+  generation during DFA transition compilation — a subtle interaction
+  between deferred assertion resolution, the `is_break_gated` filter,
+  and the `break_seeds` epsilon walk.
 
-- The `\B` assertion is context-dependent: it passes mid-input (between
-  word chars) but fails at EOI.  This makes the bug position-dependent —
-  the counter seeding appears "correct" during matching but produces a
-  wrong result at the boundary.
+- **Counter-to-counter seeding has THREE independent paths:** (a)
+  `break_seeds` (epsilon-only, with deferred assertion gating), (b) the
+  tail mechanism (consuming-state tracking with byte-by-byte advancement),
+  and (c) resolved_seeds from deferred assertions on the `with_break` DFA
+  state.  Path (c) was the problematic one, but path (b) is the correct
+  one for this pattern.  Understanding which path does what required
+  careful tracing through `populate()`.
 
-- Two independent problems needed fixing.  Fix 1 alone might have been
-  sufficient for this specific pattern, but Fix 2 provides a necessary
-  safety net for other patterns where assertion-gated states enter the
-  DFA through paths not controlled by `analyze_target`.
+- **The false negative from the first fix was caught by the fuzz artifact**
+  but on a different input (12 a's instead of 10 a's).  The artifact
+  generates multiple inputs from the seed, and the 12-a input exercises
+  the legitimate match path.  Without the artifact's broader coverage,
+  the false negative might have been missed.
 
 ## Tooling ideas
 
-- The `--debug` trace could show which deferred assertions are currently
-  verified/pending and their pass/fail status at each byte position.
-  This would make it easier to see when an assertion is "contaminating"
-  downstream counter seeding.
+- The `--debug` trace should show the source of each counter seed:
+  "seeded via tail handoff at state X" vs "seeded via unconditional
+  seed on transition" vs "seeded via break_seed trigger=cN".  This
+  would immediately reveal when a counter is being seeded through the
+  wrong mechanism.
 
-- A `dump --dfa` mode showing the `advance_origins` for each tail entry
-  would help identify when assertion-gated states are incorrectly included
-  in seeding paths.
+- A `dump --dfa` mode showing the transition's `seeds`, `break_seeds`,
+  `pre_seeds`, and `resolved_seeds` separately (rather than merged) would
+  help debug seed-related bugs without reading the `populate()` code.
 
-- The `finish()` method's decision tree is complex (match_at_end,
-  deferred asserts, counter-free paths).  A `--debug` flag that shows
-  which branch of `finish()` fired and why would speed up EOI-related
-  bug investigations.
+- The `break_seeds` computation could warn when a CInc break path
+  crosses a consuming state without producing any break_seed entries.
+  This gap in coverage (no break_seeds, but resolved_seeds can still
+  reach the downstream counter) is a known source of bugs.

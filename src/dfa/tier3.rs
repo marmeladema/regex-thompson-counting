@@ -1621,15 +1621,11 @@ impl Tier3DfaCache {
                         .is_some_and(|pos| {
                             matches!(origin_actions[pos], Some(Tier3OriginKind::Increment { .. }))
                         })
-                        // Exclude break-gated seeds UNLESS the origin is
-                        // reachable_without_break — meaning it's also
-                        // unconditionally reachable from the start state
-                        // (Bug 17).
-                        && !analysis.break_seeds.iter().any(|bs| {
-                            bs.counter == rs.0
-                                && bs.origin == rs.1
-                                && !analysis.reachable_without_break[rs.1.idx()]
-                        })
+                        // Bug 40: exclude break-gated seeds — origins NOT
+                        // reachable_without_break are counter-break-
+                        // dependent and should not be treated as
+                        // unconditional pre_seeds.
+                        && analysis.reachable_without_break[rs.1.idx()]
                 })
                 .cloned()
                 .collect();
@@ -1697,16 +1693,24 @@ impl Tier3DfaCache {
             // by the counter loop (Bug 16).
             for s in &resolved_seeds {
                 let is_pre = pre_seeds.iter().any(|p| p.0 == s.0 && p.1 == s.1);
-                // A resolved seed is break-gated only when it appears
-                // in analysis.break_seeds AND its origin is NOT
-                // reachable_without_break.  If the origin IS reachable
-                // without break, the seed is unconditionally reachable
-                // even though it also appears on a break path (Bug 17).
-                let is_break_gated = analysis.break_seeds.iter().any(|bs| {
-                    bs.counter == s.0
-                        && bs.origin == s.1
-                        && !analysis.reachable_without_break[s.1.idx()]
-                });
+                // Bug 40: a resolved seed is break-gated whenever its
+                // origin is NOT reachable_without_break.  Origins only
+                // reachable through CInc break paths are counter-break-
+                // dependent regardless of whether they appear in
+                // analysis.break_seeds.  When the break path crosses a
+                // consuming state before reaching the downstream CI,
+                // the epsilon-only break_seeds walk doesn't find the
+                // CI and produces no break_seeds entry.  But the
+                // resolved seed from deferred assertion resolution
+                // (e.g. \B on the with_break DFA state) still reaches
+                // the downstream counter.  Treating it as unconditional
+                // would seed the counter on every transition, even when
+                // the triggering counter hasn't broken.
+                //
+                // If the origin IS reachable without break, the seed
+                // is unconditionally reachable even though it may also
+                // appear on a break path (Bug 17).
+                let is_break_gated = !analysis.reachable_without_break[s.1.idx()];
                 if !is_pre && !is_break_gated {
                     // Remap origin if Phase 1 consumed this seed's
                     // origin byte (Bug 16).
@@ -2107,27 +2111,7 @@ fn analyze_target(
                 stack.push(out1);
                 stack.push(out);
             }
-            State::Assert { kind, out } => {
-                // Bug 40: do NOT follow non-End Assert states when
-                // collecting advance_origins.  Consuming states behind
-                // a deferred assertion (e.g. `\B`) are only reachable
-                // if the assertion passes at runtime.  Including them
-                // in advance_origins unconditionally causes the tail
-                // mechanism to seed downstream counters without
-                // checking the assertion, producing false positives.
-                //
-                // The DFA's epsilon closure properly defers non-End
-                // asserts and resolves them on the next byte, so
-                // consuming states behind assertions are already
-                // handled correctly by the DFA transition machinery.
-                //
-                // End Assert (`$`) is followed: it leads to Match
-                // (handled by advance_is_match_at_end), and any
-                // consuming states after `$` should still be found.
-                if kind == AssertKind::End {
-                    stack.push(out);
-                }
-            }
+            State::Assert { out, .. } => stack.push(out),
             State::CounterInstance { out, .. } => stack.push(out),
             State::CounterIncrement {
                 counter,
@@ -3418,40 +3402,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             return true;
         }
         if self.match_at_end {
-            // Bug 40: when the DFA state is contaminated (break_extras +
-            // multi-counter) and verified_deferred_asserts is non-empty,
-            // the match_at_end may have been set by a counter break whose
-            // seeding path was gated by assertions (e.g. `\B`).  Those
-            // assertions passed mid-input (between word chars) but may
-            // fail at end-of-input.  Re-evaluate them with EOI context
-            // before accepting.
-            //
-            // When verified_deferred_asserts is empty, the match_at_end
-            // is unconditionally valid (no assertion-gated seeding paths).
-            if self.verified_deferred_asserts.is_empty() {
-                return true;
-            }
-            // Check if ANY verified deferred assert passes at EOI.  If
-            // none pass, the assertion-gated path that seeded the counter
-            // is invalid at end-of-input, so suppress match_at_end.
-            // If at least one passes, the match_at_end is valid.
-            //
-            // Use the DFA state's prev byte for assertion evaluation.
-            let state = &self.cache.inner.states[self.current.idx()];
-            let prev = state.prev_byte_representative();
-            let any_pass = self.verified_deferred_asserts.iter().any(|&assert_idx| {
-                if let State::Assert { kind, out } = self.regex.states[assert_idx] {
-                    kind.eval(false, true, prev, None) == AssertEval::Pass
-                        && DfaState::can_reach_match_at_end(out, prev, self.regex)
-                } else {
-                    false
-                }
-            });
-            if any_pass {
-                return true;
-            }
-            // None of the verified deferred asserts pass at EOI.
-            // Fall through to check other match sources.
+            return true;
         }
         // Note: we intentionally do NOT check `state.is_match_at_end` here.
         // For non-counting transitions, `self.match_at_end` already captures

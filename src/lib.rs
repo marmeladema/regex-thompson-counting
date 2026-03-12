@@ -10758,27 +10758,26 @@ mod tests {
         // -- Bug 40 regression: assertion-gated counter seeding false positive --
         // The {3,3} outer repetition is unrolled into three counter copies.
         // Each has structure: ByteClass → Split(optional '1') → Assert(\B)
-        // → CI(counter) → body → CInc.  The DFA epsilon closure follows
-        // through \B states, including consuming states behind them.  When
-        // the counter loop processes these states it seeds downstream
-        // counters (c1, c2) without gating on the \B assertion.
+        // → CI(counter) → body → CInc.  The with_break DFA state has \B
+        // as a deferred assertion; when resolved, it produces seeds for
+        // downstream counters (c1, c2).  These resolved seeds were merged
+        // into the transition's unconditional seed list, causing c1/c2
+        // to be seeded on every transition from the with_break state —
+        // even when the triggering counter (c0) hadn't actually broken.
         //
-        // At end-of-input, \B fails (word boundary after last 'a'), but c2
-        // reaches value 3 (≥ min) and break_is_match_at_end fires.  The
-        // match_at_end flag was accepted in finish() without verifying the
-        // deferred \B assertions at EOI → false positive.
-        //
-        // Fix 1: analyze_target() no longer follows non-End Assert states
-        // when collecting advance_origins, preventing tail-based seeding
-        // through assertion-gated paths.
-        // Fix 2: finish() re-evaluates verified_deferred_asserts with EOI
-        // context before accepting match_at_end, as a safety net.
+        // Fix: treat resolved seeds whose origin is not
+        // reachable_without_break as break-gated (suppress from
+        // unconditional seeds).  The tail mechanism (post_break_tails +
+        // tail-to-counter handoff) handles the actual seeding with
+        // correct byte timing.
         test_tier3_assert_gated_counter_seeding {
             pattern: r"^((.1?\B.{3,28}){3,3}|(a?a?)?)$",
             memory: 1857,
             min_tier: 3,
             inputs: [
-                ("aaaaaaaaaa", false),            // Bug 40 crash: 10 a's, \B fails at EOI
+                ("aaaaaaaaaa", false),            // Bug 40 crash: 10 a's, too short for 3 reps
+                ("aaaaaaaaaaaa", true),            // 12 a's: 3 reps × (1 prefix + 3 body) = 12
+                ("aaaaaaaaaaaaa", true),           // 13 a's: extra body bytes absorbed
                 ("a1aa1aa1aaa", false),            // has '1' but \B fails at word boundaries
                 ("", true),                        // empty: outer ? skips, $ matches
                 ("a", true),                       // a?a? matches 'a'
