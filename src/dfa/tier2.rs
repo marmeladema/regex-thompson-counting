@@ -694,10 +694,14 @@ impl Tier2DfaCache {
         // When false, resolved_seeds are speculative and should NOT be
         // used on non-counting transitions (the body byte doesn't match).
         let mut resolved_body_consumed = false;
+        // Targets from consuming states on CInc break paths, consumed on
+        // this transition.  These states are only reachable when the
+        // deferred assertion passes AND the counter breaks, so they are
+        // added exclusively to the `with_break` DFA successor (Bug 18).
+        let mut resolved_break_targets: Vec<StateIdx> = Vec::new();
 
         if from != DfaStateId::DEAD {
             let from_state = &self.inner.states[from.idx()];
-
             // Phase 1: resolve deferred assertions.
             let extra = from_state.resolve_deferred(byte, regex);
             if !extra.is_empty() {
@@ -735,11 +739,14 @@ impl Tier2DfaCache {
                     while mask != 0 {
                         let ci = mask.trailing_zeros() as usize;
                         mask &= mask - 1;
-                        if regex.counter_break_can_match[ci] {
-                            for s in regex.states.iter() {
-                                if let State::CounterIncrement { counter, out1, .. } = *s
-                                    && counter.idx() == ci
-                                {
+                        for s in regex.states.iter() {
+                            if let State::CounterIncrement { counter, out1, .. } = *s
+                                && counter.idx() == ci
+                            {
+                                // Check direct (epsilon-only) match from
+                                // break target — gated on the precomputed
+                                // flag to avoid the walk when unnecessary.
+                                if regex.counter_break_can_match[ci] {
                                     let (direct, _at_end) =
                                         break_path_match_kind(out1, &regex.states);
                                     if direct {
@@ -750,6 +757,26 @@ impl Tier2DfaCache {
                                     // always has a next byte).  EOI
                                     // break-through-$ is handled by
                                     // resolve_deferred_cinc_at_end().
+                                }
+
+                                // Collect consuming states on the break
+                                // path and try to consume `byte` at them.
+                                // These targets are only reachable when
+                                // the counter breaks AND the deferred
+                                // assertion passed, so they go into
+                                // resolved_break_targets for the
+                                // with_break DFA successor (Bug 18).
+                                //
+                                // NOT gated on counter_break_can_match:
+                                // that flag only checks epsilon-reachable
+                                // Match from out1 and is false when the
+                                // break path has consuming states.
+                                let break_consuming =
+                                    break_path_consuming_states(out1, &regex.states);
+                                for bc in break_consuming {
+                                    if let Some(t) = consume_byte(bc, byte, regex) {
+                                        resolved_break_targets.push(t);
+                                    }
                                 }
                             }
                         }
@@ -818,7 +845,29 @@ impl Tier2DfaCache {
                 false,
             );
             let nb_id = self.intern_closure_result(&cr_nb, byte);
-            let wb_id = self.intern_closure_result(&probe, byte);
+            // When Phase 1 resolved a deferred assertion and reached
+            // CInc, the break path's consuming states may have consumed
+            // `byte`.  Those targets are only reachable when the counter
+            // actually breaks, so they go into the with_break closure
+            // exclusively (Bug 18).
+            let wb_id = if resolved_break_targets.is_empty() {
+                self.intern_closure_result(&probe, byte)
+            } else {
+                let wb_closure = self.epsilon_closure(
+                    memory,
+                    targets
+                        .iter()
+                        .copied()
+                        .chain(resolved_break_targets.iter().copied())
+                        .chain(std::iter::once(regex.start)),
+                    regex,
+                    false,
+                    Some(byte),
+                    None,
+                    true,
+                );
+                self.intern_closure_result(&wb_closure, byte)
+            };
             let (nb_m, nb_mae) = self.match_flags(nb_id);
             let (wb_m, wb_mae) = self.match_flags(wb_id);
 
@@ -1210,6 +1259,44 @@ fn break_path_match_kind(start: StateIdx, states: &[State]) -> (bool, bool) {
         }
     }
     (direct, at_end)
+}
+
+/// Collect consuming NFA states reachable from a CInc break target via
+/// epsilon transitions (Split, Assert, CounterInstance).  Stops at
+/// consuming states (Byte, ByteCI, ByteClass, ByteTable) and CInc —
+/// does not recurse into nested counters.
+///
+/// Used to discover break-path consuming states that need to consume
+/// the current byte when a deferred-assertion-gated counter breaks
+/// (Bug 18).
+fn break_path_consuming_states(start: StateIdx, states: &[State]) -> Vec<StateIdx> {
+    let mut result = Vec::new();
+    let mut stack = vec![start];
+    let mut visited = vec![false; states.len()];
+    while let Some(idx) = stack.pop() {
+        let i = idx.idx();
+        if visited[i] {
+            continue;
+        }
+        visited[i] = true;
+        match states[idx] {
+            State::Split { out, out1 } => {
+                stack.push(out);
+                stack.push(out1);
+            }
+            State::Assert { out, .. } => stack.push(out),
+            State::CounterInstance { out, .. } => stack.push(out),
+            State::Byte { .. }
+            | State::ByteCI { .. }
+            | State::ByteClass { .. }
+            | State::ByteTable { .. } => {
+                result.push(idx);
+            }
+            // CInc, Match: stop.
+            _ => {}
+        }
+    }
+    result
 }
 
 /// Compute a bitmask of counters reachable via CInc from deferred

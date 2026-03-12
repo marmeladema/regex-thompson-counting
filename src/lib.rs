@@ -9965,6 +9965,38 @@ mod tests {
                 ("12345678", false),         // 8 chars
             ],
         }
+        // Regression (Bug 18): deferred assertion (\B) inside an L=1
+        // counter body gates the path to CInc.  When the counter breaks,
+        // the break path's consuming states need to consume the current
+        // byte and enter the with_break DFA successor.  Before the fix,
+        // the code only checked break_path_match_kind (epsilon-to-Match)
+        // and never collected consuming states from the break path.
+        // The with_break DFA successor was missing those states, causing
+        // a false negative.
+        test_deferred_assert_inside_counter_break_consuming {
+            pattern: r"^(a\B){4,4}a$",
+            memory: 940,
+            min_tier: 1,
+            inputs: [
+                ("aaaaa", true),       // 4 × a\B + a$
+                ("aaaa", false),        // only 4 chars, need 5
+                ("aaaaaa", false),      // 6 chars, too many
+                ("baaaa", false),       // first byte 'b' doesn't match body Byte('a')
+            ],
+        }
+        test_deferred_assert_inside_counter_break_consuming_varlen {
+            pattern: r"^(a\B){2,5}a$",
+            memory: 1105,
+            min_tier: 1,
+            inputs: [
+                ("aaa", true),         // 2 × a\B + a$
+                ("aaaa", true),        // 3 × a\B + a$
+                ("aaaaa", true),       // 4 × a\B + a$
+                ("aaaaaa", true),      // 5 × a\B + a$
+                ("aa", false),         // too few
+                ("aaaaaaa", false),    // too many
+            ],
+        }
         // Regression (defense-in-depth): `break_closure()` used to follow
         // through `CounterInstance` nodes, which meant that for sequential
         // multi-counter patterns like `.{1,2}.{4,4}$`, counter A's
