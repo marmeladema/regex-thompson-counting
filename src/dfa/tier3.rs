@@ -639,11 +639,9 @@ struct Transition {
     /// DFA successor when no instance can break (continue-only closure).
     no_break: DfaStateId,
     no_break_is_match: bool,
-    no_break_is_match_at_end: bool,
     /// DFA successor when at least one instance can break (both closure).
     with_break: DfaStateId,
     with_break_is_match: bool,
-    with_break_is_match_at_end: bool,
     /// True if this transition crosses a CInc node.
     is_counting: bool,
     /// Seeds applied BEFORE counter increment.
@@ -669,17 +667,20 @@ struct Transition {
     origin_actions: Box<[OriginAction]>,
     /// True if any origin's byte-consumption target reaches `$ → Match`
     /// without going through a CInc node.  This is the "counter-free"
-    /// subset of `no_break_is_match_at_end` — safe to propagate even for
-    /// counting transitions, because the `$ → Match` path doesn't depend
-    /// on any counter reaching its minimum.
+    /// subset of the DFA state's `is_match_at_end` — safe to propagate
+    /// for counting transitions, because the `$ → Match` path doesn't
+    /// depend on any counter reaching its minimum.
     counter_free_match_at_end: bool,
     /// True if the no-break closure's `is_match_at_end` comes from
     /// counter-free paths (targets of `reachable_without_break` origins,
     /// or epsilon `$ → Match` paths from the start state).
     ///
-    /// Used in `finish()` instead of the raw DFA state's `is_match_at_end`,
-    /// which may include `$ → Match` from counter-dependent origins that
-    /// entered the DFA state via previous counter breaks (Bug 13).
+    /// Used for both counting and non-counting transitions in `step_slow`
+    /// and `step_from_dead` (Bug 23), as well as in `finish()`.  The raw
+    /// DFA state's `is_match_at_end` may include `$ → Match` from
+    /// counter-dependent origins that entered the DFA state via previous
+    /// counter breaks (Bug 13) or from post-break tail NFA states that
+    /// are only valid when all upstream counters have broken (Bug 23).
     nb_counter_free_mae: bool,
 }
 
@@ -688,10 +689,8 @@ impl Transition {
         Self {
             no_break: DfaStateId::UNPOPULATED,
             no_break_is_match: false,
-            no_break_is_match_at_end: false,
             with_break: DfaStateId::UNPOPULATED,
             with_break_is_match: false,
-            with_break_is_match_at_end: false,
             is_counting: false,
             pre_seeds: Box::new([]),
             seeds: Box::new([]),
@@ -1456,7 +1455,7 @@ impl Tier3DfaCache {
             let wb_id = self.intern_closure_result(&probe, byte);
 
             let (nb_m, nb_mae) = self.match_flags(nb_id);
-            let (wb_m, wb_mae) = self.match_flags(wb_id);
+            let (wb_m, _wb_mae) = self.match_flags(wb_id);
 
             let nb_counter_free_mae = self.counter_free_nb_mae(
                 memory,
@@ -1634,10 +1633,8 @@ impl Tier3DfaCache {
             Transition {
                 no_break: nb_id,
                 no_break_is_match: nb_m || resolved_is_match,
-                no_break_is_match_at_end: nb_mae,
                 with_break: wb_id,
                 with_break_is_match: wb_m || resolved_is_match,
-                with_break_is_match_at_end: wb_mae,
                 is_counting: true,
                 pre_seeds: pre_seeds.into(),
                 seeds: seeds.into(),
@@ -1681,10 +1678,8 @@ impl Tier3DfaCache {
             Transition {
                 no_break: id,
                 no_break_is_match: m || resolved_is_match,
-                no_break_is_match_at_end: mae,
                 with_break: id,
                 with_break_is_match: m || resolved_is_match,
-                with_break_is_match_at_end: mae,
                 is_counting: false,
                 pre_seeds: Box::new([]),
                 seeds: seeds.into(),
@@ -2517,16 +2512,27 @@ macro_rules! step_slow_impl {
                 }
             }
             if !t.is_counting {
-                let (m, mae) = if any_can_break {
-                    (t.with_break_is_match, t.with_break_is_match_at_end)
+                // For non-counting transitions, use counter-free mae just
+                // like the fast path (Bug 23).  The raw
+                // no_break_is_match_at_end may include $ → Match paths
+                // from post-break tail NFA states that only become active
+                // after counter breaks — but those counters may not have
+                // met their minimums.
+                let cf_mae = if from_contaminated {
+                    self.clean_counter_free_mae(t)
                 } else {
-                    (t.no_break_is_match, t.no_break_is_match_at_end)
+                    t.nb_counter_free_mae
+                };
+                if cf_mae {
+                    self.match_at_end = true;
+                }
+                let m = if any_can_break {
+                    t.with_break_is_match
+                } else {
+                    t.no_break_is_match
                 };
                 if m {
                     self.ever_matched = true;
-                }
-                if mae {
-                    self.match_at_end = true;
                 }
             } else {
                 // For counting transitions, propagate only no_break_is_match
@@ -2710,7 +2716,10 @@ impl<'a> Tier3DfaMatcher<'a> {
             if trans.no_break_is_match {
                 self.ever_matched = true;
             }
-            if trans.no_break_is_match_at_end {
+            // Use counter-free mae, not raw no_break_is_match_at_end,
+            // for the same reason as in step_slow (Bug 23).
+            // From DEAD, no contamination possible.
+            if trans.nb_counter_free_mae {
                 self.match_at_end = true;
             }
         }

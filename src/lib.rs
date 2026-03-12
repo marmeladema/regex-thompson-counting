@@ -10185,6 +10185,43 @@ mod tests {
             ],
         }
 
+        // Bug 23: Tier 3 false positive from non-counting transition
+        // propagating raw `no_break_is_match_at_end` without counter-free
+        // filtering.
+        //
+        // Pattern `c{2,12}c{2,12}f$` with input "cccccccdcccf": the 'd' at
+        // position 7 breaks all counter threads, leaving only 3 c's (not
+        // enough for c{2,12}c{2,12} which needs ≥4).  NFA correctly says
+        // NO MATCH.
+        //
+        // Root cause: DFA state 2 (nfa={0,3,6}) includes NFA state 6
+        // (Byte 'f'), a post-break tail only reachable after both counters
+        // break.  The transition from state 2 on 'f' is classified as
+        // non-counting (probe closure doesn't encounter CInc).  The
+        // non-counting branch in step_slow directly propagated
+        // no_break_is_match_at_end=true (from state 6 → Assert(End) →
+        // Match), without filtering through nb_counter_free_mae.
+        //
+        // Fix: use nb_counter_free_mae (or clean_counter_free_mae when
+        // contaminated) for non-counting transitions in step_slow and
+        // step_from_dead, matching the fast-path logic.
+        test_tier3_non_counting_mae_false_positive {
+            pattern: r"c{2,12}c{2,12}f$",
+            memory: 2127,
+            min_tier: 1,
+            inputs: [
+                ("ccf", false),               // only 2 c's, need ≥4 (2+2)
+                ("cccf", false),              // only 3 c's, need ≥4 (2+2)
+                ("ccccf", true),              // c{2,12}="cc", c{2,12}="cc", f
+                ("cccccccdcccf", false),       // Bug 23 reproducer: 'd' breaks chain
+                ("cccccccccccf", true),        // 10 c's + f: c{2,12}="cc...", c{2,12}="cc...", f
+                ("ccccccccccccf", true),       // 11 c's + f
+                ("cf", false),                // too few c's
+                ("f", false),                 // no c's
+                ("cccccccccccccccccccccccccf", true), // 24 c's (12+12) + f
+            ],
+        }
+
         // Regression (defense-in-depth): `break_closure()` used to follow
         // through `CounterInstance` nodes, which meant that for sequential
         // multi-counter patterns like `.{1,2}.{4,4}$`, counter A's
