@@ -2364,9 +2364,15 @@ fn break_consuming_tails(
                     result.push(idx);
                 }
             }
-            State::ByteTable { table: _ } => {
-                // ByteTable has variable targets; conservatively skip.
-                // Tier 3 patterns with ByteTable post-break tails are rare.
+            State::ByteTable { .. } => {
+                // ByteTable maps multiple bytes to different targets.
+                // Include it as a tail unconditionally — the runtime
+                // tail tracking handles byte-specific matching via the
+                // DFA transition's origin_keys/origin_actions.
+                // Previously skipped ("conservatively skip"), causing
+                // Bug 35: break paths through ByteTable states lost all
+                // downstream tail tracking and match-at-end detection.
+                result.push(idx);
             }
             _ => {}
         }

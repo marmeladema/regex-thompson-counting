@@ -10562,6 +10562,31 @@ mod tests {
             ],
         }
 
+        // -- Bug 35 regression: ByteTable skipped in break_consuming_tails --
+        // Pattern `^(c{2,48}c?y?b1)?((a?a?)?(a?a?)?)?$` has a counter c0
+        // for `c{2,48}`.  When c0 breaks, the break path goes to state 5
+        // (ByteTable for `c?y?b1`).  break_consuming_tails was skipping
+        // ByteTable states entirely, so state 5 never became a
+        // post_break_tail.  The downstream consuming chain (y→b→1) was
+        // never tracked, and target_is_match_at_end[9] (for state 9, the
+        // '1' byte leading to `$→Match`) was never checked → false negative.
+        //
+        // Fix: include ByteTable states in break_consuming_tails.
+        test_tier3_byte_table_break_tail {
+            pattern: r"^(c{2,48}c?y?b1)?((a?a?)?(a?a?)?)?$",
+            memory: 2425,
+            min_tier: 2,
+            inputs: [
+                ("cccccccccccccccccccccccccccccccccccccccccyb1", true), // 41 c's + yb1: Bug 35 crash case
+                ("ccyb1", true),           // 2 c's + yb1
+                ("ccb1", true),            // 2 c's + b1 (skip optional y)
+                ("ccyb1aa", true),         // 2 c's + yb1 + aa
+                ("cb1", false),            // 1 c (< min 2)
+                ("", true),               // empty matches via outer ?
+                ("cccccccccccccccccccccccccccccccccccccccccccccccccccyb1", false), // 51 c's (> max 48+1)
+            ],
+        }
+
         // -- Bug 34 regression: deferred asserts lost on None target in post_break_tails --
         // Pattern `^1{2,30}c{9,48}y\b$` has two counters.  When c1 breaks,
         // the break path goes to state 7 (Byte('y')), which is tracked as
