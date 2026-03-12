@@ -118,6 +118,21 @@ pub(crate) struct Tier3Analysis {
     /// a byte and its target has no further consuming states (Bug 25).
     pub(crate) target_is_match: Box<[bool]>,
 
+    /// Per-consuming-state deferred assertions on the epsilon path from
+    /// the byte-consumption target to further consuming states or Match.
+    ///
+    /// Indexed by NFA state index.  For each consuming state, contains the
+    /// NFA state indices of non-End Assert states (e.g. `\b`, `\B`) that
+    /// lie on the epsilon path from its target.  Empty for non-consuming
+    /// states or when no assertions are on the path.
+    ///
+    /// Used by the post-break tail tracker (Bug 30): when a tail advances
+    /// through a consuming state, these assertions are deposited into
+    /// `verified_deferred_asserts` for proper counter-gated evaluation,
+    /// rather than relying on the contaminated `no_break_current` DFA
+    /// state's deferred asserts.
+    pub(crate) target_deferred_asserts: Box<[Box<[StateIdx]>]>,
+
     /// Per-NFA-state flag: true if the state is reachable from the start
     /// state by following only CInc *continue* paths (not break paths).
     ///
@@ -609,6 +624,64 @@ pub(crate) fn compute_tier3_analysis(
         }
     }
 
+    // -- Step 6c: compute per-consuming-state target_deferred_asserts -----------
+    // For each consuming NFA state, walk epsilon transitions from its target
+    // and collect non-End Assert state indices.  These are assertions that
+    // lie on the path from the byte-consumption target to further consuming
+    // states or Match but are NOT `Assert(End)` (which is already handled
+    // by `target_is_match_at_end`).
+    //
+    // This walk follows through Assert states (unlike Steps 6a/6b) to reach
+    // what lies beyond them, collecting the Assert indices along the way.
+    // Used by the post-break tail tracker to deposit these into
+    // `verified_deferred_asserts` when a tail advances through the state
+    // (Bug 30).
+    let mut target_da: Vec<Box<[StateIdx]>> = Vec::with_capacity(n);
+    for state in states.iter() {
+        let target = match *state {
+            State::Byte { out, .. } | State::ByteCI { out, .. } | State::ByteClass { out, .. } => {
+                if out != StateIdx::NONE {
+                    Some(out)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let mut asserts = Vec::new();
+        if let Some(t) = target {
+            let mut estack = vec![t];
+            let mut evisited = vec![false; n];
+            while let Some(eidx) = estack.pop() {
+                let ei = eidx.idx();
+                if evisited[ei] {
+                    continue;
+                }
+                evisited[ei] = true;
+                match states[eidx] {
+                    State::Split { out, out1 } => {
+                        estack.push(out1);
+                        estack.push(out);
+                    }
+                    State::Assert { kind, out } => {
+                        // Record non-End asserts as deferred; follow
+                        // through to discover what lies beyond.
+                        if kind != AssertKind::End {
+                            asserts.push(eidx);
+                        }
+                        estack.push(out);
+                    }
+                    State::CounterInstance { out, .. } => estack.push(out),
+                    _ => {}
+                }
+            }
+        }
+        // Deduplicate (shouldn't be needed but defensive).
+        asserts.sort_unstable_by_key(|s| s.0);
+        asserts.dedup_by_key(|s| s.0);
+        target_da.push(asserts.into_boxed_slice());
+    }
+
     // -- Step 7: compute reachable_without_break --------------------------------
     // Transitive closure from start following ALL paths EXCEPT CInc break
     // paths.  Mark consuming states reachable without any counter break.
@@ -707,6 +780,7 @@ pub(crate) fn compute_tier3_analysis(
         max_body_origins,
         target_is_match_at_end: target_mae.into_boxed_slice(),
         target_is_match: target_match.into_boxed_slice(),
+        target_deferred_asserts: target_da.into_boxed_slice(),
         reachable_without_break: rwb.into_boxed_slice(),
         max_instance_stride,
         all_counters_rangeable,
@@ -2461,6 +2535,17 @@ macro_rules! step_slow_impl {
                                 self.next_post_break_tails.push(new_o);
                             }
                         }
+                        // Bug 30: deposit target deferred asserts for this
+                        // consuming state into verified_deferred_asserts.
+                        // These are non-End Assert states on the epsilon
+                        // path from pbo's target, which would otherwise
+                        // only fire via the contaminated no_break_current
+                        // DFA state.
+                        for &da in self.analysis.target_deferred_asserts[pbo.idx()].iter() {
+                            if !self.verified_deferred_asserts.contains(&da) {
+                                self.verified_deferred_asserts.push(da);
+                            }
+                        }
                         check_tail_match_flags!(self, pbo);
                     }
                     Some(Some(Tier3OriginKind::Increment {
@@ -3233,9 +3318,30 @@ impl<'a> Tier3DfaMatcher<'a> {
             return true;
         }
         // Deferred assertions from the no-break state.
-        if self.no_break_current != DfaStateId::DEAD {
-            let state = &self.cache.inner.states[self.no_break_current.idx()];
-            if state.resolve_deferred_at_end(self.regex) {
+        //
+        // Bug 30: when contaminated (break_extras && num_counters > 1),
+        // `no_break_current` may include deferred assertions from
+        // break-gated origins (e.g. `\b` after `Byte('f')` which is only
+        // reachable via c1's break path).  These spurious deferred asserts
+        // fire at EOI even when the gating counter never reached its min.
+        //
+        // Fix: when contaminated, skip `no_break_current`'s deferred asserts
+        // entirely.  Legitimate counter-break deferred asserts are deposited
+        // into `verified_deferred_asserts` by the post-break tail tracker
+        // (using `target_deferred_asserts`) and resolved separately above.
+        // Non-contaminated deferred asserts from `clean_nb` are handled below.
+        let from_contaminated = self.current_has_break_extras && self.regex.num_counters > 1;
+        if self.no_break_current != DfaStateId::DEAD && !from_contaminated {
+            let nb_state = &self.cache.inner.states[self.no_break_current.idx()];
+            if nb_state.resolve_deferred_at_end(self.regex) {
+                return true;
+            }
+        }
+        // When contaminated, fall back to clean_nb for counter-free deferred
+        // asserts (clean_nb excludes break-gated origins).
+        if from_contaminated && self.clean_nb != DfaStateId::DEAD {
+            let clean_state = &self.cache.inner.states[self.clean_nb.idx()];
+            if clean_state.resolve_deferred_at_end(self.regex) {
                 return true;
             }
         }
