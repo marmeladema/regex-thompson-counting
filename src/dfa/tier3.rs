@@ -1969,16 +1969,15 @@ impl Tier3DfaCache {
         seeds: &[(CounterIdx, StateIdx, u32)],
         analysis: &Tier3Analysis,
     ) -> Vec<(CounterIdx, CounterIdx, StateIdx, u32)> {
+        let _ = seeds; // Bug 32: previously skipped break_seeds that duplicated
+        // unconditional seeds.  Now we keep all break_seeds because
+        // the runtime seed filter (Bug 32) may suppress the
+        // unconditional seed when the DFA state is contaminated.
+        // Double-seeding is harmless: `seed()` deduplicates via
+        // `contains()`.
         let mut result: Vec<(CounterIdx, CounterIdx, StateIdx, u32)> = Vec::new();
         for bs in analysis.break_seeds.iter() {
             let entry = (bs.trigger, bs.counter, bs.origin, 0u32);
-            // Skip if this seed is already in the unconditional list.
-            if seeds
-                .iter()
-                .any(|e| e.0 == entry.1 && e.1 == entry.2 && e.2 == entry.3)
-            {
-                continue;
-            }
             if !result
                 .iter()
                 .any(|e| e.0 == entry.0 && e.1 == entry.1 && e.2 == entry.2 && e.3 == entry.3)
@@ -2485,6 +2484,14 @@ pub struct Tier3DfaMatcher<'a> {
     /// DFA state, so its `no_break_is_match` only reflects genuinely
     /// counter-free `Match` paths.
     clean_nb_is_match: bool,
+    /// Transition-table slot for the clean_nb chain's transition on the
+    /// current byte.  Set when the current state is contaminated
+    /// (`current_has_break_extras`) and used in `step_slow` to filter
+    /// unconditional seeds on **counting** transitions: only seeds that
+    /// also appear in the clean_nb transition are truly counter-free
+    /// (Bug 32).  `None` when clean_nb is DEAD or the state is not
+    /// contaminated.
+    clean_nb_trans_slot: Option<usize>,
     prefilter: Prefilter,
 }
 
@@ -2806,8 +2813,35 @@ macro_rules! step_slow_impl {
             std::mem::swap(&mut self.$current, &mut self.$next);
             std::mem::swap(&mut self.post_break_tails, &mut self.next_post_break_tails);
 
-            // Seed new instances.
+            // Seed new instances (unconditional).
+            //
+            // Bug 32: on COUNTING transitions when the current DFA state
+            // is contaminated (has break extras), the `counter_free_seeds`
+            // computation in `populate()` may include seeds from origins
+            // that are globally `reachable_without_break` but entered THIS
+            // DFA state only via a counter break.  Gate these seeds on the
+            // clean_nb chain's transition: only seeds that also appear in
+            // the clean chain are truly counter-free.
+            //
+            // Non-counting transitions are NOT filtered: their seeds come
+            // from the full probe closure (follow_break=true) and there
+            // are no break_seeds to fall back on.  Filtering them would
+            // kill legitimate downstream counter seeds (regression on
+            // `^(a{1,17}b){2,3}$` / "abab").
+            //
+            // Suppressed seeds are still available as break_seeds (Bug 32
+            // part 2: `compute_break_seeds` no longer deduplicates against
+            // unconditional seeds on counting transitions, so the break
+            // path fires when the triggering counter actually breaks).
             for &(counter, origin, value) in t.seeds.iter() {
+                if t.is_counting {
+                    if let Some(cn_slot) = self.clean_nb_trans_slot {
+                        let cn_t = &self.cache.transitions[cn_slot];
+                        if !cn_t.seeds.iter().any(|s| s.0 == counter && s.1 == origin) {
+                            continue;
+                        }
+                    }
+                }
                 self.$current.seed(counter.idx(), origin, value);
             }
             // Break seeds gated on the triggering counter.
@@ -2903,6 +2937,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             clean_nb: cache.inner.start_id,
             clean_nb_cf_mae: cache.inner.start_is_match_at_end,
             clean_nb_is_match: cache.inner.start_is_match,
+            clean_nb_trans_slot: None,
             cache,
             memory,
             regex,
@@ -3129,6 +3164,10 @@ impl<'a> Tier3DfaMatcher<'a> {
             // When contaminated, advance `clean_nb` independently from the
             // previous clean state.  When not contaminated, defer update
             // to after reading `t.no_break` (see below).
+            //
+            // Bug 32: save the clean_nb transition slot so step_slow can
+            // filter unconditional seeds on counting transitions against
+            // the clean chain's seeds.
             if self.current_has_break_extras && self.regex.num_counters > 1 {
                 if self.clean_nb != DfaStateId::DEAD {
                     let cn_slot = self.clean_nb.idx() * stride + class;
@@ -3142,6 +3181,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                         );
                         self.cache.transitions[cn_slot] = cn_trans;
                     }
+                    self.clean_nb_trans_slot = Some(cn_slot);
                     let cn_trans = &self.cache.transitions[cn_slot];
                     self.clean_nb_cf_mae = cn_trans.nb_counter_free_mae;
                     self.clean_nb_is_match = cn_trans.no_break_is_match;
@@ -3149,7 +3189,10 @@ impl<'a> Tier3DfaMatcher<'a> {
                 } else {
                     self.clean_nb_cf_mae = false;
                     self.clean_nb_is_match = false;
+                    self.clean_nb_trans_slot = None;
                 }
+            } else {
+                self.clean_nb_trans_slot = None;
             }
 
             let t = &self.cache.transitions[slot];

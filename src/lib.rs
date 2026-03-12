@@ -10506,6 +10506,37 @@ mod tests {
             ],
         }
 
+        // -- Bug 32 regression: contaminated counter_free_seeds false positive --
+        // Pattern `^((a{8,13}d*)?.?a?.{6,6}a?)?$` has two counters:
+        // c0={8,13} and c1={6,6}.  When c0 breaks, the with_break DFA state
+        // includes origins {4,7,9} from the break chain.  Origins 7,9 are
+        // globally `reachable_without_break` (reachable from `^` via the
+        // optional skip), so the `counter_free_seeds` computation in
+        // `populate()` treats them as unconditional — seeding c1 on every
+        // byte from the contaminated state.  This causes c1 instances to
+        // roll indefinitely even after c0 dies (position 13+), producing
+        // a false match_at_end.
+        //
+        // Fix: at runtime, on counting transitions from a contaminated
+        // state, filter unconditional seeds against the clean_nb chain's
+        // transition seeds.  Only seeds also present in the uncontaminated
+        // chain are truly counter-free.  Non-counting transitions are NOT
+        // filtered because they have no break_seeds fallback.
+        test_tier3_contaminated_counter_free_seeds {
+            pattern: r"^((a{8,13}d*)?.?a?.{6,6}a?)?$",
+            memory: 2085,
+            min_tier: 1,
+            inputs: [
+                ("aaaaaaaaa", true),                                     // 9 'a's: matches (a{8}+.?=a → 9)
+                ("aaaaaaaaaa", false),                                   // 10 'a's: no valid partition
+                ("a]]]]]", true),                                       // 6 chars: skip c0, .?a?.{6,6}a? can match
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false), // 50 'a's: false positive in Bug 32
+                ("aaaaaaaaaaaaaa", true),                                // 14 'a's: a{8}+.?a?.{6,6}a?
+                ("aaaaaaaaaaaaaaaaaaaa", true),                          // 20 'a's: a{13}+.?.{6,6}
+                ("aaaaaaaaaaaaaaaaaaaaa", true),                         // 21 'a's: a{13}+.?a?.{6,6}a?
+            ],
+        }
+
         // -- Bug 31 regression: chained assertions in target_deferred_asserts --
         // Pattern has `.\b\B` after counter break.  State 4's target epsilon
         // path goes through \b@5 then \B@6.  If target_deferred_asserts
