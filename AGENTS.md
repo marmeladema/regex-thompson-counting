@@ -56,7 +56,8 @@ Does NOT touch `min_tier:` values — those are left alone to catch tier regress
 
 ```
 src/lib.rs          # Core NFA compiler, matcher, counter pool, ALL tests (~9800 lines)
-src/main.rs         # CLI binary `rethoc` (info, match, dot subcommands)
+src/main.rs         # CLI binary `rethoc` (info, match, dot, dump subcommands)
+src/dump.rs         # Human-readable dump (DumpRegex, DumpState Display wrappers)
 src/info.rs         # Diagnostic/serialization types (RegexInfo, MemoryInfo, etc.)
 src/memrange.rs     # SIMD byte-range prefilter (SSE2/AVX2/NEON + scalar fallback)
 src/fuzz_gen.rs     # Grammar-aware pattern + input generator for fuzzing
@@ -228,6 +229,9 @@ cargo run --release -- dot '<pattern>'                  # Graphviz DOT output
 cargo run --release -- match --tier 2 '<pattern>' 'input' # force a specific tier
 cargo run --release -- info --unroll-limit 0 '<pattern>'  # disable unrolling (force counters)
 cargo run --release -- match --unroll-limit 0 '<pattern>' 'input' # match with counters only
+cargo run --release -- dump '<pattern>'                 # NFA states, counters, byte classes, aux arrays
+cargo run --release -- dump --dfa '<pattern>'           # + tier-specific DFA analysis (Tier 2/3)
+cargo run --release -- dump --format debug '<pattern>'  # Rust {:#?} of the Regex struct
 ```
 
 ## Benchmarks

@@ -34,11 +34,13 @@ fn parse_pattern(pattern: &str, unroll_limit: Option<usize>) -> Regex {
     })
 }
 
-/// Output format for the `info` command.
+/// Output format for the `info` and `dump` commands.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Format {
     Text,
     Json,
+    /// Rust `{:#?}` Debug output.
+    Debug,
 }
 
 fn print_usage() {
@@ -50,12 +52,14 @@ Commands:
   info  <pattern>                Print diagnostic information about the compiled regex
   dot   <pattern>                Output DOT (Graphviz) representation of the NFA
   match <pattern> <input>...     Match pattern against one or more inputs
+  dump  <pattern>                Dump compiled NFA states, counters, and analysis
 
 Options:
-  --format <text|json> Output format for info command (default: text)
+  --format <text|json|debug>  Output format (default: text; debug uses Rust {{:#?}})
   --chunk-size <N>     Feed input in chunks of N bytes (default: entire input at once)
   --tier <0|1|2|3|4>   Force a specific execution tier (0=NFA, 1-4=DFA tiers)
   --unroll-limit <N>   Max NFA states for repetition unrolling (0=disable, default: 32)
+  --dfa                Include tier-specific DFA analysis in dump output
   --debug              Print matcher state after each step
   -h, --help           Print this help message"
     );
@@ -79,6 +83,12 @@ enum Command {
         unroll_limit: Option<usize>,
         debug: bool,
     },
+    Dump {
+        pattern: String,
+        unroll_limit: Option<usize>,
+        format: Format,
+        dfa: bool,
+    },
 }
 
 fn parse_args() -> Command {
@@ -93,6 +103,7 @@ fn parse_args() -> Command {
     let mut unroll_limit: Option<usize> = None;
     let mut format = Format::Text;
     let mut debug = false;
+    let mut dfa = false;
     let mut positional = Vec::new();
 
     let mut i = 0;
@@ -147,17 +158,23 @@ fn parse_args() -> Command {
             "--format" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("error: --format requires a value (text or json)");
+                    eprintln!("error: --format requires a value (text, json, or debug)");
                     process::exit(1);
                 }
                 format = match args[i].as_str() {
                     "text" => Format::Text,
                     "json" => Format::Json,
+                    "debug" => Format::Debug,
                     other => {
-                        eprintln!("error: unknown format: {other} (expected 'text' or 'json')");
+                        eprintln!(
+                            "error: unknown format: {other} (expected 'text', 'json', or 'debug')"
+                        );
                         process::exit(1);
                     }
                 };
+            }
+            "--dfa" => {
+                dfa = true;
             }
             "--debug" => {
                 debug = true;
@@ -215,6 +232,18 @@ fn parse_args() -> Command {
                 debug,
             }
         }
+        "dump" => {
+            if positional.len() != 2 {
+                eprintln!("error: 'dump' command takes exactly one pattern argument");
+                process::exit(1);
+            }
+            Command::Dump {
+                pattern: positional[1].clone(),
+                unroll_limit,
+                format,
+                dfa,
+            }
+        }
         other => {
             eprintln!("error: unknown command: {other}");
             print_usage();
@@ -238,6 +267,9 @@ fn run_info(pattern: &str, unroll_limit: Option<usize>, format: Format) {
                 serde_json::to_string(&info).expect("RegexInfo should serialize to JSON")
             );
         }
+        Format::Debug => {
+            println!("{:#?}", regex);
+        }
     }
 }
 
@@ -247,6 +279,22 @@ fn run_dot(pattern: &str, unroll_limit: Option<usize>) {
     let mut out = stdout.lock();
     regex.to_dot(&mut out);
     out.flush().unwrap();
+}
+
+fn run_dump(pattern: &str, unroll_limit: Option<usize>, format: Format, dfa: bool) {
+    let regex = parse_pattern(pattern, unroll_limit);
+    match format {
+        Format::Text => {
+            print!("{}", regex.dump(dfa));
+        }
+        Format::Debug => {
+            println!("{:#?}", regex);
+        }
+        Format::Json => {
+            eprintln!("error: JSON format is not supported for 'dump' (use 'info' instead)");
+            process::exit(1);
+        }
+    }
 }
 
 fn run_match(
@@ -347,5 +395,11 @@ fn main() {
             unroll_limit,
             debug,
         } => run_match(&pattern, &inputs, chunk_size, tier, unroll_limit, debug),
+        Command::Dump {
+            pattern,
+            unroll_limit,
+            format,
+            dfa,
+        } => run_dump(&pattern, unroll_limit, format, dfa),
     }
 }

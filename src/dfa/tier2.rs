@@ -334,7 +334,7 @@ pub(crate) struct Tier2Analysis {
 impl Tier2Analysis {
     /// Returns the sorted slice of interior NFA state indices for counter
     /// `ci`.  Empty for L=1 counters.
-    fn interior(&self, ci: usize) -> &[u32] {
+    pub(crate) fn interior(&self, ci: usize) -> &[u32] {
         let (start, end) = self.body_ranges[ci];
         &self.body_interior[start..end]
     }

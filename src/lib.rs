@@ -73,6 +73,7 @@ use ahash::HashMap;
 static NEXT_REGEX_ID: AtomicU64 = AtomicU64::new(1);
 
 mod dfa;
+mod dump;
 pub mod fuzz_gen;
 mod info;
 mod memrange;
@@ -82,6 +83,7 @@ use dfa::{
     Tier3Analysis, Tier3DfaCache, Tier3DfaMatcher, Tier4DfaCache, Tier4DfaMatcher,
     compute_tier2_analysis, compute_tier3_analysis,
 };
+pub use dump::DumpRegex;
 pub use info::{
     CounterInfo, ExecutionInfo, MemoryInfo, NfaStateBreakdown, RegexInfo, StartClosureInfo,
 };
@@ -1149,6 +1151,19 @@ impl Regex {
                 writeln!(buffer, "\t{} [peripheries=2];", idx).unwrap();
             }
         }
+    }
+
+    /// Return a human-readable dump of the compiled NFA states, counters,
+    /// and analysis data.
+    ///
+    /// When `dfa` is `true`, the dump also includes tier-specific DFA
+    /// analysis (Tier 2 body interior, Tier 3 origin actions, break seeds,
+    /// reachability flags, etc.).
+    ///
+    /// The returned value implements [`Display`](fmt::Display), so it can
+    /// be used directly with `print!` or `write!`.
+    pub fn dump(&self, dfa: bool) -> DumpRegex<'_> {
+        DumpRegex::new(self, dfa)
     }
 }
 
