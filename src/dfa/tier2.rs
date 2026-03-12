@@ -329,6 +329,15 @@ pub(crate) struct Tier2Analysis {
     body_interior: Box<[u32]>,
     /// Per-counter `(start, end)` range into [`body_interior`](Self::body_interior).
     body_ranges: Box<[(usize, usize)]>,
+    /// Flat array of NFA consuming-state indices reachable from each
+    /// counter's break target (`CInc.out1`) via epsilon transitions.
+    /// These are the states that need to consume the current byte when
+    /// a deferred-assertion-gated counter breaks (Bug 18).
+    ///
+    /// Precomputed at build time — depends only on the NFA structure.
+    break_consuming: Box<[StateIdx]>,
+    /// Per-counter `(start, end)` range into [`break_consuming`](Self::break_consuming).
+    break_consuming_ranges: Box<[(usize, usize)]>,
 }
 
 impl Tier2Analysis {
@@ -338,20 +347,32 @@ impl Tier2Analysis {
         let (start, end) = self.body_ranges[ci];
         &self.body_interior[start..end]
     }
+
+    /// Returns the slice of consuming NFA states reachable from counter
+    /// `ci`'s break target (`CInc.out1`) via epsilon transitions.
+    pub(crate) fn break_consuming(&self, ci: usize) -> &[StateIdx] {
+        let (start, end) = self.break_consuming_ranges[ci];
+        &self.break_consuming[start..end]
+    }
 }
 
-/// Precompute body interior data for all counters in a Tier 2 pattern.
+/// Precompute body interior data and break-path consuming states for all
+/// counters in a Tier 2 pattern.
 ///
-/// For each counter, identifies the set of NFA consuming states that are
-/// in the "interior" of the counter body — i.e., reachable from the body
-/// entry but not among the first consuming states.  These are body
-/// positions 1..L-1 for a body of length L.
+/// For each counter, identifies:
+/// 1. **Interior states** — NFA consuming states in the "interior" of the
+///    counter body (body positions 1..L-1 for a body of length L).  Used to
+///    detect when a DFA successor has in-progress body instances.
+/// 2. **Break consuming states** — NFA consuming states reachable from
+///    `CInc.out1` (the break target) via epsilon transitions.  Used when
+///    a deferred-assertion-gated counter breaks (Bug 18).
 pub(crate) fn compute_tier2_analysis(
     states: &[State],
     byte_tables: &[crate::ByteMap],
     num_counters: usize,
 ) -> Tier2Analysis {
     let mut per_counter: Vec<Vec<u32>> = vec![Vec::new(); num_counters];
+    let mut break_per_counter: Vec<Vec<StateIdx>> = vec![Vec::new(); num_counters];
 
     for s in states.iter() {
         if let State::CounterInstance { counter, out } = s {
@@ -412,9 +433,17 @@ pub(crate) fn compute_tier2_analysis(
             interior.dedup();
             per_counter[ci] = interior;
         }
+
+        // Collect break-path consuming states for each CInc.
+        if let State::CounterIncrement { counter, out1, .. } = *s {
+            let ci = counter.idx();
+            if ci < num_counters {
+                break_per_counter[ci] = collect_break_consuming(out1, states);
+            }
+        }
     }
 
-    // Flatten into a single Vec with (start, end) ranges.
+    // Flatten body interior into a single Vec with (start, end) ranges.
     let mut flat: Vec<u32> = Vec::new();
     let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(num_counters);
     for v in per_counter {
@@ -422,10 +451,54 @@ pub(crate) fn compute_tier2_analysis(
         flat.extend(v);
         ranges.push((start, flat.len()));
     }
+
+    // Flatten break consuming into a single Vec with (start, end) ranges.
+    let mut break_flat: Vec<StateIdx> = Vec::new();
+    let mut break_ranges: Vec<(usize, usize)> = Vec::with_capacity(num_counters);
+    for v in break_per_counter {
+        let start = break_flat.len();
+        break_flat.extend(v);
+        break_ranges.push((start, break_flat.len()));
+    }
+
     Tier2Analysis {
         body_interior: flat.into_boxed_slice(),
         body_ranges: ranges.into_boxed_slice(),
+        break_consuming: break_flat.into_boxed_slice(),
+        break_consuming_ranges: break_ranges.into_boxed_slice(),
     }
+}
+
+/// Collect consuming NFA states reachable from `start` via epsilon
+/// transitions (Split, Assert, CounterInstance).  Stops at consuming
+/// states and CInc — does not recurse into nested counters.
+fn collect_break_consuming(start: StateIdx, states: &[State]) -> Vec<StateIdx> {
+    let mut result = Vec::new();
+    let mut stack = vec![start];
+    let mut visited = vec![false; states.len()];
+    while let Some(idx) = stack.pop() {
+        let i = idx.idx();
+        if visited[i] {
+            continue;
+        }
+        visited[i] = true;
+        match states[idx] {
+            State::Split { out, out1 } => {
+                stack.push(out);
+                stack.push(out1);
+            }
+            State::Assert { out, .. } => stack.push(out),
+            State::CounterInstance { out, .. } => stack.push(out),
+            State::Byte { .. }
+            | State::ByteCI { .. }
+            | State::ByteClass { .. }
+            | State::ByteTable { .. } => {
+                result.push(idx);
+            }
+            _ => {}
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -739,14 +812,14 @@ impl Tier2DfaCache {
                     while mask != 0 {
                         let ci = mask.trailing_zeros() as usize;
                         mask &= mask - 1;
-                        for s in regex.states.iter() {
-                            if let State::CounterIncrement { counter, out1, .. } = *s
-                                && counter.idx() == ci
-                            {
-                                // Check direct (epsilon-only) match from
-                                // break target — gated on the precomputed
-                                // flag to avoid the walk when unnecessary.
-                                if regex.counter_break_can_match[ci] {
+
+                        // Check direct (epsilon-only) match from break
+                        // target — gated on the precomputed flag.
+                        if regex.counter_break_can_match[ci] {
+                            for s in regex.states.iter() {
+                                if let State::CounterIncrement { counter, out1, .. } = *s
+                                    && counter.idx() == ci
+                                {
                                     let (direct, _at_end) =
                                         break_path_match_kind(out1, &regex.states);
                                     if direct {
@@ -758,26 +831,16 @@ impl Tier2DfaCache {
                                     // break-through-$ is handled by
                                     // resolve_deferred_cinc_at_end().
                                 }
+                            }
+                        }
 
-                                // Collect consuming states on the break
-                                // path and try to consume `byte` at them.
-                                // These targets are only reachable when
-                                // the counter breaks AND the deferred
-                                // assertion passed, so they go into
-                                // resolved_break_targets for the
-                                // with_break DFA successor (Bug 18).
-                                //
-                                // NOT gated on counter_break_can_match:
-                                // that flag only checks epsilon-reachable
-                                // Match from out1 and is false when the
-                                // break path has consuming states.
-                                let break_consuming =
-                                    break_path_consuming_states(out1, &regex.states);
-                                for bc in break_consuming {
-                                    if let Some(t) = consume_byte(bc, byte, regex) {
-                                        resolved_break_targets.push(t);
-                                    }
-                                }
+                        // Consume the current byte at precomputed
+                        // break-path consuming states (Bug 18).
+                        // These are only reachable when the counter
+                        // breaks AND the deferred assertion passed.
+                        for &bc in analysis.break_consuming(ci) {
+                            if let Some(t) = consume_byte(bc, byte, regex) {
+                                resolved_break_targets.push(t);
                             }
                         }
                     }
@@ -1261,43 +1324,7 @@ fn break_path_match_kind(start: StateIdx, states: &[State]) -> (bool, bool) {
     (direct, at_end)
 }
 
-/// Collect consuming NFA states reachable from a CInc break target via
-/// epsilon transitions (Split, Assert, CounterInstance).  Stops at
-/// consuming states (Byte, ByteCI, ByteClass, ByteTable) and CInc —
-/// does not recurse into nested counters.
-///
-/// Used to discover break-path consuming states that need to consume
-/// the current byte when a deferred-assertion-gated counter breaks
-/// (Bug 18).
-fn break_path_consuming_states(start: StateIdx, states: &[State]) -> Vec<StateIdx> {
-    let mut result = Vec::new();
-    let mut stack = vec![start];
-    let mut visited = vec![false; states.len()];
-    while let Some(idx) = stack.pop() {
-        let i = idx.idx();
-        if visited[i] {
-            continue;
-        }
-        visited[i] = true;
-        match states[idx] {
-            State::Split { out, out1 } => {
-                stack.push(out);
-                stack.push(out1);
-            }
-            State::Assert { out, .. } => stack.push(out),
-            State::CounterInstance { out, .. } => stack.push(out),
-            State::Byte { .. }
-            | State::ByteCI { .. }
-            | State::ByteClass { .. }
-            | State::ByteTable { .. } => {
-                result.push(idx);
-            }
-            // CInc, Match: stop.
-            _ => {}
-        }
-    }
-    result
-}
+
 
 /// Compute a bitmask of counters reachable via CInc from deferred
 /// assertions in a closure result.  When a deferred assertion gates

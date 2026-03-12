@@ -330,6 +330,17 @@ impl DumpRegex<'_> {
                             .join(", ")
                     )?;
                 }
+                let bc = t2.break_consuming(ci);
+                if !bc.is_empty() {
+                    writeln!(
+                        f,
+                        "  c{ci}: break_consuming: [{}]",
+                        bc.iter()
+                            .map(|s| s.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )?;
+                }
             }
         }
 
