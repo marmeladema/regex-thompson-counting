@@ -390,11 +390,33 @@ impl DumpRegex<'_> {
             if !t3.break_seeds.is_empty() {
                 writeln!(f, "  break_seeds:")?;
                 for bs in t3.break_seeds.iter() {
-                    writeln!(
-                        f,
-                        "    trigger:c{} → seed c{} at origin:{}",
-                        bs.trigger, bs.counter, bs.origin
-                    )?;
+                    if bs.deferred_asserts.is_empty() {
+                        writeln!(
+                            f,
+                            "    trigger:c{} → seed c{} at origin:{}",
+                            bs.trigger, bs.counter, bs.origin
+                        )?;
+                    } else {
+                        let gates: Vec<String> = bs
+                            .deferred_asserts
+                            .iter()
+                            .map(|&da| {
+                                if let State::Assert { kind, .. } = r.states.0[da] {
+                                    format!("{}@{}", kind.label(), da)
+                                } else {
+                                    format!("?@{da}")
+                                }
+                            })
+                            .collect();
+                        writeln!(
+                            f,
+                            "    trigger:c{} → seed c{} at origin:{} (gated by {})",
+                            bs.trigger,
+                            bs.counter,
+                            bs.origin,
+                            gates.join(", ")
+                        )?;
+                    }
                 }
             }
 
