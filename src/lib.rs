@@ -10222,6 +10222,40 @@ mod tests {
             ],
         }
 
+        // Bug 24: When contaminated (break_extras && num_counters > 1),
+        // `clean_counter_free_mae` compared origins against `clean_nb`'s
+        // post-transition NFA states.  When the transition's only target
+        // was Assert(End) → Match (no consuming successors), `clean_nb`
+        // had empty NFA states, losing the mae signal from legitimate
+        // counter-free origins like `.{8,8}` → state 8.
+        //
+        // Pattern: ^(.{8,8}|f{5,26}|f{5,26})$ — the two f{5,26}
+        // alternatives create 2 counters (triggering contamination).
+        // Input "fffffabc" (8 chars): 5 f's match both f{5,26} alts
+        // (counters reach min), then "abc" continues the .{8,8} path.
+        // The .{8,8} alternative should match at exactly 8 chars, but
+        // the contaminated cf_mae check failed because origin 8 wasn't
+        // in the post-transition clean_nb state.
+        test_tier3_contaminated_cf_mae_empty_nfa {
+            pattern: r"^(.{8,8}|f{5,26}|f{5,26})$",
+            memory: 1461,
+            min_tier: 3,
+            inputs: [
+                ("fffffabc", true),            // Bug 24: .{8,8} via counter-free path
+                ("fffffXXX", true),            // Same: 5 f's + 3 non-f's = 8 chars
+                ("ffffffxx", true),            // 6 f's + 2 non-f's = 8 chars
+                ("fffffffx", true),            // 7 f's + 1 non-f = 8 chars
+                ("ffffffff", true),            // 8 f's: matches both .{8,8} and f{5,26}
+                ("abcdefgh", true),            // 8 non-f chars: only .{8,8}
+                ("fffff", true),               // 5 f's: f{5,26} matches
+                ("ffffffffffffffffffffffffffffff", false), // 30 f's > 26: f{5,26} fails, .{8,8} fails
+                ("ffff", false),               // 4 f's: too short for both
+                ("ffffabcd", true),            // 4 f's + 4 non-f = 8 chars: .{8,8}
+                ("fffffab", false),            // 7 chars: too short for .{8,8}
+                ("", false),
+            ],
+        }
+
         // Regression (defense-in-depth): `break_closure()` used to follow
         // through `CounterInstance` nodes, which meant that for sequential
         // multi-counter patterns like `.{1,2}.{4,4}$`, counter A's

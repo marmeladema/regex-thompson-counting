@@ -2287,10 +2287,17 @@ pub struct Tier3DfaMatcher<'a> {
     current_has_break_extras: bool,
     /// The "clean" no-break DFA state chain: always computed from the
     /// previous clean_nb state, never from a contaminated state.
-    /// Used by `clean_counter_free_mae()` as the reference for which
-    /// NFA states are genuinely reachable without counter breaks (Bug 22).
+    /// Used as the reference for which NFA states are genuinely reachable
+    /// without counter breaks (Bug 22).
     /// Updated each step: `clean_nb = no_break_successor(clean_nb, byte)`.
     clean_nb: DfaStateId,
+    /// The `nb_counter_free_mae` from the clean chain's last transition.
+    /// When contaminated, this replaces `clean_counter_free_mae(t)` which
+    /// was incorrectly checking origins against the post-transition
+    /// `clean_nb` state (Bug 24).  The clean chain's transition is from
+    /// a guaranteed-clean DFA state, so its `nb_counter_free_mae` correctly
+    /// indicates whether a counter-free `$ → Match` path exists.
+    clean_nb_cf_mae: bool,
     prefilter: Prefilter,
 }
 
@@ -2495,7 +2502,7 @@ macro_rules! step_slow_impl {
             self.no_break_current = t.no_break;
             let from_contaminated = self.current_has_break_extras && self.regex.num_counters > 1;
             self.last_nb_counter_free_mae = if from_contaminated {
-                self.clean_counter_free_mae(t)
+                self.clean_nb_cf_mae
             } else {
                 t.nb_counter_free_mae
             };
@@ -2520,7 +2527,7 @@ macro_rules! step_slow_impl {
                 // met their minimums.
                 let mae_before = self.match_at_end;
                 let cf_mae = if from_contaminated {
-                    self.clean_counter_free_mae(t)
+                    self.clean_nb_cf_mae
                 } else {
                     t.nb_counter_free_mae
                 };
@@ -2554,7 +2561,7 @@ macro_rules! step_slow_impl {
                     self.ever_matched = true;
                 }
                 let cf_mae = if from_contaminated {
-                    self.clean_counter_free_mae(t)
+                    self.clean_nb_cf_mae
                 } else {
                     t.counter_free_match_at_end
                 };
@@ -2630,6 +2637,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             // Treat the start state as uncontaminated.
             current_has_break_extras: false,
             clean_nb: cache.inner.start_id,
+            clean_nb_cf_mae: cache.inner.start_is_match_at_end,
             cache,
             memory,
             regex,
@@ -2645,54 +2653,13 @@ impl<'a> Tier3DfaMatcher<'a> {
     step_slow_impl!(step_slow_ranged, ranged_counters, next_ranged);
     step_slow_impl!(step_slow_instances, inst_counters, next_instances);
 
-    /// Check whether `counter_free_match_at_end` is trustworthy when the
-    /// FROM state was reached via a `with_break` transition (contaminated).
-    ///
-    /// When contaminated, some origins in the FROM state entered via counter
-    /// breaks — they are NOT genuinely counter-free even though they may be
-    /// statically `reachable_without_break`.  To avoid false positives
-    /// (Bug 19), we restrict the check to origins that are also present in
-    /// the no-break version of the FROM state (`self.no_break_current`).
-    ///
-    /// Returns `true` only if at least one origin satisfies all three
-    /// conditions:
-    /// 1. Present in the no-break FROM state's `nfa_states`
-    /// 2. `reachable_without_break[origin]` is true
-    /// 3. `target_is_match_at_end[origin]` is true
-    /// 4. The origin's action is NOT an `Increment` (counter-free path)
-    ///
-    /// This preserves legitimate counter-free match-at-end paths (Bug 20:
-    /// `^(.{0,2}|d+)$` on "ddd" where the `d+` exit to `$ → Match` is
-    /// genuinely counter-free) while blocking false positives from origins
-    /// that entered the DFA state only through counter breaks.
-    /// Check whether `counter_free_match_at_end` is trustworthy when the
-    /// FROM state was reached via a `with_break` transition (contaminated).
-    ///
-    /// Uses `self.clean_nb` — a DFA state maintained by following only
-    /// no-break transitions from the previous clean state (never from a
-    /// contaminated state).  This guarantees that its NFA states are
-    /// genuinely reachable without counter breaks.  Origins in the
-    /// transition are only trusted if they also appear in `clean_nb`.
-    ///
-    /// Using `self.no_break_current` would be wrong: it's the no-break
-    /// successor of the potentially contaminated FROM state, so it inherits
-    /// NFA states that entered via counter breaks (Bug 22).
-    #[inline]
-    fn clean_counter_free_mae(&self, t: &Transition) -> bool {
-        if self.clean_nb == DfaStateId::DEAD {
-            return false;
-        }
-        let nb_nfa = &self.cache.inner.states[self.clean_nb.idx()].nfa_states;
-        t.origin_keys
-            .iter()
-            .zip(t.origin_actions.iter())
-            .any(|(&origin, action)| {
-                !matches!(action, Some(Tier3OriginKind::Increment { .. }))
-                    && self.analysis.target_is_match_at_end[origin.idx()]
-                    && self.analysis.reachable_without_break[origin.idx()]
-                    && nb_nfa.contains(&origin)
-            })
-    }
+    // `clean_counter_free_mae` was removed in Bug 24.  The method
+    // compared origins against `clean_nb`'s *post-transition* NFA states,
+    // which could be empty when the transition's only target was an
+    // Assert(End) with no consuming successors — losing the mae signal
+    // from legitimate counter-free origins.  Replaced by `clean_nb_cf_mae`,
+    // the clean chain transition's `nb_counter_free_mae`, which is
+    // computed against the *pre-transition* clean state.
 
     fn step_from_dead(&mut self, byte: u8) {
         if self.has_live_instances {
@@ -2720,6 +2687,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         self.last_nb_counter_free_mae = trans.nb_counter_free_mae;
         self.current_has_break_extras = false;
         self.clean_nb = trans.no_break;
+        self.clean_nb_cf_mae = trans.nb_counter_free_mae;
 
         if !trans.is_counting {
             if trans.no_break_is_match {
@@ -2831,22 +2799,25 @@ impl<'a> Tier3DfaMatcher<'a> {
             // When contaminated, advance `clean_nb` independently from the
             // previous clean state.  When not contaminated, defer update
             // to after reading `t.no_break` (see below).
-            if self.current_has_break_extras
-                && self.regex.num_counters > 1
-                && self.clean_nb != DfaStateId::DEAD
-            {
-                let cn_slot = self.clean_nb.idx() * stride + class;
-                if self.cache.transitions[cn_slot].no_break == DfaStateId::UNPOPULATED {
-                    let cn_trans = self.cache.populate(
-                        self.memory,
-                        self.clean_nb,
-                        b,
-                        self.regex,
-                        self.analysis,
-                    );
-                    self.cache.transitions[cn_slot] = cn_trans;
+            if self.current_has_break_extras && self.regex.num_counters > 1 {
+                if self.clean_nb != DfaStateId::DEAD {
+                    let cn_slot = self.clean_nb.idx() * stride + class;
+                    if self.cache.transitions[cn_slot].no_break == DfaStateId::UNPOPULATED {
+                        let cn_trans = self.cache.populate(
+                            self.memory,
+                            self.clean_nb,
+                            b,
+                            self.regex,
+                            self.analysis,
+                        );
+                        self.cache.transitions[cn_slot] = cn_trans;
+                    }
+                    let cn_trans = &self.cache.transitions[cn_slot];
+                    self.clean_nb_cf_mae = cn_trans.nb_counter_free_mae;
+                    self.clean_nb = cn_trans.no_break;
+                } else {
+                    self.clean_nb_cf_mae = false;
                 }
-                self.clean_nb = self.cache.transitions[cn_slot].no_break;
             }
 
             let t = &self.cache.transitions[slot];
@@ -2854,6 +2825,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             // When not contaminated, clean_nb simply tracks no_break.
             if !(self.current_has_break_extras && self.regex.num_counters > 1) {
                 self.clean_nb = t.no_break;
+                self.clean_nb_cf_mae = t.nb_counter_free_mae;
             }
 
             if !t.is_counting
@@ -2867,7 +2839,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                 self.current = t.no_break;
                 self.no_break_current = t.no_break;
                 let cf_mae = if from_contaminated {
-                    self.clean_counter_free_mae(t)
+                    self.clean_nb_cf_mae
                 } else {
                     t.nb_counter_free_mae
                 };
@@ -2991,6 +2963,7 @@ impl fmt::Debug for Tier3DfaMatcher<'_> {
             .field("has_live_instances", &self.has_live_instances)
             .field("current_has_break_extras", &self.current_has_break_extras)
             .field("clean_nb", &self.clean_nb)
+            .field("clean_nb_cf_mae", &self.clean_nb_cf_mae)
             .field("post_break_tails_len", &self.post_break_tails.len())
             .field(
                 "verified_deferred_asserts_len",
