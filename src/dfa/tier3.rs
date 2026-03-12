@@ -2437,6 +2437,20 @@ macro_rules! step_slow_impl {
             // Each tail is a consuming NFA state from a previous counter
             // break.  If it consumed this byte and its target reaches
             // `$ → Match`, set match_at_end.
+            //
+            // Shared match-flag check for Advance and None branches
+            // (Bug 29: ensures both branches check target_is_match and
+            // target_is_match_at_end consistently).
+            macro_rules! check_tail_match_flags {
+                ($self:ident, $origin:expr) => {
+                    if $self.analysis.target_is_match_at_end[$origin.idx()] {
+                        $self.match_at_end = true;
+                    }
+                    if $self.analysis.target_is_match[$origin.idx()] {
+                        $self.ever_matched = true;
+                    }
+                };
+            }
             self.next_post_break_tails.clear();
             for &pbo in &self.post_break_tails {
                 let pos = t.origin_keys.iter().position(|&k| k == pbo);
@@ -2447,16 +2461,7 @@ macro_rules! step_slow_impl {
                                 self.next_post_break_tails.push(new_o);
                             }
                         }
-                        if self.analysis.target_is_match_at_end[pbo.idx()] {
-                            self.match_at_end = true;
-                        }
-                        // Bug 29: also check direct Match (not just
-                        // $ → Match).  The tail consumed the byte and its
-                        // target epsilon-closure includes Match — this is
-                        // a live match, same as the None (dead) branch.
-                        if self.analysis.target_is_match[pbo.idx()] {
-                            self.ever_matched = true;
-                        }
+                        check_tail_match_flags!(self, pbo);
                     }
                     Some(Some(Tier3OriginKind::Increment {
                         counter,
@@ -2513,19 +2518,10 @@ macro_rules! step_slow_impl {
                         }
                     }
                     Some(None) => {
-                        // `None` (dead) target.  Check $ → Match and
-                        // direct Match via precomputed flags.
-                        if self.analysis.target_is_match_at_end[pbo.idx()] {
-                            self.match_at_end = true;
-                        }
-                        // Bug 25: also check direct Match (not just
-                        // $ → Match).  For unanchored patterns like
-                        // `(ab|a){1,50}(xy|x){1,50}z`, the break path
-                        // leads to `Byte('z') → Match` — a direct match
-                        // that doesn't involve an End assertion.
-                        if self.analysis.target_is_match[pbo.idx()] {
-                            self.ever_matched = true;
-                        }
+                        // `None` (dead) target — byte not accepted by
+                        // this tail, but check precomputed match flags
+                        // (Bug 25: direct Match; Bug 29: shared helper).
+                        check_tail_match_flags!(self, pbo);
                     }
                     None => {
                         // Origin not in transition — byte not accepted.
