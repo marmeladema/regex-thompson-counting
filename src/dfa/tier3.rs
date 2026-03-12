@@ -2198,9 +2198,22 @@ fn analyze_target(
             break_consuming_states: Box::new([]),
         })
     } else if advance_origins.is_empty() {
-        // Dead — no consuming states reachable.  But may still reach
-        // Match / ($ → Match) through the epsilon path.
-        None
+        if advance_is_match_at_end {
+            // Bug 39: no consuming states downstream but `$ → Match`
+            // IS reachable.  Return an Advance with empty origins so
+            // that post-break tails pick up the byte-specific
+            // `is_match_at_end` flag.  Previously returned `None`,
+            // which lost the match-at-end information for ByteTable
+            // tails (the static `target_is_match_at_end` array skips
+            // ByteTable states).
+            Some(Tier3OriginKind::Advance {
+                new_origins: Box::new([]),
+                is_match_at_end: true,
+            })
+        } else {
+            // Truly dead — no consuming states and no `$ → Match`.
+            None
+        }
     } else {
         Some(Tier3OriginKind::Advance {
             new_origins: advance_origins.into_boxed_slice(),

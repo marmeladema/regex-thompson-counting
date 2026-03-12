@@ -10727,6 +10727,34 @@ mod tests {
             ],
         }
 
+        // -- Bug 39 regression: dead target loses match_at_end for ByteTable tails --
+        // Pattern `^(.{6,36}a{0,4}e*c)?$` has a ByteTable at state 11
+        // (unrolled `a{0,4}` → entries 'a', 'c', 'e').  After c0 breaks,
+        // state 11 is a post_break_tail.  Consuming 'c' → state 16
+        // (Assert(End) → Match) should set match_at_end.  But
+        // analyze_target(16) returned None (no consuming states) and the
+        // tail processing's Some(None) branch used the static
+        // target_is_match_at_end array — always false for ByteTable.
+        //
+        // Fix: return Advance { new_origins: [], is_match_at_end: true }
+        // from analyze_target when the epsilon walk reaches $ → Match
+        // even with no consuming states downstream.
+        test_tier3_dead_target_byte_table_mae {
+            pattern: r"^(.{6,36}a{0,4}e*c)?$",
+            memory: 5555,
+            min_tier: 2,
+            inputs: [
+                ("xxxcbd ccac", true),          // Bug 39 crash case
+                ("xxxxxxc", true),              // 6 wildcards + c (minimum)
+                ("xxxxxxac", true),             // 6 wildcards + a + c
+                ("xxxxxxaaac", true),           // 6 wildcards + aaa + c
+                ("xxxxxxaaaaec", true),         // 6 wildcards + aaaa + e + c
+                ("xxxxx", false),               // 5 chars, no c (< min 6 wildcards)
+                ("xxxxxxx", false),             // 7 wildcards but no c
+                ("", true),                     // empty (outer ? skips group, $ matches)
+            ],
+        }
+
         // -- Bug 30 regression: contaminated no_break_current deferred asserts --
         // When c0 (.{0,44}) breaks, the DFA state inherits state 8 (Byte 'f')
         // from c1's break path.  State 8→9 (\b) ends up as a deferred assert
