@@ -2518,6 +2518,7 @@ macro_rules! step_slow_impl {
                 // from post-break tail NFA states that only become active
                 // after counter breaks — but those counters may not have
                 // met their minimums.
+                let mae_before = self.match_at_end;
                 let cf_mae = if from_contaminated {
                     self.clean_counter_free_mae(t)
                 } else {
@@ -2526,6 +2527,14 @@ macro_rules! step_slow_impl {
                 if cf_mae {
                     self.match_at_end = true;
                 }
+                // Bug 23 guard: match_at_end must only become true via
+                // cf_mae, never from the raw DFA state is_match_at_end.
+                debug_assert!(
+                    !self.match_at_end || mae_before || cf_mae,
+                    "Bug 23 guard: non-counting transition set match_at_end \
+                     without cf_mae (state={:?})",
+                    self.current,
+                );
                 let m = if any_can_break {
                     t.with_break_is_match
                 } else {
@@ -2722,6 +2731,14 @@ impl<'a> Tier3DfaMatcher<'a> {
             if trans.nb_counter_free_mae {
                 self.match_at_end = true;
             }
+            // Bug 23 guard: match_at_end was reset to false above, so
+            // it can only be true here if nb_counter_free_mae is true.
+            debug_assert!(
+                !self.match_at_end || trans.nb_counter_free_mae,
+                "Bug 23 guard: step_from_dead set match_at_end without \
+                 nb_counter_free_mae (state={:?})",
+                self.current,
+            );
         }
 
         // Seed instances.
@@ -3011,6 +3028,9 @@ impl fmt::Display for Tier3DfaMatcher<'_> {
         }
         if self.match_at_end {
             write!(f, " mae")?;
+        }
+        if self.last_nb_counter_free_mae {
+            write!(f, " cf_mae")?;
         }
         if self.current_has_break_extras {
             write!(f, " break_extras")?;
