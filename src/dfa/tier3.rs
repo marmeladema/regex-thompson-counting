@@ -399,63 +399,19 @@ pub(crate) fn compute_tier3_analysis(
             }
         }
 
-        // Phase 2: follow consuming states' targets to find CI nodes
-        // reachable after one byte consumption (multi-hop break seeds).
-        // Self-referential seeds (counter == trigger) are EXCLUDED here
-        // because consuming states on the break path entered the DFA
-        // state through a previous with_break closure; re-seeding the
-        // trigger counter at val=0 would create imprecise ranges.
+        // Phase 2 was previously here: it followed consuming states'
+        // targets to find CI nodes reachable after one byte consumption
+        // ("multi-hop break seeds").  However, these seeds fire on the
+        // same byte as the counter break, one step too early — the
+        // intervening consuming state hasn't consumed its byte yet.
+        // The tail mechanism (break_consuming_tails + post_break_tails)
+        // now correctly handles these cases: the consuming state is
+        // tracked as a tail, consumes its byte on the next step, and
+        // seeds the downstream counter with proper byte timing.
         //
-        // Phase 2 seeds go through a consuming state, so deferred
-        // asserts from Phase 1 don't carry over (they were resolved by
-        // the byte consumption).  Phase 2 tracks its own asserts.
-        for cs in &break_consuming {
-            let target = match states[*cs] {
-                State::Byte { out, .. }
-                | State::ByteCI { out, .. }
-                | State::ByteClass { out, .. } => out,
-                State::ByteTable { .. } => continue,
-                _ => continue,
-            };
-            let mut hop_stack: Vec<(StateIdx, Vec<StateIdx>)> = vec![(target, Vec::new())];
-            let mut hop_visited = vec![false; n];
-            while let Some((idx, deferred)) = hop_stack.pop() {
-                let i = idx.idx();
-                if hop_visited[i] {
-                    continue;
-                }
-                hop_visited[i] = true;
-                match states[idx] {
-                    State::CounterInstance { counter, out } => {
-                        // Only add seeds for DIFFERENT counters to
-                        // prevent self-referential re-seeding.
-                        if counter != trigger {
-                            let ci_consuming = consuming_states_from(out, states);
-                            for c in ci_consuming {
-                                break_seeds_raw.push((trigger, counter, c, deferred.clone()));
-                            }
-                        }
-                        hop_stack.push((out, deferred));
-                    }
-                    State::Split { out, out1 } => {
-                        hop_stack.push((out1, deferred.clone()));
-                        hop_stack.push((out, deferred));
-                    }
-                    State::Assert { kind, out } => {
-                        let mut d = deferred;
-                        if kind != AssertKind::End {
-                            d.push(idx);
-                        }
-                        hop_stack.push((out, d));
-                    }
-                    State::CounterIncrement { .. } => {
-                        // Don't follow through another CInc — tier 3
-                        // doesn't support nested counters in break paths.
-                    }
-                    _ => {}
-                }
-            }
-        }
+        // Bug 38: removing phase 2 fixes false positives on patterns
+        // like `^e{4,5}e{4,5}ee{4,5}$` where the break path crosses
+        // a consuming state before reaching the next counter's CI.
     }
     break_seeds_raw.sort_by_key(|e| (e.0.idx(), e.1.idx(), e.2 .0));
     break_seeds_raw.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);

@@ -10700,6 +10700,33 @@ mod tests {
             ],
         }
 
+        // -- Bug 38 regression: phase-2 break_seeds fire one byte too early --
+        // Pattern `^e{4,5}e{4,5}ee{4,5}$` requires 13-16 e's.  When c1
+        // breaks at value 4, the break path crosses a consuming state
+        // (literal 'e' at state 7) before reaching c2's CounterInstance.
+        // Phase-2 break_seeds (which follow consuming states' targets to
+        // find downstream CIs) seeded c2 immediately at the break byte,
+        // bypassing state 7's byte consumption.  This gave c2 one extra
+        // counting step, producing a false positive on 12 e's.
+        //
+        // Fix: remove phase-2 break_seeds entirely.  The tail mechanism
+        // (break_consuming_tails + post_break_tails) handles multi-hop
+        // break paths with correct byte timing.
+        test_tier3_phase2_break_seed_false_positive {
+            pattern: r"^e{4,5}e{4,5}ee{4,5}$",
+            memory: 1334,
+            min_tier: 1,
+            inputs: [
+                ("eeeeeeeeeeee", false),       // 12 e's: Bug 38 crash case (< min 13)
+                ("eeeeeeeeeeeee", true),        // 13 e's: 4+4+1+4 = minimum
+                ("eeeeeeeeeeeeee", true),       // 14 e's
+                ("eeeeeeeeeeeeeee", true),      // 15 e's
+                ("eeeeeeeeeeeeeeee", true),     // 16 e's: 5+5+1+5 = maximum
+                ("eeeeeeeeeeeeeeeee", false),   // 17 e's: > max 16
+                ("", false),                    // empty
+            ],
+        }
+
         // -- Bug 30 regression: contaminated no_break_current deferred asserts --
         // When c0 (.{0,44}) breaks, the DFA state inherits state 8 (Byte 'f')
         // from c1's break path.  State 8→9 (\b) ends up as a deferred assert
