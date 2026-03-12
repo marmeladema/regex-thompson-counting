@@ -2548,6 +2548,9 @@ macro_rules! step_slow_impl {
                     }
                 };
             }
+            let mut any_can_break = false;
+            let mut counter_broke: u64 = 0;
+
             self.next_post_break_tails.clear();
             for &pbo in &self.post_break_tails {
                 let pos = t.origin_keys.iter().position(|&k| k == pbo);
@@ -2604,7 +2607,16 @@ macro_rules! step_slow_impl {
                             }
                         }
                         // Check break (value after increment >= min).
+                        // Bug 36: the tail→CInc handoff IS a counter
+                        // break — set any_can_break and counter_broke so
+                        // the DFA selects with_break (which includes
+                        // post-break NFA origins) and break_seeds fire.
+                        // Without this, the DFA goes to the no_break
+                        // state and subsequent tails are dropped because
+                        // their origin isn't in the no_break closure.
                         if pbt_value + 1 >= *min {
+                            any_can_break = true;
+                            counter_broke |= 1u64 << counter.idx();
                             if *break_is_match {
                                 self.ever_matched = true;
                             }
@@ -2651,10 +2663,11 @@ macro_rules! step_slow_impl {
                 self.$current.seed(counter.idx(), origin, value);
             }
 
-            let mut any_can_break = false;
+            // Note: any_can_break and counter_broke are declared ABOVE
+            // the tail loop (Bug 36) so that tail→CInc handoffs that
+            // produce a break can set them before the counter loop.
             let num_counters = self.$current.num_counters();
             debug_assert!(num_counters <= 64);
-            let mut counter_broke: u64 = 0;
 
             #[allow(clippy::needless_range_loop)]
             for c_idx in 0..num_counters {

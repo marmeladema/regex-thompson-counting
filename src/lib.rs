@@ -10636,6 +10636,39 @@ mod tests {
             ],
         }
 
+        // -- Bug 36 regression: tail→CInc handoff break not setting any_can_break --
+        // Pattern `^(.{1,3}.{0,0} )+$` has one counter c0 {1,3} for
+        // `.{1,3}`.  The `+` loop re-enters via Split → CI(c0) → body.
+        // After matching "ax " (c0 breaks at 2, ' ' consumed via
+        // post_break_tail [4]), the tail chain Advance → [1] creates a
+        // new tail at origin 1.  On the next 'a', this tail hits CInc
+        // and the handoff produces a break (value 0→1 ≥ min 1), adding
+        // break_consuming_states [4].  But `any_can_break` was only set
+        // by the counter entry loop (which had 0 entries), so the DFA
+        // selected `no_break` (nfa={1}), dropping origin 4 from the
+        // state.  At the next ' ', tail [4]'s origin was not in
+        // origin_keys → dropped → false negative.
+        //
+        // Fix: set `any_can_break` and `counter_broke` in the tail→CInc
+        // Increment arm when value >= min, so the DFA selects `with_break`.
+        test_tier3_tail_cinc_handoff_break {
+            pattern: r"^(.{1,3}.{0,0} )+$",
+            memory: 1194,
+            min_tier: 1,
+            inputs: [
+                ("ax a ", true),            // Bug 36 minimal crash case: 2-char body + space, 1-char body + space
+                ("ax a ca f c0 c 1 c ", true), // Bug 36 original fuzz input (len=19)
+                ("a ", true),               // single iteration: 1 char + space
+                ("ab ", true),              // single iteration: 2 chars + space
+                ("abc ", true),             // single iteration: 3 chars + space (max)
+                ("a b ", true),             // two iterations: 1+space, 1+space
+                ("abc ab a ", true),        // three iterations with different body lengths
+                ("abcd ", false),           // 4 chars before space exceeds max 3
+                ("", false),               // empty: + requires ≥1 iteration
+                (" ", false),              // space only: body needs ≥1 char
+            ],
+        }
+
         // -- Bug 30 regression: contaminated no_break_current deferred asserts --
         // When c0 (.{0,44}) breaks, the DFA state inherits state 8 (Byte 'f')
         // from c1's break path.  State 8→9 (\b) ends up as a deferred assert
