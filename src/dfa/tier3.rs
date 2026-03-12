@@ -3372,6 +3372,30 @@ impl fmt::Display for Tier3DfaMatcher<'_> {
         if self.current_has_break_extras {
             write!(f, " break_extras")?;
         }
+        // Clean chain state (only shown when contaminated or divergent).
+        if self.current_has_break_extras && self.regex.num_counters > 1 {
+            if self.clean_nb == DfaStateId::DEAD {
+                write!(f, " clean_nb=DEAD")?;
+            } else {
+                let clean_state = &self.cache.inner.states[self.clean_nb.idx()];
+                write!(
+                    f,
+                    " clean_nb={{{}}}",
+                    clean_state
+                        .nfa_states
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )?;
+            }
+            if self.clean_nb_is_match {
+                write!(f, " clean_is_match")?;
+            }
+            if self.clean_nb_cf_mae {
+                write!(f, " clean_cf_mae")?;
+            }
+        }
         // Counter summary.
         if self.has_live_instances {
             if self.use_ranges {
