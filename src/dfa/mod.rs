@@ -158,13 +158,17 @@ impl DfaState {
     /// statically reachable but dynamically impossible at the same position.
     pub(super) fn can_reach_match_at_end(start: StateIdx, prev: Option<u8>, regex: &Regex) -> bool {
         let states = &regex.states;
+        let num_states = states.len();
+        let mut visited = vec![false; num_states];
         let mut stack = vec![start];
         while let Some(idx) = stack.pop() {
+            let i = idx.idx();
             // Quick static check: if Match is unreachable from this state
             // at all, skip it.
-            if !regex.state_can_reach_match[idx.idx()] {
+            if i >= num_states || visited[i] || !regex.state_can_reach_match[i] {
                 continue;
             }
+            visited[i] = true;
             match states[idx] {
                 State::Match => return true,
                 State::Assert { kind, out } => {

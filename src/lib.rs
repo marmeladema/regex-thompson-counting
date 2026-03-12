@@ -10537,6 +10537,31 @@ mod tests {
             ],
         }
 
+        // -- Bug 33 regression: OOM in can_reach_match epsilon walk --
+        // Patterns containing `(\b|\B)*` create epsilon cycles in the NFA:
+        // the `*`'s Split loops back through the alternation, and since
+        // either `\b` or `\B` always passes, the walk never terminates
+        // without a visited set.  Both `can_reach_match_at_end` (mod.rs)
+        // and `can_reach_match_mid` (tier3.rs) were missing visited sets,
+        // causing OOM during deferred assertion resolution.
+        //
+        // Fix: add a `visited` bitvec to both epsilon walk functions.
+        test_epsilon_cycle_assert_oom {
+            pattern: r"^a{2,5}(\b|\B)*b$",
+            memory: 1136,
+            min_tier: 1,
+            inputs: [
+                ("aab", true),
+                ("aaab", true),
+                ("aaaab", true),
+                ("aaaaab", true),
+                ("ab", false),       // too few a's
+                ("aaaaaab", false),   // too many a's
+                ("aa", false),        // no trailing b
+                ("", false),
+            ],
+        }
+
         // -- Bug 31 regression: chained assertions in target_deferred_asserts --
         // Pattern has `.\b\B` after counter break.  State 4's target epsilon
         // path goes through \b@5 then \B@6.  If target_deferred_asserts
@@ -11319,4 +11344,5 @@ mod tests {
             .translate(pattern, &ast)
             .ok()
     }
+
 }

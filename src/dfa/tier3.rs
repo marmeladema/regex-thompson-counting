@@ -3297,11 +3297,15 @@ impl<'a> Tier3DfaMatcher<'a> {
         regex: &Regex,
     ) -> bool {
         let states = &regex.states;
+        let num_states = states.len();
+        let mut visited = vec![false; num_states];
         let mut stack = vec![start];
         while let Some(idx) = stack.pop() {
-            if !regex.state_can_reach_match[idx.idx()] {
+            let i = idx.idx();
+            if i >= num_states || visited[i] || !regex.state_can_reach_match[i] {
                 continue;
             }
+            visited[i] = true;
             match states[idx] {
                 State::Match => return true,
                 State::Assert { kind, out } => {
