@@ -3393,6 +3393,7 @@ impl MatcherMemory {
 }
 
 /// A matcher that dispatches to either the lazy DFA or the NFA simulator.
+#[allow(clippy::large_enum_variant)]
 pub enum AnyMatcher<'a> {
     /// Lazy DFA path (Tier 1: counter-free, simple-assertion patterns).
     Dfa(DfaMatcher<'a>),
@@ -10445,6 +10446,43 @@ mod tests {
                 ("a b", true),                  // \b between 'a' and ' '
                 ("ab ", false),                 // \b(a,b)=no, \b(b, )=yes but .{2,2}$ fails
                 ("a  ", true),                  // \b between 'a' and ' '
+            ],
+        }
+
+        // Bug 28: break-seed deferred assertion evaluated at wrong position.
+        // The `\b` on the break path from c0 to c1 was evaluated with
+        // `prev=byte, next=byte` (always false for `\b`).  The assertion
+        // must be deferred to the next byte: `prev=byte, next=next_byte`.
+        // Without the fix, `\b` never passes in break seeds, and c1 is
+        // never seeded through that path.
+        test_tier3_pending_break_seed {
+            pattern: r"^f{3,4}\b.{5,10}a?$",
+            memory: 1706,
+            min_tier: 1,
+            inputs: [
+                ("fff abcde", true),            // \b between 'f' and ' '
+                ("fff abcd", true),             // \b between 'f' and ' '
+                ("ffffffff", false),            // no \b (all word chars)
+                ("fff     ", true),             // \b between 'f' and ' '
+                ("fffabcde", false),            // no \b (f/a both word chars)
+                ("fff", false),                 // too short for c1
+                ("ffff bcde", true),            // 4 f's, \b between 'f' and ' '
+            ],
+        }
+
+        // Bug 28 variant: `\B` (non-word-boundary) on break path.
+        // The break seed for c1 passes through `\B`.  Same deferred
+        // evaluation applies — `\B(byte, byte)` is always true, so
+        // without the fix, `\B`-gated seeds fire incorrectly.
+        test_tier3_pending_break_seed_non_word_boundary {
+            pattern: r"^(a?.{2,2}\Bx{2,2})?$",
+            memory: 1211,
+            min_tier: 1,
+            inputs: [
+                ("xxxx", true),                 // \B between x and x (same word class)
+                ("aa  ", false),                // \B between ' ' and ' ' would pass, but no 'x'
+                ("", true),                     // empty matches via outer `?`
+                ("aaxx", true),                 // a, then .{2,2}=ax, \B(x,x), xx
             ],
         }
     }

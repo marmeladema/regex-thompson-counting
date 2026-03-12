@@ -2364,6 +2364,13 @@ pub struct Tier3DfaMatcher<'a> {
     /// on the path to `$ → Match` from a counter that actually broke with
     /// enough value.  Evaluated in `finish()` at end-of-input.
     verified_deferred_asserts: Vec<StateIdx>,
+    /// Pending break seeds whose deferred assertions (e.g. `\b`) could not
+    /// be evaluated at break time because the next byte was unknown (Bug 28).
+    /// Each entry stores `(trigger, counter, origin, value, prev_was_word)` —
+    /// the triggering counter, the seed to apply, and the word-ness of the
+    /// byte at the break position.  Resolved at the start of the next byte
+    /// (in `chunk()`) or at end-of-input (in `finish()`).
+    pending_break_seeds: Vec<(CounterIdx, CounterIdx, StateIdx, u32, bool)>,
     /// True when the current DFA state (`self.current`) was reached via a
     /// `with_break` transition and may contain NFA consuming states that
     /// entered through a counter break path.  When true, the precomputed
@@ -2424,6 +2431,7 @@ macro_rules! step_slow_impl {
             self.$next.clear();
             self.match_at_end = false;
             self.verified_deferred_asserts.clear();
+            self.pending_break_seeds.clear();
 
             // Advance existing post-break tails through this transition.
             // Each tail is a consuming NFA state from a previous counter
@@ -2705,16 +2713,16 @@ macro_rules! step_slow_impl {
                 self.$current.seed(counter.idx(), origin, value);
             }
             // Break seeds gated on the triggering counter.
-            // Bug 27: also check deferred asserts from the analysis-level
-            // break_seeds.  If the path from trigger's break to the seed's
-            // CI passes through a deferred assertion (e.g. `\b`), the seed
-            // should only be applied if the assertion passes at the current
-            // position.
+            // Bug 27: break seeds with deferred assertions (e.g. `\b`) on
+            // the path from the trigger's CInc break to the seed's CI.
+            // Bug 28: the assertion is at the position AFTER consuming
+            // `byte` (between `byte` and the next input byte).  Since the
+            // next byte is unknown at break time, the assertion must be
+            // DEFERRED — stored in `pending_break_seeds` and evaluated at
+            // the start of the next byte (or at end-of-input in `finish()`).
             for &(trigger, counter, origin, value) in t.break_seeds.iter() {
                 if counter_broke & (1u64 << trigger.idx()) != 0 {
-                    // Look up deferred asserts for this break seed in the
-                    // precomputed analysis.
-                    let asserts_pass = self
+                    let has_deferred = self
                         .analysis
                         .break_seeds
                         .iter()
@@ -2723,24 +2731,20 @@ macro_rules! step_slow_impl {
                                 && bs.counter == counter
                                 && bs.origin == origin
                         })
-                        .map_or(true, |bs| {
-                            if bs.deferred_asserts.is_empty() {
-                                return true;
-                            }
-                            let state = &self.cache.inner.states[self.current.idx()];
-                            let prev = state.prev_byte_representative();
-                            bs.deferred_asserts.iter().all(|&assert_idx| {
-                                if let State::Assert { kind, .. } =
-                                    self.regex.states[assert_idx]
-                                {
-                                    kind.eval(false, false, prev, Some(byte))
-                                        == AssertEval::Pass
-                                } else {
-                                    true
-                                }
-                            })
-                        });
-                    if asserts_pass {
+                        .is_some_and(|bs| !bs.deferred_asserts.is_empty());
+                    if has_deferred {
+                        // Defer: store the seed with the word-ness of the
+                        // break position (= `byte`, the byte just consumed
+                        // by the body) for later evaluation.
+                        self.pending_break_seeds.push((
+                            trigger,
+                            counter,
+                            origin,
+                            value,
+                            crate::is_word_byte(byte),
+                        ));
+                    } else {
+                        // No assertions on break path — apply immediately.
                         self.$current.seed(counter.idx(), origin, value);
                     }
                 }
@@ -2792,6 +2796,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             post_break_tails: Vec::new(),
             next_post_break_tails: Vec::new(),
             verified_deferred_asserts: Vec::new(),
+            pending_break_seeds: Vec::new(),
             // The start state may include NFA states from break paths
             // (the start closure is computed with follow_break=true), but
             // these are freshly seeded — not from a previous counter break.
@@ -2957,6 +2962,59 @@ impl<'a> Tier3DfaMatcher<'a> {
                     {
                         self.ever_matched = true;
                         break;
+                    }
+                }
+            }
+
+            // Resolve pending break seeds from the PREVIOUS step (Bug 28).
+            // These are break seeds whose deferred assertions (e.g. `\b`)
+            // could not be evaluated at break time because the next byte
+            // was unknown.  Now that we have the next byte (`b`), evaluate
+            // the assertions and seed the counter if they pass.
+            if !self.pending_break_seeds.is_empty() {
+                for i in 0..self.pending_break_seeds.len() {
+                    let (trigger, counter, origin, value, prev_was_word) =
+                        self.pending_break_seeds[i];
+                    let prev = if prev_was_word {
+                        Some(b'a')
+                    } else {
+                        Some(b' ')
+                    };
+                    // Look up deferred asserts for this seed.
+                    let pass = self
+                        .analysis
+                        .break_seeds
+                        .iter()
+                        .find(|bs| {
+                            bs.trigger == trigger
+                                && bs.counter == counter
+                                && bs.origin == origin
+                        })
+                        .is_none_or(|bs| {
+                            bs.deferred_asserts.iter().all(|&assert_idx| {
+                                if let State::Assert { kind, .. } =
+                                    self.regex.states[assert_idx]
+                                {
+                                    kind.eval(false, false, prev, Some(b))
+                                        == AssertEval::Pass
+                                } else {
+                                    true
+                                }
+                            })
+                        });
+                    if pass {
+                        if self.use_ranges {
+                            self.ranged_counters.insert(
+                                counter.idx(),
+                                origin,
+                                value,
+                                value,
+                            );
+                        } else {
+                            self.inst_counters
+                                .seed(counter.idx(), origin, value);
+                        }
+                        self.has_live_instances = true;
                     }
                 }
             }
@@ -3156,6 +3214,62 @@ impl<'a> Tier3DfaMatcher<'a> {
                 return true;
             }
         }
+        // Pending break seeds at end-of-input (Bug 28): evaluate the
+        // deferred assertions with `at_end=true`.  If the assertion passes
+        // AND the seeded counter can immediately break (value >= min) with
+        // a match-producing break path, this is a match.
+        if !self.pending_break_seeds.is_empty() {
+            for &(trigger, counter, origin, value, prev_was_word) in &self.pending_break_seeds {
+                let prev = if prev_was_word {
+                    Some(b'a')
+                } else {
+                    Some(b' ')
+                };
+                let pass = self
+                    .analysis
+                    .break_seeds
+                    .iter()
+                    .find(|bs| {
+                        bs.trigger == trigger
+                            && bs.counter == counter
+                            && bs.origin == origin
+                    })
+                    .is_none_or(|bs| {
+                        bs.deferred_asserts.iter().all(|&assert_idx| {
+                            if let State::Assert { kind, .. } = self.regex.states[assert_idx] {
+                                kind.eval(false, true, prev, None) == AssertEval::Pass
+                            } else {
+                                true
+                            }
+                        })
+                    });
+                if pass {
+                    // The seed counter starts at `value` with no more input.
+                    // Check if it can immediately break (value >= min) and if
+                    // the break path reaches Match/$ → Match.
+                    // Look up the counter's CInc target to find min/break info.
+                    // The origin is a consuming state; its target (after byte
+                    // consumption) holds the CInc increment action.
+                    for target_action in self.analysis.targets.iter().flatten() {
+                        if let Tier3OriginKind::Increment {
+                            counter: tc,
+                            min,
+                            break_is_match_at_end,
+                            break_is_match,
+                            ..
+                        } = target_action
+                            && *tc == counter
+                            && value >= *min
+                            && (*break_is_match_at_end || *break_is_match)
+                        {
+                            return true;
+                        }
+                    }
+                    // Even if the counter can't immediately break, the seed
+                    // doesn't help at end-of-input (no more bytes to process).
+                }
+            }
+        }
         // Counter-dependent deferred assertions: evaluate assertions from
         // counter break paths that actually broke with enough value.  These
         // are NFA Assert state indices (e.g. \b, \B) on the path to
@@ -3207,6 +3321,10 @@ impl fmt::Debug for Tier3DfaMatcher<'_> {
             .field(
                 "verified_deferred_asserts_len",
                 &self.verified_deferred_asserts.len(),
+            )
+            .field(
+                "pending_break_seeds_len",
+                &self.pending_break_seeds.len(),
             )
             .field("use_ranges", &self.use_ranges);
         s.finish()
