@@ -333,12 +333,14 @@ When fuzzing discovers bugs, follow this discipline:
    diverge.
 3. **Commit each fix separately.** Each bug fix gets its own commit with a
    descriptive message.  Always ask for confirmation before committing.
+   Include the regression test **and** the post-mortem in the same commit
+   as the code fix — they are all part of the same logical change.
 4. **Add a regression test** as an entry in the `match_tests!` macro (not a
    handwritten test function).  The macro automatically tests all eligible
    tiers and re-runs with `unroll_limit=0`.
 5. **Run the full test suite** (`cargo test`) after each fix to ensure no
    regressions.
-6. **Write a post-mortem.**  After each fix, create a Markdown file in
+6. **Write a post-mortem** as part of the fix.  Create a Markdown file in
    `docs/bugs/` (e.g. `docs/bugs/001-tier3-range-merge.md`) documenting:
    - **Bug summary** — pattern, input, expected vs actual, affected tier(s).
    - **Root cause** — what went wrong and why.
