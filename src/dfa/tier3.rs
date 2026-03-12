@@ -111,6 +111,13 @@ pub(crate) struct Tier3Analysis {
     /// target has no further consuming states but may have `$ → Match`).
     pub(crate) target_is_match_at_end: Box<[bool]>,
 
+    /// Indexed by NFA state index.  True if consuming a byte at this state
+    /// leads directly to `Match` through epsilon transitions (Split, Assert,
+    /// CI — but NOT through CInc).  Used by the post-break tail tracker to
+    /// detect direct matches (not just match-at-end) when a tail consumes
+    /// a byte and its target has no further consuming states (Bug 25).
+    pub(crate) target_is_match: Box<[bool]>,
+
     /// Per-NFA-state flag: true if the state is reachable from the start
     /// state by following only CInc *continue* paths (not break paths).
     ///
@@ -522,6 +529,52 @@ pub(crate) fn compute_tier3_analysis(
         }
     }
 
+    // -- Step 6b: compute per-consuming-state target_is_match -------------------
+    // Similar to target_mae but checks for direct `Match` reachability (not
+    // `$ → Match`).  Used by the post-break tail tracker to detect matches
+    // when a tail consumes a byte and its target leads to Match without any
+    // intervening `Assert(End)` (Bug 25).
+    let mut target_match = vec![false; n];
+    for (i, state) in states.iter().enumerate() {
+        let target = match *state {
+            State::Byte { out, .. } | State::ByteCI { out, .. } | State::ByteClass { out, .. } => {
+                if out != StateIdx::NONE {
+                    Some(out)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(t) = target {
+            let mut estack = vec![t];
+            let mut evisited = vec![false; n];
+            while let Some(eidx) = estack.pop() {
+                let ei = eidx.idx();
+                if evisited[ei] {
+                    continue;
+                }
+                evisited[ei] = true;
+                match states[eidx] {
+                    State::Split { out, out1 } => {
+                        estack.push(out1);
+                        estack.push(out);
+                    }
+                    // Do NOT follow Assert states: target_is_match
+                    // means Match is reachable unconditionally (no
+                    // assertion gating).  Assert(End) → Match is
+                    // already handled by target_is_match_at_end.
+                    State::Assert { .. } => {}
+                    State::CounterInstance { out, .. } => estack.push(out),
+                    State::Match => {
+                        target_match[i] = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     // -- Step 7: compute reachable_without_break --------------------------------
     // Transitive closure from start following ALL paths EXCEPT CInc break
     // paths.  Mark consuming states reachable without any counter break.
@@ -619,6 +672,7 @@ pub(crate) fn compute_tier3_analysis(
         break_seeds: break_seeds.into_boxed_slice(),
         max_body_origins,
         target_is_match_at_end: target_mae.into_boxed_slice(),
+        target_is_match: target_match.into_boxed_slice(),
         reachable_without_break: rwb.into_boxed_slice(),
         max_instance_stride,
         all_counters_rangeable,
@@ -2292,12 +2346,20 @@ pub struct Tier3DfaMatcher<'a> {
     /// Updated each step: `clean_nb = no_break_successor(clean_nb, byte)`.
     clean_nb: DfaStateId,
     /// The `nb_counter_free_mae` from the clean chain's last transition.
-    /// When contaminated, this replaces `clean_counter_free_mae(t)` which
-    /// was incorrectly checking origins against the post-transition
+    /// When contaminated, this replaces the old `clean_counter_free_mae(t)`
+    /// which was incorrectly checking origins against the post-transition
     /// `clean_nb` state (Bug 24).  The clean chain's transition is from
     /// a guaranteed-clean DFA state, so its `nb_counter_free_mae` correctly
     /// indicates whether a counter-free `$ → Match` path exists.
     clean_nb_cf_mae: bool,
+    /// The `no_break_is_match` from the clean chain's last transition.
+    /// When contaminated, the main transition's `no_break_is_match` may
+    /// include `Match` from break-gated origins (e.g. `Byte('f') → Match`
+    /// entered via a counter break) that haven't met their counter minimum
+    /// (Bug 25).  The clean chain's transition is from a guaranteed-clean
+    /// DFA state, so its `no_break_is_match` only reflects genuinely
+    /// counter-free `Match` paths.
+    clean_nb_is_match: bool,
     prefilter: Prefilter,
 }
 
@@ -2402,9 +2464,18 @@ macro_rules! step_slow_impl {
                         }
                     }
                     Some(None) => {
-                        // `None` (dead) target.  Check $ → Match via precomputed flag.
+                        // `None` (dead) target.  Check $ → Match and
+                        // direct Match via precomputed flags.
                         if self.analysis.target_is_match_at_end[pbo.idx()] {
                             self.match_at_end = true;
+                        }
+                        // Bug 25: also check direct Match (not just
+                        // $ → Match).  For unanchored patterns like
+                        // `(ab|a){1,50}(xy|x){1,50}z`, the break path
+                        // leads to `Byte('z') → Match` — a direct match
+                        // that doesn't involve an End assertion.
+                        if self.analysis.target_is_match[pbo.idx()] {
+                            self.ever_matched = true;
                         }
                     }
                     None => {
@@ -2544,6 +2615,14 @@ macro_rules! step_slow_impl {
                 );
                 let m = if any_can_break {
                     t.with_break_is_match
+                } else if from_contaminated {
+                    // When contaminated and no counter broke, the
+                    // no_break_is_match flag may include Match from
+                    // break-gated origins that never reached their
+                    // counter minimum (Bug 25).  Use the clean chain's
+                    // flag instead.  Post-break tail matches are handled
+                    // separately via target_is_match in the tail loop.
+                    self.clean_nb_is_match
                 } else {
                     t.no_break_is_match
                 };
@@ -2557,7 +2636,20 @@ macro_rules! step_slow_impl {
                 // post-break origins that haven't met their counter minimums.
                 // Counter-dependent paths are handled by per-instance break
                 // checks and the post_break_tails mechanism.
-                if t.no_break_is_match {
+                //
+                // When contaminated, the no_break_is_match flag may
+                // include Match from break-gated origins that never
+                // reached their counter minimum (Bug 25).  Use the
+                // clean chain's flag instead.  Per-instance break
+                // checks (above) already set ever_matched when an
+                // actual counter breaks with break_is_match=true,
+                // so no signal is lost.
+                let m = if from_contaminated {
+                    self.clean_nb_is_match
+                } else {
+                    t.no_break_is_match
+                };
+                if m {
                     self.ever_matched = true;
                 }
                 let cf_mae = if from_contaminated {
@@ -2638,6 +2730,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             current_has_break_extras: false,
             clean_nb: cache.inner.start_id,
             clean_nb_cf_mae: cache.inner.start_is_match_at_end,
+            clean_nb_is_match: cache.inner.start_is_match,
             cache,
             memory,
             regex,
@@ -2688,6 +2781,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         self.current_has_break_extras = false;
         self.clean_nb = trans.no_break;
         self.clean_nb_cf_mae = trans.nb_counter_free_mae;
+        self.clean_nb_is_match = trans.no_break_is_match;
 
         if !trans.is_counting {
             if trans.no_break_is_match {
@@ -2814,9 +2908,11 @@ impl<'a> Tier3DfaMatcher<'a> {
                     }
                     let cn_trans = &self.cache.transitions[cn_slot];
                     self.clean_nb_cf_mae = cn_trans.nb_counter_free_mae;
+                    self.clean_nb_is_match = cn_trans.no_break_is_match;
                     self.clean_nb = cn_trans.no_break;
                 } else {
                     self.clean_nb_cf_mae = false;
+                    self.clean_nb_is_match = false;
                 }
             }
 
@@ -2826,6 +2922,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             if !(self.current_has_break_extras && self.regex.num_counters > 1) {
                 self.clean_nb = t.no_break;
                 self.clean_nb_cf_mae = t.nb_counter_free_mae;
+                self.clean_nb_is_match = t.no_break_is_match;
             }
 
             if !t.is_counting
@@ -2851,7 +2948,15 @@ impl<'a> Tier3DfaMatcher<'a> {
                 if !from_contaminated {
                     self.current_has_break_extras = false;
                 }
-                if t.no_break_is_match {
+                // When contaminated, `t.no_break_is_match` may include
+                // Match from break-gated origins (Bug 25).  Use the
+                // clean chain's transition flag instead.
+                let m = if from_contaminated {
+                    self.clean_nb_is_match
+                } else {
+                    t.no_break_is_match
+                };
+                if m {
                     self.ever_matched = true;
                 }
                 continue;
@@ -2964,6 +3069,7 @@ impl fmt::Debug for Tier3DfaMatcher<'_> {
             .field("current_has_break_extras", &self.current_has_break_extras)
             .field("clean_nb", &self.clean_nb)
             .field("clean_nb_cf_mae", &self.clean_nb_cf_mae)
+            .field("clean_nb_is_match", &self.clean_nb_is_match)
             .field("post_break_tails_len", &self.post_break_tails.len())
             .field(
                 "verified_deferred_asserts_len",
