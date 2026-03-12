@@ -2957,20 +2957,8 @@ impl<'a> Tier3DfaMatcher<'a> {
             // deferred_asserts are resolved during transition population
             // (resolve_deferred), but counter-break asserts are runtime-
             // only and live in verified_deferred_asserts.
-            if !self.verified_deferred_asserts.is_empty()
-                && self.current != DfaStateId::DEAD
-            {
-                let state = &self.cache.inner.states[self.current.idx()];
-                let prev = state.prev_byte_representative();
-                for &assert_idx in &self.verified_deferred_asserts {
-                    if let State::Assert { kind, out } = self.regex.states[assert_idx]
-                        && kind.eval(false, false, prev, Some(b)) == AssertEval::Pass
-                        && Self::can_reach_match_mid(out, prev, Some(b), self.regex)
-                    {
-                        self.ever_matched = true;
-                        break;
-                    }
-                }
+            if self.resolve_verified_deferred_asserts(false, Some(b)) {
+                self.ever_matched = true;
             }
 
             // Resolve pending break seeds from the PREVIOUS step (Bug 28).
@@ -3129,6 +3117,40 @@ impl<'a> Tier3DfaMatcher<'a> {
 
     /// Walk epsilon transitions from `start` mid-input (not at end-of-input),
     /// evaluating any assertions encountered with `prev` and `next`.  Returns
+    /// Evaluate counter-break deferred assertions against a given byte context.
+    ///
+    /// Returns `true` if any deferred assertion passes and its downstream path
+    /// reaches `Match`.  Used from two sites:
+    ///
+    /// - **Mid-input** (`chunk()`, `at_end=false`, `next=Some(byte)`): sets
+    ///   `self.ever_matched` when the assertion passes and Match is reachable
+    ///   through epsilon transitions with mid-input evaluation.
+    /// - **End-of-input** (`finish()`, `at_end=true`, `next=None`): checks
+    ///   whether the assertion passes at end-of-input and Match is reachable
+    ///   through `$ → Match` paths.
+    fn resolve_verified_deferred_asserts(&self, at_end: bool, next: Option<u8>) -> bool {
+        if self.verified_deferred_asserts.is_empty() || self.current == DfaStateId::DEAD {
+            return false;
+        }
+        let state = &self.cache.inner.states[self.current.idx()];
+        let prev = state.prev_byte_representative();
+        for &assert_idx in &self.verified_deferred_asserts {
+            if let State::Assert { kind, out } = self.regex.states[assert_idx]
+                && kind.eval(false, at_end, prev, next) == AssertEval::Pass
+            {
+                let reachable = if at_end {
+                    DfaState::can_reach_match_at_end(out, prev, self.regex)
+                } else {
+                    Self::can_reach_match_mid(out, prev, next, self.regex)
+                };
+                if reachable {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// true if `Match` is reachable with all assertions passing.
     ///
     /// Similar to [`DfaState::can_reach_match_at_end`] but uses `at_end=false`
@@ -3281,23 +3303,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         // counter break paths that actually broke with enough value.  These
         // are NFA Assert state indices (e.g. \b, \B) on the path to
         // `$ → Match` from a counter whose break condition was met.
-        //
-        // We use the with-break DFA state (`self.current`) for prev_byte
-        // context, since the current DFA state reflects the actual match
-        // position (including break paths that fired).
-        if !self.verified_deferred_asserts.is_empty() && self.current != DfaStateId::DEAD {
-            let state = &self.cache.inner.states[self.current.idx()];
-            let prev = state.prev_byte_representative();
-            for &assert_idx in &self.verified_deferred_asserts {
-                if let State::Assert { kind, out } = self.regex.states[assert_idx]
-                    && kind.eval(false, true, prev, None) == AssertEval::Pass
-                    && DfaState::can_reach_match_at_end(out, prev, self.regex)
-                {
-                    return true;
-                }
-            }
-        }
-        false
+        self.resolve_verified_deferred_asserts(true, None)
     }
 
     #[allow(dead_code)]
