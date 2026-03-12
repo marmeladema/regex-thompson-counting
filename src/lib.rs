@@ -10424,6 +10424,29 @@ mod tests {
                 ("ccc", false),                 // 3c: c0 min=2 ok but c1 min=4 not reached
             ],
         }
+
+        // Bug 27: Tier 3 false positive — break seeds unconditionally
+        // seeded through deferred assertion.
+        //
+        // Pattern `^.{0,13}\b.{2,2}$` has a `\b` between c0's break and
+        // c1.  The break seed `trigger:c0 → seed c1 at origin:6` was
+        // applied unconditionally when c0 broke, ignoring the `\b` gate.
+        // For input "abc", the `\b` between positions should fail (both
+        // sides are word chars) but c1 was seeded anyway, leading to a
+        // false match_at_end.
+        test_tier3_break_seed_deferred_assert_gate {
+            pattern: r"^.{0,13}\b.{2,2}$",
+            memory: 1904,
+            min_tier: 1,
+            inputs: [
+                ("abc", false),                 // all word chars — no \b boundary
+                ("abcd", false),                // all word chars — no \b boundary
+                (" ab", true),                  // \b between ' ' and 'a'
+                ("a b", true),                  // \b between 'a' and ' '
+                ("ab ", false),                 // \b(a,b)=no, \b(b, )=yes but .{2,2}$ fails
+                ("a  ", true),                  // \b between 'a' and ' '
+            ],
+        }
     }
 
     /// Tier 2 encodes counter identity in `u64` bitmasks, so patterns with

@@ -192,6 +192,11 @@ pub(crate) struct Tier3BreakSeed {
     pub(crate) counter: CounterIdx,
     /// The consuming NFA state where the new instance starts.
     pub(crate) origin: StateIdx,
+    /// Deferred assertion NFA state indices on the path from the trigger's
+    /// CInc break output to this seed's CI.  These assertions must pass at
+    /// the break position before the seed is applied (Bug 27).  Empty when
+    /// the path has no assertions.
+    pub(crate) deferred_asserts: Box<[StateIdx]>,
 }
 
 /// Build the [`Tier3Analysis`] for a tier-3-eligible pattern.
@@ -316,19 +321,23 @@ pub(crate) fn compute_tier3_analysis(
         }
     }
 
-    let mut break_seeds_raw: Vec<(CounterIdx, CounterIdx, StateIdx)> = Vec::new();
+    let mut break_seeds_raw: Vec<(CounterIdx, CounterIdx, StateIdx, Vec<StateIdx>)> = Vec::new();
     for &(trigger, break_target) in &all_cinc_nodes {
         // Phase 1: walk epsilon transitions from break target (Split,
         // Assert, CI) — same as the original code.  Self-referential
         // seeds (counter == trigger) are allowed here because they
         // represent the outer loop re-entering the counter body
         // through epsilon transitions (e.g. `(a{2,3})+`).
-        let mut ci_stack = vec![break_target];
+        //
+        // The stack carries accumulated deferred assert state indices
+        // (Bug 27): non-End Assert states on the path from break_target
+        // to a CI are gating conditions that must pass at break time.
+        let mut ci_stack: Vec<(StateIdx, Vec<StateIdx>)> = vec![(break_target, Vec::new())];
         let mut ci_visited = vec![false; n];
         // Collect consuming states reachable via epsilon from the break
         // path — these are the "hop points" for phase 2.
         let mut break_consuming: Vec<StateIdx> = Vec::new();
-        while let Some(idx) = ci_stack.pop() {
+        while let Some((idx, deferred)) = ci_stack.pop() {
             let i = idx.idx();
             if ci_visited[i] {
                 continue;
@@ -338,15 +347,24 @@ pub(crate) fn compute_tier3_analysis(
                 State::CounterInstance { counter, out } => {
                     let ci_consuming = consuming_states_from(out, states);
                     for c in ci_consuming {
-                        break_seeds_raw.push((trigger, counter, c));
+                        break_seeds_raw.push((trigger, counter, c, deferred.clone()));
                     }
-                    ci_stack.push(out);
+                    ci_stack.push((out, deferred));
                 }
                 State::Split { out, out1 } => {
-                    ci_stack.push(out1);
-                    ci_stack.push(out);
+                    ci_stack.push((out1, deferred.clone()));
+                    ci_stack.push((out, deferred));
                 }
-                State::Assert { out, .. } => ci_stack.push(out),
+                State::Assert { kind, out } => {
+                    let mut d = deferred;
+                    // Non-End asserts are deferred — they need the next
+                    // byte to evaluate.  End asserts are handled separately
+                    // by the break closure (break_is_match_at_end).
+                    if kind != AssertKind::End {
+                        d.push(idx);
+                    }
+                    ci_stack.push((out, d));
+                }
                 State::Byte { .. }
                 | State::ByteCI { .. }
                 | State::ByteClass { .. }
@@ -363,6 +381,10 @@ pub(crate) fn compute_tier3_analysis(
         // because consuming states on the break path entered the DFA
         // state through a previous with_break closure; re-seeding the
         // trigger counter at val=0 would create imprecise ranges.
+        //
+        // Phase 2 seeds go through a consuming state, so deferred
+        // asserts from Phase 1 don't carry over (they were resolved by
+        // the byte consumption).  Phase 2 tracks its own asserts.
         for cs in &break_consuming {
             let target = match states[*cs] {
                 State::Byte { out, .. }
@@ -371,9 +393,9 @@ pub(crate) fn compute_tier3_analysis(
                 State::ByteTable { .. } => continue,
                 _ => continue,
             };
-            let mut hop_stack = vec![target];
+            let mut hop_stack: Vec<(StateIdx, Vec<StateIdx>)> = vec![(target, Vec::new())];
             let mut hop_visited = vec![false; n];
-            while let Some(idx) = hop_stack.pop() {
+            while let Some((idx, deferred)) = hop_stack.pop() {
                 let i = idx.idx();
                 if hop_visited[i] {
                     continue;
@@ -386,16 +408,22 @@ pub(crate) fn compute_tier3_analysis(
                         if counter != trigger {
                             let ci_consuming = consuming_states_from(out, states);
                             for c in ci_consuming {
-                                break_seeds_raw.push((trigger, counter, c));
+                                break_seeds_raw.push((trigger, counter, c, deferred.clone()));
                             }
                         }
-                        hop_stack.push(out);
+                        hop_stack.push((out, deferred));
                     }
                     State::Split { out, out1 } => {
-                        hop_stack.push(out1);
-                        hop_stack.push(out);
+                        hop_stack.push((out1, deferred.clone()));
+                        hop_stack.push((out, deferred));
                     }
-                    State::Assert { out, .. } => hop_stack.push(out),
+                    State::Assert { kind, out } => {
+                        let mut d = deferred;
+                        if kind != AssertKind::End {
+                            d.push(idx);
+                        }
+                        hop_stack.push((out, d));
+                    }
                     State::CounterIncrement { .. } => {
                         // Don't follow through another CInc — tier 3
                         // doesn't support nested counters in break paths.
@@ -405,15 +433,21 @@ pub(crate) fn compute_tier3_analysis(
             }
         }
     }
-    break_seeds_raw.sort_by_key(|&(t, c, s)| (t.idx(), c.idx(), s.0));
-    break_seeds_raw.dedup();
+    break_seeds_raw.sort_by_key(|e| (e.0.idx(), e.1.idx(), e.2 .0));
+    break_seeds_raw.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
 
     let break_seeds: Vec<Tier3BreakSeed> = break_seeds_raw
         .into_iter()
-        .map(|(trigger, counter, origin)| Tier3BreakSeed {
-            trigger,
-            counter,
-            origin,
+        .map(|(trigger, counter, origin, deferred)| {
+            let mut da = deferred;
+            da.sort_unstable_by_key(|s| s.0);
+            da.dedup();
+            Tier3BreakSeed {
+                trigger,
+                counter,
+                origin,
+                deferred_asserts: da.into_boxed_slice(),
+            }
         })
         .collect();
 
@@ -2383,7 +2417,7 @@ pub struct Tier3DfaMatcher<'a> {
 macro_rules! step_slow_impl {
     ($method:ident, $current:ident, $next:ident) => {
         #[inline(never)]
-        fn $method(&mut self, slot: usize) {
+        fn $method(&mut self, slot: usize, byte: u8) {
             let t = &self.cache.transitions[slot];
 
             // Reset next buffer and match flags.
@@ -2671,9 +2705,44 @@ macro_rules! step_slow_impl {
                 self.$current.seed(counter.idx(), origin, value);
             }
             // Break seeds gated on the triggering counter.
+            // Bug 27: also check deferred asserts from the analysis-level
+            // break_seeds.  If the path from trigger's break to the seed's
+            // CI passes through a deferred assertion (e.g. `\b`), the seed
+            // should only be applied if the assertion passes at the current
+            // position.
             for &(trigger, counter, origin, value) in t.break_seeds.iter() {
                 if counter_broke & (1u64 << trigger.idx()) != 0 {
-                    self.$current.seed(counter.idx(), origin, value);
+                    // Look up deferred asserts for this break seed in the
+                    // precomputed analysis.
+                    let asserts_pass = self
+                        .analysis
+                        .break_seeds
+                        .iter()
+                        .find(|bs| {
+                            bs.trigger == trigger
+                                && bs.counter == counter
+                                && bs.origin == origin
+                        })
+                        .map_or(true, |bs| {
+                            if bs.deferred_asserts.is_empty() {
+                                return true;
+                            }
+                            let state = &self.cache.inner.states[self.current.idx()];
+                            let prev = state.prev_byte_representative();
+                            bs.deferred_asserts.iter().all(|&assert_idx| {
+                                if let State::Assert { kind, .. } =
+                                    self.regex.states[assert_idx]
+                                {
+                                    kind.eval(false, false, prev, Some(byte))
+                                        == AssertEval::Pass
+                                } else {
+                                    true
+                                }
+                            })
+                        });
+                    if asserts_pass {
+                        self.$current.seed(counter.idx(), origin, value);
+                    }
                 }
             }
 
@@ -2986,9 +3055,9 @@ impl<'a> Tier3DfaMatcher<'a> {
             }
 
             if self.use_ranges {
-                self.step_slow_ranged(slot);
+                self.step_slow_ranged(slot, b);
             } else {
-                self.step_slow_instances(slot);
+                self.step_slow_instances(slot, b);
             }
         }
     }
