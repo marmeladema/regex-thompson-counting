@@ -10485,6 +10485,26 @@ mod tests {
                 ("aaxx", true),                 // a, then .{2,2}=ax, \B(x,x), xx
             ],
         }
+
+        // Bug 29: post-break tail Advance branch missing target_is_match check.
+        // The tail at state 8 (Byte('e')) consumes 'e' and advances to {9}
+        // (new_origins), but the epsilon closure of its target includes
+        // Match (state 11 via Split at 10).  The Advance branch checked
+        // target_is_match_at_end but not target_is_match, so the direct
+        // match was missed — producing a false negative.
+        test_tier3_post_break_tail_advance_match {
+            pattern: r"^c{3,5}c{1,5}cee?",
+            memory: 1318,
+            min_tier: 1,
+            inputs: [
+                ("ccccce", true),               // ccc + c + c + e (+ empty e?)
+                ("cccccce", true),              // ccc + cc + c + e
+                ("ccccccee", true),             // ccc + ccc + c + ee
+                ("cccccee", true),              // ccc + cc + c + ee
+                ("cccce", false),               // only 4 c's: ccc + c = min, no c left for literal
+                ("ccce", false),                // 3 c's + e: c{3,5}=ccc, no c left for c{1,5}
+            ],
+        }
     }
 
     /// Tier 2 encodes counter identity in `u64` bitmasks, so patterns with

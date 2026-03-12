@@ -2450,6 +2450,13 @@ macro_rules! step_slow_impl {
                         if self.analysis.target_is_match_at_end[pbo.idx()] {
                             self.match_at_end = true;
                         }
+                        // Bug 29: also check direct Match (not just
+                        // $ → Match).  The tail consumed the byte and its
+                        // target epsilon-closure includes Match — this is
+                        // a live match, same as the None (dead) branch.
+                        if self.analysis.target_is_match[pbo.idx()] {
+                            self.ever_matched = true;
+                        }
                     }
                     Some(Some(Tier3OriginKind::Increment {
                         counter,
