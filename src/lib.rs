@@ -10094,6 +10094,42 @@ mod tests {
             ],
         }
 
+        // Bug 22: Tier 3 false positive from contaminated no-break chain.
+        // In `^(.{7,25}.{7,25})?((a?a?)?(a?a?)?)?$`, the two chained
+        // `.{7,25}` counters need at least 14 chars combined.  The suffix
+        // `((a?a?)?(a?a?)?)?` only accepts 'a' chars.  On input
+        // "dcya cbcyaa" (11 chars, includes non-'a'), neither counter
+        // completes — the answer should be NO MATCH.
+        //
+        // Root cause: When counter 0 breaks, the with_break DFA state
+        // includes the suffix's consuming states (Byte 'a').  These
+        // propagate into subsequent no-break DFA states because the
+        // no-break closure from the contaminated state inherits them.
+        // The `clean_counter_free_mae` check (Bug 19) used
+        // `self.no_break_current` as the "clean" reference, but that state
+        // was ITSELF contaminated.
+        //
+        // Fix: Maintain a separate `clean_nb` DFA state chain that always
+        // advances from the previous clean state, never from a contaminated
+        // one.  `clean_counter_free_mae` uses `clean_nb` to verify that
+        // an origin is genuinely reachable without counter breaks.
+        test_tier3_contaminated_no_break_chain_false_positive {
+            pattern: r"^(.{7,25}.{7,25})?((a?a?)?(a?a?)?)?$",
+            memory: 1495,
+            min_tier: 3,
+            inputs: [
+                ("", true),              // optional group skips, suffix skips, $ matches
+                ("a", true),             // optional group skips, suffix matches "a"
+                ("aa", true),            // optional group skips, suffix matches "aa"
+                ("aaaa", true),          // optional group skips, suffix matches "aaaa"
+                ("d", false),            // suffix only accepts 'a', counter needs 14+
+                ("dcya cbcyaa", false),  // Bug 22 reproducer: 11 chars, non-'a' chars
+                ("aaaaaaaaaaaaaaa", true), // 15 chars: counters complete (7+7), suffix "a"
+                ("aaaaaaaaaaaaaa", true),  // 14 chars: counters complete exactly (7+7)
+                ("aaaaaaaaaaaaa", false),  // 13 chars: too short for 7+7
+            ],
+        }
+
         // Regression (defense-in-depth): `break_closure()` used to follow
         // through `CounterInstance` nodes, which meant that for sequential
         // multi-counter patterns like `.{1,2}.{4,4}$`, counter A's

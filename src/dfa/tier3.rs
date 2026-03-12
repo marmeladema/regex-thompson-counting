@@ -2290,6 +2290,12 @@ pub struct Tier3DfaMatcher<'a> {
     /// `reachable_without_break` but entered this DFA state via a counter
     /// break (Bug 19).
     current_has_break_extras: bool,
+    /// The "clean" no-break DFA state chain: always computed from the
+    /// previous clean_nb state, never from a contaminated state.
+    /// Used by `clean_counter_free_mae()` as the reference for which
+    /// NFA states are genuinely reachable without counter breaks (Bug 22).
+    /// Updated each step: `clean_nb = no_break_successor(clean_nb, byte)`.
+    clean_nb: DfaStateId,
     prefilter: Prefilter,
 }
 
@@ -2320,6 +2326,7 @@ macro_rules! step_slow_impl {
             self.$next.clear();
             self.match_at_end = false;
             self.verified_deferred_asserts.clear();
+
 
             // Advance existing post-break tails through this transition.
             // Each tail is a consuming NFA state from a previous counter
@@ -2485,20 +2492,13 @@ macro_rules! step_slow_impl {
             }
 
             // Select DFA successor.
-            self.no_break_current = t.no_break;
-            // When the FROM state was reached via a with_break transition
-            // and the pattern has ≥2 counters, origins from downstream
-            // counter break chains may be in the DFA state before those
-            // downstream counters have actually reached their minimums.
-            // The precomputed `counter_free_match_at_end` flag uses the
-            // static `reachable_without_break` property, which can't
-            // detect this dynamic contamination (Bug 19).
             //
-            // With only 1 counter, any break-path origin is valid once
-            // the single counter breaks — no multi-counter chain issue.
-            // Use `clean_counter_free_mae()` (which restricts to origins
-            // also in the no-break FROM state) only for multi-counter
-            // patterns to avoid false negatives (Bug 20/21).
+            // Contamination check (Bug 19/22): When the FROM state was
+            // reached via a with_break transition and the pattern has ≥2
+            // counters, origins from downstream counter break chains may
+            // be in the DFA state before those downstream counters have
+            // actually reached their minimums.
+            self.no_break_current = t.no_break;
             let from_contaminated = self.current_has_break_extras
                 && self.regex.num_counters > 1;
             self.last_nb_counter_free_mae = if from_contaminated {
@@ -2511,7 +2511,12 @@ macro_rules! step_slow_impl {
                 self.current_has_break_extras = true;
             } else {
                 self.current = t.no_break;
-                self.current_has_break_extras = false;
+                // Propagate contamination: the no-break successor of a
+                // contaminated state inherits NFA states that originally
+                // entered via counter breaks (Bug 22).
+                if !from_contaminated {
+                    self.current_has_break_extras = false;
+                }
             }
             if !t.is_counting {
                 let (m, mae) = if any_can_break {
@@ -2611,6 +2616,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             // these are freshly seeded — not from a previous counter break.
             // Treat the start state as uncontaminated.
             current_has_break_extras: false,
+            clean_nb: cache.inner.start_id,
             cache,
             memory,
             regex,
@@ -2646,12 +2652,24 @@ impl<'a> Tier3DfaMatcher<'a> {
     /// `^(.{0,2}|d+)$` on "ddd" where the `d+` exit to `$ → Match` is
     /// genuinely counter-free) while blocking false positives from origins
     /// that entered the DFA state only through counter breaks.
+    /// Check whether `counter_free_match_at_end` is trustworthy when the
+    /// FROM state was reached via a `with_break` transition (contaminated).
+    ///
+    /// Uses `self.clean_nb` — a DFA state maintained by following only
+    /// no-break transitions from the previous clean state (never from a
+    /// contaminated state).  This guarantees that its NFA states are
+    /// genuinely reachable without counter breaks.  Origins in the
+    /// transition are only trusted if they also appear in `clean_nb`.
+    ///
+    /// Using `self.no_break_current` would be wrong: it's the no-break
+    /// successor of the potentially contaminated FROM state, so it inherits
+    /// NFA states that entered via counter breaks (Bug 22).
     #[inline]
     fn clean_counter_free_mae(&self, t: &Transition) -> bool {
-        if self.no_break_current == DfaStateId::DEAD {
+        if self.clean_nb == DfaStateId::DEAD {
             return false;
         }
-        let nb_nfa = &self.cache.inner.states[self.no_break_current.idx()].nfa_states;
+        let nb_nfa = &self.cache.inner.states[self.clean_nb.idx()].nfa_states;
         t.origin_keys
             .iter()
             .zip(t.origin_actions.iter())
@@ -2688,6 +2706,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         self.no_break_current = trans.no_break;
         self.last_nb_counter_free_mae = trans.nb_counter_free_mae;
         self.current_has_break_extras = false;
+        self.clean_nb = trans.no_break;
 
         if !trans.is_counting {
             if trans.no_break_is_match {
@@ -2782,7 +2801,36 @@ impl<'a> Tier3DfaMatcher<'a> {
                         .populate(self.memory, self.current, b, self.regex, self.analysis);
                 self.cache.transitions[slot] = trans;
             }
+
+            // Advance the clean no-break chain (Bug 22) BEFORE borrowing
+            // the main transition `t`, since populate() mutates the cache.
+            // When contaminated, advance `clean_nb` independently from the
+            // previous clean state.  When not contaminated, defer update
+            // to after reading `t.no_break` (see below).
+            if self.current_has_break_extras
+                && self.regex.num_counters > 1
+                && self.clean_nb != DfaStateId::DEAD
+            {
+                let cn_slot = self.clean_nb.idx() * stride + class;
+                if self.cache.transitions[cn_slot].no_break == DfaStateId::UNPOPULATED {
+                    let cn_trans = self.cache.populate(
+                        self.memory,
+                        self.clean_nb,
+                        b,
+                        self.regex,
+                        self.analysis,
+                    );
+                    self.cache.transitions[cn_slot] = cn_trans;
+                }
+                self.clean_nb = self.cache.transitions[cn_slot].no_break;
+            }
+
             let t = &self.cache.transitions[slot];
+
+            // When not contaminated, clean_nb simply tracks no_break.
+            if !(self.current_has_break_extras && self.regex.num_counters > 1) {
+                self.clean_nb = t.no_break;
+            }
 
             if !t.is_counting
                 && t.pre_seeds.is_empty()
@@ -2790,26 +2838,23 @@ impl<'a> Tier3DfaMatcher<'a> {
                 && !self.has_live_instances
                 && self.post_break_tails.is_empty()
             {
+                let from_contaminated = self.current_has_break_extras
+                    && self.regex.num_counters > 1;
                 self.current = t.no_break;
                 self.no_break_current = t.no_break;
-                // When the FROM state was reached via a with_break
-                // transition and the pattern has ≥2 counters,
-                // downstream counter break chains may produce origins
-                // that haven't met their counters' minimums (Bug 19).
-                // Use `clean_counter_free_mae()` to restrict to origins
-                // also in the no-break FROM state.  With 1 counter,
-                // break-path origins are valid (Bug 20/21).
-                let cf_mae = if self.current_has_break_extras
-                    && self.regex.num_counters > 1
-                {
+                let cf_mae = if from_contaminated {
                     self.clean_counter_free_mae(t)
                 } else {
                     t.nb_counter_free_mae
                 };
                 self.last_nb_counter_free_mae = cf_mae;
                 self.match_at_end = cf_mae;
-                // No counter broke → successor is no_break → not contaminated.
-                self.current_has_break_extras = false;
+                // Propagate contamination through no-break successors
+                // (Bug 22): the no-break closure of a contaminated state
+                // inherits NFA states from counter breaks.
+                if !from_contaminated {
+                    self.current_has_break_extras = false;
+                }
                 if t.no_break_is_match {
                     self.ever_matched = true;
                 }
