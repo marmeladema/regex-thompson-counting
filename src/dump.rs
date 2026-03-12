@@ -454,7 +454,7 @@ impl DumpRegex<'_> {
                 writeln!(f, "  targets:")?;
                 for (i, kind) in target_entries {
                     match kind {
-                        Tier3OriginKind::Advance { new_origins } => {
+                        Tier3OriginKind::Advance { new_origins, .. } => {
                             writeln!(
                                 f,
                                 "    state {i}: Advance → [{}]",

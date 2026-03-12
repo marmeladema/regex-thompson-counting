@@ -10669,6 +10669,37 @@ mod tests {
             ],
         }
 
+        // -- Bug 37 regression: ByteTable tail target_is_match_at_end skipped --
+        // Pattern `^0{3,43}((a?c)*x(a?a?)?(a?a?)?)?$` has a ByteTable at
+        // state 7 with entries 'a'→6, 'c'→7, 'x'→13.  After c0 breaks,
+        // state 7 appears as a post_break_tail.  Consuming 'x' through
+        // state 7 leads to state 13 (Split → optional a? chains → $ → Match).
+        // The static target_is_match_at_end array skipped ByteTable states
+        // (per-byte targets made a single static flag unsound), so
+        // target_is_match_at_end[7] was false.  The check_tail_match_flags
+        // macro never set match_at_end → false negative on "000x".
+        //
+        // Fix: store is_match_at_end on the Advance action variant (computed
+        // per-byte-target in analyze_target), and use it in the Advance arm
+        // of tail processing instead of the static array.
+        test_tier3_byte_table_tail_mae {
+            pattern: r"^0{3,43}((a?c)*x(a?a?)?(a?a?)?)?$",
+            memory: 2359,
+            min_tier: 2,
+            inputs: [
+                ("000x", true),                // Bug 37 crash case: 3 zeros + x
+                ("000", true),                 // 3 zeros, outer ? skips group, $ matches
+                ("000acx", true),              // 3 zeros + ac loop + x
+                ("000xa", true),               // 3 zeros + x + a
+                ("000xaa", true),              // 3 zeros + x + aa
+                ("000xaaaa", true),            // 3 zeros + x + aaaa (both optional groups)
+                ("00x", false),                // 2 zeros (< min 3)
+                ("000b", false),               // 3 zeros + b (not in ByteTable)
+                ("000xaaaaa", false),          // too many a's for optional groups
+                ("", false),                   // empty
+            ],
+        }
+
         // -- Bug 30 regression: contaminated no_break_current deferred asserts --
         // When c0 (.{0,44}) breaks, the DFA state inherits state 8 (Byte 'f')
         // from c1's break path.  State 8→9 (\b) ends up as a deferred assert

@@ -168,7 +168,16 @@ pub(crate) struct Tier3Analysis {
 pub(crate) enum Tier3OriginKind {
     /// Epsilon closure from the target did NOT reach CInc.
     /// The instance keeps its counter value and moves to `new_origins`.
-    Advance { new_origins: Box<[StateIdx]> },
+    Advance {
+        new_origins: Box<[StateIdx]>,
+        /// True if the epsilon closure ALSO reaches `$ → Match`
+        /// (i.e. in addition to consuming states).  Used by the
+        /// post-break tail tracker to set `match_at_end` when a
+        /// tail advances through this path (Bug 37: byte-specific
+        /// flag, replacing the static `target_is_match_at_end` which
+        /// cannot handle ByteTable origins with per-byte targets).
+        is_match_at_end: bool,
+    },
     /// Epsilon closure from the target reached CInc.  Counter is
     /// incremented; min/max determine continue vs. break.
     Increment {
@@ -2165,6 +2174,42 @@ fn analyze_target(
         }
     }
 
+    // Bug 37: compute `$ → Match` reachability for the Advance case
+    // with a separate epsilon walk that mirrors the static
+    // target_is_match_at_end logic.  The walk follows Split and CI
+    // but does NOT follow non-End Assert states (they may block the
+    // path, e.g. `\B` before `$`).  Only Assert(End) with
+    // can_reach_match sets the flag.
+    let advance_is_match_at_end = {
+        let mut mae = false;
+        let mut estack = vec![target];
+        let mut evisited = vec![false; states.len()];
+        while let Some(eidx) = estack.pop() {
+            let ei = eidx.idx();
+            if evisited[ei] {
+                continue;
+            }
+            evisited[ei] = true;
+            match states[eidx] {
+                State::Split { out, out1 } => {
+                    estack.push(out1);
+                    estack.push(out);
+                }
+                State::Assert { kind, out } => {
+                    if kind == AssertKind::End && can_reach_match[out.idx()] {
+                        mae = true;
+                    }
+                    // Do NOT follow non-End Assert states: they may
+                    // block the `$ → Match` path (e.g. `\B$` only
+                    // matches when `\B` passes).
+                }
+                State::CounterInstance { out, .. } => estack.push(out),
+                _ => {} // stop at consuming states, CInc, Match
+            }
+        }
+        mae
+    };
+
     if let Some((counter, min, max)) = found_cinc {
         advance_origins.sort_unstable_by_key(|s| s.0);
         advance_origins.dedup();
@@ -2197,10 +2242,13 @@ fn analyze_target(
             break_consuming_states: Box::new([]),
         })
     } else if advance_origins.is_empty() {
-        None // Dead — no consuming states reachable.
+        // Dead — no consuming states reachable.  But may still reach
+        // Match / ($ → Match) through the epsilon path.
+        None
     } else {
         Some(Tier3OriginKind::Advance {
             new_origins: advance_origins.into_boxed_slice(),
+            is_match_at_end: advance_is_match_at_end,
         })
     }
 }
@@ -2555,7 +2603,10 @@ macro_rules! step_slow_impl {
             for &pbo in &self.post_break_tails {
                 let pos = t.origin_keys.iter().position(|&k| k == pbo);
                 match pos.map(|i| &t.origin_actions[i]) {
-                    Some(Some(Tier3OriginKind::Advance { new_origins })) => {
+                    Some(Some(Tier3OriginKind::Advance {
+                        new_origins,
+                        is_match_at_end,
+                    })) => {
                         for &new_o in new_origins.iter() {
                             if !self.next_post_break_tails.contains(&new_o) {
                                 self.next_post_break_tails.push(new_o);
@@ -2572,7 +2623,24 @@ macro_rules! step_slow_impl {
                                 self.verified_deferred_asserts.push(da);
                             }
                         }
-                        check_tail_match_flags!(self, pbo);
+                        // Bug 37: use the byte-specific is_match_at_end
+                        // from the Advance action instead of the static
+                        // target_is_match_at_end array.  ByteTable origins
+                        // have per-byte targets, so the static array
+                        // (which skipped ByteTable) was always false for
+                        // ByteTable states.
+                        //
+                        // target_is_match uses the static array (skips
+                        // ByteTable conservatively; a ByteTable tail whose
+                        // byte-specific target reaches Match directly
+                        // without Assert would need a similar byte-specific
+                        // flag, but no such pattern has been found yet).
+                        if *is_match_at_end {
+                            self.match_at_end = true;
+                        }
+                        if self.analysis.target_is_match[pbo.idx()] {
+                            self.ever_matched = true;
+                        }
                     }
                     Some(Some(Tier3OriginKind::Increment {
                         counter,
@@ -2680,7 +2748,7 @@ macro_rules! step_slow_impl {
                         .and_then(|i| t.origin_actions[i].as_ref());
 
                     match action {
-                        Some(Tier3OriginKind::Advance { new_origins }) => {
+                        Some(Tier3OriginKind::Advance { new_origins, .. }) => {
                             for &new_o in new_origins.iter() {
                                 self.$next.advance(c_idx, entry, new_o);
                             }
