@@ -2107,7 +2107,27 @@ fn analyze_target(
                 stack.push(out1);
                 stack.push(out);
             }
-            State::Assert { out, .. } => stack.push(out),
+            State::Assert { kind, out } => {
+                // Bug 40: do NOT follow non-End Assert states when
+                // collecting advance_origins.  Consuming states behind
+                // a deferred assertion (e.g. `\B`) are only reachable
+                // if the assertion passes at runtime.  Including them
+                // in advance_origins unconditionally causes the tail
+                // mechanism to seed downstream counters without
+                // checking the assertion, producing false positives.
+                //
+                // The DFA's epsilon closure properly defers non-End
+                // asserts and resolves them on the next byte, so
+                // consuming states behind assertions are already
+                // handled correctly by the DFA transition machinery.
+                //
+                // End Assert (`$`) is followed: it leads to Match
+                // (handled by advance_is_match_at_end), and any
+                // consuming states after `$` should still be found.
+                if kind == AssertKind::End {
+                    stack.push(out);
+                }
+            }
             State::CounterInstance { out, .. } => stack.push(out),
             State::CounterIncrement {
                 counter,
@@ -3398,7 +3418,40 @@ impl<'a> Tier3DfaMatcher<'a> {
             return true;
         }
         if self.match_at_end {
-            return true;
+            // Bug 40: when the DFA state is contaminated (break_extras +
+            // multi-counter) and verified_deferred_asserts is non-empty,
+            // the match_at_end may have been set by a counter break whose
+            // seeding path was gated by assertions (e.g. `\B`).  Those
+            // assertions passed mid-input (between word chars) but may
+            // fail at end-of-input.  Re-evaluate them with EOI context
+            // before accepting.
+            //
+            // When verified_deferred_asserts is empty, the match_at_end
+            // is unconditionally valid (no assertion-gated seeding paths).
+            if self.verified_deferred_asserts.is_empty() {
+                return true;
+            }
+            // Check if ANY verified deferred assert passes at EOI.  If
+            // none pass, the assertion-gated path that seeded the counter
+            // is invalid at end-of-input, so suppress match_at_end.
+            // If at least one passes, the match_at_end is valid.
+            //
+            // Use the DFA state's prev byte for assertion evaluation.
+            let state = &self.cache.inner.states[self.current.idx()];
+            let prev = state.prev_byte_representative();
+            let any_pass = self.verified_deferred_asserts.iter().any(|&assert_idx| {
+                if let State::Assert { kind, out } = self.regex.states[assert_idx] {
+                    kind.eval(false, true, prev, None) == AssertEval::Pass
+                        && DfaState::can_reach_match_at_end(out, prev, self.regex)
+                } else {
+                    false
+                }
+            });
+            if any_pass {
+                return true;
+            }
+            // None of the verified deferred asserts pass at EOI.
+            // Fall through to check other match sources.
         }
         // Note: we intentionally do NOT check `state.is_match_at_end` here.
         // For non-counting transitions, `self.match_at_end` already captures
