@@ -3450,15 +3450,34 @@ impl fmt::Display for Tier3DfaMatcher<'_> {
             )?;
         }
         if !self.verified_deferred_asserts.is_empty() {
-            write!(
-                f,
-                "\n  deferred: [{}]",
-                self.verified_deferred_asserts
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )?;
+            write!(f, "\n  deferred: [")?;
+            for (i, &da) in self.verified_deferred_asserts.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                if let State::Assert { kind, .. } = self.regex.states[da] {
+                    write!(f, "{}@{}", kind.label(), da)?;
+                } else {
+                    write!(f, "?@{da}")?;
+                }
+            }
+            write!(f, "]")?;
+        }
+        if !self.pending_break_seeds.is_empty() {
+            write!(f, "\n  pending_seeds: [")?;
+            for (i, &(trigger, counter, origin, value, prev_word)) in
+                self.pending_break_seeds.iter().enumerate()
+            {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(
+                    f,
+                    "c{}→c{}@{}(val={},pw={})",
+                    trigger, counter, origin, value, prev_word
+                )?;
+            }
+            write!(f, "]")?;
         }
         Ok(())
     }
