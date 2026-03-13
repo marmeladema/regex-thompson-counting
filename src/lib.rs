@@ -11336,6 +11336,34 @@ mod tests {
             ],
         }
 
+        // Bug 48: Contaminated pre_seeds cause false positive mae.
+        // Pattern: `^.{0,26}\B((x{7,7}a?)?(a?a?)?)?$` — two counters.
+        // Input: 50 x's — c0 (.{0,26}) breaks, the with_break DFA
+        // closure includes c1's body state (Byte('x'), state 6).  Each
+        // step, pre_seeds re-seeded c1 at origin 6 because state 6 is
+        // structurally reachable_without_break (from CI(c1)).  After 7
+        // steps c1 broke with break_is_match_at_end=true, setting
+        // mae=true.  But the NFA never actually reaches c1 via `\B`
+        // because the `\B` assertion (word boundary negate) between two
+        // word-chars passes, but the subsequent c1 path requires
+        // exactly 7 x's followed by $ — with 50 x's the NFA thread
+        // exhausts c0 at 26 and has no valid path to Match.
+        // Fix: guard pre_seeds against contamination (mirror Bug 32).
+        test_tier3_contaminated_pre_seeds_false_mae {
+            pattern: r"^.{0,26}\B((x{7,7}a?)?(a?a?)?)?$",
+            memory: 1657,
+            min_tier: 2,
+            inputs: [
+                ("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", false),  // Bug 48: 50 x's, false positive
+                ("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", true),   // 33 x's: c0=26 + c1=7 = max
+                ("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", false), // 34 x's: exceeds c0+c1 capacity
+                ("xxxxxxxx", true),      // 8 x's: c0=1, \B, c1=7
+                ("xxxxxxx", false),      // 7 x's: can't split into c0≥1 + c1=7
+                ("", true),              // empty: optional group matches
+                ("x", false),            // 1 x: no valid split
+            ],
+        }
+
         // ---------------------------------------------------------------
         // Coverage expansion: lock down Tier 3 code paths that were
         // previously untested or only partially tested.  These tests

@@ -2844,7 +2844,28 @@ macro_rules! step_slow_impl {
             }
 
             // Apply pre_seeds BEFORE counter increment.
+            //
+            // Bug 48: mirror the Bug 32 guard for unconditional seeds.
+            // Pre_seeds are resolved seeds from Increment-action origins
+            // (L=1 body consumed on this transition).  When the current
+            // DFA state is contaminated, pre_seeds may include seeds for
+            // downstream counters whose CI state entered the DFA closure
+            // only via a counter break (e.g. c1 seeded from a with_break
+            // closure that includes c0's break path).  Filter these
+            // against the clean no-break chain's pre_seeds: only seeds
+            // that also appear in the clean chain are truly
+            // counter-free.
+            let pre_seed_contaminated =
+                self.current_has_break_extras && self.regex.num_counters > 1;
             for &(counter, origin, value) in t.pre_seeds.iter() {
+                if pre_seed_contaminated {
+                    if let Some(cn_slot) = self.clean_nb_trans_slot {
+                        let cn_t = &self.cache.transitions[cn_slot];
+                        if !cn_t.pre_seeds.iter().any(|s| s.0 == counter && s.1 == origin) {
+                            continue;
+                        }
+                    }
+                }
                 self.$current.seed(counter.idx(), origin, value);
             }
 
