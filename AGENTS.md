@@ -359,6 +359,11 @@ When fuzzing discovers bugs, follow this discipline:
    debugging workflow.
 7. **Commit infrastructure improvements separately** from bug fixes (e.g.
    fuzz target enhancements, new scripts).
+8. **Update Display/Debug impls and dump output** when adding new fields to
+   matcher structs or analysis types.  The `--debug` trace is the primary
+   debugging tool — new fields that are invisible in the trace slow down
+   future investigations.  Update Display, Debug, and `dump.rs` output as
+   part of the same change that introduces the field.
 
 ### Pattern Generator (`src/fuzz_gen.rs`)
 
