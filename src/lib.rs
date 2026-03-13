@@ -11156,6 +11156,30 @@ mod tests {
             ],
         }
 
+        // Bug 42 regression: Tier 3 false positive when counter break
+        // tails are deposited unconditionally despite pending deferred
+        // assertions.  Pattern `a{2,2}\b` inside an optional group
+        // produces tails at the `a?a?` states that should be contingent
+        // on `\b` passing, but were promoted immediately.  With 12 a's,
+        // the `\b` fails (a→a) but the tails persisted, causing a
+        // spurious match_at_end at EOI.
+        test_tier3_pending_break_tails {
+            pattern: r"^a{8,8}((a{2,2}\b)?(a?a?)?)?$",
+            memory: 1301,
+            min_tier: 1,
+            inputs: [
+                ("aaaaaaaa", true),         // exactly 8 a's, skip optional → match
+                ("aaaaaaaaa", true),         // 9 a's: skip a{2,2}\b, a? matches 1 → match
+                ("aaaaaaaaaa", true),        // 10 a's: skip a{2,2}\b, a?a? matches 2 → match
+                ("aaaaaaaaaaa", false),      // 11 a's: can't consume 3 after skipping a{2,2}\b
+                ("aaaaaaaaaaaa", false),     // 12 a's: the Bug 42 case — \b fails, 4 leftover
+                ("aaaaaaaaaaaaa", false),    // 13 a's: exceeds all possible paths
+                ("aaaaaaaaaa ", false),      // 10 a's + space: \b passes but $ fails (space left)
+                ("aaaaaaaaaa", true),        // 10 a's: skip \b, a?a? = 2 → match (duplicate ok)
+                ("aaaaaaaaaaab", false),     // 8+2 a's + a + b: \b passes (a→b), but b left
+            ],
+        }
+
         // ---------------------------------------------------------------
         // Coverage expansion: lock down Tier 3 code paths that were
         // previously untested or only partially tested.  These tests

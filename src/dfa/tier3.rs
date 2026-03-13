@@ -2481,6 +2481,18 @@ pub struct Tier3DfaMatcher<'a> {
     /// byte at the break position.  Resolved at the start of the next byte
     /// (in `chunk()`) or at end-of-input (in `finish()`).
     pending_break_seeds: Vec<(CounterIdx, CounterIdx, StateIdx, u32, bool)>,
+    /// Pending post-break tails whose deferred assertions have not yet been
+    /// evaluated (Bug 42).  When a counter breaks with `break_deferred_asserts`,
+    /// the `break_consuming_states` (tails) must NOT be deposited immediately
+    /// into `next_post_break_tails` — they are contingent on the deferred
+    /// assertion passing.  Stored here and promoted to `post_break_tails` on
+    /// the next byte (or at EOI) if the deferred assertions pass.
+    pending_break_tails: Vec<StateIdx>,
+    /// Pending `break_is_match_at_end` flag from counter breaks with deferred
+    /// assertions (Bug 42).  True means at least one counter break's
+    /// `break_is_match_at_end` was deferred.  Promoted to `match_at_end`
+    /// when the deferred assertion passes.
+    pending_break_mae: bool,
     /// True when the current DFA state (`self.current`) was reached via a
     /// `with_break` transition and may contain NFA consuming states that
     /// entered through a counter break path.  When true, the precomputed
@@ -2550,6 +2562,8 @@ macro_rules! step_slow_impl {
             self.match_at_end = false;
             self.verified_deferred_asserts.clear();
             self.pending_break_seeds.clear();
+            self.pending_break_tails.clear();
+            self.pending_break_mae = false;
 
             // Advance existing post-break tails through this transition.
             // Each tail is a consuming NFA state from a previous counter
@@ -2658,22 +2672,33 @@ macro_rules! step_slow_impl {
                         if pbt_value + 1 >= *min {
                             any_can_break = true;
                             counter_broke |= 1u64 << counter.idx();
-                            if *break_is_match {
-                                self.ever_matched = true;
-                            }
-                            if *break_is_match_at_end {
-                                self.match_at_end = true;
-                            }
                             if !break_deferred_asserts.is_empty() {
+                                // Bug 42: defer tails and mae until
+                                // deferred assertions are resolved.
                                 for &da in break_deferred_asserts.iter() {
                                     if !self.verified_deferred_asserts.contains(&da) {
                                         self.verified_deferred_asserts.push(da);
                                     }
                                 }
-                            }
-                            for &new_o in break_consuming_states.iter() {
-                                if !self.next_post_break_tails.contains(&new_o) {
-                                    self.next_post_break_tails.push(new_o);
+                                if *break_is_match_at_end {
+                                    self.pending_break_mae = true;
+                                }
+                                for &new_o in break_consuming_states.iter() {
+                                    if !self.pending_break_tails.contains(&new_o) {
+                                        self.pending_break_tails.push(new_o);
+                                    }
+                                }
+                            } else {
+                                if *break_is_match {
+                                    self.ever_matched = true;
+                                }
+                                if *break_is_match_at_end {
+                                    self.match_at_end = true;
+                                }
+                                for &new_o in break_consuming_states.iter() {
+                                    if !self.next_post_break_tails.contains(&new_o) {
+                                        self.next_post_break_tails.push(new_o);
+                                    }
                                 }
                             }
                         }
@@ -2755,22 +2780,47 @@ macro_rules! step_slow_impl {
                             if self.$current.can_break(entry, *min) {
                                 any_can_break = true;
                                 counter_broke |= 1u64 << c_idx;
-                                if *break_is_match {
-                                    self.ever_matched = true;
-                                }
-                                if *break_is_match_at_end {
-                                    self.match_at_end = true;
-                                }
                                 if !break_deferred_asserts.is_empty() {
+                                    // Bug 42: tails and match_at_end are
+                                    // contingent on deferred assertions.
+                                    // Hold them pending until the next byte
+                                    // resolves the assertions.
                                     for &da in break_deferred_asserts.iter() {
                                         if !self.verified_deferred_asserts.contains(&da) {
                                             self.verified_deferred_asserts.push(da);
                                         }
                                     }
-                                }
-                                for &new_o in break_consuming_states.iter() {
-                                    if !self.next_post_break_tails.contains(&new_o) {
-                                        self.next_post_break_tails.push(new_o);
+                                    if *break_is_match {
+                                        // `ever_matched` from break_is_match
+                                        // also needs deferred assertion to
+                                        // pass, but since assertions are
+                                        // deferred and we can't un-set
+                                        // ever_matched later, we use the
+                                        // verified_deferred_asserts mechanism
+                                        // which already handles this via
+                                        // can_reach_match_mid.
+                                    }
+                                    if *break_is_match_at_end {
+                                        self.pending_break_mae = true;
+                                    }
+                                    for &new_o in break_consuming_states.iter() {
+                                        if !self.pending_break_tails.contains(&new_o) {
+                                            self.pending_break_tails.push(new_o);
+                                        }
+                                    }
+                                } else {
+                                    // No deferred assertions — apply
+                                    // immediately.
+                                    if *break_is_match {
+                                        self.ever_matched = true;
+                                    }
+                                    if *break_is_match_at_end {
+                                        self.match_at_end = true;
+                                    }
+                                    for &new_o in break_consuming_states.iter() {
+                                        if !self.next_post_break_tails.contains(&new_o) {
+                                            self.next_post_break_tails.push(new_o);
+                                        }
                                     }
                                 }
                             }
@@ -2998,6 +3048,8 @@ impl<'a> Tier3DfaMatcher<'a> {
             next_post_break_tails: Vec::new(),
             verified_deferred_asserts: Vec::new(),
             pending_break_seeds: Vec::new(),
+            pending_break_tails: Vec::new(),
+            pending_break_mae: false,
             // The start state may include NFA states from break paths
             // (the start closure is computed with follow_break=true), but
             // these are freshly seeded — not from a previous counter break.
@@ -3041,6 +3093,8 @@ impl<'a> Tier3DfaMatcher<'a> {
         }
         self.match_at_end = false;
         self.post_break_tails.clear();
+        self.pending_break_tails.clear();
+        self.pending_break_mae = false;
 
         let trans = self.cache.populate(
             self.memory,
@@ -3152,6 +3206,16 @@ impl<'a> Tier3DfaMatcher<'a> {
             // deferred_asserts are resolved during transition population
             // (resolve_deferred), but counter-break asserts are runtime-
             // only and live in verified_deferred_asserts.
+            // Bug 42: check if deferred assertions pass BEFORE clearing
+            // them — we need the result for both ever_matched (via
+            // resolve_verified_deferred_asserts) and pending break tails.
+            let any_assert_passed = if !self.pending_break_tails.is_empty()
+                || self.pending_break_mae
+            {
+                self.any_deferred_assert_passes(false, Some(b))
+            } else {
+                false
+            };
             if self.resolve_verified_deferred_asserts(false, Some(b)) {
                 self.ever_matched = true;
             }
@@ -3164,6 +3228,26 @@ impl<'a> Tier3DfaMatcher<'a> {
             // does not, which previously allowed stale deferred asserts
             // to survive indefinitely and fire at end-of-input.
             self.verified_deferred_asserts.clear();
+
+            // Bug 42: resolve pending break tails and match_at_end from
+            // the previous step's counter breaks with deferred assertions.
+            // If the deferred assertion passed, promote the pending tails
+            // to active post_break_tails and set match_at_end.  Otherwise
+            // discard — the tails are invalid because the assertion failed.
+            if !self.pending_break_tails.is_empty() || self.pending_break_mae {
+                if any_assert_passed {
+                    for &tail in &self.pending_break_tails {
+                        if !self.post_break_tails.contains(&tail) {
+                            self.post_break_tails.push(tail);
+                        }
+                    }
+                    if self.pending_break_mae {
+                        self.match_at_end = true;
+                    }
+                }
+                self.pending_break_tails.clear();
+                self.pending_break_mae = false;
+            }
 
             // Resolve pending break seeds from the PREVIOUS step (Bug 28).
             // These are break seeds whose deferred assertions (e.g. `\b`)
@@ -3372,6 +3456,25 @@ impl<'a> Tier3DfaMatcher<'a> {
         false
     }
 
+    /// Check if any counter-break deferred assertion passes (ignoring match
+    /// reachability).  Used by Bug 42 to decide whether pending break tails
+    /// and pending break match_at_end should be promoted.
+    fn any_deferred_assert_passes(&self, at_end: bool, next: Option<u8>) -> bool {
+        if self.verified_deferred_asserts.is_empty() || self.current == DfaStateId::DEAD {
+            return false;
+        }
+        let state = &self.cache.inner.states[self.current.idx()];
+        let prev = state.prev_byte_representative();
+        for &assert_idx in &self.verified_deferred_asserts {
+            if let State::Assert { kind, .. } = self.regex.states[assert_idx]
+                && kind.eval(false, at_end, prev, next) == AssertEval::Pass
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// true if `Match` is reachable with all assertions passing.
     ///
     /// Similar to [`DfaState::can_reach_match_at_end`] but uses `at_end=false`
@@ -3545,6 +3648,24 @@ impl<'a> Tier3DfaMatcher<'a> {
                 }
             }
         }
+        // Bug 42: resolve pending break tails and match_at_end at EOI.
+        // If the deferred assertion passes at end-of-input, promote pending
+        // tails — but at EOI, tails can only contribute if they themselves
+        // reach `$ → Match` at end-of-input.  This is checked via
+        // `target_is_match_at_end`.
+        if (!self.pending_break_tails.is_empty() || self.pending_break_mae)
+            && self.any_deferred_assert_passes(true, None)
+        {
+            if self.pending_break_mae {
+                return true;
+            }
+            // Check if any pending tail's target reaches Match at EOI.
+            for &tail in &self.pending_break_tails {
+                if self.analysis.target_is_match_at_end[tail.idx()] {
+                    return true;
+                }
+            }
+        }
         // Counter-dependent deferred assertions: evaluate assertions from
         // counter break paths that actually broke with enough value.  These
         // are NFA Assert state indices (e.g. \b, \B) on the path to
@@ -3585,6 +3706,11 @@ impl fmt::Debug for Tier3DfaMatcher<'_> {
                 "pending_break_seeds_len",
                 &self.pending_break_seeds.len(),
             )
+            .field(
+                "pending_break_tails_len",
+                &self.pending_break_tails.len(),
+            )
+            .field("pending_break_mae", &self.pending_break_mae)
             .field("use_ranges", &self.use_ranges);
         s.finish()
     }
