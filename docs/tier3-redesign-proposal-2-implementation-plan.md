@@ -218,6 +218,32 @@ struct AssertChainArena {
 
 Later, if needed, this can be flattened further.
 
+### 4b. Alternatives versus chains
+
+This distinction is critical and must be made explicit before any lowering
+from legacy Tier 3 analysis into typed effects.
+
+- an **assertion chain** means one ordered NFA path whose assertions must all
+  pass in order (AND semantics)
+- an **alternative set of chains** means multiple independent paths where any
+  one passing is sufficient (OR semantics)
+
+Examples:
+
+- a tail behind `\b -> \B` is one chain with AND semantics
+- two sibling break-path entry asserts `\b` and `\B` are two alternatives
+  with OR semantics, and must become two separate effects
+
+Crucial rule:
+
+- a raw `Box<[StateIdx]>` from the legacy analysis must never be blindly
+  interned as one `AssertChainId`
+- first classify whether it represents one path, one path per tail/seed, or
+  a disjunction of alternative entry points
+
+Bug 51 showed that this distinction is easy to miss and leads directly to
+false negatives when contradictory alternatives are collapsed into one chain.
+
 ### 5. Effect atoms
 
 Keep the atom set intentionally small.
@@ -251,6 +277,13 @@ struct GuardedEffect {
     atoms: Box<[EffectAtom]>,
 }
 ```
+
+Important normalization rule:
+
+- one `GuardedEffect` represents one conjunctive guard
+- OR semantics must be represented as multiple `GuardedEffect` or
+  `PendingEffect` entries, never by packing alternative assertions into one
+  `assert_chain`
 
 ### 7. Local target step
 
@@ -324,6 +357,34 @@ At runtime, it is fine to store:
 
 This is still one effect system.  Two vectors are just an execution detail.
 
+However, do not use one queue as both:
+
+- the list currently being resolved, and
+- the list receiving newly scheduled next-byte effects
+
+Use distinct buffers for the current boundary and the next boundary so that
+second-order deferred effects discovered during resolution are not dropped.
+
+## Required Semantic Normalization Pass
+
+Before implementing or migrating any typed-effect channel, write down the
+meaning of each legacy deferred-assert field in one of the following forms:
+
+- `PathChain` — one ordered path, AND semantics
+- `AlternativeChains` — OR over several paths
+- `PerTailChain` — one chain per tail
+- `PerSeedChain` — one chain per break-triggered seed
+
+At minimum, classify these fields explicitly:
+
+- `target_deferred_asserts`
+- `break_deferred_asserts`
+- `break_consuming_deferred`
+- `Tier3BreakSeed.deferred_asserts`
+
+Do not proceed with effect compilation until each field's semantics are
+written down in comments and reflected in the lowering code.
+
 ## Key Invariants
 
 These invariants should be written down in comments and enforced with
@@ -349,6 +410,26 @@ These invariants should be written down in comments and enforced with
 - assertion chains are evaluated in order, not independently
 - a chain ID must always refer to the *full required chain for that path*,
   not a flattened set of independent assertions
+- OR semantics must be represented as multiple effects, not one chain
+- every nonzero `required_breaks` guard must be checked at runtime, not just
+  carried for future use
+
+### Normalization invariants
+
+- every legacy deferred-assert field is classified as chain, alternatives,
+  per-tail chain, or per-seed chain before lowering
+- a list of assertion states must never be interpreted as AND or OR by
+  convention alone; the meaning must be documented at the field definition
+- shadow-lowered validation must compare semantic clauses, not just boolean
+  presence of "some deferred asserts"
+
+### Queue-lifecycle invariants
+
+- effects being resolved at the current boundary are stored separately from
+  effects scheduled for the next boundary
+- resolving pending effects must not clear newly scheduled effects
+- `EndOnly` machinery should exist only if there are real enqueue sites and
+  runtime resolution paths for it
 
 ### Migration invariants
 
@@ -468,6 +549,8 @@ using them for matching yet.
    equivalence before deleting anything.
 
 5. Add dump output for `target_effects`.
+6. Add comments at each legacy deferred-assert field describing whether it is
+   a conjunctive path or a disjunction of alternatives.
 
 #### What not to do yet
 
@@ -484,6 +567,8 @@ compile-time helpers that validate effect compilation for:
 - direct `$ -> Match` target
 - break path with pure match-at-end
 - break path with deferred assertion chain
+- break path with sibling deferred alternatives (OR semantics)
+- contradictory sibling deferred alternatives like `\b` vs `\B`
 - break path with consuming tail
 - ByteTable target where different bytes produce different effects
 
@@ -518,6 +603,7 @@ representation.
    - break seeds
    - pure break tails
    - deferred tails
+   - deferred-match alternatives
 
 2. Compare that lowered form against the existing legacy analysis for every
    target.
@@ -528,6 +614,14 @@ representation.
 
 If this phase fails, do not proceed.  The entire migration depends on
 proving that the effect compiler already captures the old semantics.
+
+The comparison must be semantic, not merely structural.  In particular:
+
+- do not reduce deferred-match behavior to a boolean like "has deferred
+  asserts"
+- compare whether a target lowers to one conjunctive chain, multiple
+  alternative chains, per-tail chains, or per-seed chains
+- fail if alternative paths are collapsed into one chain
 
 #### Tests to run
 
@@ -565,6 +659,8 @@ state so behavior can be compared safely.
 
    - legacy pending structures
    - effect-applier-produced pending structures
+4. Route all effect deposition through small helper functions instead of
+   open-coding the same `PendingEffect` construction in multiple deposit sites.
 
 #### Important rule
 
@@ -579,6 +675,8 @@ patch.  Route one semantic channel at a time through the effect applier.
 #### Done criteria
 
 - the effect applier can generate legacy-equivalent updates in debug mode
+- the same guard semantics are implemented in one helper per effect family,
+  not duplicated across `step_slow`, `chunk()`, and `finish()`
 
 ### Phase 5: Migrate break seeds first
 
@@ -600,6 +698,9 @@ Break seeds are the smallest isolated pending-effect channel.
 3. Resolve them via the generic pending-effect path in `chunk()` and
    `finish()`.
 4. Delete seed-specific resolution code once the generic path is trusted.
+5. If multiple assertion-gated seed paths exist for the same `(trigger,
+   counter, origin)`, preserve OR semantics explicitly instead of deduping
+   them into one chain by accident.
 
 #### Key bug families this phase must preserve
 
@@ -646,6 +747,9 @@ This is where most of the special-case complexity lives.
 4. Keep `post_break_tails` temporarily if needed, but only allow effects to
    feed it.
 5. Once stable, delete the old reinjection path.
+6. Preserve OR semantics when the same tail is reachable through multiple
+   alternative deferred paths; do not keep only one path unless one is proven
+   to subsume the others.
 
 #### Critical gotchas
 
@@ -684,6 +788,10 @@ pending-effect system.
 2. Use `EffectTiming::NextByte` and `EffectTiming::EndOnly` instead of
    separate custom logic.
 3. Delete `verified_deferred_asserts` once behavior matches.
+4. Treat sibling deferred entry points as OR semantics: emit multiple effects
+   or multiple pending entries, not one chain.
+5. Add a focused regression test where contradictory alternatives (`\b` and
+   `\B`) both exist and either one should allow the match.
 
 #### Tests to run
 
@@ -694,6 +802,8 @@ pending-effect system.
 
 - `verified_deferred_asserts` is gone
 - `finish()` is materially smaller and easier to read
+- the effect representation distinguishes conjunctive chains from disjunctive
+  alternatives correctly
 
 ### Phase 8: Decide whether Proposal 2 is enough or whether Proposal 3 overlap is needed
 
@@ -754,6 +864,11 @@ semantic systems permanently layered on top of each other.
 4. update `Debug`, `Display`, and dump output to show effect data instead of
    legacy field counts
 5. remove temporary shadow adapters and debug-only equivalence bridges
+6. do not remove the shadow adapters until:
+   - semantic normalization tests pass
+   - at least one targeted fuzz soak has run with validators still enabled
+   - every legacy deferred-assert field has been audited for AND vs OR
+     semantics
 
 #### Done criteria
 
@@ -811,8 +926,12 @@ Add tests that do not depend on the full matcher.  These should validate:
 
 - compiled effect timing
 - compiled assertion chains
+- compiled alternative-chain lowering (OR semantics)
 - byte-specific target effects
 - break-gated vs counter-free effect classification
+- runtime enforcement of `required_breaks`
+- queue lifecycle: effects scheduled during resolution survive to the next
+  boundary
 
 ### 3. Shadow equivalence tests
 
@@ -872,6 +991,12 @@ one patch.
 Do not convert `\b -> \B -> ...` into a flat set of assertion IDs.  Keep a
 per-path ordered chain.
 
+### Mistake 2b: Treating OR as AND
+
+Do not take a list of assertion entry points from sibling NFA paths and intern
+it as one `AssertChainId`.  If the semantics are "any of these paths may
+match", compile them as multiple effects.
+
 ### Mistake 3: Losing byte-specific targets
 
 `ByteTable` targets must remain byte-specific from compilation through
@@ -887,6 +1012,13 @@ context needed to evaluate them later.
 
 Shadow compilation is good.  Permanent duplication is not.  Once a channel
 is effect-driven and validated, delete the legacy version.
+
+### Mistake 6: Removing validators before fuzz soak
+
+Do not delete shadow lowering, semantic normalization checks, or equivalence
+tests immediately after the main test suite passes.  Keep them until targeted
+fuzzing has exercised the migrated effect family and field-semantics audits
+are complete.
 
 ## Suggested Commit Breakdown
 
