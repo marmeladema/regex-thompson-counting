@@ -2720,6 +2720,15 @@ pub struct Tier3DfaMatcher<'a> {
     /// contaminated.
     clean_nb_trans_slot: Option<usize>,
     prefilter: Prefilter,
+    /// Pending effects with `EffectTiming::NextByte` — evaluated at the
+    /// start of the next byte in `chunk()`.
+    ///
+    /// Part of the typed effect system (Phase 4+).  During the migration,
+    /// these coexist with the legacy pending channels above.
+    pending_effects_next_byte: Vec<tier3_effects::PendingEffect>,
+    /// Pending effects with `EffectTiming::EndOnly` — evaluated in
+    /// `finish()` at end-of-input.
+    pending_effects_end_only: Vec<tier3_effects::PendingEffect>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3282,6 +3291,8 @@ impl<'a> Tier3DfaMatcher<'a> {
             inst_counters,
             next_instances,
             prefilter: regex.prefilter,
+            pending_effects_next_byte: Vec::new(),
+            pending_effects_end_only: Vec::new(),
         }
     }
 
@@ -3310,6 +3321,8 @@ impl<'a> Tier3DfaMatcher<'a> {
         self.pending_break_tails.clear();
         self.pending_resolved_tails.clear();
         self.pending_resolved_mae = false;
+        self.pending_effects_next_byte.clear();
+        self.pending_effects_end_only.clear();
 
         let trans = self.cache.populate(
             self.memory,
@@ -3872,7 +3885,7 @@ impl<'a> Tier3DfaMatcher<'a> {
     /// Similar to [`DfaState::can_reach_match_at_end`] but uses `at_end=false`
     /// and `next=Some(byte)` for mid-input assertion evaluation.  This correctly
     /// rejects paths through `$` or `\B` that only pass at end-of-input.
-    fn can_reach_match_mid(
+    pub(super) fn can_reach_match_mid(
         start: StateIdx,
         prev: Option<u8>,
         next: Option<u8>,
@@ -4097,7 +4110,15 @@ impl fmt::Debug for Tier3DfaMatcher<'_> {
                 &self.pending_resolved_tails.len(),
             )
             .field("pending_resolved_mae", &self.pending_resolved_mae)
-            .field("use_ranges", &self.use_ranges);
+            .field("use_ranges", &self.use_ranges)
+            .field(
+                "pending_effects_next_byte_len",
+                &self.pending_effects_next_byte.len(),
+            )
+            .field(
+                "pending_effects_end_only_len",
+                &self.pending_effects_end_only.len(),
+            );
         s.finish()
     }
 }
@@ -4258,6 +4279,27 @@ impl fmt::Display for Tier3DfaMatcher<'_> {
             )?;
         }
         write!(f, "]")?;
+        // --- Effect queues (always shown when non-empty) ---
+        if !self.pending_effects_next_byte.is_empty() {
+            write!(f, "\n  eff_next_byte: [")?;
+            for (i, pe) in self.pending_effects_next_byte.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{pe}")?;
+            }
+            write!(f, "]")?;
+        }
+        if !self.pending_effects_end_only.is_empty() {
+            write!(f, "\n  eff_end_only: [")?;
+            for (i, pe) in self.pending_effects_end_only.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{pe}")?;
+            }
+            write!(f, "]")?;
+        }
         Ok(())
     }
 }

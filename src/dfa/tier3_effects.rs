@@ -36,7 +36,7 @@
 
 use std::fmt;
 
-use crate::{CounterIdx, StateIdx};
+use crate::{AssertEval, AssertKind, CounterIdx, Regex, State, StateIdx};
 
 // ---------------------------------------------------------------------------
 // Break mask (provenance-ready)
@@ -492,6 +492,172 @@ impl fmt::Display for PendingEffect {
 }
 
 // ---------------------------------------------------------------------------
+// Effect resolution results
+// ---------------------------------------------------------------------------
+
+/// Actions produced by resolving pending effects at a boundary.
+///
+/// The caller (e.g. `chunk()` or `finish()`) reads these and applies
+/// them to the matcher state.  This decouples the effect evaluation
+/// from the matcher's internal state layout.
+#[derive(Debug, Default)]
+pub(crate) struct ResolvedActions {
+    /// Seeds to apply: `(counter, origin, value)`.
+    pub(crate) seeds: Vec<(CounterIdx, StateIdx, u32)>,
+    /// Tail states to inject into `post_break_tails`.
+    pub(crate) tails: Vec<StateIdx>,
+    /// Whether an immediate match was signaled.
+    pub(crate) set_match: bool,
+    /// Whether a match-at-end was signaled.
+    pub(crate) set_match_at_end: bool,
+}
+
+impl ResolvedActions {
+    /// Whether any action was produced.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.seeds.is_empty() && self.tails.is_empty() && !self.set_match && !self.set_match_at_end
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Effect resolution: evaluate pending effects at a boundary
+// ---------------------------------------------------------------------------
+
+/// Evaluate an assertion chain against the current boundary context.
+///
+/// Returns `true` if all assertions in the chain pass.  An empty chain
+/// (i.e. `AssertChainId::NONE`) always passes.
+///
+/// # Arguments
+///
+/// - `chain_id`: the assertion chain to evaluate.
+/// - `arena`: the arena containing interned chains.
+/// - `at_end`: whether we are at end-of-input.
+/// - `prev`: the byte *before* the boundary (or `None` at start-of-input).
+/// - `next`: the byte *after* the boundary (or `None` at end-of-input).
+/// - `regex`: the compiled regex (for NFA state access and downstream
+///   reachability checks).
+pub(crate) fn eval_assert_chain(
+    chain_id: AssertChainId,
+    arena: &AssertChainArena,
+    at_end: bool,
+    prev: Option<u8>,
+    next: Option<u8>,
+    regex: &Regex,
+) -> bool {
+    if chain_id == AssertChainId::NONE {
+        return true;
+    }
+    let chain = arena.get(chain_id);
+    for &assert_idx in chain {
+        let State::Assert { kind, out } = regex.states.0[assert_idx] else {
+            // Not an Assert state — should not happen, but be defensive.
+            return false;
+        };
+        match kind.eval(false, at_end, prev, next) {
+            AssertEval::Pass => {
+                // Check if the downstream path from this assertion's `out`
+                // can still reach a match.  This handles chained assertions
+                // (e.g. `\b → \B → $ → Match`).
+                if at_end {
+                    if !super::DfaState::can_reach_match_at_end(out, prev, regex) {
+                        return false;
+                    }
+                } else {
+                    // Mid-input: check if can_reach_match_mid from the
+                    // assertion's out.  We use the Tier3DfaMatcher static
+                    // method for this.
+                    if !super::Tier3DfaMatcher::can_reach_match_mid(out, prev, next, regex) {
+                        return false;
+                    }
+                }
+            }
+            AssertEval::Fail => return false,
+            AssertEval::Defer => {
+                // The assertion needs the next byte — can't resolve yet.
+                // This shouldn't happen for NextByte effects (we have the
+                // next byte), but for EndOnly it means we treat it as
+                // failure (conservative).
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Resolve a list of pending effects against the current boundary.
+///
+/// Evaluates each pending effect's guard (break mask + assertion chain)
+/// and, if the guard passes, collects the resulting actions.
+///
+/// # Arguments
+///
+/// - `pending`: the pending effects to evaluate (drained by the caller).
+/// - `timing_filter`: only evaluate effects with this timing.
+/// - `arena`: assertion chain arena.
+/// - `at_end`: whether we are at end-of-input.
+/// - `next`: the byte after the boundary (for mid-input resolution).
+/// - `regex`: the compiled regex.
+///
+/// Effects whose guards fail are silently dropped (they are consumed).
+pub(crate) fn resolve_pending(
+    pending: &[PendingEffect],
+    timing_filter: EffectTiming,
+    arena: &AssertChainArena,
+    at_end: bool,
+    next: Option<u8>,
+    regex: &Regex,
+) -> ResolvedActions {
+    let mut actions = ResolvedActions::default();
+
+    for pe in pending {
+        if pe.timing != timing_filter {
+            continue;
+        }
+
+        // Evaluate the assertion chain with the captured boundary context.
+        // `prev` is reconstructed from `prev_was_word`:
+        // - `Some(b'a')` if prev_was_word (word character representative)
+        // - `Some(b' ')` if not (non-word character representative)
+        let prev = if pe.prev_was_word {
+            Some(b'a')
+        } else {
+            Some(b' ')
+        };
+
+        if !eval_assert_chain(pe.guard.assert_chain, arena, at_end, prev, next, regex) {
+            continue;
+        }
+
+        // Guard passed — apply atoms.
+        for atom in pe.atoms.iter() {
+            match atom {
+                EffectAtom::AddSeed {
+                    counter,
+                    origin,
+                    value,
+                } => {
+                    actions.seeds.push((*counter, *origin, *value));
+                }
+                EffectAtom::AddTail { origin } => {
+                    if !actions.tails.contains(origin) {
+                        actions.tails.push(*origin);
+                    }
+                }
+                EffectAtom::Match => {
+                    actions.set_match = true;
+                }
+                EffectAtom::MatchAtEnd => {
+                    actions.set_match_at_end = true;
+                }
+            }
+        }
+    }
+
+    actions
+}
+
+// ---------------------------------------------------------------------------
 // Debug assertions
 // ---------------------------------------------------------------------------
 
@@ -563,7 +729,7 @@ fn assert_atom_origins_consuming(atom: &EffectAtom, is_consuming: &impl Fn(State
 ///
 /// [`Tier3OriginKind`]: super::Tier3OriginKind
 pub(crate) fn compile_target_effects(
-    target_idx: StateIdx,
+    _target_idx: StateIdx,
     origin_kind: &super::Tier3OriginKind,
     break_seeds: &[super::Tier3BreakSeed],
     arena: &mut AssertChainArena,
