@@ -10810,6 +10810,31 @@ mod tests {
                 ("111fa", false),               // \b between f(word) and a(word) fails
             ],
         }
+
+        // Bug 41: stale verified_deferred_asserts surviving the fast path.
+        // When a counter breaks and deposits a deferred `\b` assert, the
+        // assert is resolved on the NEXT byte.  If the assert fails
+        // (e.g. c→z = word→word, no boundary), the entry must be cleared.
+        // Previously, the inline fast path (no live counters, no seeds)
+        // did not clear verified_deferred_asserts, allowing stale entries
+        // to persist until EOI where they would incorrectly pass.
+        test_tier3_stale_deferred_assert_fast_path {
+            pattern: r"\bc{2,12}\b",
+            memory: 1433,
+            min_tier: 1,
+            inputs: [
+                ("cc", true),                      // 2 c's, \b at both ends
+                ("cccccccccccc", true),             // 12 c's (max), \b at EOI
+                ("ccccccccccccz", false),           // 12 c's + z: no \b after c's (word→word)
+                ("cccccccccccczzz", false),         // 12 c's + zzz: same, stale deferred \b at EOI
+                ("ccccccccccccc", false),           // 13 c's: exceeds max, no match
+                ("cccccccccccc ", true),            // 12 c's + space: \b passes (word→non-word)
+                ("ccc", true),                      // 3 c's, boundary at both ends
+                ("c", false),                       // 1 c: below min
+                (" cccc ", true),                   // spaces around: \b passes at both boundaries
+                (" ccccccccccccz ", false),         // 12 c's + z after space: no \b at c/z boundary
+            ],
+        }
     }
 
     /// Tier 2 encodes counter identity in `u64` bitmasks, so patterns with

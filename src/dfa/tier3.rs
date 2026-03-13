@@ -3155,6 +3155,15 @@ impl<'a> Tier3DfaMatcher<'a> {
             if self.resolve_verified_deferred_asserts(false, Some(b)) {
                 self.ever_matched = true;
             }
+            // Bug 41: clear after resolution.  These are one-shot
+            // assertions from the previous step's counter breaks.  If
+            // they passed, `ever_matched` is already set.  If they
+            // failed, the match opportunity is lost — they must not
+            // linger into future bytes or EOI.  `step_slow_impl` also
+            // clears this list (line ~2551), but the inline fast path
+            // does not, which previously allowed stale deferred asserts
+            // to survive indefinitely and fire at end-of-input.
+            self.verified_deferred_asserts.clear();
 
             // Resolve pending break seeds from the PREVIOUS step (Bug 28).
             // These are break seeds whose deferred assertions (e.g. `\b`)
@@ -3207,6 +3216,15 @@ impl<'a> Tier3DfaMatcher<'a> {
                         self.has_live_instances = true;
                     }
                 }
+                // Bug 41: clear after resolution (same rationale as
+                // verified_deferred_asserts above).  Pending break seeds
+                // are one-shot: they capture the byte context at the time
+                // of the counter break and must be resolved exactly once
+                // on the next byte.  Without this clear, the fast path
+                // (which skips step_slow_impl) would leave stale entries
+                // that get re-evaluated on later bytes with a different
+                // next-byte context.
+                self.pending_break_seeds.clear();
             }
 
             // --- Inline fast path ---
