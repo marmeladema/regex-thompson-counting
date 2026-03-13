@@ -11427,7 +11427,7 @@ mod tests {
         // PATH 14: finish() pending break seeds at EOI.
         // When c0 breaks on the last input byte, the break seed for c1
         // has a deferred \b that can't be evaluated yet (no next byte).
-        // It goes into pending_break_seeds and is resolved in finish().
+        // It goes into pending_effects_next_byte and is resolved in finish().
         // With unroll_limit=0, .{0,3} stays as a counter.  c1 has min=0,
         // so value=0 >= min → immediate break → break_is_match_at_end.
         test_tier3_cov_pending_break_seed_eoi {

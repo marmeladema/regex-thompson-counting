@@ -7,8 +7,8 @@
 
 use std::fmt;
 
-use crate::dfa::tier3_effects::{AssertChainArena, CompiledTargetEffects};
 use crate::dfa::Tier3OriginKind;
+use crate::dfa::tier3_effects::{AssertChainArena, CompiledTargetEffects};
 use crate::{AssertKind, ByteClass, ByteMap, Regex, State, StateIdx};
 
 // ---------------------------------------------------------------------------

@@ -528,6 +528,14 @@ impl ResolvedActions {
 /// Returns `true` if all assertions in the chain pass.  An empty chain
 /// (i.e. `AssertChainId::NONE`) always passes.
 ///
+/// When `check_reachability` is `true`, also verifies that the downstream
+/// path from each assertion's `out` state can reach a match — this is
+/// needed for `Match`/`MatchAtEnd` effects where the assertion guards the
+/// match signal itself.  When `false`, only the assertion evaluation is
+/// performed — this is correct for `AddSeed`/`AddTail` effects where
+/// the assertion gates a non-match action and downstream reachability is
+/// irrelevant.
+///
 /// # Arguments
 ///
 /// - `chain_id`: the assertion chain to evaluate.
@@ -537,6 +545,8 @@ impl ResolvedActions {
 /// - `next`: the byte *after* the boundary (or `None` at end-of-input).
 /// - `regex`: the compiled regex (for NFA state access and downstream
 ///   reachability checks).
+/// - `check_reachability`: whether to verify downstream match reachability
+///   after each assertion passes.
 pub(crate) fn eval_assert_chain(
     chain_id: AssertChainId,
     arena: &AssertChainArena,
@@ -544,6 +554,7 @@ pub(crate) fn eval_assert_chain(
     prev: Option<u8>,
     next: Option<u8>,
     regex: &Regex,
+    check_reachability: bool,
 ) -> bool {
     if chain_id == AssertChainId::NONE {
         return true;
@@ -556,19 +567,20 @@ pub(crate) fn eval_assert_chain(
         };
         match kind.eval(false, at_end, prev, next) {
             AssertEval::Pass => {
-                // Check if the downstream path from this assertion's `out`
-                // can still reach a match.  This handles chained assertions
-                // (e.g. `\b → \B → $ → Match`).
-                if at_end {
-                    if !super::DfaState::can_reach_match_at_end(out, prev, regex) {
-                        return false;
-                    }
-                } else {
-                    // Mid-input: check if can_reach_match_mid from the
-                    // assertion's out.  We use the Tier3DfaMatcher static
-                    // method for this.
-                    if !super::Tier3DfaMatcher::can_reach_match_mid(out, prev, next, regex) {
-                        return false;
+                if check_reachability {
+                    // Check if the downstream path from this assertion's
+                    // `out` can still reach a match.  This handles chained
+                    // assertions (e.g. `\b → \B → $ → Match`).
+                    if at_end {
+                        if !super::DfaState::can_reach_match_at_end(out, prev, regex) {
+                            return false;
+                        }
+                    } else {
+                        // Mid-input: check if can_reach_match_mid from the
+                        // assertion's out.
+                        if !super::Tier3DfaMatcher::can_reach_match_mid(out, prev, next, regex) {
+                            return false;
+                        }
                     }
                 }
             }
@@ -625,7 +637,22 @@ pub(crate) fn resolve_pending(
             Some(b' ')
         };
 
-        if !eval_assert_chain(pe.guard.assert_chain, arena, at_end, prev, next, regex) {
+        // Check downstream reachability only when the effect contains
+        // Match or MatchAtEnd atoms — for AddSeed/AddTail the assertion
+        // is just a gate on a non-match action.
+        let has_match_atoms = pe
+            .atoms
+            .iter()
+            .any(|a| matches!(a, EffectAtom::Match | EffectAtom::MatchAtEnd));
+        if !eval_assert_chain(
+            pe.guard.assert_chain,
+            arena,
+            at_end,
+            prev,
+            next,
+            regex,
+            has_match_atoms,
+        ) {
             continue;
         }
 
@@ -778,8 +805,8 @@ pub(crate) fn compile_target_effects(
             let step = TargetStep::Increment {
                 counter: *counter,
                 advance_origins: advance_origins.clone(),
-                min: *min as u32,
-                max: *max as u32,
+                min: *min,
+                max: *max,
                 continue_origins: continue_origins.clone(),
             };
 
@@ -1037,13 +1064,13 @@ pub(crate) fn lower_to_legacy(effects: &CompiledTargetEffects) -> LoweredLegacyF
     facts.break_consuming_pure.sort_unstable_by_key(|s| s.0);
     facts
         .break_seeds_ungated
-        .sort_unstable_by_key(|s| (s.0.idx(), s.1 .0, s.2));
+        .sort_unstable_by_key(|s| (s.0.idx(), s.1.0, s.2));
     facts
         .break_consuming_deferred
-        .sort_unstable_by_key(|s| s.0 .0);
+        .sort_unstable_by_key(|s| s.0.0);
     facts
         .break_seeds_gated
-        .sort_unstable_by_key(|s| (s.0.idx(), s.1 .0, s.2));
+        .sort_unstable_by_key(|s| (s.0.idx(), s.1.0, s.2));
 
     facts
 }
@@ -1147,14 +1174,8 @@ fn validate_one_target(
                         eff_adv.as_ref(),
                         "state {state_idx}: Increment advance_origins mismatch"
                     );
-                    assert_eq!(
-                        *min as u32, *eff_min,
-                        "state {state_idx}: Increment min mismatch"
-                    );
-                    assert_eq!(
-                        *max as u32, *eff_max,
-                        "state {state_idx}: Increment max mismatch"
-                    );
+                    assert_eq!(*min, *eff_min, "state {state_idx}: Increment min mismatch");
+                    assert_eq!(*max, *eff_max, "state {state_idx}: Increment max mismatch");
                     assert_eq!(
                         continue_origins.as_ref(),
                         eff_cont.as_ref(),

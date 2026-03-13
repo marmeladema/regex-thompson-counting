@@ -248,6 +248,11 @@ pub(crate) struct Tier3BreakSeed {
     /// the break position before the seed is applied (Bug 27).  Empty when
     /// the path has no assertions.
     pub(crate) deferred_asserts: Box<[StateIdx]>,
+    /// Interned assertion chain ID for the deferred assertions.
+    /// [`AssertChainId::NONE`] when `deferred_asserts` is empty.
+    /// Populated during [`compute_tier3_analysis`] after the assertion
+    /// chain arena is built.
+    pub(crate) assert_chain_id: tier3_effects::AssertChainId,
 }
 
 /// Build the [`Tier3Analysis`] for a tier-3-eligible pattern.
@@ -459,6 +464,9 @@ pub(crate) fn compute_tier3_analysis(
                 counter,
                 origin,
                 deferred_asserts: da.into_boxed_slice(),
+                // Placeholder — populated after the assertion chain arena
+                // is built in Step 9.
+                assert_chain_id: tier3_effects::AssertChainId::NONE,
             }
         })
         .collect();
@@ -797,9 +805,17 @@ pub(crate) fn compute_tier3_analysis(
     };
 
     // -- Step 9: shadow-compile typed target effects --------------------------
-    let (target_effects, assert_chain_arena) =
+    let (target_effects, mut assert_chain_arena) =
         tier3_effects::compile_all_target_effects(&analysis);
     analysis.target_effects = target_effects;
+
+    // Populate assert_chain_id on each break seed by interning its
+    // deferred_asserts into the (already-populated) arena.  The arena
+    // deduplicates, so these are no-ops for chains already interned
+    // during effect compilation — they just return the existing ID.
+    for bs in analysis.break_seeds.iter_mut() {
+        bs.assert_chain_id = assert_chain_arena.intern(&bs.deferred_asserts);
+    }
     analysis.assert_chain_arena = assert_chain_arena;
 
     analysis
@@ -2644,17 +2660,8 @@ pub struct Tier3DfaMatcher<'a> {
     /// `EffectAtom::Match` / `EffectAtom::MatchAtEnd` and an assertion-chain
     /// guard (Phase 7).
     verified_deferred_asserts: Vec<StateIdx>,
-    /// Pending break seeds whose deferred assertions (e.g. `\b`) could not
-    /// be evaluated at break time because the next byte was unknown (Bug 28).
-    /// Each entry stores `(trigger, counter, origin, value, prev_was_word)` —
-    /// the triggering counter, the seed to apply, and the word-ness of the
-    /// byte at the break position.  Resolved at the start of the next byte
-    /// (in `chunk()`) or at end-of-input (in `finish()`).
-    ///
-    /// TODO(effects): replace with `PendingEffect` entries carrying
-    /// `EffectAtom::AddSeed` with `EffectTiming::NextByte` and assertion-chain
-    /// guard (Phase 5).
-    pending_break_seeds: Vec<(CounterIdx, CounterIdx, StateIdx, u32, bool)>,
+    // `pending_break_seeds` has been replaced by `pending_effects_next_byte`
+    // entries carrying `EffectAtom::AddSeed` (Phase 5).
     /// Pending post-break tails whose deferred assertions have not yet been
     /// evaluated (Bug 42).  When a counter breaks with `break_deferred_asserts`,
     /// the `break_consuming_states` (tails) must NOT be deposited immediately
@@ -2758,7 +2765,7 @@ macro_rules! step_slow_impl {
             self.$next.clear();
             self.match_at_end = false;
             self.verified_deferred_asserts.clear();
-            self.pending_break_seeds.clear();
+            self.pending_effects_next_byte.clear();
             self.pending_break_tails.clear();
 
             // Advance existing post-break tails through this transition.
@@ -3193,29 +3200,38 @@ macro_rules! step_slow_impl {
             // Bug 28: the assertion is at the position AFTER consuming
             // `byte` (between `byte` and the next input byte).  Since the
             // next byte is unknown at break time, the assertion must be
-            // DEFERRED — stored in `pending_break_seeds` and evaluated at
-            // the start of the next byte (or at end-of-input in `finish()`).
+            // DEFERRED — stored as a `PendingEffect` with `NextByte` timing
+            // and evaluated at the start of the next byte (or at
+            // end-of-input in `finish()`).
             for &(trigger, counter, origin, value) in t.break_seeds.iter() {
                 if counter_broke & (1u64 << trigger.idx()) != 0 {
-                    let has_deferred = self
-                        .analysis
-                        .break_seeds
-                        .iter()
-                        .find(|bs| {
-                            bs.trigger == trigger && bs.counter == counter && bs.origin == origin
-                        })
-                        .is_some_and(|bs| !bs.deferred_asserts.is_empty());
+                    // Look up the pre-interned assert chain ID for this
+                    // break seed from the analysis table.
+                    let bs_entry = self.analysis.break_seeds.iter().find(|bs| {
+                        bs.trigger == trigger && bs.counter == counter && bs.origin == origin
+                    });
+                    let has_deferred = bs_entry.is_some_and(|bs| !bs.deferred_asserts.is_empty());
                     if has_deferred {
-                        // Defer: store the seed with the word-ness of the
-                        // break position (= `byte`, the byte just consumed
-                        // by the body) for later evaluation.
-                        self.pending_break_seeds.push((
-                            trigger,
-                            counter,
-                            origin,
-                            value,
-                            crate::is_word_byte(byte),
-                        ));
+                        let chain_id = bs_entry.unwrap().assert_chain_id;
+                        // Defer: schedule as a PendingEffect with the
+                        // word-ness of the break position (= `byte`, the
+                        // byte just consumed by the body) for later
+                        // evaluation.
+                        self.pending_effects_next_byte
+                            .push(tier3_effects::PendingEffect {
+                                timing: tier3_effects::EffectTiming::NextByte,
+                                guard: tier3_effects::EffectGuard {
+                                    required_breaks: 1u64 << trigger.idx(),
+                                    assert_chain: chain_id,
+                                },
+                                atoms: vec![tier3_effects::EffectAtom::AddSeed {
+                                    counter,
+                                    origin,
+                                    value,
+                                }]
+                                .into_boxed_slice(),
+                                prev_was_word: crate::is_word_byte(byte),
+                            });
                     } else {
                         // No assertions on break path — apply immediately.
                         self.$current.seed(counter.idx(), origin, value);
@@ -3269,7 +3285,6 @@ impl<'a> Tier3DfaMatcher<'a> {
             post_break_tails: Vec::new(),
             next_post_break_tails: Vec::new(),
             verified_deferred_asserts: Vec::new(),
-            pending_break_seeds: Vec::new(),
             pending_break_tails: Vec::new(),
             pending_resolved_tails: Vec::new(),
             pending_resolved_mae: false,
@@ -3618,56 +3633,38 @@ impl<'a> Tier3DfaMatcher<'a> {
                 }
             }
 
-            // Resolve pending break seeds from the PREVIOUS step (Bug 28).
-            // These are break seeds whose deferred assertions (e.g. `\b`)
-            // could not be evaluated at break time because the next byte
-            // was unknown.  Now that we have the next byte (`b`), evaluate
-            // the assertions and seed the counter if they pass.
-            if !self.pending_break_seeds.is_empty() {
-                for i in 0..self.pending_break_seeds.len() {
-                    let (trigger, counter, origin, value, prev_was_word) =
-                        self.pending_break_seeds[i];
-                    let prev = if prev_was_word {
-                        Some(b'a')
+            // Resolve pending effects from the PREVIOUS step (Bug 28).
+            // These are break seeds (and future: tails, matches) whose
+            // deferred assertions could not be evaluated at break time
+            // because the next byte was unknown.  Now that we have the
+            // next byte (`b`), evaluate the assertions via the generic
+            // pending-effect path and apply the resulting actions.
+            if !self.pending_effects_next_byte.is_empty() {
+                let actions = tier3_effects::resolve_pending(
+                    &self.pending_effects_next_byte,
+                    tier3_effects::EffectTiming::NextByte,
+                    &self.analysis.assert_chain_arena,
+                    false,   // at_end = false (mid-input)
+                    Some(b), // next byte is known
+                    self.regex,
+                );
+                for &(counter, origin, value) in &actions.seeds {
+                    if self.use_ranges {
+                        self.ranged_counters
+                            .insert(counter.idx(), origin, value, value);
                     } else {
-                        Some(b' ')
-                    };
-                    // Look up deferred asserts for this seed.
-                    let pass = self
-                        .analysis
-                        .break_seeds
-                        .iter()
-                        .find(|bs| {
-                            bs.trigger == trigger && bs.counter == counter && bs.origin == origin
-                        })
-                        .is_none_or(|bs| {
-                            bs.deferred_asserts.iter().all(|&assert_idx| {
-                                if let State::Assert { kind, .. } = self.regex.states[assert_idx] {
-                                    kind.eval(false, false, prev, Some(b)) == AssertEval::Pass
-                                } else {
-                                    true
-                                }
-                            })
-                        });
-                    if pass {
-                        if self.use_ranges {
-                            self.ranged_counters
-                                .insert(counter.idx(), origin, value, value);
-                        } else {
-                            self.inst_counters.seed(counter.idx(), origin, value);
-                        }
-                        self.has_live_instances = true;
+                        self.inst_counters.seed(counter.idx(), origin, value);
                     }
+                    self.has_live_instances = true;
                 }
-                // Bug 41: clear after resolution (same rationale as
-                // verified_deferred_asserts above).  Pending break seeds
-                // are one-shot: they capture the byte context at the time
-                // of the counter break and must be resolved exactly once
-                // on the next byte.  Without this clear, the fast path
+                // Bug 41: clear after resolution.  Pending effects are
+                // one-shot: they capture the byte context at the time of
+                // the counter break and must be resolved exactly once on
+                // the next byte.  Without this clear, the fast path
                 // (which skips step_slow_impl) would leave stale entries
                 // that get re-evaluated on later bytes with a different
                 // next-byte context.
-                self.pending_break_seeds.clear();
+                self.pending_effects_next_byte.clear();
             }
 
             // --- Inline fast path ---
@@ -3997,58 +3994,45 @@ impl<'a> Tier3DfaMatcher<'a> {
                 return true;
             }
         }
-        // Pending break seeds at end-of-input (Bug 28): evaluate the
-        // deferred assertions with `at_end=true`.  If the assertion passes
-        // AND the seeded counter can immediately break (value >= min) with
-        // a match-producing break path, this is a match.
-        if !self.pending_break_seeds.is_empty() {
-            for &(trigger, counter, origin, value, prev_was_word) in &self.pending_break_seeds {
-                let prev = if prev_was_word {
-                    Some(b'a')
-                } else {
-                    Some(b' ')
-                };
-                let pass = self
-                    .analysis
-                    .break_seeds
-                    .iter()
-                    .find(|bs| {
-                        bs.trigger == trigger && bs.counter == counter && bs.origin == origin
-                    })
-                    .is_none_or(|bs| {
-                        bs.deferred_asserts.iter().all(|&assert_idx| {
-                            if let State::Assert { kind, .. } = self.regex.states[assert_idx] {
-                                kind.eval(false, true, prev, None) == AssertEval::Pass
-                            } else {
-                                true
-                            }
-                        })
-                    });
-                if pass {
-                    // The seed counter starts at `value` with no more input.
-                    // Check if it can immediately break (value >= min) and if
-                    // the break path reaches Match/$ → Match.
-                    // Look up the counter's CInc target to find min/break info.
-                    // The origin is a consuming state; its target (after byte
-                    // consumption) holds the CInc increment action.
-                    for target_action in self.analysis.targets.iter().flatten() {
-                        if let Tier3OriginKind::Increment {
-                            counter: tc,
-                            min,
-                            break_is_match_at_end,
-                            break_is_match,
-                            ..
-                        } = target_action
-                            && *tc == counter
-                            && value >= *min
-                            && (*break_is_match_at_end || *break_is_match)
-                        {
-                            return true;
-                        }
+        // Pending break seeds at end-of-input (Bug 28): evaluate
+        // deferred assertions with `at_end=true` via the generic
+        // pending-effect path.  If the assertion passes AND the seeded
+        // counter can immediately break (value >= min) with a
+        // match-producing break path, this is a match.
+        //
+        // Note: these are NextByte-timed effects that were never
+        // resolved mid-input (the input ended before the next byte
+        // arrived).  We resolve them here with EOI context.
+        if !self.pending_effects_next_byte.is_empty() {
+            let actions = tier3_effects::resolve_pending(
+                &self.pending_effects_next_byte,
+                tier3_effects::EffectTiming::NextByte,
+                &self.analysis.assert_chain_arena,
+                true, // at_end = true
+                None, // no next byte
+                self.regex,
+            );
+            for &(counter, _origin, value) in &actions.seeds {
+                // The seed counter starts at `value` with no more input.
+                // Check if it can immediately break (value >= min) and if
+                // the break path reaches Match/$ → Match.
+                for target_action in self.analysis.targets.iter().flatten() {
+                    if let Tier3OriginKind::Increment {
+                        counter: tc,
+                        min,
+                        break_is_match_at_end,
+                        break_is_match,
+                        ..
+                    } = target_action
+                        && *tc == counter
+                        && value >= *min
+                        && (*break_is_match_at_end || *break_is_match)
+                    {
+                        return true;
                     }
-                    // Even if the counter can't immediately break, the seed
-                    // doesn't help at end-of-input (no more bytes to process).
                 }
+                // Even if the counter can't immediately break, the seed
+                // doesn't help at end-of-input (no more bytes to process).
             }
         }
         // Bug 42 + Bug 46: resolve pending break tails at EOI.
@@ -4103,7 +4087,6 @@ impl fmt::Debug for Tier3DfaMatcher<'_> {
                 "verified_deferred_asserts_len",
                 &self.verified_deferred_asserts.len(),
             )
-            .field("pending_break_seeds_len", &self.pending_break_seeds.len())
             .field("pending_break_tails_len", &self.pending_break_tails.len())
             .field(
                 "pending_resolved_tails_len",
@@ -4264,23 +4247,10 @@ impl fmt::Display for Tier3DfaMatcher<'_> {
                 .collect::<Vec<_>>()
                 .join(",")
         )?;
-        // --- Pending break seeds (always shown) ---
-        write!(f, "\n  pending_seeds: [")?;
-        for (i, &(trigger, counter, origin, value, prev_word)) in
-            self.pending_break_seeds.iter().enumerate()
+        // --- Effect queues (always shown) ---
+        // Break seeds are now in pending_effects_next_byte as
+        // PendingEffect entries with EffectAtom::AddSeed (Phase 5).
         {
-            if i > 0 {
-                write!(f, ", ")?;
-            }
-            write!(
-                f,
-                "c{}→c{}@{}(val={},pw={})",
-                trigger, counter, origin, value, prev_word
-            )?;
-        }
-        write!(f, "]")?;
-        // --- Effect queues (always shown when non-empty) ---
-        if !self.pending_effects_next_byte.is_empty() {
             write!(f, "\n  eff_next_byte: [")?;
             for (i, pe) in self.pending_effects_next_byte.iter().enumerate() {
                 if i > 0 {
