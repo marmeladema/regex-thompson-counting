@@ -574,6 +574,7 @@ impl DumpRegex<'_> {
                             break_consuming_states,
                             break_consuming_pure,
                             break_consuming_deferred,
+                            break_assert_chain_id,
                         } => {
                             writeln!(f, "    state {i}: Increment(c{counter}, {{{min},{max}}})",)?;
                             writeln!(
@@ -601,12 +602,13 @@ impl DumpRegex<'_> {
                             )?;
                             writeln!(
                                 f,
-                                "      break_deferred_asserts: [{}]",
+                                "      break_deferred_asserts: [{}] ({})",
                                 break_deferred_asserts
                                     .iter()
                                     .map(|s| s.to_string())
                                     .collect::<Vec<_>>()
-                                    .join(", ")
+                                    .join(", "),
+                                break_assert_chain_id,
                             )?;
                             writeln!(
                                 f,

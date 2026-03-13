@@ -36,7 +36,7 @@
 
 use std::fmt;
 
-use crate::{AssertEval, AssertKind, CounterIdx, Regex, State, StateIdx};
+use crate::{AssertEval, CounterIdx, Regex, State, StateIdx};
 
 // ---------------------------------------------------------------------------
 // Break mask (provenance-ready)
@@ -801,6 +801,7 @@ pub(crate) fn compile_target_effects(
             break_consuming_states: _,
             break_consuming_pure,
             break_consuming_deferred,
+            break_assert_chain_id: _,
         } => {
             let step = TargetStep::Increment {
                 counter: *counter,
@@ -847,10 +848,10 @@ pub(crate) fn compile_target_effects(
             //
             // When break_deferred_asserts is non-empty, the break path
             // includes assertions (e.g. `\b`, `\B`) that gate access to
-            // Match or $ → Match.  The runtime stores these in
-            // `verified_deferred_asserts` and evaluates them via
-            // `can_reach_match_at_end()` at the next byte boundary and
-            // at end-of-input.
+            // Match or $ → Match.  At runtime, these are emitted as
+            // PendingEffect entries with Match atoms and evaluated via
+            // `eval_assert_chain` with downstream reachability checks at
+            // the next byte boundary and at end-of-input.
             //
             // The effect representation captures this as a guarded
             // MatchAtEnd — the assertion chain determines whether the
@@ -931,11 +932,21 @@ pub(crate) fn compile_target_effects(
 /// Shadow-compile all target effects for a [`Tier3Analysis`].
 ///
 /// Iterates over all targets in the analysis and compiles a
-/// `CompiledTargetEffects` for each non-`None` target.  Returns the
-/// per-target effect array and the populated assertion chain arena.
+/// `CompiledTargetEffects` for each non-`None` target.  Also interns
+/// each individual assert from `target_deferred_asserts` as a 1-element
+/// chain so that deposit sites can emit [`PendingEffect`] entries with
+/// proper chain guards.
+///
+/// Returns `(per-target effects, per-state chain IDs for target deferred
+/// asserts, populated assertion chain arena)`.
+#[allow(clippy::type_complexity)]
 pub(crate) fn compile_all_target_effects(
     analysis: &super::Tier3Analysis,
-) -> (Box<[Option<CompiledTargetEffects>]>, AssertChainArena) {
+) -> (
+    Box<[Option<CompiledTargetEffects>]>,
+    Box<[Box<[AssertChainId]>]>,
+    AssertChainArena,
+) {
     let mut arena = AssertChainArena::new();
     let effects: Vec<Option<CompiledTargetEffects>> = analysis
         .targets
@@ -947,7 +958,27 @@ pub(crate) fn compile_all_target_effects(
             })
         })
         .collect();
-    (effects.into_boxed_slice(), arena)
+
+    // Intern each individual assert from target_deferred_asserts as a
+    // 1-element chain.  This allows deposit sites to create PendingEffect
+    // entries with the chain as a guard for Match atoms (Phase 7).
+    let target_chain_ids: Vec<Box<[AssertChainId]>> = analysis
+        .target_deferred_asserts
+        .iter()
+        .map(|asserts| {
+            asserts
+                .iter()
+                .map(|&assert_idx| arena.intern(&[assert_idx]))
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        })
+        .collect();
+
+    (
+        effects.into_boxed_slice(),
+        target_chain_ids.into_boxed_slice(),
+        arena,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1155,6 +1186,7 @@ fn validate_one_target(
             break_consuming_states: _,
             break_consuming_pure,
             break_consuming_deferred,
+            break_assert_chain_id: _,
         } => {
             // Step must be Increment with matching fields.
             match &eff.step {

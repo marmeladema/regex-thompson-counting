@@ -48,7 +48,7 @@ use crate::{
     is_word_byte,
 };
 
-use super::{DfaCache, DfaMemory, DfaState, DfaStateId, tier3_effects};
+use super::{DfaCache, DfaMemory, DfaStateId, tier3_effects};
 
 // ---------------------------------------------------------------------------
 // Precomputed NFA analysis (built once at regex compile time)
@@ -127,10 +127,11 @@ pub(crate) struct Tier3Analysis {
     /// states or when no assertions are on the path.
     ///
     /// Used by the post-break tail tracker (Bug 30): when a tail advances
-    /// through a consuming state, these assertions are deposited into
-    /// `verified_deferred_asserts` for proper counter-gated evaluation,
-    /// rather than relying on the contaminated `no_break_current` DFA
-    /// state's deferred asserts.
+    /// through a consuming state, these assertions are emitted as
+    /// [`PendingEffect`](tier3_effects::PendingEffect) entries with
+    /// `EffectAtom::Match` and the corresponding chain ID from
+    /// `target_assert_chain_ids`, rather than relying on the contaminated
+    /// `no_break_current` DFA state's deferred asserts.
     pub(crate) target_deferred_asserts: Box<[Box<[StateIdx]>]>,
 
     /// Per-NFA-state flag: true if the state is reachable from the start
@@ -166,6 +167,18 @@ pub(crate) struct Tier3Analysis {
     /// with the legacy fields above; once validated, the legacy fields
     /// will be removed.
     pub(crate) target_effects: Box<[Option<tier3_effects::CompiledTargetEffects>]>,
+
+    /// Per-consuming-state assertion chain IDs for `target_deferred_asserts`.
+    ///
+    /// Indexed by NFA state index.  For each consuming state, contains one
+    /// [`AssertChainId`](tier3_effects::AssertChainId) per assert in
+    /// `target_deferred_asserts[state]`.  Each individual assert index is
+    /// interned as a 1-element chain so it can be used as a guard in
+    /// [`PendingEffect`](tier3_effects::PendingEffect) entries.
+    ///
+    /// Populated alongside `target_effects` during
+    /// [`compile_all_target_effects`](tier3_effects::compile_all_target_effects).
+    pub(crate) target_assert_chain_ids: Box<[Box<[tier3_effects::AssertChainId]>]>,
 
     /// Arena of interned assertion chains referenced by effect guards.
     pub(crate) assert_chain_arena: tier3_effects::AssertChainArena,
@@ -234,6 +247,12 @@ pub(crate) enum Tier3OriginKind {
         /// Bug 46: used to gate each tail individually — a tail behind
         /// `\b` AND `\B` must have BOTH pass, not just the top-level `\b`.
         break_consuming_deferred: Box<[(StateIdx, Box<[StateIdx]>, tier3_effects::AssertChainId)]>,
+        /// Interned assertion chain ID for `break_deferred_asserts`.
+        /// [`AssertChainId::NONE`](tier3_effects::AssertChainId::NONE)
+        /// when `break_deferred_asserts` is empty.  Populated during
+        /// [`compute_tier3_analysis`] after the assertion chain arena
+        /// is built.
+        break_assert_chain_id: tier3_effects::AssertChainId,
     },
 }
 
@@ -635,21 +654,22 @@ pub(crate) fn compute_tier3_analysis(
     // -- Step 6c: compute per-consuming-state target_deferred_asserts -----------
     // For each consuming NFA state, walk epsilon transitions from its target
     // and collect the FIRST non-End Assert state indices on each reachable
-    // path.  These are the "entry-point" assertions that
-    // `resolve_verified_deferred_asserts` will evaluate at runtime; subsequent
-    // chained assertions (e.g. `\b → \B`) are handled by the downstream
-    // `can_reach_match_at_end` / `can_reach_match_mid` walk that follows
-    // the assert's `out` edge.
+    // path.  These are the "entry-point" assertions that the pending-effect
+    // system (Phase 7) will evaluate at runtime via `eval_assert_chain`;
+    // subsequent chained assertions (e.g. `\b → \B`) are handled by the
+    // downstream `can_reach_match_at_end` / `can_reach_match_mid` walk that
+    // follows the assert's `out` edge.
     //
     // IMPORTANT: the walk does NOT follow through non-End Assert states
     // (Bug 31).  Following through would record every assert in a chain
-    // independently, causing `resolve_verified_deferred_asserts` to evaluate
-    // them as if they were on separate paths — a chain like `\b → \B`
-    // (contradictory) would spuriously match because `\B` alone can pass.
+    // independently, causing each to be evaluated as if on a separate path —
+    // a chain like `\b → \B` (contradictory) would spuriously match because
+    // `\B` alone can pass.
     //
-    // Used by the post-break tail tracker to deposit these into
-    // `verified_deferred_asserts` when a tail advances through the state
-    // (Bug 30).
+    // Used by the post-break tail tracker to emit PendingEffect entries with
+    // Match atoms when a tail advances through the state (Bug 30).  Each
+    // individual assert is interned as a 1-element chain in
+    // `target_assert_chain_ids` during `compile_all_target_effects`.
     let mut target_da: Vec<Box<[StateIdx]>> = Vec::with_capacity(n);
     for state in states.iter() {
         let target = match *state {
@@ -802,15 +822,17 @@ pub(crate) fn compute_tier3_analysis(
         reachable_without_break: rwb.into_boxed_slice(),
         max_instance_stride,
         all_counters_rangeable,
-        // Placeholder — filled in below.
+        // Placeholders — filled in below.
         target_effects: Box::new([]),
+        target_assert_chain_ids: Box::new([]),
         assert_chain_arena: tier3_effects::AssertChainArena::new(),
     };
 
     // -- Step 9: shadow-compile typed target effects --------------------------
-    let (target_effects, mut assert_chain_arena) =
+    let (target_effects, target_assert_chain_ids, mut assert_chain_arena) =
         tier3_effects::compile_all_target_effects(&analysis);
     analysis.target_effects = target_effects;
+    analysis.target_assert_chain_ids = target_assert_chain_ids;
 
     // Populate assert_chain_id on each break seed by interning its
     // deferred_asserts into the (already-populated) arena.  The arena
@@ -820,16 +842,20 @@ pub(crate) fn compute_tier3_analysis(
         bs.assert_chain_id = assert_chain_arena.intern(&bs.deferred_asserts);
     }
 
-    // Populate assert_chain_id on each per-tail deferred entry.
+    // Populate assert_chain_id on each per-tail deferred entry and
+    // break_assert_chain_id for the global break deferred asserts.
     for target in analysis.targets.iter_mut().flatten() {
         if let Tier3OriginKind::Increment {
+            break_deferred_asserts,
             break_consuming_deferred,
+            break_assert_chain_id,
             ..
         } = target
         {
             for (_, asserts, chain_id) in break_consuming_deferred.iter_mut() {
                 *chain_id = assert_chain_arena.intern(asserts);
             }
+            *break_assert_chain_id = assert_chain_arena.intern(break_deferred_asserts);
         }
     }
     analysis.assert_chain_arena = assert_chain_arena;
@@ -2338,6 +2364,8 @@ fn analyze_target(
             break_consuming_states: Box::new([]),
             break_consuming_pure: Box::new([]),
             break_consuming_deferred: Box::new([]),
+            // Populated after the assertion chain arena is built.
+            break_assert_chain_id: tier3_effects::AssertChainId::NONE,
         })
     } else if advance_origins.is_empty() {
         if advance_is_match_at_end || advance_is_match {
@@ -2400,9 +2428,11 @@ struct BreakClosureResult {
     /// (e.g. `\b → $ → Match`).
     ///
     /// At runtime, when the counter breaks with enough value, these are
-    /// stored in `verified_deferred_asserts` and evaluated at end-of-input
-    /// in `finish()` using `can_reach_match_at_end()`, which handles both
-    /// `Match` and `$ → Match` paths.
+    /// emitted as [`PendingEffect`](tier3_effects::PendingEffect) entries
+    /// with `EffectAtom::Match` and the assertion chain as a guard.  The
+    /// pending-effect system evaluates them at the next byte boundary
+    /// (mid-input) or at end-of-input via `eval_assert_chain` with
+    /// downstream reachability checks.
     deferred_asserts: Box<[StateIdx]>,
 }
 
@@ -2669,15 +2699,6 @@ pub struct Tier3DfaMatcher<'a> {
     post_break_tails: Vec<StateIdx>,
     /// Scratch buffer for advancing `post_break_tails` (double-buffered).
     next_post_break_tails: Vec<StateIdx>,
-    /// Deferred assertion NFA states from counter break paths that fired
-    /// during the last `step_slow()`.  These are assertions (e.g. `\b`)
-    /// on the path to `$ → Match` from a counter that actually broke with
-    /// enough value.  Evaluated in `finish()` at end-of-input.
-    ///
-    /// TODO(effects): replace with `PendingEffect` entries carrying
-    /// `EffectAtom::Match` / `EffectAtom::MatchAtEnd` and an assertion-chain
-    /// guard (Phase 7).
-    verified_deferred_asserts: Vec<StateIdx>,
     // `pending_break_seeds` has been replaced by `pending_effects_next_byte`
     // entries carrying `EffectAtom::AddSeed` (Phase 5).
     //
@@ -2685,6 +2706,12 @@ pub struct Tier3DfaMatcher<'a> {
     // `pending_resolved_mae` have been replaced by `pending_effects_next_byte`
     // entries carrying `EffectAtom::AddTail` (Phase 6).  Resolved tails and
     // match_at_end are now handled via local variables in chunk().
+    //
+    // `verified_deferred_asserts` has been replaced by
+    // `pending_effects_next_byte` entries carrying `EffectAtom::Match`
+    // with assertion-chain guards (Phase 7).  Deferred assertions from
+    // counter break paths and target advancement are now evaluated via
+    // the unified `resolve_pending` path in `chunk()` and `finish()`.
     /// True when the current DFA state (`self.current`) was reached via a
     /// `with_break` transition and may contain NFA consuming states that
     /// entered through a counter break path.  When true, the precomputed
@@ -2761,7 +2788,6 @@ macro_rules! step_slow_impl {
             // Reset next buffer and match flags.
             self.$next.clear();
             self.match_at_end = false;
-            self.verified_deferred_asserts.clear();
             self.pending_effects_next_byte.clear();
 
             // Advance existing post-break tails through this transition.
@@ -2799,16 +2825,24 @@ macro_rules! step_slow_impl {
                                 self.next_post_break_tails.push(new_o);
                             }
                         }
-                        // Bug 30: deposit target deferred asserts for this
-                        // consuming state into verified_deferred_asserts.
+                        // Bug 30: deposit target deferred asserts as
+                        // PendingEffect entries with Match atoms (Phase 7).
                         // These are non-End Assert states on the epsilon
                         // path from pbo's target, which would otherwise
                         // only fire via the contaminated no_break_current
                         // DFA state.
-                        for &da in self.analysis.target_deferred_asserts[pbo.idx()].iter() {
-                            if !self.verified_deferred_asserts.contains(&da) {
-                                self.verified_deferred_asserts.push(da);
-                            }
+                        for &chain_id in self.analysis.target_assert_chain_ids[pbo.idx()].iter() {
+                            self.pending_effects_next_byte.push(
+                                tier3_effects::PendingEffect {
+                                    timing: tier3_effects::EffectTiming::NextByte,
+                                    guard: tier3_effects::EffectGuard {
+                                        required_breaks: 0,
+                                        assert_chain: chain_id,
+                                    },
+                                    atoms: Box::new([tier3_effects::EffectAtom::Match]),
+                                    prev_was_word: crate::is_word_byte(byte),
+                                },
+                            );
                         }
                         // Bug 37 + Bug 47: use the byte-specific
                         // is_match_at_end and is_match from the Advance
@@ -2835,6 +2869,7 @@ macro_rules! step_slow_impl {
                         break_consuming_states,
                         break_consuming_pure,
                         break_consuming_deferred,
+                        break_assert_chain_id,
                     })) => {
                         // Tail hit a CInc — hand off to the counter
                         // instance machinery.  The post-break tail
@@ -2876,12 +2911,20 @@ macro_rules! step_slow_impl {
                                 self.match_at_end = true;
                             }
                             if !break_deferred_asserts.is_empty() {
-                                // Bug 42+46: deposit deferred asserts for
-                                // resolve_verified_deferred_asserts.
-                                for &da in break_deferred_asserts.iter() {
-                                    if !self.verified_deferred_asserts.contains(&da) {
-                                        self.verified_deferred_asserts.push(da);
-                                    }
+                                // Bug 42+46: deposit deferred asserts as
+                                // PendingEffect with Match atom (Phase 7).
+                                if *break_assert_chain_id != tier3_effects::AssertChainId::NONE {
+                                    self.pending_effects_next_byte.push(
+                                        tier3_effects::PendingEffect {
+                                            timing: tier3_effects::EffectTiming::NextByte,
+                                            guard: tier3_effects::EffectGuard {
+                                                required_breaks: 1u64 << counter.idx(),
+                                                assert_chain: *break_assert_chain_id,
+                                            },
+                                            atoms: Box::new([tier3_effects::EffectAtom::Match]),
+                                            prev_was_word: crate::is_word_byte(byte),
+                                        },
+                                    );
                                 }
                                 // Bug 45: pure tails go immediately.
                                 for &new_o in break_consuming_pure.iter() {
@@ -2931,10 +2974,19 @@ macro_rules! step_slow_impl {
                         // (Bug 34: `y\b$` after counter break was lost
                         // because analyze_target returned None for the
                         // assert-only path).
-                        for &da in self.analysis.target_deferred_asserts[pbo.idx()].iter() {
-                            if !self.verified_deferred_asserts.contains(&da) {
-                                self.verified_deferred_asserts.push(da);
-                            }
+                        // Phase 7: deposit as PendingEffect with Match atom.
+                        for &chain_id in self.analysis.target_assert_chain_ids[pbo.idx()].iter() {
+                            self.pending_effects_next_byte.push(
+                                tier3_effects::PendingEffect {
+                                    timing: tier3_effects::EffectTiming::NextByte,
+                                    guard: tier3_effects::EffectGuard {
+                                        required_breaks: 0,
+                                        assert_chain: chain_id,
+                                    },
+                                    atoms: Box::new([tier3_effects::EffectAtom::Match]),
+                                    prev_was_word: crate::is_word_byte(byte),
+                                },
+                            );
                         }
                         check_tail_match_flags!(self, pbo);
                     }
@@ -3009,6 +3061,7 @@ macro_rules! step_slow_impl {
                             break_consuming_states,
                             break_consuming_pure,
                             break_consuming_deferred,
+                            break_assert_chain_id,
                         }) => {
                             // Advance-or-increment: entry survives at
                             // advance_origins with the same values.
@@ -3035,11 +3088,20 @@ macro_rules! step_slow_impl {
                                     self.match_at_end = true;
                                 }
                                 if !break_deferred_asserts.is_empty() {
-                                    // Bug 42+46: deposit deferred asserts.
-                                    for &da in break_deferred_asserts.iter() {
-                                        if !self.verified_deferred_asserts.contains(&da) {
-                                            self.verified_deferred_asserts.push(da);
-                                        }
+                                    // Bug 42+46: deposit deferred asserts as
+                                    // PendingEffect with Match atom (Phase 7).
+                                    if *break_assert_chain_id != tier3_effects::AssertChainId::NONE {
+                                        self.pending_effects_next_byte.push(
+                                            tier3_effects::PendingEffect {
+                                                timing: tier3_effects::EffectTiming::NextByte,
+                                                guard: tier3_effects::EffectGuard {
+                                                    required_breaks: 1u64 << c_idx,
+                                                    assert_chain: *break_assert_chain_id,
+                                                },
+                                                atoms: Box::new([tier3_effects::EffectAtom::Match]),
+                                                prev_was_word: crate::is_word_byte(byte),
+                                            },
+                                        );
                                     }
                                     // Bug 45: pure tails go immediately.
                                     for &new_o in break_consuming_pure.iter() {
@@ -3309,7 +3371,6 @@ impl<'a> Tier3DfaMatcher<'a> {
             has_live_instances,
             post_break_tails: Vec::new(),
             next_post_break_tails: Vec::new(),
-            verified_deferred_asserts: Vec::new(),
             // The start state may include NFA states from break paths
             // (the start closure is computed with follow_break=true), but
             // these are freshly seeded — not from a previous counter break.
@@ -3461,30 +3522,8 @@ impl<'a> Tier3DfaMatcher<'a> {
                 return;
             }
 
-            // Resolve counter-break deferred asserts from the PREVIOUS
-            // step (Bug 26).  These asserts (e.g. `\B → Match`) were
-            // emitted when a counter broke but need the NEXT byte to
-            // evaluate word-boundary conditions.  The DFA state's own
-            // deferred_asserts are resolved during transition population
-            // (resolve_deferred), but counter-break asserts are runtime-
-            // only and live in verified_deferred_asserts.
-            // Bug 42: resolve global deferred asserts (e.g. `\B → Match`)
-            // for ever_matched BEFORE clearing them.
-            if self.resolve_verified_deferred_asserts(false, Some(b)) {
-                self.ever_matched = true;
-            }
-            // Bug 41: clear after resolution.  These are one-shot
-            // assertions from the previous step's counter breaks.  If
-            // they passed, `ever_matched` is already set.  If they
-            // failed, the match opportunity is lost — they must not
-            // linger into future bytes or EOI.  `step_slow_impl` also
-            // clears this list (line ~2551), but the inline fast path
-            // does not, which previously allowed stale deferred asserts
-            // to survive indefinitely and fire at end-of-input.
-            self.verified_deferred_asserts.clear();
-
-            // Resolve pending effects from the PREVIOUS step (Bug 28,
-            // Bug 42, Bug 44, Bug 46).
+            // Resolve pending effects from the PREVIOUS step (Bug 26,
+            // Bug 28, Bug 42, Bug 44, Bug 46).
             //
             // This unified block resolves ALL pending NextByte effects:
             // - AddSeed: apply seeds to counter storage
@@ -3492,6 +3531,10 @@ impl<'a> Tier3DfaMatcher<'a> {
             //   analysis targets (Advance/Increment/None), same as the
             //   legacy tail resolution.  Results are stored in local
             //   variables and injected after step_slow.
+            // - Match: counter-break deferred asserts (e.g. `\B → Match`)
+            //   and target deferred asserts — set `ever_matched` when the
+            //   assertion chain passes and downstream Match is reachable.
+            // - MatchAtEnd: set `resolved_mae` for end-of-input match.
             //
             // Tails that can't consume `b` are kept as post_break_tails
             // for the next step (injected after step_slow).
@@ -3506,6 +3549,13 @@ impl<'a> Tier3DfaMatcher<'a> {
                     Some(b), // next byte is known
                     self.regex,
                 );
+                // Phase 7: apply match signals from deferred assertions.
+                if actions.set_match {
+                    self.ever_matched = true;
+                }
+                if actions.set_match_at_end {
+                    resolved_mae = true;
+                }
                 // Apply resolved seeds.
                 for &(counter, origin, value) in &actions.seeds {
                     if self.use_ranges {
@@ -3534,11 +3584,22 @@ impl<'a> Tier3DfaMatcher<'a> {
                                 if is_match_at_end {
                                     resolved_mae = true;
                                 }
-                                for &da in self.analysis.target_deferred_asserts[tail.idx()].iter()
+                                // Phase 7: deposit target deferred asserts
+                                // as PendingEffect with Match atom.
+                                for &chain_id in
+                                    self.analysis.target_assert_chain_ids[tail.idx()].iter()
                                 {
-                                    if !self.verified_deferred_asserts.contains(&da) {
-                                        self.verified_deferred_asserts.push(da);
-                                    }
+                                    self.pending_effects_next_byte.push(
+                                        tier3_effects::PendingEffect {
+                                            timing: tier3_effects::EffectTiming::NextByte,
+                                            guard: tier3_effects::EffectGuard {
+                                                required_breaks: 0,
+                                                assert_chain: chain_id,
+                                            },
+                                            atoms: Box::new([tier3_effects::EffectAtom::Match]),
+                                            prev_was_word: crate::is_word_byte(b),
+                                        },
+                                    );
                                 }
                                 // Bug 47: use byte-specific is_match from
                                 // the Advance action (handles ByteTable).
@@ -3557,6 +3618,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                                 ref break_consuming_states,
                                 ref break_consuming_pure,
                                 ref break_consuming_deferred,
+                                break_assert_chain_id,
                                 ..
                             }) => {
                                 // Tail hit CInc — hand off to counter.
@@ -3590,11 +3652,24 @@ impl<'a> Tier3DfaMatcher<'a> {
                                         resolved_mae = true;
                                     }
                                     if !break_deferred_asserts.is_empty() {
-                                        // Bug 42: deposit deferred asserts.
-                                        for &da in break_deferred_asserts.iter() {
-                                            if !self.verified_deferred_asserts.contains(&da) {
-                                                self.verified_deferred_asserts.push(da);
-                                            }
+                                        // Bug 42: deposit deferred asserts as
+                                        // PendingEffect with Match atom (Phase 7).
+                                        if break_assert_chain_id
+                                            != tier3_effects::AssertChainId::NONE
+                                        {
+                                            self.pending_effects_next_byte.push(
+                                                tier3_effects::PendingEffect {
+                                                    timing: tier3_effects::EffectTiming::NextByte,
+                                                    guard: tier3_effects::EffectGuard {
+                                                        required_breaks: 1u64 << counter.idx(),
+                                                        assert_chain: break_assert_chain_id,
+                                                    },
+                                                    atoms: Box::new([
+                                                        tier3_effects::EffectAtom::Match,
+                                                    ]),
+                                                    prev_was_word: crate::is_word_byte(b),
+                                                },
+                                            );
                                         }
                                         // Bug 45: pure tails go immediately.
                                         for &new_o in break_consuming_pure.iter() {
@@ -3642,11 +3717,22 @@ impl<'a> Tier3DfaMatcher<'a> {
                                 if self.analysis.target_is_match[tail.idx()] {
                                     self.ever_matched = true;
                                 }
-                                for &da in self.analysis.target_deferred_asserts[tail.idx()].iter()
+                                // Phase 7: deposit target deferred asserts
+                                // as PendingEffect with Match atom.
+                                for &chain_id in
+                                    self.analysis.target_assert_chain_ids[tail.idx()].iter()
                                 {
-                                    if !self.verified_deferred_asserts.contains(&da) {
-                                        self.verified_deferred_asserts.push(da);
-                                    }
+                                    self.pending_effects_next_byte.push(
+                                        tier3_effects::PendingEffect {
+                                            timing: tier3_effects::EffectTiming::NextByte,
+                                            guard: tier3_effects::EffectGuard {
+                                                required_breaks: 0,
+                                                assert_chain: chain_id,
+                                            },
+                                            atoms: Box::new([tier3_effects::EffectAtom::Match]),
+                                            prev_was_word: crate::is_word_byte(b),
+                                        },
+                                    );
                                 }
                             }
                         }
@@ -3795,42 +3881,6 @@ impl<'a> Tier3DfaMatcher<'a> {
         }
     }
 
-    /// Walk epsilon transitions from `start` mid-input (not at end-of-input),
-    /// evaluating any assertions encountered with `prev` and `next`.  Returns
-    /// Evaluate counter-break deferred assertions against a given byte context.
-    ///
-    /// Returns `true` if any deferred assertion passes and its downstream path
-    /// reaches `Match`.  Used from two sites:
-    ///
-    /// - **Mid-input** (`chunk()`, `at_end=false`, `next=Some(byte)`): sets
-    ///   `self.ever_matched` when the assertion passes and Match is reachable
-    ///   through epsilon transitions with mid-input evaluation.
-    /// - **End-of-input** (`finish()`, `at_end=true`, `next=None`): checks
-    ///   whether the assertion passes at end-of-input and Match is reachable
-    ///   through `$ → Match` paths.
-    fn resolve_verified_deferred_asserts(&self, at_end: bool, next: Option<u8>) -> bool {
-        if self.verified_deferred_asserts.is_empty() || self.current == DfaStateId::DEAD {
-            return false;
-        }
-        let state = &self.cache.inner.states[self.current.idx()];
-        let prev = state.prev_byte_representative();
-        for &assert_idx in &self.verified_deferred_asserts {
-            if let State::Assert { kind, out } = self.regex.states[assert_idx]
-                && kind.eval(false, at_end, prev, next) == AssertEval::Pass
-            {
-                let reachable = if at_end {
-                    DfaState::can_reach_match_at_end(out, prev, self.regex)
-                } else {
-                    Self::can_reach_match_mid(out, prev, next, self.regex)
-                };
-                if reachable {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     /// true if `Match` is reachable with all assertions passing.
     ///
     /// Similar to [`DfaState::can_reach_match_at_end`] but uses `at_end=false`
@@ -3930,8 +3980,8 @@ impl<'a> Tier3DfaMatcher<'a> {
         //
         // Fix: when contaminated, skip `no_break_current`'s deferred asserts
         // entirely.  Legitimate counter-break deferred asserts are deposited
-        // into `verified_deferred_asserts` by the post-break tail tracker
-        // (using `target_deferred_asserts`) and resolved separately above.
+        // as PendingEffect entries with Match atoms (Phase 7) and resolved
+        // via the pending-effect path below.
         // Non-contaminated deferred asserts from `clean_nb` are handled below.
         let from_contaminated = self.current_has_break_extras && self.regex.num_counters > 1;
         if self.no_break_current != DfaStateId::DEAD && !from_contaminated {
@@ -3948,19 +3998,15 @@ impl<'a> Tier3DfaMatcher<'a> {
                 return true;
             }
         }
-        // Pending break seeds at end-of-input (Bug 28): evaluate
-        // deferred assertions with `at_end=true` via the generic
-        // pending-effect path.  If the assertion passes AND the seeded
-        // counter can immediately break (value >= min) with a
-        // match-producing break path, this is a match.
-        //
-        // Note: these are NextByte-timed effects that were never
-        // resolved mid-input (the input ended before the next byte
-        // arrived).  We resolve them here with EOI context.
         // Pending effects at end-of-input (Bug 28 + Bug 42 + Bug 46):
-        // Resolve all NextByte effects with EOI context.  This handles
-        // both break seeds and break tails whose deferred assertions
-        // couldn't be evaluated mid-input.
+        // Resolve all NextByte effects with EOI context.  This handles:
+        // - Break seeds whose deferred assertions couldn't be evaluated
+        //   mid-input (if the assertion passes AND the seeded counter can
+        //   immediately break with value >= min, this is a match).
+        // - Break tails whose deferred assertions need EOI context.
+        // - Counter-break deferred assertions (Phase 7): Match atoms
+        //   whose assertion chains are evaluated with at_end=true and
+        //   downstream reachability checked via can_reach_match_at_end.
         if !self.pending_effects_next_byte.is_empty() {
             let actions = tier3_effects::resolve_pending(
                 &self.pending_effects_next_byte,
@@ -3994,12 +4040,15 @@ impl<'a> Tier3DfaMatcher<'a> {
                     return true;
                 }
             }
+            // Phase 7: counter-dependent deferred assertions are now
+            // resolved as Match effects within the same resolve_pending
+            // call.  If any assertion chain passed with downstream
+            // reachability, set_match or set_match_at_end is set.
+            if actions.set_match || actions.set_match_at_end {
+                return true;
+            }
         }
-        // Counter-dependent deferred assertions: evaluate assertions from
-        // counter break paths that actually broke with enough value.  These
-        // are NFA Assert state indices (e.g. \b, \B) on the path to
-        // `$ → Match` from a counter whose break condition was met.
-        self.resolve_verified_deferred_asserts(true, None)
+        false
     }
 
     #[allow(dead_code)]
@@ -4027,10 +4076,6 @@ impl fmt::Debug for Tier3DfaMatcher<'_> {
             .field("clean_nb_cf_mae", &self.clean_nb_cf_mae)
             .field("clean_nb_is_match", &self.clean_nb_is_match)
             .field("post_break_tails_len", &self.post_break_tails.len())
-            .field(
-                "verified_deferred_asserts_len",
-                &self.verified_deferred_asserts.len(),
-            )
             .field("use_ranges", &self.use_ranges)
             .field(
                 "pending_effects_next_byte_len",
@@ -4148,22 +4193,9 @@ impl fmt::Display for Tier3DfaMatcher<'_> {
                 .collect::<Vec<_>>()
                 .join(",")
         )?;
-        // --- Verified deferred asserts (always shown) ---
-        write!(f, "\n  deferred: [")?;
-        for (i, &da) in self.verified_deferred_asserts.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
-            }
-            if let State::Assert { kind, .. } = self.regex.states[da] {
-                write!(f, "{}@{}", kind.label(), da)?;
-            } else {
-                write!(f, "?@{da}")?;
-            }
-        }
-        write!(f, "]")?;
         // --- Effect queues (always shown) ---
-        // Break seeds (Phase 5) and break tails (Phase 6) are now in
-        // pending_effects_next_byte as PendingEffect entries.
+        // Break seeds (Phase 5), break tails (Phase 6), and deferred
+        // assertions (Phase 7) are all in pending_effects_next_byte.
         {
             write!(f, "\n  eff_next_byte: [")?;
             for (i, pe) in self.pending_effects_next_byte.iter().enumerate() {
