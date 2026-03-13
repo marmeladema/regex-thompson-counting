@@ -11237,6 +11237,29 @@ mod tests {
             ],
         }
 
+        // Bug 45: pure break_is_match_at_end incorrectly deferred behind
+        // deferred assertions from a sibling break path.
+        // Pattern: ^.{1,11}((\B|a?))?$ — the counter break path has both
+        // a deferred \B assertion (on one alternation branch) and a pure
+        // $ → Match path (skipping the optional group entirely).  The pure
+        // match-at-end was incorrectly gated behind \B resolution instead
+        // of firing unconditionally.
+        test_tier3_pure_break_mae_with_sibling_deferred {
+            pattern: r"^.{1,11}((\B|a?))?$",
+            memory: 1821,
+            min_tier: 1,
+            inputs: [
+                ("aa", true),           // original minimal: .{1,} → skip group → $
+                ("cd yc 1a", true),     // original fuzz input (8 chars)
+                ("aaaaaaaa", true),     // all a's, various counter values
+                ("x", true),            // single char: .{1} → skip group → $
+                ("abcdefghijk", true),  // 11 chars: max counter value
+                ("aaaaaaaaaaaa", true), // 12 chars: .{11} + a? consumes 12th
+                ("abcdefghijklm", false), // 13 chars: exceeds .{11} + a?
+                ("", false),            // empty: counter min is 1
+            ],
+        }
+
         // ---------------------------------------------------------------
         // Coverage expansion: lock down Tier 3 code paths that were
         // previously untested or only partially tested.  These tests

@@ -518,6 +518,7 @@ impl DumpRegex<'_> {
                             break_is_match_at_end,
                             break_deferred_asserts,
                             break_consuming_states,
+                            break_consuming_pure,
                         } => {
                             writeln!(f, "    state {i}: Increment(c{counter}, {{{min},{max}}})",)?;
                             writeln!(
@@ -561,6 +562,17 @@ impl DumpRegex<'_> {
                                     .collect::<Vec<_>>()
                                     .join(", ")
                             )?;
+                            if !break_consuming_pure.is_empty() {
+                                writeln!(
+                                    f,
+                                    "      break_consuming_pure: [{}]",
+                                    break_consuming_pure
+                                        .iter()
+                                        .map(|s| s.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )?;
+                            }
                         }
                     }
                 }
