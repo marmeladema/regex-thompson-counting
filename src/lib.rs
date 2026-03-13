@@ -11312,6 +11312,30 @@ mod tests {
             ],
         }
 
+        // Bug 47: ByteTable post-break tail reaching Match directly.
+        // Pattern: `c{0,32}.{6,36}a?c?x` — unanchored, two counters.
+        // Input: "aaaaaax" — c0 (c{0,32}) has min=0, so it breaks
+        // immediately.  c1 (.{6,36}) counts 6 a's, breaks, producing
+        // post-break tail state 8 (ByteTable: a→10, c→11, x→12).
+        // On byte 'x', state 8 consumes 'x' → state 12 (Match).
+        // Root cause: target_is_match was computed only for Byte/ByteCI/
+        // ByteClass states, skipping ByteTable.  The Advance action
+        // lacked an is_match flag, so ByteTable tails whose byte-specific
+        // target reached Match directly were never detected.
+        test_tier3_byte_table_tail_direct_match {
+            pattern: r"c{0,32}.{6,36}a?c?x",
+            memory: 2319,
+            min_tier: 3,
+            inputs: [
+                ("aaaaaax", true),      // Bug 47: ByteTable tail 'x' → Match
+                ("aaaaaacx", true),     // tail 'c' → 11, then 'x' → Match
+                ("aaaaax", false),      // only 5 a's: c1 min=6 not reached
+                ("ccccccx", true),      // 6 c's: c0 counts, c1 counts, break tail 'x'
+                ("aaaaaaaaax", true),   // 9 a's + x
+                ("", false),            // empty
+            ],
+        }
+
         // ---------------------------------------------------------------
         // Coverage expansion: lock down Tier 3 code paths that were
         // previously untested or only partially tested.  These tests

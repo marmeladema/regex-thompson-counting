@@ -497,10 +497,11 @@ impl DumpRegex<'_> {
                         Tier3OriginKind::Advance {
                             new_origins,
                             is_match_at_end,
+                            is_match,
                         } => {
                             writeln!(
                                 f,
-                                "    state {i}: Advance → [{}] mae={is_match_at_end}",
+                                "    state {i}: Advance → [{}] mae={is_match_at_end} im={is_match}",
                                 new_origins
                                     .iter()
                                     .map(|s| s.to_string())

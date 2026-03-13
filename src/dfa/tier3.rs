@@ -177,6 +177,11 @@ pub(crate) enum Tier3OriginKind {
         /// flag, replacing the static `target_is_match_at_end` which
         /// cannot handle ByteTable origins with per-byte targets).
         is_match_at_end: bool,
+        /// True if the epsilon closure reaches `Match` directly
+        /// (without `$`).  Bug 47: byte-specific flag for ByteTable
+        /// tails whose per-byte target reaches Match directly.
+        /// Replaces the static `target_is_match` which skips ByteTable.
+        is_match: bool,
     },
     /// Epsilon closure from the target reached CInc.  Counter is
     /// incremented; min/max determine continue vs. break.
@@ -2186,6 +2191,37 @@ fn analyze_target(
         mae
     };
 
+    // Bug 47: compute direct `Match` reachability for the Advance case.
+    // Mirrors the static target_is_match logic but works per-target,
+    // handling ByteTable origins whose per-byte targets differ.
+    // The walk follows Split and CI but stops at Assert states (Match
+    // behind assertions is NOT unconditional).
+    let advance_is_match = {
+        let mut im = false;
+        let mut estack = vec![target];
+        let mut evisited = vec![false; states.len()];
+        while let Some(eidx) = estack.pop() {
+            let ei = eidx.idx();
+            if evisited[ei] {
+                continue;
+            }
+            evisited[ei] = true;
+            match states[eidx] {
+                State::Split { out, out1 } => {
+                    estack.push(out1);
+                    estack.push(out);
+                }
+                State::CounterInstance { out, .. } => estack.push(out),
+                State::Match => {
+                    im = true;
+                }
+                // Stop at Assert, consuming states, CInc.
+                _ => {}
+            }
+        }
+        im
+    };
+
     if let Some((counter, min, max)) = found_cinc {
         advance_origins.sort_unstable_by_key(|s| s.0);
         advance_origins.dedup();
@@ -2220,17 +2256,17 @@ fn analyze_target(
             break_consuming_deferred: Box::new([]),
         })
     } else if advance_origins.is_empty() {
-        if advance_is_match_at_end {
-            // Bug 39: no consuming states downstream but `$ → Match`
-            // IS reachable.  Return an Advance with empty origins so
-            // that post-break tails pick up the byte-specific
-            // `is_match_at_end` flag.  Previously returned `None`,
-            // which lost the match-at-end information for ByteTable
-            // tails (the static `target_is_match_at_end` array skips
-            // ByteTable states).
+        if advance_is_match_at_end || advance_is_match {
+            // Bug 39/47: no consuming states downstream but `$ → Match`
+            // or `Match` IS reachable.  Return an Advance with empty
+            // origins so that post-break tails pick up the byte-specific
+            // `is_match_at_end` / `is_match` flags.  Previously returned
+            // `None`, which lost the information for ByteTable tails
+            // (the static arrays skip ByteTable states).
             Some(Tier3OriginKind::Advance {
                 new_origins: Box::new([]),
-                is_match_at_end: true,
+                is_match_at_end: advance_is_match_at_end,
+                is_match: advance_is_match,
             })
         } else {
             // Truly dead — no consuming states and no `$ → Match`.
@@ -2240,6 +2276,7 @@ fn analyze_target(
         Some(Tier3OriginKind::Advance {
             new_origins: advance_origins.into_boxed_slice(),
             is_match_at_end: advance_is_match_at_end,
+            is_match: advance_is_match,
         })
     }
 }
@@ -2670,6 +2707,7 @@ macro_rules! step_slow_impl {
                     Some(Some(Tier3OriginKind::Advance {
                         new_origins,
                         is_match_at_end,
+                        is_match,
                     })) => {
                         for &new_o in new_origins.iter() {
                             if !self.next_post_break_tails.contains(&new_o) {
@@ -2687,22 +2725,16 @@ macro_rules! step_slow_impl {
                                 self.verified_deferred_asserts.push(da);
                             }
                         }
-                        // Bug 37: use the byte-specific is_match_at_end
-                        // from the Advance action instead of the static
-                        // target_is_match_at_end array.  ByteTable origins
-                        // have per-byte targets, so the static array
-                        // (which skipped ByteTable) was always false for
-                        // ByteTable states.
-                        //
-                        // target_is_match uses the static array (skips
-                        // ByteTable conservatively; a ByteTable tail whose
-                        // byte-specific target reaches Match directly
-                        // without Assert would need a similar byte-specific
-                        // flag, but no such pattern has been found yet).
+                        // Bug 37 + Bug 47: use the byte-specific
+                        // is_match_at_end and is_match from the Advance
+                        // action instead of the static arrays.  ByteTable
+                        // origins have per-byte targets, so the static
+                        // arrays (which skip ByteTable) were always false
+                        // for ByteTable states.
                         if *is_match_at_end {
                             self.match_at_end = true;
                         }
-                        if self.analysis.target_is_match[pbo.idx()] {
+                        if *is_match {
                             self.ever_matched = true;
                         }
                     }
@@ -3343,6 +3375,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                             Some(Tier3OriginKind::Advance {
                                 ref new_origins,
                                 is_match_at_end,
+                                is_match,
                             }) => {
                                 // Put advanced tails into pending_resolved
                                 // (injected after step_slow to avoid
@@ -3361,7 +3394,9 @@ impl<'a> Tier3DfaMatcher<'a> {
                                         self.verified_deferred_asserts.push(da);
                                     }
                                 }
-                                if self.analysis.target_is_match[tail.idx()] {
+                                // Bug 47: use byte-specific is_match from
+                                // the Advance action (handles ByteTable).
+                                if is_match {
                                     self.ever_matched = true;
                                 }
                             }
