@@ -2836,7 +2836,6 @@ macro_rules! step_slow_impl {
                                 tier3_effects::PendingEffect {
                                     timing: tier3_effects::EffectTiming::NextByte,
                                     guard: tier3_effects::EffectGuard {
-                                        required_breaks: 0,
                                         assert_chain: chain_id,
                                     },
                                     atoms: Box::new([tier3_effects::EffectAtom::Match]),
@@ -2919,7 +2918,6 @@ macro_rules! step_slow_impl {
                                         tier3_effects::PendingEffect {
                                             timing: tier3_effects::EffectTiming::NextByte,
                                             guard: tier3_effects::EffectGuard {
-                                                required_breaks: 1u64 << counter.idx(),
                                                 assert_chain: chain_id,
                                             },
                                             atoms: Box::new([tier3_effects::EffectAtom::Match]),
@@ -2947,7 +2945,6 @@ macro_rules! step_slow_impl {
                                             tier3_effects::PendingEffect {
                                                 timing: tier3_effects::EffectTiming::NextByte,
                                                 guard: tier3_effects::EffectGuard {
-                                                    required_breaks: 1u64 << counter.idx(),
                                                     assert_chain: chain_id,
                                                 },
                                                 atoms: vec![tier3_effects::EffectAtom::AddTail {
@@ -2982,7 +2979,6 @@ macro_rules! step_slow_impl {
                                 tier3_effects::PendingEffect {
                                     timing: tier3_effects::EffectTiming::NextByte,
                                     guard: tier3_effects::EffectGuard {
-                                        required_breaks: 0,
                                         assert_chain: chain_id,
                                     },
                                     atoms: Box::new([tier3_effects::EffectAtom::Match]),
@@ -3098,7 +3094,6 @@ macro_rules! step_slow_impl {
                                             tier3_effects::PendingEffect {
                                                 timing: tier3_effects::EffectTiming::NextByte,
                                                 guard: tier3_effects::EffectGuard {
-                                                    required_breaks: 1u64 << c_idx,
                                                     assert_chain: chain_id,
                                                 },
                                                 atoms: Box::new([tier3_effects::EffectAtom::Match]),
@@ -3126,8 +3121,7 @@ macro_rules! step_slow_impl {
                                                 tier3_effects::PendingEffect {
                                                     timing: tier3_effects::EffectTiming::NextByte,
                                                     guard: tier3_effects::EffectGuard {
-                                                        required_breaks: 1u64 << c_idx,
-                                                        assert_chain: chain_id,
+                                                            assert_chain: chain_id,
                                                     },
                                                     atoms: vec![tier3_effects::EffectAtom::AddTail {
                                                         origin: tail,
@@ -3312,7 +3306,6 @@ macro_rules! step_slow_impl {
                             .push(tier3_effects::PendingEffect {
                                 timing: tier3_effects::EffectTiming::NextByte,
                                 guard: tier3_effects::EffectGuard {
-                                    required_breaks: 1u64 << trigger.idx(),
                                     assert_chain: chain_id,
                                 },
                                 atoms: vec![tier3_effects::EffectAtom::AddSeed {
@@ -3597,7 +3590,6 @@ impl<'a> Tier3DfaMatcher<'a> {
                                         tier3_effects::PendingEffect {
                                             timing: tier3_effects::EffectTiming::NextByte,
                                             guard: tier3_effects::EffectGuard {
-                                                required_breaks: 0,
                                                 assert_chain: chain_id,
                                             },
                                             atoms: Box::new([tier3_effects::EffectAtom::Match]),
@@ -3668,18 +3660,17 @@ impl<'a> Tier3DfaMatcher<'a> {
                                                 self.pending_effects_next_byte.push(
                                                     tier3_effects::PendingEffect {
                                                         timing: tier3_effects::EffectTiming::NextByte,
-                                                        guard: tier3_effects::EffectGuard {
-                                                            required_breaks: 1u64 << counter.idx(),
-                                                            assert_chain: chain_id,
-                                                        },
-                                                        atoms: Box::new([
-                                                            tier3_effects::EffectAtom::Match,
-                                                        ]),
-                                                        prev_was_word: crate::is_word_byte(b),
-                                                    },
-                                                );
-                                            }
-                                        }
+                                                         guard: tier3_effects::EffectGuard {
+                                                             assert_chain: chain_id,
+                                                         },
+                                                         atoms: Box::new([
+                                                             tier3_effects::EffectAtom::Match,
+                                                         ]),
+                                                         prev_was_word: crate::is_word_byte(b),
+                                                     },
+                                                 );
+                                             }
+                                         }
                                         // Bug 45: pure tails go immediately.
                                         for &new_o in break_consuming_pure.iter() {
                                             if !resolved_tails.contains(&new_o) {
@@ -3696,14 +3687,13 @@ impl<'a> Tier3DfaMatcher<'a> {
                                                         timing:
                                                             tier3_effects::EffectTiming::NextByte,
                                                         guard: tier3_effects::EffectGuard {
-                                                            required_breaks: 1u64 << counter.idx(),
-                                                            assert_chain: chain_id,
-                                                        },
-                                                        atoms: vec![
-                                                            tier3_effects::EffectAtom::AddTail {
-                                                                origin: new_o,
-                                                            },
-                                                        ]
+                                                             assert_chain: chain_id,
+                                                         },
+                                                         atoms: vec![
+                                                             tier3_effects::EffectAtom::AddTail {
+                                                                 origin: new_o,
+                                                             },
+                                                         ]
                                                         .into_boxed_slice(),
                                                         prev_was_word: crate::is_word_byte(b),
                                                     },
@@ -3735,7 +3725,6 @@ impl<'a> Tier3DfaMatcher<'a> {
                                         tier3_effects::PendingEffect {
                                             timing: tier3_effects::EffectTiming::NextByte,
                                             guard: tier3_effects::EffectGuard {
-                                                required_breaks: 0,
                                                 assert_chain: chain_id,
                                             },
                                             atoms: Box::new([tier3_effects::EffectAtom::Match]),

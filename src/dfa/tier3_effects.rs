@@ -23,12 +23,47 @@
 //! questions about individual entries.  The effect system handles the
 //! *nonlocal* and *guarded* consequences.
 //!
-//! # Provenance
+//! # Provenance (future)
 //!
-//! [`BreakMask`] reserves space for break provenance on guards and pending
-//! effects.  In the first implementation `0` means counter-free.  This
-//! field exists so that Proposal 3-style provenance can be adopted later
-//! without restructuring the effect types.
+//! [`BreakMask`] is a type alias reserved for future break-provenance
+//! tracking.  It is NOT currently used at runtime.
+//!
+//! An earlier version stored `required_breaks: BreakMask` on [`EffectGuard`]
+//! to record which counter breaks were necessary to reach a given effect.
+//! That field was removed because:
+//!
+//! 1. It was **never checked** during effect resolution — `resolve_pending()`
+//!    evaluated only the assertion chain, not the break mask.
+//! 2. All deposit sites already guard effect creation behind an explicit
+//!    break-condition check (`can_break(entry, min)` or `value >= min`), so
+//!    the mask was always trivially satisfied by construction.
+//! 3. Carrying an unenforced guard field creates a false sense of safety and
+//!    risks semantic drift (Bug 51 was an instance of this broader pattern).
+//!
+//! If Proposal 3 (provenance-aware state) is later adopted, reintroduce
+//! `required_breaks` on `EffectGuard` with the following enforcement pattern:
+//!
+//! ```text
+//! // In resolve_pending():
+//! fn resolve_pending(
+//!     effects: &[PendingEffect],
+//!     satisfied_breaks: BreakMask,   // ← new parameter
+//!     ...
+//! ) {
+//!     for pe in effects {
+//!         if (pe.guard.required_breaks & satisfied_breaks)
+//!             != pe.guard.required_breaks
+//!         {
+//!             continue; // break condition not met — skip this effect
+//!         }
+//!         // ... evaluate assert_chain as today ...
+//!     }
+//! }
+//!
+//! // At call sites: accumulate a break mask during step_slow by
+//! // OR-ing in `1u64 << counter.idx()` whenever a counter breaks,
+//! // then pass it to resolve_pending() on the next byte.
+//! ```
 //!
 //! [`super::Tier3OriginKind`]: super::Tier3OriginKind
 //! [`Transition`]: super::Tier3DfaCache
@@ -39,7 +74,7 @@ use std::fmt;
 use crate::{AssertEval, CounterIdx, Regex, State, StateIdx};
 
 // ---------------------------------------------------------------------------
-// Break mask (provenance-ready)
+// Break mask (reserved for future provenance tracking)
 // ---------------------------------------------------------------------------
 
 /// Bitmask identifying which counter breaks were required to reach a fact.
@@ -48,8 +83,14 @@ use crate::{AssertEval, CounterIdx, Regex, State, StateIdx};
 /// - Bit `i` set means counter `i` must have broken for this fact to be
 ///   valid.
 ///
+/// **Currently unused at runtime.**  This type alias is retained so that
+/// Proposal 3-style provenance can be adopted later without restructuring
+/// the effect types.  See the module-level documentation for the full
+/// reintroduction pattern.
+///
 /// The current Tier 3 is capped to 64 counters by bitmask width elsewhere
 /// (`MAX_TIER2_COUNTERS`), so `u64` is sufficient.
+#[allow(dead_code)]
 pub(crate) type BreakMask = u64;
 
 // ---------------------------------------------------------------------------
@@ -167,27 +208,40 @@ impl AssertChainArena {
 
 /// Condition under which an effect is valid.
 ///
-/// A guard is a conjunction of two orthogonal conditions:
+/// Currently the only runtime condition is an assertion chain.
+/// [`AssertChainId::NONE`] means no assertion gating (unconditional).
 ///
-/// - **`required_breaks`**: which counter breaks must have occurred.
-///   `0` means counter-free (always valid with respect to breaks).
-/// - **`assert_chain`**: an ordered sequence of NFA assertions that must
-///   all pass at the evaluation boundary.  [`AssertChainId::NONE`] means
-///   no assertion gating.
+/// # Provenance (future)
 ///
-/// Both conditions must hold for the guard to pass.
+/// An earlier version included a `required_breaks: BreakMask` field
+/// to record which counter breaks were necessary for the effect to be
+/// valid.  That field was removed because it was **never enforced** at
+/// resolution time — all deposit sites already ensured the break had
+/// occurred before creating the effect, making the field redundant.
+///
+/// If Proposal 3 (provenance-aware state) is adopted, reintroduce
+/// `required_breaks` here and enforce it in [`resolve_pending()`] by
+/// passing a `satisfied_breaks` mask.  See the module-level doc for
+/// the full pattern.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct EffectGuard {
-    /// Which counter breaks are required.  `0` = counter-free.
-    pub(crate) required_breaks: BreakMask,
     /// Assertion chain that must pass.  `NONE` = no assertions.
     pub(crate) assert_chain: AssertChainId,
 }
 
 impl EffectGuard {
-    /// Whether this guard is unconditional (counter-free and no assertions).
+    /// A guard that is always satisfied (no assertions, no break requirement).
+    ///
+    /// Currently unused — deposit sites construct `EffectGuard` inline.
+    /// Patch 7 (deposit helpers) will route through this constant.
+    #[allow(dead_code)]
+    pub(crate) const ALWAYS: Self = Self {
+        assert_chain: AssertChainId::NONE,
+    };
+
+    /// Whether this guard is unconditional (no assertions).
     pub(crate) fn is_always(&self) -> bool {
-        self.required_breaks == 0 && self.assert_chain == AssertChainId::NONE
+        self.assert_chain == AssertChainId::NONE
     }
 }
 
@@ -196,14 +250,7 @@ impl fmt::Display for EffectGuard {
         if self.is_always() {
             return write!(f, "always");
         }
-        let mut parts = Vec::new();
-        if self.required_breaks != 0 {
-            parts.push(format!("breaks=0x{:x}", self.required_breaks));
-        }
-        if self.assert_chain != AssertChainId::NONE {
-            parts.push(format!("asserts={}", self.assert_chain));
-        }
-        write!(f, "{}", parts.join("+"))
+        write!(f, "asserts={}", self.assert_chain)
     }
 }
 
@@ -837,7 +884,6 @@ pub(crate) fn compile_target_effects(
                     guarded.push(GuardedEffect {
                         timing: EffectTiming::NextByte,
                         guard: EffectGuard {
-                            required_breaks: 1u64 << counter.idx(),
                             assert_chain: chain_id,
                         },
                         atoms: vec![EffectAtom::MatchAtEnd].into_boxed_slice(),
@@ -846,7 +892,6 @@ pub(crate) fn compile_target_effects(
                     guarded.push(GuardedEffect {
                         timing: EffectTiming::EndOnly,
                         guard: EffectGuard {
-                            required_breaks: 1u64 << counter.idx(),
                             assert_chain: chain_id,
                         },
                         atoms: vec![EffectAtom::MatchAtEnd].into_boxed_slice(),
@@ -864,7 +909,6 @@ pub(crate) fn compile_target_effects(
                 guarded.push(GuardedEffect {
                     timing: EffectTiming::NextByte,
                     guard: EffectGuard {
-                        required_breaks: 1u64 << counter.idx(),
                         assert_chain: chain_id,
                     },
                     atoms: vec![EffectAtom::AddTail { origin: tail }].into_boxed_slice(),
@@ -878,7 +922,6 @@ pub(crate) fn compile_target_effects(
                     guarded.push(GuardedEffect {
                         timing: EffectTiming::NextByte,
                         guard: EffectGuard {
-                            required_breaks: 1u64 << counter.idx(),
                             assert_chain: chain_id,
                         },
                         atoms: vec![EffectAtom::AddSeed {
@@ -1019,20 +1062,9 @@ mod tests {
 
     #[test]
     fn test_effect_guard_is_always() {
-        let always = EffectGuard {
-            required_breaks: 0,
-            assert_chain: AssertChainId::NONE,
-        };
-        assert!(always.is_always());
-
-        let break_gated = EffectGuard {
-            required_breaks: 1,
-            assert_chain: AssertChainId::NONE,
-        };
-        assert!(!break_gated.is_always());
+        assert!(EffectGuard::ALWAYS.is_always());
 
         let assert_gated = EffectGuard {
-            required_breaks: 0,
             assert_chain: AssertChainId(0),
         };
         assert!(!assert_gated.is_always());
@@ -1067,15 +1099,11 @@ mod tests {
         let ge = GuardedEffect {
             timing: EffectTiming::NextByte,
             guard: EffectGuard {
-                required_breaks: 1,
                 assert_chain: AssertChainId(0),
             },
             atoms: vec![EffectAtom::Match].into_boxed_slice(),
         };
-        assert_eq!(
-            format!("{ge}"),
-            "[next_byte|breaks=0x1+asserts=chain#0] Match"
-        );
+        assert_eq!(format!("{ge}"), "[next_byte|asserts=chain#0] Match");
     }
 
     #[test]
@@ -1097,10 +1125,7 @@ mod tests {
     fn test_pending_effect_display() {
         let pe = PendingEffect {
             timing: EffectTiming::NextByte,
-            guard: EffectGuard {
-                required_breaks: 0,
-                assert_chain: AssertChainId::NONE,
-            },
+            guard: EffectGuard::ALWAYS,
             atoms: vec![EffectAtom::AddTail {
                 origin: StateIdx(3),
             }]
