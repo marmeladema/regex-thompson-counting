@@ -10968,7 +10968,7 @@ mod tests {
         // non-word), giving a false positive even though \b fails.
         //
         // Fix: target_deferred_asserts records only the FIRST assert on each
-        // path (here: \b@5).  The PendingEffect system (Phase 7) evaluates
+        // path (here: \b@5).  The PendingEffect system evaluates
         // \b@5 via eval_assert_chain with check_reachability=true, which
         // properly handles the downstream \B chain.
         test_tier3_chained_assert_target_deferred {

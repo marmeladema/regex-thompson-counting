@@ -60,6 +60,7 @@ pub(crate) type BreakMask = u64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum EffectTiming {
     /// Apply immediately during the current step.
+    #[allow(dead_code)]
     Now,
     /// Defer until the next byte boundary (when the next byte is known).
     NextByte,
@@ -187,6 +188,7 @@ pub(crate) struct EffectGuard {
     pub(crate) assert_chain: AssertChainId,
 }
 
+#[allow(dead_code)]
 impl EffectGuard {
     /// Unconditional guard: counter-free, no assertions.
     pub(crate) const ALWAYS: Self = Self {
@@ -317,6 +319,7 @@ impl fmt::Display for GuardedEffect {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TargetStep {
     /// No counter motion — the target is dead or unreachable.
+    #[allow(dead_code)]
     None,
     /// The entry advances without incrementing: epsilon closure from the
     /// target did not reach `CInc`.  The entry keeps its counter value
@@ -514,6 +517,7 @@ pub(crate) struct ResolvedActions {
 
 impl ResolvedActions {
     /// Whether any action was produced.
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.seeds.is_empty() && self.tails.is_empty() && !self.set_match && !self.set_match_at_end
     }
@@ -695,6 +699,7 @@ pub(crate) fn resolve_pending(
 /// The `is_consuming` closure should return `true` for states that are
 /// consuming (Byte, ByteTable, etc.).
 #[cfg(debug_assertions)]
+#[allow(dead_code)]
 pub(crate) fn debug_assert_origins_consuming(
     effects: &CompiledTargetEffects,
     is_consuming: impl Fn(StateIdx) -> bool,
@@ -716,6 +721,7 @@ pub(crate) fn debug_assert_origins_consuming(
 }
 
 #[cfg(debug_assertions)]
+#[allow(dead_code)]
 fn assert_atom_origins_consuming(atom: &EffectAtom, is_consuming: &impl Fn(StateIdx) -> bool) {
     match atom {
         EffectAtom::AddSeed { origin, .. } => {
@@ -737,20 +743,20 @@ fn assert_atom_origins_consuming(atom: &EffectAtom, is_consuming: &impl Fn(State
 }
 
 // ---------------------------------------------------------------------------
-// Shadow compilation: legacy → effects
+// Effect compilation: Tier3OriginKind → CompiledTargetEffects
 // ---------------------------------------------------------------------------
 
-/// Compile [`CompiledTargetEffects`] for a single target from its legacy
+/// Compile [`CompiledTargetEffects`] for a single target from its
 /// [`Tier3OriginKind`] and the global break seed table.
 ///
-/// This is the "shadow compiler" for Phase 2: it reads the already-computed
-/// legacy analysis and translates it into the effect representation.  The
-/// result must be semantically equivalent to the legacy data.
+/// Reads the structural analysis computed by `compute_tier3_analysis()` and
+/// translates each target's origin kind into the typed effect representation
+/// used at runtime by `resolve_pending()`.
 ///
 /// # Arguments
 ///
 /// - `target_idx`: NFA state index of the post-consumption target.
-/// - `origin_kind`: the legacy structural action for this target.
+/// - `origin_kind`: the structural action for this target.
 /// - `break_seeds`: global break seed table from `Tier3Analysis`.
 /// - `arena`: assertion chain arena (mutably borrowed for interning).
 ///
@@ -855,11 +861,11 @@ pub(crate) fn compile_target_effects(
             //
             // The effect representation captures this as a guarded
             // MatchAtEnd — the assertion chain determines whether the
-            // match fires.  This covers three legacy cases:
+            // match fires.  This covers three cases:
             // 1. break_is_match_at_end=true with deferred asserts
             //    (e.g. `\b → $ → Match`)
-            // 2. break_is_match=false, break_is_match_at_end=false,
-            //    but deferred asserts lead to Match (e.g. `\b → Match`)
+            // 2. Deferred asserts lead to Match without break_is_match
+            //    (e.g. `\b → Match`)
             // 3. Both Match and $ → Match behind the same chain
             if !break_deferred_asserts.is_empty() {
                 let chain_id = arena.intern(break_deferred_asserts);
@@ -929,7 +935,7 @@ pub(crate) fn compile_target_effects(
     }
 }
 
-/// Shadow-compile all target effects for a [`Tier3Analysis`].
+/// Compile all target effects for a [`Tier3Analysis`].
 ///
 /// Iterates over all targets in the analysis and compiles a
 /// `CompiledTargetEffects` for each non-`None` target.  Also interns
@@ -961,7 +967,7 @@ pub(crate) fn compile_all_target_effects(
 
     // Intern each individual assert from target_deferred_asserts as a
     // 1-element chain.  This allows deposit sites to create PendingEffect
-    // entries with the chain as a guard for Match atoms (Phase 7).
+    // entries with the chain as a guard for Match atoms.
     let target_chain_ids: Vec<Box<[AssertChainId]>> = analysis
         .target_deferred_asserts
         .iter()
@@ -979,311 +985,6 @@ pub(crate) fn compile_all_target_effects(
         target_chain_ids.into_boxed_slice(),
         arena,
     )
-}
-
-// ---------------------------------------------------------------------------
-// Shadow lowering: effects → legacy categories (Phase 3)
-// ---------------------------------------------------------------------------
-
-/// Legacy facts extracted from a [`CompiledTargetEffects`].
-///
-/// This is a test-only / debug-only structure that "lowers" the typed
-/// effects back into the same categories the legacy analysis uses.
-/// Comparing these against the original legacy data proves that the
-/// effect compiler captured the same information.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct LoweredLegacyFacts {
-    // -- From Advance targets --
-    /// True if there is an immediate `EffectAtom::Match`.
-    pub(crate) is_match: bool,
-    /// True if there is an immediate `EffectAtom::MatchAtEnd`.
-    pub(crate) is_match_at_end: bool,
-
-    // -- From Increment targets --
-    /// True if on_break contains `EffectAtom::Match`.
-    pub(crate) break_is_match: bool,
-    /// True if on_break contains `EffectAtom::MatchAtEnd`.
-    pub(crate) break_is_match_at_end: bool,
-    /// Pure tails from on_break `EffectAtom::AddTail`.
-    pub(crate) break_consuming_pure: Vec<StateIdx>,
-    /// Break seeds (ungated) from on_break `EffectAtom::AddSeed`.
-    pub(crate) break_seeds_ungated: Vec<(CounterIdx, StateIdx, u32)>,
-    /// Whether there are deferred assertion chains on break path.
-    pub(crate) has_break_deferred_asserts: bool,
-    /// Per-tail deferred assertion entries from guarded `AddTail` effects.
-    pub(crate) break_consuming_deferred: Vec<(StateIdx, AssertChainId)>,
-    /// Break seeds gated by deferred assertions.
-    pub(crate) break_seeds_gated: Vec<(CounterIdx, StateIdx, u32, AssertChainId)>,
-}
-
-/// Lower a [`CompiledTargetEffects`] back into legacy-compatible facts.
-pub(crate) fn lower_to_legacy(effects: &CompiledTargetEffects) -> LoweredLegacyFacts {
-    let mut facts = LoweredLegacyFacts {
-        is_match: false,
-        is_match_at_end: false,
-        break_is_match: false,
-        break_is_match_at_end: false,
-        break_consuming_pure: Vec::new(),
-        break_seeds_ungated: Vec::new(),
-        has_break_deferred_asserts: false,
-        break_consuming_deferred: Vec::new(),
-        break_seeds_gated: Vec::new(),
-    };
-
-    // Immediate effects (counter-free).
-    for atom in effects.immediate.iter() {
-        match atom {
-            EffectAtom::Match => facts.is_match = true,
-            EffectAtom::MatchAtEnd => facts.is_match_at_end = true,
-            _ => {}
-        }
-    }
-
-    // On-break effects (break-gated, no assertion chain).
-    for atom in effects.on_break.iter() {
-        match atom {
-            EffectAtom::Match => facts.break_is_match = true,
-            EffectAtom::MatchAtEnd => facts.break_is_match_at_end = true,
-            EffectAtom::AddTail { origin } => {
-                facts.break_consuming_pure.push(*origin);
-            }
-            EffectAtom::AddSeed {
-                counter,
-                origin,
-                value,
-            } => {
-                facts.break_seeds_ungated.push((*counter, *origin, *value));
-            }
-        }
-    }
-
-    // Guarded effects.
-    for ge in effects.guarded.iter() {
-        if ge.guard.is_assert_gated() {
-            facts.has_break_deferred_asserts = true;
-        }
-
-        for atom in ge.atoms.iter() {
-            match atom {
-                EffectAtom::MatchAtEnd if ge.guard.is_assert_gated() => {
-                    // Break-path match-at-end behind deferred assertions.
-                    // Already captured by has_break_deferred_asserts.
-                }
-                EffectAtom::AddTail { origin } if ge.guard.is_assert_gated() => {
-                    facts
-                        .break_consuming_deferred
-                        .push((*origin, ge.guard.assert_chain));
-                }
-                EffectAtom::AddSeed {
-                    counter,
-                    origin,
-                    value,
-                } if ge.guard.is_assert_gated() => {
-                    facts.break_seeds_gated.push((
-                        *counter,
-                        *origin,
-                        *value,
-                        ge.guard.assert_chain,
-                    ));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // Sort for stable comparison.
-    facts.break_consuming_pure.sort_unstable_by_key(|s| s.0);
-    facts
-        .break_seeds_ungated
-        .sort_unstable_by_key(|s| (s.0.idx(), s.1.0, s.2));
-    facts
-        .break_consuming_deferred
-        .sort_unstable_by_key(|s| s.0.0);
-    facts
-        .break_seeds_gated
-        .sort_unstable_by_key(|s| (s.0.idx(), s.1.0, s.2));
-
-    facts
-}
-
-/// Validate that shadow-compiled effects agree with legacy analysis for
-/// every target.
-///
-/// This is the core Phase 3 invariant check.  Call it from tests after
-/// `compute_tier3_analysis()` populates both legacy and effect data.
-///
-/// Panics with a descriptive message if any disagreement is found.
-pub(crate) fn validate_effects_vs_legacy(analysis: &super::Tier3Analysis) {
-    for (i, (legacy, effect)) in analysis
-        .targets
-        .iter()
-        .zip(analysis.target_effects.iter())
-        .enumerate()
-    {
-        match (legacy, effect) {
-            (None, None) => {}
-            (Some(_), None) => {
-                panic!("state {i}: legacy has target but effect is None");
-            }
-            (None, Some(_)) => {
-                panic!("state {i}: effect has target but legacy is None");
-            }
-            (Some(kind), Some(eff)) => {
-                validate_one_target(i, kind, eff, analysis);
-            }
-        }
-    }
-}
-
-/// Validate one target's effects against its legacy `Tier3OriginKind`.
-fn validate_one_target(
-    state_idx: usize,
-    kind: &super::Tier3OriginKind,
-    eff: &CompiledTargetEffects,
-    analysis: &super::Tier3Analysis,
-) {
-    let lowered = lower_to_legacy(eff);
-
-    match kind {
-        super::Tier3OriginKind::Advance {
-            new_origins,
-            is_match_at_end,
-            is_match,
-        } => {
-            // Step must be Advance with same origins.
-            match &eff.step {
-                TargetStep::Advance {
-                    new_origins: eff_origins,
-                } => {
-                    assert_eq!(
-                        new_origins.as_ref(),
-                        eff_origins.as_ref(),
-                        "state {state_idx}: Advance new_origins mismatch"
-                    );
-                }
-                other => panic!("state {state_idx}: expected Advance step, got {other}"),
-            }
-
-            assert_eq!(
-                *is_match, lowered.is_match,
-                "state {state_idx}: Advance is_match mismatch"
-            );
-            assert_eq!(
-                *is_match_at_end, lowered.is_match_at_end,
-                "state {state_idx}: Advance is_match_at_end mismatch"
-            );
-        }
-
-        super::Tier3OriginKind::Increment {
-            counter,
-            advance_origins,
-            min,
-            max,
-            continue_origins,
-            break_is_match,
-            break_is_match_at_end: _,
-            break_deferred_asserts,
-            break_consuming_states: _,
-            break_consuming_pure,
-            break_consuming_deferred,
-            break_assert_chain_id: _,
-        } => {
-            // Step must be Increment with matching fields.
-            match &eff.step {
-                TargetStep::Increment {
-                    counter: eff_counter,
-                    advance_origins: eff_adv,
-                    min: eff_min,
-                    max: eff_max,
-                    continue_origins: eff_cont,
-                } => {
-                    assert_eq!(
-                        counter, eff_counter,
-                        "state {state_idx}: Increment counter mismatch"
-                    );
-                    assert_eq!(
-                        advance_origins.as_ref(),
-                        eff_adv.as_ref(),
-                        "state {state_idx}: Increment advance_origins mismatch"
-                    );
-                    assert_eq!(*min, *eff_min, "state {state_idx}: Increment min mismatch");
-                    assert_eq!(*max, *eff_max, "state {state_idx}: Increment max mismatch");
-                    assert_eq!(
-                        continue_origins.as_ref(),
-                        eff_cont.as_ref(),
-                        "state {state_idx}: Increment continue_origins mismatch"
-                    );
-                }
-                other => panic!("state {state_idx}: expected Increment step, got {other}"),
-            }
-
-            // Break-path direct match.
-            assert_eq!(
-                *break_is_match, lowered.break_is_match,
-                "state {state_idx}: break_is_match mismatch"
-            );
-
-            // Break deferred asserts presence.
-            assert_eq!(
-                !break_deferred_asserts.is_empty(),
-                lowered.has_break_deferred_asserts,
-                "state {state_idx}: break_deferred_asserts presence mismatch"
-            );
-
-            // Pure tails.
-            let mut expected_pure: Vec<StateIdx> = break_consuming_pure.to_vec();
-            expected_pure.sort_unstable_by_key(|s| s.0);
-            assert_eq!(
-                expected_pure, lowered.break_consuming_pure,
-                "state {state_idx}: break_consuming_pure mismatch"
-            );
-
-            // Per-tail deferred assertions: check that each deferred tail
-            // appears in the lowered data with an assertion chain.
-            let deferred_only: Vec<StateIdx> = break_consuming_deferred
-                .iter()
-                .filter(|(_, asserts, _)| !asserts.is_empty())
-                .map(|(s, _, _)| *s)
-                .collect();
-            let mut lowered_deferred_tails: Vec<StateIdx> = lowered
-                .break_consuming_deferred
-                .iter()
-                .map(|(s, _)| *s)
-                .collect();
-            lowered_deferred_tails.sort_unstable_by_key(|s| s.0);
-            let mut expected_deferred: Vec<StateIdx> = deferred_only;
-            expected_deferred.sort_unstable_by_key(|s| s.0);
-            assert_eq!(
-                expected_deferred, lowered_deferred_tails,
-                "state {state_idx}: break_consuming_deferred tails mismatch"
-            );
-
-            // Break seeds: check ungated seeds match legacy break_seeds
-            // for this counter.
-            let expected_ungated: Vec<(CounterIdx, StateIdx, u32)> = analysis
-                .break_seeds
-                .iter()
-                .filter(|bs| bs.trigger == *counter && bs.deferred_asserts.is_empty())
-                .map(|bs| (bs.counter, bs.origin, 0u32))
-                .collect();
-            assert_eq!(
-                expected_ungated, lowered.break_seeds_ungated,
-                "state {state_idx}: ungated break seeds mismatch"
-            );
-
-            // Gated seeds: check that the right number exist.
-            let expected_gated_count = analysis
-                .break_seeds
-                .iter()
-                .filter(|bs| bs.trigger == *counter && !bs.deferred_asserts.is_empty())
-                .count();
-            assert_eq!(
-                expected_gated_count,
-                lowered.break_seeds_gated.len(),
-                "state {state_idx}: gated break seeds count mismatch"
-            );
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1467,80 +1168,5 @@ mod tests {
         assert!(s.contains("Increment(c0, {2,5})"));
         assert!(s.contains("adv=[1]"));
         assert!(s.contains("cont=[3]"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Phase 3: Shadow lowering validation tests
-    // -----------------------------------------------------------------------
-
-    /// Helper: compile a pattern with unroll_limit=0 and validate that
-    /// the shadow-compiled effects agree with the legacy analysis.
-    fn validate_pattern(pattern: &str) {
-        use crate::RegexBuilder;
-        let hir = regex_syntax::ParserBuilder::new()
-            .utf8(false)
-            .unicode(false)
-            .build()
-            .parse(pattern)
-            .unwrap_or_else(|e| panic!("failed to parse '{pattern}': {e}"));
-        let mut builder = RegexBuilder::default();
-        builder.max_unroll_states(0);
-        let regex = builder
-            .build(&hir)
-            .unwrap_or_else(|e| panic!("failed to compile '{pattern}': {e}"));
-        if let Some(ref analysis) = regex.tier3_analysis {
-            validate_effects_vs_legacy(analysis);
-        }
-        // If no tier3_analysis, the pattern isn't tier-3-eligible — skip.
-    }
-
-    #[test]
-    fn test_shadow_validate_simple_counter() {
-        validate_pattern("a{2,4}");
-    }
-
-    #[test]
-    fn test_shadow_validate_counter_with_end_anchor() {
-        validate_pattern("a{2,4}$");
-    }
-
-    #[test]
-    fn test_shadow_validate_word_boundary_counter() {
-        validate_pattern(r"\b\w{2,4}\b");
-    }
-
-    #[test]
-    fn test_shadow_validate_word_boundary_class() {
-        validate_pattern(r"\b[a-z]{2,3}\b");
-    }
-
-    #[test]
-    fn test_shadow_validate_alternation_counter() {
-        validate_pattern("(a|bb){2,3}c");
-    }
-
-    #[test]
-    fn test_shadow_validate_class_counter_with_tail() {
-        validate_pattern("[ab]{2,3}c");
-    }
-
-    #[test]
-    fn test_shadow_validate_dot_counter() {
-        validate_pattern(".{2,5}x");
-    }
-
-    #[test]
-    fn test_shadow_validate_multi_byte_body() {
-        validate_pattern("(ab){2,4}");
-    }
-
-    #[test]
-    fn test_shadow_validate_counter_with_prefix() {
-        validate_pattern("x.{2,3}y");
-    }
-
-    #[test]
-    fn test_shadow_validate_complex_body() {
-        validate_pattern("([a-z][0-9]){2,3}!");
     }
 }
