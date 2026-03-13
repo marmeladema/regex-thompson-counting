@@ -48,7 +48,7 @@ use crate::{
     is_word_byte,
 };
 
-use super::{DfaCache, DfaMemory, DfaState, DfaStateId};
+use super::{DfaCache, DfaMemory, DfaState, DfaStateId, tier3_effects};
 
 // ---------------------------------------------------------------------------
 // Precomputed NFA analysis (built once at regex compile time)
@@ -158,6 +158,17 @@ pub(crate) struct Tier3Analysis {
     /// can become non-contiguous and range compression would
     /// over-approximate, so the per-instance fallback is used instead.
     pub(crate) all_counters_rangeable: bool,
+
+    /// Shadow-compiled typed effects for each target state.
+    ///
+    /// Populated by [`tier3_effects::compile_all_target_effects`] from
+    /// the legacy `targets` data.  During the migration, this coexists
+    /// with the legacy fields above; once validated, the legacy fields
+    /// will be removed.
+    pub(crate) target_effects: Box<[Option<tier3_effects::CompiledTargetEffects>]>,
+
+    /// Arena of interned assertion chains referenced by effect guards.
+    pub(crate) assert_chain_arena: tier3_effects::AssertChainArena,
 }
 
 /// What happens structurally when a byte is consumed at a given target.
@@ -769,7 +780,7 @@ pub(crate) fn compute_tier3_analysis(
             .all(|(i, s)| !matches!(s, State::CounterInstance { .. }) || ci_reached[i])
     };
 
-    Tier3Analysis {
+    let mut analysis = Tier3Analysis {
         targets: targets_vec.into_boxed_slice(),
         ci_origins: ci_origins_vec.into_boxed_slice(),
         break_seeds: break_seeds.into_boxed_slice(),
@@ -780,7 +791,18 @@ pub(crate) fn compute_tier3_analysis(
         reachable_without_break: rwb.into_boxed_slice(),
         max_instance_stride,
         all_counters_rangeable,
-    }
+        // Placeholder — filled in below.
+        target_effects: Box::new([]),
+        assert_chain_arena: tier3_effects::AssertChainArena::new(),
+    };
+
+    // -- Step 9: shadow-compile typed target effects --------------------------
+    let (target_effects, assert_chain_arena) =
+        tier3_effects::compile_all_target_effects(&analysis);
+    analysis.target_effects = target_effects;
+    analysis.assert_chain_arena = assert_chain_arena;
+
+    analysis
 }
 
 // ---------------------------------------------------------------------------

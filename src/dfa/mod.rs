@@ -35,7 +35,8 @@ use indexmap::IndexSet;
 pub(crate) use tier1::{DfaMatcher, Tier1DfaCache};
 pub(crate) use tier2::{Tier2Analysis, Tier2DfaCache, Tier2DfaMatcher, compute_tier2_analysis};
 pub(crate) use tier3::{
-    Tier3Analysis, Tier3DfaCache, Tier3DfaMatcher, Tier3OriginKind, compute_tier3_analysis,
+    Tier3Analysis, Tier3BreakSeed, Tier3DfaCache, Tier3DfaMatcher, Tier3OriginKind,
+    compute_tier3_analysis,
 };
 pub(crate) use tier4::{Tier4DfaCache, Tier4DfaMatcher};
 

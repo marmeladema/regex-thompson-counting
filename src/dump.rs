@@ -653,6 +653,11 @@ impl DumpRegex<'_> {
                     }
                 }
             }
+
+            // Typed effects (shadow-compiled in Phase 2).
+            writeln!(f)?;
+            writeln!(f, "  --- Typed Effects (shadow) ---")?;
+            fmt_target_effects(f, &t3.target_effects, &t3.assert_chain_arena, &r.states.0)?;
         }
 
         Ok(())

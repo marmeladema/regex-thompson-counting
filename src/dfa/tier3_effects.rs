@@ -544,6 +544,220 @@ fn assert_atom_origins_consuming(atom: &EffectAtom, is_consuming: &impl Fn(State
 }
 
 // ---------------------------------------------------------------------------
+// Shadow compilation: legacy → effects
+// ---------------------------------------------------------------------------
+
+/// Compile [`CompiledTargetEffects`] for a single target from its legacy
+/// [`Tier3OriginKind`] and the global break seed table.
+///
+/// This is the "shadow compiler" for Phase 2: it reads the already-computed
+/// legacy analysis and translates it into the effect representation.  The
+/// result must be semantically equivalent to the legacy data.
+///
+/// # Arguments
+///
+/// - `target_idx`: NFA state index of the post-consumption target.
+/// - `origin_kind`: the legacy structural action for this target.
+/// - `break_seeds`: global break seed table from `Tier3Analysis`.
+/// - `arena`: assertion chain arena (mutably borrowed for interning).
+///
+/// [`Tier3OriginKind`]: super::Tier3OriginKind
+pub(crate) fn compile_target_effects(
+    target_idx: StateIdx,
+    origin_kind: &super::Tier3OriginKind,
+    break_seeds: &[super::Tier3BreakSeed],
+    arena: &mut AssertChainArena,
+) -> CompiledTargetEffects {
+    match origin_kind {
+        super::Tier3OriginKind::Advance {
+            new_origins,
+            is_match_at_end,
+            is_match,
+        } => {
+            // Advance: no counter increment involved.
+            let step = TargetStep::Advance {
+                new_origins: new_origins.clone(),
+            };
+
+            // Immediate effects: direct match and/or match-at-end.
+            let mut immediate = Vec::new();
+            if *is_match {
+                immediate.push(EffectAtom::Match);
+            }
+            if *is_match_at_end {
+                immediate.push(EffectAtom::MatchAtEnd);
+            }
+
+            CompiledTargetEffects {
+                step,
+                immediate: immediate.into_boxed_slice(),
+                on_break: Box::new([]),
+                guarded: Box::new([]),
+            }
+        }
+
+        super::Tier3OriginKind::Increment {
+            counter,
+            advance_origins,
+            min,
+            max,
+            continue_origins,
+            break_is_match,
+            break_is_match_at_end,
+            break_deferred_asserts,
+            break_consuming_states: _,
+            break_consuming_pure,
+            break_consuming_deferred,
+        } => {
+            let step = TargetStep::Increment {
+                counter: *counter,
+                advance_origins: advance_origins.clone(),
+                min: *min as u32,
+                max: *max as u32,
+                continue_origins: continue_origins.clone(),
+            };
+
+            // --- on_break: immediate effects gated on counter break ---
+            let mut on_break = Vec::new();
+
+            // Break-path direct match.
+            if *break_is_match {
+                on_break.push(EffectAtom::Match);
+            }
+
+            // Break-path match-at-end (only when no deferred asserts gate it).
+            if *break_is_match_at_end && break_deferred_asserts.is_empty() {
+                on_break.push(EffectAtom::MatchAtEnd);
+            }
+
+            // Pure tails: consuming states reachable from break path
+            // WITHOUT deferred assertions — deposited immediately on break.
+            for &tail in break_consuming_pure.iter() {
+                on_break.push(EffectAtom::AddTail { origin: tail });
+            }
+
+            // Break seeds triggered by THIS counter's break.
+            for bs in break_seeds.iter() {
+                if bs.trigger == *counter && bs.deferred_asserts.is_empty() {
+                    on_break.push(EffectAtom::AddSeed {
+                        counter: bs.counter,
+                        origin: bs.origin,
+                        value: 0,
+                    });
+                }
+            }
+
+            // --- guarded: deferred / assertion-gated effects ---
+            let mut guarded = Vec::new();
+
+            // Break-path deferred assertions.
+            //
+            // When break_deferred_asserts is non-empty, the break path
+            // includes assertions (e.g. `\b`, `\B`) that gate access to
+            // Match or $ → Match.  The runtime stores these in
+            // `verified_deferred_asserts` and evaluates them via
+            // `can_reach_match_at_end()` at the next byte boundary and
+            // at end-of-input.
+            //
+            // The effect representation captures this as a guarded
+            // MatchAtEnd — the assertion chain determines whether the
+            // match fires.  This covers three legacy cases:
+            // 1. break_is_match_at_end=true with deferred asserts
+            //    (e.g. `\b → $ → Match`)
+            // 2. break_is_match=false, break_is_match_at_end=false,
+            //    but deferred asserts lead to Match (e.g. `\b → Match`)
+            // 3. Both Match and $ → Match behind the same chain
+            if !break_deferred_asserts.is_empty() {
+                let chain_id = arena.intern(break_deferred_asserts);
+                guarded.push(GuardedEffect {
+                    timing: EffectTiming::NextByte,
+                    guard: EffectGuard {
+                        required_breaks: 1u64 << counter.idx(),
+                        assert_chain: chain_id,
+                    },
+                    atoms: vec![EffectAtom::MatchAtEnd].into_boxed_slice(),
+                });
+                // Also an EndOnly variant for finish().
+                guarded.push(GuardedEffect {
+                    timing: EffectTiming::EndOnly,
+                    guard: EffectGuard {
+                        required_breaks: 1u64 << counter.idx(),
+                        assert_chain: chain_id,
+                    },
+                    atoms: vec![EffectAtom::MatchAtEnd].into_boxed_slice(),
+                });
+            }
+
+            // Per-tail deferred assertions: each tail has its own chain.
+            for &(tail, ref per_tail_asserts) in break_consuming_deferred.iter() {
+                if per_tail_asserts.is_empty() {
+                    // Pure tail — already handled above.
+                    continue;
+                }
+                let chain_id = arena.intern(per_tail_asserts);
+                guarded.push(GuardedEffect {
+                    timing: EffectTiming::NextByte,
+                    guard: EffectGuard {
+                        required_breaks: 1u64 << counter.idx(),
+                        assert_chain: chain_id,
+                    },
+                    atoms: vec![EffectAtom::AddTail { origin: tail }].into_boxed_slice(),
+                });
+            }
+
+            // Break seeds with deferred assertions.
+            for bs in break_seeds.iter() {
+                if bs.trigger == *counter && !bs.deferred_asserts.is_empty() {
+                    let chain_id = arena.intern(&bs.deferred_asserts);
+                    guarded.push(GuardedEffect {
+                        timing: EffectTiming::NextByte,
+                        guard: EffectGuard {
+                            required_breaks: 1u64 << counter.idx(),
+                            assert_chain: chain_id,
+                        },
+                        atoms: vec![EffectAtom::AddSeed {
+                            counter: bs.counter,
+                            origin: bs.origin,
+                            value: 0,
+                        }]
+                        .into_boxed_slice(),
+                    });
+                }
+            }
+
+            CompiledTargetEffects {
+                step,
+                immediate: Box::new([]),
+                on_break: on_break.into_boxed_slice(),
+                guarded: guarded.into_boxed_slice(),
+            }
+        }
+    }
+}
+
+/// Shadow-compile all target effects for a [`Tier3Analysis`].
+///
+/// Iterates over all targets in the analysis and compiles a
+/// `CompiledTargetEffects` for each non-`None` target.  Returns the
+/// per-target effect array and the populated assertion chain arena.
+pub(crate) fn compile_all_target_effects(
+    analysis: &super::Tier3Analysis,
+) -> (Box<[Option<CompiledTargetEffects>]>, AssertChainArena) {
+    let mut arena = AssertChainArena::new();
+    let effects: Vec<Option<CompiledTargetEffects>> = analysis
+        .targets
+        .iter()
+        .enumerate()
+        .map(|(i, target)| {
+            target.as_ref().map(|kind| {
+                compile_target_effects(StateIdx(i as u32), kind, &analysis.break_seeds, &mut arena)
+            })
+        })
+        .collect();
+    (effects.into_boxed_slice(), arena)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

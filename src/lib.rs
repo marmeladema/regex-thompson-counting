@@ -5316,7 +5316,7 @@ mod tests {
     match_tests! {
         test_counting {
             pattern: "^.*a.{3}bc$",
-            memory: 1227,
+            memory: 1267,
             min_tier: 1,
             inputs: [
                 ("aybzbc", true),
@@ -5335,7 +5335,7 @@ mod tests {
         }
         test_range {
             pattern: "^(a|bc){1,2}$",
-            memory: 1004,
+            memory: 1044,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -5351,7 +5351,7 @@ mod tests {
         }
         test_nested_counting {
             pattern: "^((a|bc){1,2}){2,3}$",
-            memory: 1631,
+            memory: 1671,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -5368,7 +5368,7 @@ mod tests {
         }
         test_aaaaa {
             pattern: "^(a|a?){2,3}$",
-            memory: 1136,
+            memory: 1176,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -5385,7 +5385,7 @@ mod tests {
         }
         test_one_plus_basic {
             pattern: "^a+$",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -5400,7 +5400,7 @@ mod tests {
         }
         test_one_plus_wildcard {
             pattern: "^.+$",
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -5411,7 +5411,7 @@ mod tests {
         }
         test_one_plus_catenation {
             pattern: "^a+b+$",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -5426,7 +5426,7 @@ mod tests {
         }
         test_one_plus_group {
             pattern: "^(ab)+$",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -5439,7 +5439,7 @@ mod tests {
         }
         test_one_plus_alternate {
             pattern: "^(a|b)+$",
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -5458,7 +5458,7 @@ mod tests {
         }
         test_one_plus_with_counting {
             pattern: "^.*a.{3}b+c$",
-            memory: 1260,
+            memory: 1300,
             min_tier: 1,
             inputs: [
                 ("a123bc", true),
@@ -5477,7 +5477,7 @@ mod tests {
         }
         test_repetition_inside_one_plus {
             pattern: "^(a{2,3})+$",
-            memory: 872,
+            memory: 912,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -5495,7 +5495,7 @@ mod tests {
         }
         test_range_alternation_inside_one_plus {
             pattern: "^((a|bc){1,2})+$",
-            memory: 1037,
+            memory: 1077,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -5507,7 +5507,7 @@ mod tests {
         }
         test_one_plus_inside_repetition {
             pattern: "^(a+){2,3}$",
-            memory: 938,
+            memory: 978,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -5523,7 +5523,7 @@ mod tests {
         }
         test_one_plus_alternation_inside_repetition {
             pattern: "^((a|b)+){2,4}$",
-            memory: 1293,
+            memory: 1333,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -5534,7 +5534,7 @@ mod tests {
         }
         test_mixed_plus_and_repetition_inside_one_plus {
             pattern: "^(a+b{2,3})+$",
-            memory: 938,
+            memory: 978,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -5554,7 +5554,7 @@ mod tests {
         }
         test_min_zero_basic {
             pattern: "^a{0,2}$",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -5566,7 +5566,7 @@ mod tests {
         }
         test_min_zero_max_one {
             pattern: "^a{0,1}$",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -5577,7 +5577,7 @@ mod tests {
         }
         test_min_zero_alternation {
             pattern: "^(a|bc){0,3}$",
-            memory: 1202,
+            memory: 1242,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -5588,7 +5588,7 @@ mod tests {
         }
         test_min_zero_unbounded {
             pattern: "^a{0,}$",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -5605,7 +5605,7 @@ mod tests {
         }
         test_min_zero_unbounded_group {
             pattern: "^(ab){0,}$",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -5618,7 +5618,7 @@ mod tests {
         }
         test_min_zero_inside_one_plus {
             pattern: "^x(a{0,2})+y$",
-            memory: 938,
+            memory: 978,
             min_tier: 1,
             inputs: [
                 ("xy", true),
@@ -5638,7 +5638,7 @@ mod tests {
         }
         test_min_zero_inside_repetition {
             pattern: "^(a{0,2}){2,3}$",
-            memory: 1136,
+            memory: 1176,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -5654,7 +5654,7 @@ mod tests {
         }
         test_one_plus_inside_min_zero_repetition {
             pattern: "^(a+){0,3}$",
-            memory: 1004,
+            memory: 1044,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -5669,7 +5669,7 @@ mod tests {
         }
         test_min_zero_wildcard {
             pattern: "^.{0,3}$",
-            memory: 1161,
+            memory: 1201,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -5681,7 +5681,7 @@ mod tests {
         }
         test_none_min_repetition {
             pattern: "^a{0,3}$",
-            memory: 905,
+            memory: 945,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -5696,7 +5696,7 @@ mod tests {
         }
         test_literal_single {
             pattern: "^a$",
-            memory: 740,
+            memory: 780,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -5709,7 +5709,7 @@ mod tests {
         }
         test_literal_multi {
             pattern: "^abc$",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -5727,7 +5727,7 @@ mod tests {
         }
         test_dot_single {
             pattern: "^.$",
-            memory: 996,
+            memory: 1036,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -5741,7 +5741,7 @@ mod tests {
         }
         test_alternation_bare {
             pattern: "^(a|bc)$",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -5757,7 +5757,7 @@ mod tests {
         }
         test_alternation_three_way {
             pattern: "^(a|b|c)$",
-            memory: 996,
+            memory: 1036,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -5771,7 +5771,7 @@ mod tests {
         }
         test_question_mark_single {
             pattern: "^a?$",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -5783,7 +5783,7 @@ mod tests {
         }
         test_question_mark_group {
             pattern: "^(ab)?$",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -5797,7 +5797,7 @@ mod tests {
         }
         test_question_mark_prefix {
             pattern: "^a?b$",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("b", true),
@@ -5812,7 +5812,7 @@ mod tests {
         }
         test_star_single {
             pattern: "^a*$",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -5829,7 +5829,7 @@ mod tests {
         }
         test_star_group {
             pattern: "^(ab)*$",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -5846,7 +5846,7 @@ mod tests {
         }
         test_star_then_literal {
             pattern: "^a*b$",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("b", true),
@@ -5864,7 +5864,7 @@ mod tests {
         }
         test_min_n_unbounded {
             pattern: "^a{2,}$",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("aa", true),
@@ -5881,7 +5881,7 @@ mod tests {
         }
         test_min_n_unbounded_group {
             pattern: "^(ab){2,}$",
-            memory: 872,
+            memory: 912,
             min_tier: 1,
             inputs: [
                 ("abab", true),
@@ -5898,7 +5898,7 @@ mod tests {
         }
         test_bounded_range {
             pattern: "^a{3,5}$",
-            memory: 938,
+            memory: 978,
             min_tier: 1,
             inputs: [
                 ("aaa", true),
@@ -5916,7 +5916,7 @@ mod tests {
         // ── Non-fixed unrolling edge-case tests ──────────────────────────
         test_unroll_byte_class_bounded {
             pattern: "[0-9a-f]{1,4}",
-            memory: 1128,
+            memory: 1168,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -5929,7 +5929,7 @@ mod tests {
         }
         test_unroll_byte_class_unbounded {
             pattern: "[0-9a-f]{2,}",
-            memory: 996,
+            memory: 1036,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -5941,7 +5941,7 @@ mod tests {
         }
         test_unroll_at_budget_limit {
             pattern: "^a{1,16}$",
-            memory: 1730,
+            memory: 1770,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -5954,7 +5954,7 @@ mod tests {
         }
         test_unroll_over_budget {
             pattern: "^a{1,17}$",
-            memory: 807,
+            memory: 847,
             min_tier: 2,
             inputs: [
                 ("a", true),
@@ -5967,7 +5967,7 @@ mod tests {
         }
         test_unroll_zero_min_bounded {
             pattern: "^a{0,4}$",
-            memory: 971,
+            memory: 1011,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -5982,7 +5982,7 @@ mod tests {
         // ── Complex-body unrolling tests (estimate_nfa_states) ────────────
         test_unroll_multi_byte_fixed {
             pattern: "^(ab){3}$",
-            memory: 905,
+            memory: 945,
             min_tier: 1,
             inputs: [
                 ("ababab", true),
@@ -5995,7 +5995,7 @@ mod tests {
         }
         test_unroll_multi_byte_bounded {
             pattern: "^(ab){2,4}$",
-            memory: 1037,
+            memory: 1077,
             min_tier: 1,
             inputs: [
                 ("abab", true),
@@ -6008,7 +6008,7 @@ mod tests {
         }
         test_unroll_alternation_body {
             pattern: "^(a|bc){2,3}$",
-            memory: 1136,
+            memory: 1176,
             min_tier: 1,
             inputs: [
                 ("aa", true),
@@ -6025,7 +6025,7 @@ mod tests {
         }
         test_unroll_nested_fixed_flattened {
             pattern: "^((a{2}){3}){2}$",
-            memory: 1103,
+            memory: 1143,
             min_tier: 1,
             inputs: [
                 ("aaaaaaaaaaaa", true),
@@ -6036,7 +6036,7 @@ mod tests {
         }
         test_unroll_ipv4_octets {
             pattern: r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}",
-            memory: 1656,
+            memory: 1696,
             min_tier: 1,
             inputs: [
                 ("192.168.1.1", true),
@@ -6050,7 +6050,7 @@ mod tests {
         }
         test_unroll_concat_with_inner_rep {
             pattern: "(a+b){2,3}",
-            memory: 971,
+            memory: 1011,
             min_tier: 1,
             inputs: [
                 ("abab", true),
@@ -6064,7 +6064,7 @@ mod tests {
         }
         test_exact_repetition {
             pattern: "^a{3,3}$",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("aaa", true),
@@ -6079,7 +6079,7 @@ mod tests {
         }
         test_wildcard_fixed_unrolled {
             pattern: "^a.{3}b$",
-            memory: 1128,
+            memory: 1168,
             min_tier: 1,
             inputs: [
                 ("a123b", true),
@@ -6093,7 +6093,7 @@ mod tests {
         }
         test_byte_class_range {
             pattern: "^[a-c]$",
-            memory: 996,
+            memory: 1036,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -6106,7 +6106,7 @@ mod tests {
         }
         test_byte_class_one_plus {
             pattern: "^[a-c]+$",
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -6119,7 +6119,7 @@ mod tests {
         }
         test_byte_class_counted {
             pattern: "^[a-c]{2,3}$",
-            memory: 1095,
+            memory: 1135,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -6133,7 +6133,7 @@ mod tests {
         }
         test_byte_class_disjoint {
             pattern: "^[ax]$",
-            memory: 996,
+            memory: 1036,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -6145,7 +6145,7 @@ mod tests {
         }
         test_byte_class_multi_range {
             pattern: "^[a-cx-z]+$",
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -6159,7 +6159,7 @@ mod tests {
         }
         test_byte_class_with_wildcard {
             pattern: "^[a-c].*[x-z]$",
-            memory: 1607,
+            memory: 1647,
             min_tier: 1,
             inputs: [
                 ("ax", true),
@@ -6172,7 +6172,7 @@ mod tests {
         }
         test_digit {
             pattern: r#"^\d$"#,
-            memory: 996,
+            memory: 1036,
             min_tier: 1,
             inputs: [
                 ("0", true),
@@ -6188,7 +6188,7 @@ mod tests {
         }
         test_digit_plus {
             pattern: r#"^\d+$"#,
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("0", true),
@@ -6204,7 +6204,7 @@ mod tests {
         }
         test_digit_counted {
             pattern: r#"^\d{3,5}$"#,
-            memory: 1194,
+            memory: 1234,
             min_tier: 1,
             inputs: [
                 ("123", true),
@@ -6220,7 +6220,7 @@ mod tests {
         }
         test_non_digit {
             pattern: r#"^\D$"#,
-            memory: 996,
+            memory: 1036,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -6236,7 +6236,7 @@ mod tests {
         }
         test_non_digit_plus {
             pattern: r#"^\D+$"#,
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6250,7 +6250,7 @@ mod tests {
         }
         test_space {
             pattern: r#"^\s$"#,
-            memory: 996,
+            memory: 1036,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -6265,7 +6265,7 @@ mod tests {
         }
         test_space_plus {
             pattern: r#"^\s+$"#,
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -6279,7 +6279,7 @@ mod tests {
         }
         test_non_space {
             pattern: r#"^\S$"#,
-            memory: 996,
+            memory: 1036,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -6294,7 +6294,7 @@ mod tests {
         }
         test_non_space_plus {
             pattern: r#"^\S+$"#,
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6308,7 +6308,7 @@ mod tests {
         }
         test_word {
             pattern: r#"^\w$"#,
-            memory: 996,
+            memory: 1036,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -6325,7 +6325,7 @@ mod tests {
         }
         test_word_plus {
             pattern: r#"^\w+$"#,
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("hello", true),
@@ -6340,7 +6340,7 @@ mod tests {
         }
         test_word_counted {
             pattern: r#"^\w{2,4}$"#,
-            memory: 1161,
+            memory: 1201,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -6355,7 +6355,7 @@ mod tests {
         }
         test_non_word {
             pattern: r#"^\W$"#,
-            memory: 996,
+            memory: 1036,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -6371,7 +6371,7 @@ mod tests {
         }
         test_non_word_plus {
             pattern: r#"^\W+$"#,
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -6386,7 +6386,7 @@ mod tests {
         }
         test_predefined_mixed {
             pattern: r#"^\d+\s+\w+$"#,
-            memory: 1673,
+            memory: 1713,
             min_tier: 1,
             inputs: [
                 ("42 hello", true),
@@ -6403,7 +6403,7 @@ mod tests {
         }
         test_anchor_start_only {
             pattern: "^abc",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6418,7 +6418,7 @@ mod tests {
         }
         test_anchor_end_only {
             pattern: "abc$",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6433,7 +6433,7 @@ mod tests {
         }
         test_unanchored_literal {
             pattern: "abc",
-            memory: 740,
+            memory: 780,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6450,7 +6450,7 @@ mod tests {
         }
         test_anchor_start_wildcard {
             pattern: "^a.b",
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("axb", true),
@@ -6463,7 +6463,7 @@ mod tests {
         }
         test_anchor_end_wildcard {
             pattern: "a.b$",
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("axb", true),
@@ -6476,7 +6476,7 @@ mod tests {
         }
         test_both_anchors_quantifiers {
             pattern: "^a+b+$",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -6493,7 +6493,7 @@ mod tests {
         }
         test_unanchored_quantifiers {
             pattern: "a+b+",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -6512,7 +6512,7 @@ mod tests {
         }
         test_anchor_start_one_plus {
             pattern: "^a+",
-            memory: 740,
+            memory: 780,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -6527,7 +6527,7 @@ mod tests {
         }
         test_anchor_end_one_plus {
             pattern: "a+$",
-            memory: 740,
+            memory: 780,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -6543,25 +6543,25 @@ mod tests {
         }
         test_anchors_empty {
             pattern: "^$",
-            memory: 707,
+            memory: 747,
             min_tier: 1,
             inputs: [("", true), ("a", false), ("ab", false)],
         }
         test_anchor_start_bare {
             pattern: "^",
-            memory: 674,
+            memory: 714,
             min_tier: 1,
             inputs: [("", true), ("a", true), ("abc", true)],
         }
         test_anchor_end_bare {
             pattern: "$",
-            memory: 674,
+            memory: 714,
             min_tier: 1,
             inputs: [("", true), ("a", true), ("abc", true)],
         }
         test_unanchored_alternation {
             pattern: "(a|b)",
-            memory: 930,
+            memory: 970,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -6576,7 +6576,7 @@ mod tests {
         }
         test_unanchored_star_literal {
             pattern: "a*b",
-            memory: 740,
+            memory: 780,
             min_tier: 1,
             inputs: [
                 ("b", true),
@@ -6593,7 +6593,7 @@ mod tests {
         }
         test_anchor_in_alternation_start {
             pattern: "a|^b",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -6614,7 +6614,7 @@ mod tests {
         }
         test_anchor_in_alternation_end {
             pattern: "a$|b",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -6635,7 +6635,7 @@ mod tests {
         }
         test_multiline_start_basic {
             pattern: "(?m)^abc",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6650,7 +6650,7 @@ mod tests {
         }
         test_multiline_end_basic {
             pattern: "(?m)abc$",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6665,7 +6665,7 @@ mod tests {
         }
         test_multiline_both_anchors {
             pattern: "(?m)^abc$",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6685,7 +6685,7 @@ mod tests {
         }
         test_multiline_multi_lines {
             pattern: "(?m)^abc$",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("abc\ndef\nghi", true),
@@ -6696,7 +6696,7 @@ mod tests {
         }
         test_multiline_catenation_across_newline {
             pattern: r#"(?m)abc$\n^def"#,
-            memory: 938,
+            memory: 978,
             min_tier: 1,
             inputs: [
                 ("abc\ndef", true),
@@ -6707,7 +6707,7 @@ mod tests {
         }
         test_multiline_with_dot_plus {
             pattern: "(?m)^.+$",
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6721,7 +6721,7 @@ mod tests {
         }
         test_multiline_with_counting {
             pattern: r#"(?m)^\d{2,4}$"#,
-            memory: 1161,
+            memory: 1201,
             min_tier: 1,
             inputs: [
                 ("12", true),
@@ -6737,7 +6737,7 @@ mod tests {
         }
         test_multiline_edge_cases_empty {
             pattern: "(?m)^$",
-            memory: 707,
+            memory: 747,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -6751,19 +6751,19 @@ mod tests {
         }
         test_multiline_start_only_empty_lines {
             pattern: "(?m)^",
-            memory: 674,
+            memory: 714,
             min_tier: 1,
             inputs: [("", true), ("a", true), ("\n", true)],
         }
         test_multiline_end_only {
             pattern: "(?m)$",
-            memory: 674,
+            memory: 714,
             min_tier: 1,
             inputs: [("", true), ("a", true), ("\n", true)],
         }
         test_multiline_alternation {
             pattern: "(?m)^(abc|def)$",
-            memory: 938,
+            memory: 978,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6776,7 +6776,7 @@ mod tests {
         }
         test_multiline_mixed_with_nonmultiline {
             pattern: "^abc(?m:$)",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6787,7 +6787,7 @@ mod tests {
         }
         test_crlf_start_basic {
             pattern: "(?Rm)^abc",
-            memory: 773,
+            memory: 813,
             min_tier: 0,
             inputs: [
                 ("abc", true),
@@ -6802,7 +6802,7 @@ mod tests {
         }
         test_crlf_end_basic {
             pattern: "(?Rm)abc$",
-            memory: 773,
+            memory: 813,
             min_tier: 0,
             inputs: [
                 ("abc", true),
@@ -6817,7 +6817,7 @@ mod tests {
         }
         test_crlf_both_anchors {
             pattern: "(?Rm)^abc$",
-            memory: 806,
+            memory: 846,
             min_tier: 0,
             inputs: [
                 ("abc", true),
@@ -6835,7 +6835,7 @@ mod tests {
         }
         test_crlf_empty_lines {
             pattern: "(?Rm)^$",
-            memory: 707,
+            memory: 747,
             min_tier: 0,
             inputs: [
                 ("", true),
@@ -6849,19 +6849,19 @@ mod tests {
         }
         test_crlf_multiline_vs_lf_1 {
             pattern: "(?Rm)^abc$",
-            memory: 806,
+            memory: 846,
             min_tier: 0,
             inputs: [("\r\nabc\r\n", true)],
         }
         test_crlf_multiline_vs_lf_2 {
             pattern: "(?m)^abc$",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [("\r\nabc\r\n", false)],
         }
         test_crlf_with_dot_plus {
             pattern: "(?Rm)^.+$",
-            memory: 1029,
+            memory: 1069,
             min_tier: 0,
             inputs: [
                 ("abc", true),
@@ -6875,7 +6875,7 @@ mod tests {
         }
         test_crlf_with_counting {
             pattern: r#"(?Rm)^\d{2,4}$"#,
-            memory: 1161,
+            memory: 1201,
             min_tier: 0,
             inputs: [
                 ("12", true),
@@ -6887,25 +6887,25 @@ mod tests {
         }
         test_crlf_bare_cr_as_line_terminator {
             pattern: "(?Rm)^abc$",
-            memory: 806,
+            memory: 846,
             min_tier: 0,
             inputs: [("xxx\rabc\ryyy", true), ("xxx\rabc", true), ("abc\ryyy", true)],
         }
         test_crlf_end_before_cr {
             pattern: "(?Rm)abc$",
-            memory: 773,
+            memory: 813,
             min_tier: 0,
             inputs: [("abc\r", true), ("abc\r\n", true), ("abc\rxxx", true)],
         }
         test_crlf_start_after_lf_not_crlf_middle {
             pattern: "(?Rm)^x",
-            memory: 707,
+            memory: 747,
             min_tier: 0,
             inputs: [("\nx", true), ("\r\nx", true), ("\rx", true)],
         }
         test_crlf_mixed_terminators {
             pattern: "(?Rm)^abc$",
-            memory: 806,
+            memory: 846,
             min_tier: 0,
             inputs: [
                 ("xxx\nabc\ryyy", true),
@@ -6917,7 +6917,7 @@ mod tests {
         }
         test_crlf_end_only {
             pattern: "(?Rm)$",
-            memory: 674,
+            memory: 714,
             min_tier: 0,
             inputs: [
                 ("", true),
@@ -6929,7 +6929,7 @@ mod tests {
         }
         test_crlf_start_only {
             pattern: "(?Rm)^",
-            memory: 674,
+            memory: 714,
             min_tier: 0,
             inputs: [
                 ("", true),
@@ -6941,7 +6941,7 @@ mod tests {
         }
         test_word_boundary_literal {
             pattern: r#"\bfoo\b"#,
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("foo", true),
@@ -6958,19 +6958,19 @@ mod tests {
         }
         test_word_boundary_start_end_1 {
             pattern: r#"\bx"#,
-            memory: 707,
+            memory: 747,
             min_tier: 1,
             inputs: [("x", true), (" x", true), ("ax", false)],
         }
         test_word_boundary_start_end_2 {
             pattern: r#"x\b"#,
-            memory: 707,
+            memory: 747,
             min_tier: 1,
             inputs: [("x", true), ("x ", true), ("xa", false)],
         }
         test_word_boundary_quantifiers {
             pattern: r#"\b\w+\b"#,
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("hello", true),
@@ -6983,7 +6983,7 @@ mod tests {
         }
         test_word_boundary_counter {
             pattern: r#"\b\w{3,5}\b"#,
-            memory: 1194,
+            memory: 1234,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6997,7 +6997,7 @@ mod tests {
         }
         test_non_word_boundary {
             pattern: r#"\Bfoo\B"#,
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("xfooy", true),
@@ -7010,25 +7010,25 @@ mod tests {
         }
         test_word_boundary_digits_underscore_1 {
             pattern: r#"\b\d+\b"#,
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [("123", true), (" 456 ", true), ("abc123def", false)],
         }
         test_word_boundary_digits_underscore_2 {
             pattern: r#"\b_test_\b"#,
-            memory: 905,
+            memory: 945,
             min_tier: 1,
             inputs: [("_test_", true), (" _test_ ", true), ("x_test_y", false)],
         }
         test_word_boundary_bare {
             pattern: r#"\b"#,
-            memory: 674,
+            memory: 714,
             min_tier: 1,
             inputs: [("a", true), (" ", false), ("", false)],
         }
         test_non_word_boundary_bare {
             pattern: r#"\B"#,
-            memory: 674,
+            memory: 714,
             min_tier: 1,
             inputs: [("", true), (" ", true), ("a", false)],
         }
@@ -7037,7 +7037,7 @@ mod tests {
         // boundary, so non-boundary assertion fails).
         test_word_boundary_b_neg_end_of_word {
             pattern: r#"\B$"#,
-            memory: 707,
+            memory: 747,
             min_tier: 1,
             inputs: [
                 ("zzz", false),
@@ -7056,7 +7056,7 @@ mod tests {
         // cannot satisfy both ^ and $ at the same position.
         test_word_boundary_b_neg_anchored {
             pattern: r#"^\B$"#,
-            memory: 740,
+            memory: 780,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -7072,7 +7072,7 @@ mod tests {
         // So `^\b$` never matches any input.
         test_word_boundary_b_pos_anchored {
             pattern: r#"^\b$"#,
-            memory: 740,
+            memory: 780,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -7084,7 +7084,7 @@ mod tests {
         }
         test_word_boundary_mixed {
             pattern: r#"\bfoo\B"#,
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("foobar", true),
@@ -7096,7 +7096,7 @@ mod tests {
         }
         test_word_boundary_alternation {
             pattern: r#"\b(cat|dog)\b"#,
-            memory: 938,
+            memory: 978,
             min_tier: 1,
             inputs: [
                 ("cat", true),
@@ -7108,7 +7108,7 @@ mod tests {
         }
         test_word_boundary_special_chars {
             pattern: r#"\btest\b"#,
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("\0test\0", true),
@@ -7135,7 +7135,7 @@ mod tests {
         // char fails because prev=word, next=EOI(non-word) is a boundary.
         test_tier2_b_neg_eoi_counter {
             pattern: r#"^a{3,34}b{1,6}\B$"#,
-            memory: 1203,
+            memory: 1243,
             min_tier: 2,
             inputs: [
                 ("aaabb", false),
@@ -7148,7 +7148,7 @@ mod tests {
         // should still reject non-empty word-char inputs.
         test_tier2_b_neg_eoi_optional {
             pattern: r#"^(a{3,34}b{1,6}\B)?$"#,
-            memory: 1236,
+            memory: 1276,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -7160,7 +7160,7 @@ mod tests {
         // Tier 2: counted rep + \b\B (impossible assertion) at EOI.
         test_tier2_b_pos_b_neg_eoi {
             pattern: r#"^a?b{6,30}\b\B$"#,
-            memory: 939,
+            memory: 979,
             min_tier: 2,
             inputs: [
                 ("abbbbbbb", false),
@@ -7174,7 +7174,7 @@ mod tests {
         // end-of-input after word chars should fail.
         test_tier3_b_neg_eoi_counter {
             pattern: r#"^(ab?){3,34}\B$"#,
-            memory: 906,
+            memory: 946,
             min_tier: 3,
             inputs: [
                 ("aaa", false),
@@ -7201,7 +7201,7 @@ mod tests {
         // 13 chars: MATCH (\b passes at word→end).
         test_tier3_multi_counter_deferred_break {
             pattern: r#"^.{6,39}.{7,31}\b$"#,
-            memory: 1196,
+            memory: 1236,
             min_tier: 3,
             inputs: [
                 ("aaaaaaaaaaaa", false),
@@ -7212,7 +7212,7 @@ mod tests {
         // Same pattern with \B instead: \B fails at word→end.
         test_tier3_multi_counter_deferred_break_neg {
             pattern: r#"^.{6,39}.{7,31}\B$"#,
-            memory: 1196,
+            memory: 1236,
             min_tier: 3,
             inputs: [
                 ("aaaaaaaaaaaaa", false),
@@ -7234,7 +7234,7 @@ mod tests {
         // ---------------------------------------------------------------
         test_tier3_counter_alt_epsilon_mae {
             pattern: r#"(0{2,2}|1*)$"#,
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("0", true),
@@ -7263,7 +7263,7 @@ mod tests {
         // false.  On empty input, \b fails (SOI→EOI: same class=non-word).
         test_b_pos_b_neg_adjacent_simple {
             pattern: r#"^a?\b\B$"#,
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -7275,7 +7275,7 @@ mod tests {
         // takes the zero-repetition path, bypassing \b\B entirely).
         test_b_pos_b_neg_adjacent_optional {
             pattern: r#"^(a?\b\B)?$"#,
-            memory: 872,
+            memory: 912,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -7287,7 +7287,7 @@ mod tests {
 
         test_unanchored_counter_simple_1 {
             pattern: r#"\w{3,5}"#,
-            memory: 1128,
+            memory: 1168,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -7304,7 +7304,7 @@ mod tests {
         }
         test_unanchored_counter_simple_2 {
             pattern: "a{3}",
-            memory: 740,
+            memory: 780,
             min_tier: 1,
             inputs: [
                 ("aaa", true),
@@ -7318,7 +7318,7 @@ mod tests {
         }
         test_unanchored_counter_simple_3 {
             pattern: "[0-9]{4}",
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("1234", true),
@@ -7331,7 +7331,7 @@ mod tests {
         }
         test_unanchored_counter_alternation_body {
             pattern: "(a|bc){2,4}",
-            memory: 1235,
+            memory: 1275,
             min_tier: 1,
             inputs: [
                 ("aa", true),
@@ -7350,7 +7350,7 @@ mod tests {
         }
         test_unanchored_counter_multi_byte_body {
             pattern: "(ab){2,3}",
-            memory: 872,
+            memory: 912,
             min_tier: 1,
             inputs: [
                 ("abab", true),
@@ -7366,7 +7366,7 @@ mod tests {
         }
         test_unanchored_counter_nested {
             pattern: "((a|b){1,2}){2,3}",
-            memory: 1227,
+            memory: 1267,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -7381,7 +7381,7 @@ mod tests {
         }
         test_unanchored_counter_min_zero {
             pattern: "a{0,3}",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -7395,7 +7395,7 @@ mod tests {
         }
         test_unanchored_counter_unbounded {
             pattern: "a{2,}",
-            memory: 740,
+            memory: 780,
             min_tier: 1,
             inputs: [
                 ("aa", true),
@@ -7409,7 +7409,7 @@ mod tests {
         }
         test_unanchored_counter_wildcard_body {
             pattern: ".{3,5}",
-            memory: 1128,
+            memory: 1168,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -7422,7 +7422,7 @@ mod tests {
         }
         test_partial_anchor_start_counter_1 {
             pattern: "^a{2,3}",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("aa", true),
@@ -7435,7 +7435,7 @@ mod tests {
         }
         test_partial_anchor_start_counter_2 {
             pattern: r#"^\d{2,4}"#,
-            memory: 1128,
+            memory: 1168,
             min_tier: 1,
             inputs: [
                 ("12", true),
@@ -7448,7 +7448,7 @@ mod tests {
         }
         test_partial_anchor_end_counter_1 {
             pattern: "a{2,3}$",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("aa", true),
@@ -7461,7 +7461,7 @@ mod tests {
         }
         test_partial_anchor_end_counter_2 {
             pattern: r#"\d{2,4}$"#,
-            memory: 1128,
+            memory: 1168,
             min_tier: 1,
             inputs: [
                 ("12", true),
@@ -7474,7 +7474,7 @@ mod tests {
         }
         test_unanchored_byte_class_1 {
             pattern: r#"\d+"#,
-            memory: 963,
+            memory: 1003,
             min_tier: 1,
             inputs: [
                 ("123", true),
@@ -7485,7 +7485,7 @@ mod tests {
         }
         test_unanchored_byte_class_2 {
             pattern: r#"\w+"#,
-            memory: 963,
+            memory: 1003,
             min_tier: 1,
             inputs: [
                 ("hello", true),
@@ -7496,7 +7496,7 @@ mod tests {
         }
         test_unanchored_byte_class_3 {
             pattern: "[a-c]+",
-            memory: 963,
+            memory: 1003,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -7508,7 +7508,7 @@ mod tests {
         }
         test_unanchored_byte_table_counter {
             pattern: "(ab|cd|ef){2,3}",
-            memory: 4538,
+            memory: 4578,
             min_tier: 1,
             inputs: [
                 ("abcd", true),
@@ -7524,7 +7524,7 @@ mod tests {
         }
         test_unanchored_question_mark {
             pattern: "a?b",
-            memory: 740,
+            memory: 780,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -7538,7 +7538,7 @@ mod tests {
         }
         test_counter_exact_one {
             pattern: "a{1,1}",
-            memory: 674,
+            memory: 714,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -7550,7 +7550,7 @@ mod tests {
         }
         test_multiline_alternation_counter {
             pattern: "(?m:^)(a|bc){2,3}(?m:$)",
-            memory: 1136,
+            memory: 1176,
             min_tier: 1,
             inputs: [
                 ("aa", true),
@@ -7565,13 +7565,13 @@ mod tests {
         }
         test_empty_input_unanchored_counter {
             pattern: "a{0,3}",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [("", true)],
         }
         test_unanchored_byte_class_counter {
             pattern: r#"\d{2,4}"#,
-            memory: 1095,
+            memory: 1135,
             min_tier: 1,
             inputs: [
                 ("12", true),
@@ -7586,7 +7586,7 @@ mod tests {
         }
         test_counter_body_with_assertion_1 {
             pattern: "(?m:^a){2,3}",
-            memory: 872,
+            memory: 912,
             min_tier: 1,
             inputs: [
                 ("a\na", false),
@@ -7600,7 +7600,7 @@ mod tests {
         }
         test_counter_body_with_assertion_2 {
             pattern: "(?m:a$){2,3}",
-            memory: 872,
+            memory: 912,
             min_tier: 1,
             inputs: [
                 ("a\na", false),
@@ -7613,7 +7613,7 @@ mod tests {
         }
         test_counter_body_with_assertion_3 {
             pattern: "(?m:^a$){2,3}",
-            memory: 971,
+            memory: 1011,
             min_tier: 1,
             inputs: [
                 ("a\na", false),
@@ -7627,7 +7627,7 @@ mod tests {
         // Deferred assertion in L=1 counter body (promoted to tier 2)
         test_counter_body_word_boundary_end_1 {
             pattern: r"(\w\b){1,3}",
-            memory: 1161,
+            memory: 1201,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -7641,7 +7641,7 @@ mod tests {
         }
         test_counter_body_word_boundary_end_2 {
             pattern: r"(\w\b){2,4}",
-            memory: 1227,
+            memory: 1267,
             min_tier: 1,
             inputs: [
                 ("a", false),
@@ -7653,7 +7653,7 @@ mod tests {
         }
         test_counter_body_word_boundary_end_3 {
             pattern: r"(\w\b){1,2}",
-            memory: 1062,
+            memory: 1102,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -7665,7 +7665,7 @@ mod tests {
         }
         test_counter_body_dot_boundary {
             pattern: r"(.\b){2,4}",
-            memory: 1227,
+            memory: 1267,
             min_tier: 1,
             inputs: [
                 ("a b", true),
@@ -7679,7 +7679,7 @@ mod tests {
         }
         test_counter_body_boundary_at_start {
             pattern: r"(\ba){2,4}",
-            memory: 971,
+            memory: 1011,
             min_tier: 1,
             inputs: [
                 ("aa", false),
@@ -7695,7 +7695,7 @@ mod tests {
         // only fire at actual EOI (not mid-stream via match_at_end).
         test_counter_body_non_word_boundary_1 {
             pattern: r"^(.\B){1,2}$",
-            memory: 1128,
+            memory: 1168,
             min_tier: 1,
             inputs: [
                 (" ", true),    // 1 non-word: \B passes at EOI
@@ -7707,7 +7707,7 @@ mod tests {
         }
         test_counter_body_non_word_boundary_2 {
             pattern: r"^(.\B){2,3}$",
-            memory: 1194,
+            memory: 1234,
             min_tier: 1,
             inputs: [
                 ("  ", true),
@@ -7720,7 +7720,7 @@ mod tests {
         }
         test_counter_body_non_word_boundary_3 {
             pattern: r"^(.\B){1,12}$",
-            memory: 1096,
+            memory: 1136,
             min_tier: 2,
             inputs: [
                 (" ", true),
@@ -7733,7 +7733,7 @@ mod tests {
         // (break path through deferred assert can't be followed in probe closure)
         test_multi_counter_deferred_body {
             pattern: r"(a\B){2,3}(b\B){2,3}",
-            memory: 1103,
+            memory: 1143,
             min_tier: 1,
             inputs: [
                 ("aabbc", true),
@@ -7750,7 +7750,7 @@ mod tests {
         // before increment so the counter is non-empty when CInc fires.
         test_deferred_assert_before_counter_1 {
             pattern: r"\b.{1,2}",
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -7762,7 +7762,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_2 {
             pattern: r"^(\b.{1,34}?)?$",
-            memory: 1129,
+            memory: 1169,
             min_tier: 2,
             inputs: [
                 ("a", true),
@@ -7773,7 +7773,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_3 {
             pattern: r"^(\b((.{1,34}|a?))?)?$",
-            memory: 1261,
+            memory: 1301,
             min_tier: 2,
             inputs: [
                 ("x", true),
@@ -7783,7 +7783,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_4 {
             pattern: r"^(\B.{1,34}?)?$",
-            memory: 1129,
+            memory: 1169,
             min_tier: 2,
             inputs: [
                 ("\x00", true), // \B: non-word→non-word
@@ -7797,7 +7797,7 @@ mod tests {
         // outer ? / * pushed RepeatZeroOne expecting a fragment.
         test_zero_zero_rep_nested {
             pattern: r"^(.{0,0}?)?((a?a?)?(a?a?)?)?$",
-            memory: 1070,
+            memory: 1110,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -7815,7 +7815,7 @@ mod tests {
         // can_reach_match_at_end().
         test_contradictory_adjacent_asserts {
             pattern: r"^.{10,31}\B\b$",
-            memory: 1129,
+            memory: 1169,
             min_tier: 2,
             inputs: [
                 ("yyyyyyyyyy0aaaaaaaaaaaaaaaaa", false), // \B\b always fails
@@ -7833,7 +7833,7 @@ mod tests {
         // off-by-one in the counter.
         test_tier2_resolved_seed_non_body_byte {
             pattern: r"\B {7,12}",
-            memory: 1235,
+            memory: 1275,
             min_tier: 1,
             inputs: [
                 (" !      ", false),   // 1 space + ! + 6 spaces: need 7 contiguous from \B
@@ -7847,7 +7847,7 @@ mod tests {
         // Deferred assertion patterns (migrated from standalone tests)
         test_non_word_boundary_inside_word {
             pattern: r#"\Boo\B"#,
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("foobar", true),
@@ -7858,7 +7858,7 @@ mod tests {
         }
         test_endlf_before_newline {
             pattern: r#"(?m)foo$"#,
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("foo", true),
@@ -7871,7 +7871,7 @@ mod tests {
         }
         test_endlf_at_eof {
             pattern: r#"(?m)bar$"#,
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("bar", true),
@@ -7882,7 +7882,7 @@ mod tests {
         }
         test_word_boundary_with_endlf {
             pattern: r#"(?m)\bfoo\b$"#,
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("foo", true),
@@ -7895,7 +7895,7 @@ mod tests {
         }
         test_word_boundary_sql_keywords {
             pattern: r#"\b(?:select|insert|update|delete)\b"#,
-            memory: 3646,
+            memory: 3686,
             min_tier: 1,
             inputs: [
                 ("select", true),
@@ -7909,7 +7909,7 @@ mod tests {
         // Word-start and word-end boundary assertions
         test_word_start_basic {
             pattern: r#"\b{start}\w+\b{end}"#,
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("hello", true),
@@ -7922,7 +7922,7 @@ mod tests {
         }
         test_word_start_only {
             pattern: r#"\b{start}foo"#,
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("foo", true),
@@ -7934,7 +7934,7 @@ mod tests {
         }
         test_word_end_only {
             pattern: r#"foo\b{end}"#,
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("foo", true),
@@ -7946,7 +7946,7 @@ mod tests {
         }
         test_word_start_alternation {
             pattern: r#"\b{start}(?:cat|dog)\b{end}"#,
-            memory: 938,
+            memory: 978,
             min_tier: 1,
             inputs: [
                 ("cat", true),
@@ -7958,7 +7958,7 @@ mod tests {
         }
         test_word_start_with_counter {
             pattern: r#"\b{start}\w{3,5}\b{end}"#,
-            memory: 1194,
+            memory: 1234,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -7972,7 +7972,7 @@ mod tests {
         }
         test_word_end_at_eof {
             pattern: r#"test\b{end}"#,
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("test", true),
@@ -7983,7 +7983,7 @@ mod tests {
         }
         test_word_start_at_start {
             pattern: r#"\b{start}test"#,
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("test", true),
@@ -7994,7 +7994,7 @@ mod tests {
         }
         test_multiline_abc {
             pattern: "(?m:^)abc(?m:$)",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -8007,7 +8007,7 @@ mod tests {
         }
         test_unanchored_counter_a35 {
             pattern: "a{3,5}",
-            memory: 872,
+            memory: 912,
             min_tier: 1,
             inputs: [
                 ("aaa", true),
@@ -8022,7 +8022,7 @@ mod tests {
         // Nested counter patterns (migrated from survey_nested_counter_bugs)
         test_nested_a2_x3 {
             pattern: "(a{2}){3}",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("aaaaa", false),
@@ -8032,7 +8032,7 @@ mod tests {
         }
         test_nested_a3_x2 {
             pattern: "(a{3}){2}",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("aaaa", false),
@@ -8043,7 +8043,7 @@ mod tests {
         }
         test_nested_ab_x2 {
             pattern: "(ab){2}",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("aba", false),
@@ -8054,7 +8054,7 @@ mod tests {
         }
         test_nested_ab_x3 {
             pattern: "(ab){3}",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("ababa", false),
@@ -8065,7 +8065,7 @@ mod tests {
         }
         test_nested_a23_x2 {
             pattern: "(a{2,3}){2}",
-            memory: 905,
+            memory: 945,
             min_tier: 1,
             inputs: [
                 ("aaa", false),
@@ -8077,7 +8077,7 @@ mod tests {
         }
         test_nested_a2_x2_x2 {
             pattern: "((a{2}){2}){2}",
-            memory: 905,
+            memory: 945,
             min_tier: 1,
             inputs: [
                 ("aaaaaaa", false),
@@ -8087,7 +8087,7 @@ mod tests {
         }
         test_nested_a2_x23 {
             pattern: "(a{2}){2,3}",
-            memory: 872,
+            memory: 912,
             min_tier: 1,
             inputs: [
                 ("aaa", false),
@@ -8099,7 +8099,7 @@ mod tests {
         }
         test_nested_dotdot_x2 {
             pattern: "(..){2}",
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("aaa", false),
@@ -8110,7 +8110,7 @@ mod tests {
         }
         test_nested_abc_x2 {
             pattern: "(abc){2}",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("abcab", false),
@@ -8121,7 +8121,7 @@ mod tests {
         }
         test_non_nested_a4 {
             pattern: "a{4}",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("aaa", false),
@@ -8132,7 +8132,7 @@ mod tests {
         }
         test_non_nested_a2 {
             pattern: "a{2}",
-            memory: 707,
+            memory: 747,
             min_tier: 1,
             inputs: [
                 ("aa", true),
@@ -8143,7 +8143,7 @@ mod tests {
         }
         test_nested_a12_x2 {
             pattern: "^(a{1,2}){2}$",
-            memory: 905,
+            memory: 945,
             min_tier: 1,
             inputs: [
                 ("aa", true),
@@ -8155,7 +8155,7 @@ mod tests {
         }
         test_byte_table_cross_validate_unanchored {
             pattern: "(ab|cd|ef)",
-            memory: 1929,
+            memory: 1969,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -8173,7 +8173,7 @@ mod tests {
         }
         test_byte_table_with_bounded_repetition_cross_validate {
             pattern: "^(ab|cd|ef){2,4}$",
-            memory: 2062,
+            memory: 2102,
             min_tier: 2,
             inputs: [
                 ("abcd", true),
@@ -8191,7 +8191,7 @@ mod tests {
         }
         test_byte_table_counted_with_suffix {
             pattern: "^(ab|cd|ef){1,3}x$",
-            memory: 6718,
+            memory: 6758,
             min_tier: 1,
             inputs: [
                 ("abx", true),
@@ -8209,7 +8209,7 @@ mod tests {
         }
         test_byte_table_mixed_length_unanchored {
             pattern: "(a|bc|def)",
-            memory: 1929,
+            memory: 1969,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -8225,7 +8225,7 @@ mod tests {
         }
         test_byte_table_with_prefix_and_suffix {
             pattern: "^xx(ab|cd|ef)yy$",
-            memory: 2127,
+            memory: 2167,
             min_tier: 1,
             inputs: [
                 ("xxabyy", true),
@@ -8241,7 +8241,7 @@ mod tests {
         }
         test_byte_table_after_wildcard {
             pattern: "^..(ab|cd|ef)$",
-            memory: 2317,
+            memory: 2357,
             min_tier: 1,
             inputs: [
                 ("xxab", true),
@@ -8256,7 +8256,7 @@ mod tests {
         }
         test_byte_table_followed_by_wildcard {
             pattern: "^(ab|cd|ef).*x$",
-            memory: 2350,
+            memory: 2390,
             min_tier: 1,
             inputs: [
                 ("abx", true),
@@ -8273,7 +8273,7 @@ mod tests {
         }
         test_byte_table_sandwiched_by_wildcards {
             pattern: "^.*(ab|cd|ef).*$",
-            memory: 2383,
+            memory: 2423,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -8290,7 +8290,7 @@ mod tests {
         }
         test_step_fused_multi_counter_same_byte {
             pattern: "a{2}.*a{3}",
-            memory: 1128,
+            memory: 1168,
             min_tier: 1,
             inputs: [
                 ("aaaaa", true),
@@ -8305,7 +8305,7 @@ mod tests {
         }
         test_step_fused_alternation_overlap {
             pattern: "(a|a){2,3}",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("aa", true),
@@ -8319,7 +8319,7 @@ mod tests {
         }
         test_step_fused_byteclass_and_literal {
             pattern: "[a-z]{2}a{2}",
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("xyaa", true),
@@ -8335,7 +8335,7 @@ mod tests {
         }
         test_step_fused_reseed_with_counter {
             pattern: "(a{2}){2}",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("aaaa", true),
@@ -8351,7 +8351,7 @@ mod tests {
         }
         test_ci_literal_single {
             pattern: "^(?i)a$",
-            memory: 740,
+            memory: 780,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -8367,7 +8367,7 @@ mod tests {
         }
         test_ci_literal_multi {
             pattern: "^(?i)abc$",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -8391,7 +8391,7 @@ mod tests {
         }
         test_ci_one_plus {
             pattern: "^(?i)a+$",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -8411,7 +8411,7 @@ mod tests {
         }
         test_ci_star {
             pattern: "^(?i)a*$",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -8426,7 +8426,7 @@ mod tests {
         }
         test_ci_question {
             pattern: "^(?i)a?$",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -8440,7 +8440,7 @@ mod tests {
         }
         test_ci_counted {
             pattern: "^(?i)a{2,4}$",
-            memory: 905,
+            memory: 945,
             min_tier: 1,
             inputs: [
                 ("aa", true),
@@ -8467,7 +8467,7 @@ mod tests {
         }
         test_ci_counted_min_zero {
             pattern: "^(?i)a{0,3}$",
-            memory: 905,
+            memory: 945,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -8484,7 +8484,7 @@ mod tests {
         }
         test_ci_alternation {
             pattern: "^(?i)(a|bc)$",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -8506,7 +8506,7 @@ mod tests {
         }
         test_ci_alternation_three_way {
             pattern: "^(?i)(abc|def|ghi)$",
-            memory: 1070,
+            memory: 1110,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -8529,7 +8529,7 @@ mod tests {
         }
         test_ci_mixed_letter_nonletter {
             pattern: "^(?i)hello world$",
-            memory: 1070,
+            memory: 1110,
             min_tier: 1,
             inputs: [
                 ("hello world", true),
@@ -8546,7 +8546,7 @@ mod tests {
         }
         test_ci_with_digits {
             pattern: "^(?i)a1b2c$",
-            memory: 872,
+            memory: 912,
             min_tier: 1,
             inputs: [
                 ("a1b2c", true),
@@ -8562,7 +8562,7 @@ mod tests {
         }
         test_ci_byte_class {
             pattern: "^(?i)[abc]$",
-            memory: 996,
+            memory: 1036,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -8582,7 +8582,7 @@ mod tests {
         }
         test_ci_byte_class_full_alpha {
             pattern: "^(?i)[a-z]$",
-            memory: 996,
+            memory: 1036,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -8600,7 +8600,7 @@ mod tests {
         }
         test_ci_byte_class_alpha_digit {
             pattern: "^(?i)[a-z0-9]+$",
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("abc123", true),
@@ -8616,7 +8616,7 @@ mod tests {
         }
         test_ci_word_boundary {
             pattern: r"(?i)\bfoo\b",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("foo", true),
@@ -8642,7 +8642,7 @@ mod tests {
         }
         test_ci_unanchored {
             pattern: "(?i)select",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("SELECT", true),
@@ -8661,7 +8661,7 @@ mod tests {
         }
         test_ci_counted_group {
             pattern: "^(?i)(ab){2,3}$",
-            memory: 938,
+            memory: 978,
             min_tier: 1,
             inputs: [
                 ("abab", true),
@@ -8683,7 +8683,7 @@ mod tests {
         }
         test_ci_catenation_one_plus {
             pattern: "^(?i)a+b+c+$",
-            memory: 905,
+            memory: 945,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -8704,7 +8704,7 @@ mod tests {
         }
         test_ci_wildcard {
             pattern: "^(?i).*foo.*$",
-            memory: 1194,
+            memory: 1234,
             min_tier: 1,
             inputs: [
                 ("foo", true),
@@ -8724,7 +8724,7 @@ mod tests {
         }
         test_ci_digit_then_hex {
             pattern: r#"^(?i)\d+[a-f]+$"#,
-            memory: 1351,
+            memory: 1391,
             min_tier: 1,
             inputs: [
                 ("1a", true),
@@ -8743,7 +8743,7 @@ mod tests {
         }
         test_ci_word_class {
             pattern: r#"^(?i)\w+$"#,
-            memory: 1029,
+            memory: 1069,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -8759,7 +8759,7 @@ mod tests {
         }
         test_ci_waf_sql_keywords {
             pattern: r"(?i)\b(?:select|insert|update|delete)\b",
-            memory: 1598,
+            memory: 1638,
             min_tier: 1,
             inputs: [
                 ("SELECT", true),
@@ -8791,7 +8791,7 @@ mod tests {
         }
         test_ci_function_call {
             pattern: r#"(?i)\bfoo\("#,
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("foo(", true),
@@ -8810,7 +8810,7 @@ mod tests {
         }
         test_ci_counted_alternation {
             pattern: "^(?i)(a|b){1,2}$",
-            memory: 1062,
+            memory: 1102,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -8838,7 +8838,7 @@ mod tests {
         }
         test_ci_dot_in_middle {
             pattern: "^(?i)x.y$",
-            memory: 1062,
+            memory: 1102,
             min_tier: 1,
             inputs: [
                 ("xay", true),
@@ -8856,7 +8856,7 @@ mod tests {
         }
         test_ci_negated_class {
             pattern: "^(?i)[^a-z]$",
-            memory: 996,
+            memory: 1036,
             min_tier: 1,
             inputs: [
                 ("0", true),
@@ -8876,7 +8876,7 @@ mod tests {
         }
         test_ci_counted_wildcard {
             pattern: "^(?i).{2,4}$",
-            memory: 1161,
+            memory: 1201,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -8892,7 +8892,7 @@ mod tests {
         }
         test_ci_repeated_alternation {
             pattern: "^(?i)(foo|bar)+$",
-            memory: 971,
+            memory: 1011,
             min_tier: 1,
             inputs: [
                 ("foo", true),
@@ -8917,7 +8917,7 @@ mod tests {
         }
         test_ci_non_word_class {
             pattern: r#"^(?i)a\Wb$"#,
-            memory: 1062,
+            memory: 1102,
             min_tier: 1,
             inputs: [
                 ("a b", true),
@@ -8936,7 +8936,7 @@ mod tests {
         }
         test_partial_ci_middle {
             pattern: "^a(?i:b)c$",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -8955,7 +8955,7 @@ mod tests {
         }
         test_partial_ci_prefix {
             pattern: "^(?i:a)b$",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -8970,7 +8970,7 @@ mod tests {
         }
         test_partial_ci_suffix {
             pattern: "^a(?i:b)$",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -8984,7 +8984,7 @@ mod tests {
         }
         test_partial_ci_toggle_on_off {
             pattern: "^(?i)a(?-i)b$",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -8999,7 +8999,7 @@ mod tests {
         }
         test_partial_ci_toggle_off_then_on {
             pattern: "^a(?-i)b(?i)c$",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -9015,7 +9015,7 @@ mod tests {
         }
         test_partial_ci_quantified_group {
             pattern: "^a(?i:b)+c$",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -9034,7 +9034,7 @@ mod tests {
         }
         test_partial_ci_star_group {
             pattern: "^a(?i:b)*c$",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("ac", true),
@@ -9051,7 +9051,7 @@ mod tests {
         }
         test_partial_ci_counted_group {
             pattern: "^a(?i:b){2,4}c$",
-            memory: 971,
+            memory: 1011,
             min_tier: 1,
             inputs: [
                 ("abbc", true),
@@ -9074,7 +9074,7 @@ mod tests {
         }
         test_partial_ci_multi_letter_group {
             pattern: "^a(?i:bc)d$",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("abcd", true),
@@ -9092,7 +9092,7 @@ mod tests {
         }
         test_partial_ci_adjacent_groups {
             pattern: "^(?i:a)(?i:b)c$",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -9109,7 +9109,7 @@ mod tests {
         }
         test_partial_ci_alternation_then_literal {
             pattern: "^(?i:a|bc)d$",
-            memory: 872,
+            memory: 912,
             min_tier: 1,
             inputs: [
                 ("ad", true),
@@ -9130,7 +9130,7 @@ mod tests {
         }
         test_partial_ci_word_in_middle {
             pattern: "^x(?i:foo)y$",
-            memory: 872,
+            memory: 912,
             min_tier: 1,
             inputs: [
                 ("xfooy", true),
@@ -9148,7 +9148,7 @@ mod tests {
         }
         test_partial_ci_three_segments {
             pattern: "^(?i)abc(?-i)def(?i)ghi$",
-            memory: 1004,
+            memory: 1044,
             min_tier: 1,
             inputs: [
                 ("abcdefghi", true),
@@ -9170,7 +9170,7 @@ mod tests {
         }
         test_partial_ci_waf_keyword_prefix {
             pattern: r#"(?i:select)\s+\w+"#,
-            memory: 1483,
+            memory: 1523,
             min_tier: 1,
             inputs: [
                 ("select foo", true),
@@ -9188,7 +9188,7 @@ mod tests {
         }
         test_partial_ci_optional_group {
             pattern: "^a(?i:b)?c$",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("ac", true),
@@ -9205,7 +9205,7 @@ mod tests {
         }
         test_partial_ci_unanchored_key_value {
             pattern: "x(?i:key)=",
-            memory: 806,
+            memory: 846,
             min_tier: 1,
             inputs: [
                 ("xkey=val", true),
@@ -9221,7 +9221,7 @@ mod tests {
         }
         test_partial_ci_counted_group_then_literal {
             pattern: "^(?i:ab){2,3}c$",
-            memory: 971,
+            memory: 1011,
             min_tier: 1,
             inputs: [
                 ("ababc", true),
@@ -9241,7 +9241,7 @@ mod tests {
         }
         test_partial_ci_class_in_group {
             pattern: "^a(?i:[b-d])e$",
-            memory: 1062,
+            memory: 1102,
             min_tier: 1,
             inputs: [
                 ("abe", true),
@@ -9261,7 +9261,7 @@ mod tests {
         }
         test_partial_ci_four_toggles {
             pattern: "^(?i)a(?-i)b(?i)c(?-i)d$",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("abcd", true),
@@ -9279,7 +9279,7 @@ mod tests {
         }
         test_partial_ci_interleaved_digits {
             pattern: "^(?i:a)1(?i:b)2$",
-            memory: 839,
+            memory: 879,
             min_tier: 1,
             inputs: [
                 ("a1b2", true),
@@ -9302,7 +9302,7 @@ mod tests {
 
         test_multi_counter_two_fixed {
             pattern: "^[A-Z]{4}[0-9]{16}$",
-            memory: 1879,
+            memory: 1919,
             min_tier: 1,
             inputs: [
                 ("ABCD1234567890123456", true),
@@ -9316,7 +9316,7 @@ mod tests {
         }
         test_multi_counter_two_ranges {
             pattern: "^a{3,5}b{2,4}$",
-            memory: 1136,
+            memory: 1176,
             min_tier: 1,
             inputs: [
                 ("aaabb", true),
@@ -9338,7 +9338,7 @@ mod tests {
         }
         test_multi_counter_three_fixed {
             pattern: "^a{2}b{3}c{2}$",
-            memory: 938,
+            memory: 978,
             min_tier: 1,
             inputs: [
                 ("aabbbcc", true),
@@ -9353,7 +9353,7 @@ mod tests {
         }
         test_multi_counter_three_ranges {
             pattern: "^x{1,3}y{2,4}z{1,2}$",
-            memory: 1169,
+            memory: 1209,
             min_tier: 1,
             inputs: [
                 ("xyyz", true),
@@ -9373,7 +9373,7 @@ mod tests {
         }
         test_multi_counter_unanchored {
             pattern: "[A-Z]{3}[0-9]{3}",
-            memory: 1351,
+            memory: 1391,
             min_tier: 1,
             inputs: [
                 ("ABC123", true),
@@ -9386,7 +9386,7 @@ mod tests {
         }
         test_multi_counter_with_literal_prefix {
             pattern: "^ID-[A-Z]{4}-[0-9]{6}$",
-            memory: 1681,
+            memory: 1721,
             min_tier: 1,
             inputs: [
                 ("ID-ABCD-123456", true),
@@ -9402,7 +9402,7 @@ mod tests {
         // Overlapping character classes: must NOT be tier 2.
         test_multi_counter_overlapping_falls_to_tier3 {
             pattern: r"^\w{3}\d{2}$",
-            memory: 1384,
+            memory: 1424,
             min_tier: 1,
             inputs: [
                 ("abc12", true),
@@ -9421,7 +9421,7 @@ mod tests {
         // Empty child.
         test_alternation_empty_branch_ci {
             pattern: r"(?i)\[(groups|group)\]",
-            memory: 938,
+            memory: 978,
             min_tier: 1,
             inputs: [
                 ("[groups]", true),
@@ -9435,7 +9435,7 @@ mod tests {
         // Explicit `(a|)` — one branch is empty.
         test_alternation_explicit_empty {
             pattern: "(a|)",
-            memory: 707,
+            memory: 747,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -9446,7 +9446,7 @@ mod tests {
         // Empty branch first: `(|a)`.
         test_alternation_empty_first {
             pattern: "(|a)",
-            memory: 707,
+            memory: 747,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -9457,7 +9457,7 @@ mod tests {
         // Three-way alternation with empty branch: `(a|b|)`.
         test_alternation_three_way_empty {
             pattern: "(a|b|)",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -9469,7 +9469,7 @@ mod tests {
         // Anchored common-prefix factoring: `^(abc|ab)$` → `^ab(c?)$`.
         test_alternation_common_prefix_anchored {
             pattern: "^(abc|ab)$",
-            memory: 905,
+            memory: 945,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -9481,7 +9481,7 @@ mod tests {
         // Case-insensitive common-prefix: `(?i)(abc|ab)`.
         test_alternation_common_prefix_ci {
             pattern: "(?i)(abc|ab)",
-            memory: 773,
+            memory: 813,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -9494,7 +9494,7 @@ mod tests {
         // Common-prefix with counter body: `^(a{2,3}b|a{2,3})$`.
         test_alternation_common_prefix_counter {
             pattern: "^(a{2,3}b|a{2,3})$",
-            memory: 1037,
+            memory: 1077,
             min_tier: 1,
             inputs: [
                 ("aa", true),
@@ -9519,7 +9519,7 @@ mod tests {
         // Optional at end of body: `(aaa?){2}` — the original bug case.
         test_tier3_optional_end {
             pattern: "^(aaa?){2}$",
-            memory: 971,
+            memory: 1011,
             min_tier: 1,
             inputs: [
                 ("aaaa", true),
@@ -9534,7 +9534,7 @@ mod tests {
         // Optional in 2-char body: `(ab?){2}`.
         test_tier3_optional_short_body {
             pattern: "^(ab?){2}$",
-            memory: 905,
+            memory: 945,
             min_tier: 1,
             inputs: [
                 ("aa", true),
@@ -9550,7 +9550,7 @@ mod tests {
         // Optional at start of body: `(a?b){2}`.
         test_tier3_optional_start {
             pattern: "^(a?b){2}$",
-            memory: 905,
+            memory: 945,
             min_tier: 1,
             inputs: [
                 ("bb", true),
@@ -9566,7 +9566,7 @@ mod tests {
         // Optional in middle of 3-char body: `(ab?c){2}`.
         test_tier3_optional_middle {
             pattern: "^(ab?c){2}$",
-            memory: 971,
+            memory: 1011,
             min_tier: 1,
             inputs: [
                 ("acac", true),
@@ -9582,7 +9582,7 @@ mod tests {
         // Higher count: `(ab?){3}`.
         test_tier3_optional_higher_count {
             pattern: "^(ab?){3}$",
-            memory: 1004,
+            memory: 1044,
             min_tier: 1,
             inputs: [
                 ("aaa", true),
@@ -9598,7 +9598,7 @@ mod tests {
         // Range count with optional: `(aab?){2,4}`.
         test_tier3_optional_range {
             pattern: "^(aab?){2,4}$",
-            memory: 1301,
+            memory: 1341,
             min_tier: 1,
             inputs: [
                 ("aaaa", true),
@@ -9615,7 +9615,7 @@ mod tests {
         // Range count, optional at start: `(a?b){3,5}`.
         test_tier3_optional_range_start {
             pattern: "^(a?b){3,5}$",
-            memory: 1268,
+            memory: 1308,
             min_tier: 1,
             inputs: [
                 ("bbb", true),
@@ -9631,7 +9631,7 @@ mod tests {
         // Multi-char body with optional: `(abc?d){2}`.
         test_tier3_optional_multichar {
             pattern: "^(abc?d){2}$",
-            memory: 1037,
+            memory: 1077,
             min_tier: 1,
             inputs: [
                 ("abdabd", true),
@@ -9651,7 +9651,7 @@ mod tests {
 
         test_adjacent_same_byte_counters {
             pattern: "^a{2,50}a{3,70}$",
-            memory: 907,
+            memory: 947,
             min_tier: 3,
             inputs: [
                 ("aaaaa", true),
@@ -9672,7 +9672,7 @@ mod tests {
         // Simple: inner {1,3} unrolls (cost 5 ≤ 32), body becomes variable-length → tier 3.
         test_inner_unroll_simple {
             pattern: "^(a{1,3}){2,4}$",
-            memory: 1433,
+            memory: 1473,
             min_tier: 1,
             inputs: [
                 ("aa", true),
@@ -9689,7 +9689,7 @@ mod tests {
         // Inner {1,2} with multi-byte body inside counter.
         test_inner_unroll_multibyte_body {
             pattern: "^(ab{1,2}){2,3}$",
-            memory: 1136,
+            memory: 1176,
             min_tier: 1,
             inputs: [
                 ("abab", true),
@@ -9705,7 +9705,7 @@ mod tests {
         // Inner {0,3} inside counter — zero-min inner unrolls too.
         test_inner_unroll_zero_min {
             pattern: "^(a{0,3}){2,4}$",
-            memory: 1565,
+            memory: 1605,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -9720,7 +9720,7 @@ mod tests {
         // Two inner repetitions in the same counter body.
         test_inner_unroll_two_reps {
             pattern: "^(a{1,2}b{1,2}){2,3}$",
-            memory: 1334,
+            memory: 1374,
             min_tier: 1,
             inputs: [
                 ("abab", true),
@@ -9736,7 +9736,7 @@ mod tests {
         // Case-insensitive inner unrolling.
         test_inner_unroll_case_insensitive {
             pattern: "^(?i)(a{1,3}){2,4}$",
-            memory: 1433,
+            memory: 1473,
             min_tier: 1,
             inputs: [
                 ("aA", true),
@@ -9755,7 +9755,7 @@ mod tests {
         // sequential counters.
         test_inner_unroll_over_budget {
             pattern: "^(a{1,17}b){2,3}$",
-            memory: 1139,
+            memory: 1179,
             min_tier: 3,
             inputs: [
                 ("abab", true),
@@ -9771,7 +9771,7 @@ mod tests {
         // The motivating pattern from the rebar benchmarks.
         test_inner_unroll_ip_pattern {
             pattern: r"(?i)(?:(?:[0-9]{1,3}\.){3}[0-9]{1,3}|(?:[0-9a-f]{1,4}::?){2,7}[0-9a-f]{1,4}):$",
-            memory: 2639,
+            memory: 2679,
             min_tier: 3,
             inputs: [
                 ("192.168.1.1:", true),
@@ -9787,7 +9787,7 @@ mod tests {
         // Anchored inner {1,4} inside {3} (fixed outer).
         test_inner_unroll_fixed_outer {
             pattern: "^(a{1,4}){3}$",
-            memory: 1400,
+            memory: 1440,
             min_tier: 1,
             inputs: [
                 ("aaa", true),
@@ -9801,7 +9801,7 @@ mod tests {
         // Inner {2,3} inside {0,2} — zero-min outer with inner unrolling.
         test_inner_unroll_zero_min_outer {
             pattern: "^(a{2,3}){0,2}$",
-            memory: 1037,
+            memory: 1077,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -9817,7 +9817,7 @@ mod tests {
         // Dot-based inner repetition inside counter.
         test_inner_unroll_dot_body {
             pattern: "^(.{1,3}x){2,3}$",
-            memory: 1590,
+            memory: 1630,
             min_tier: 1,
             inputs: [
                 ("axbx", true),
@@ -9861,7 +9861,7 @@ mod tests {
         // where the 'a' origin dies on non-'a' bytes.
         test_tier3_varlen_alternation_body {
             pattern: "(ab|a){1,100}c",
-            memory: 873,
+            memory: 913,
             min_tier: 3,
             inputs: [
                 ("ac", true),
@@ -9878,7 +9878,7 @@ mod tests {
         // All bytes match at every origin, so ranges grow uniformly.
         test_tier3_varlen_dot_range_body {
             pattern: "(.{1,5}){1,100}z",
-            memory: 1294,
+            memory: 1334,
             min_tier: 3,
             inputs: [
                 ("az", true),
@@ -9893,7 +9893,7 @@ mod tests {
         // any byte.  The 'b' branch bypasses origin 1 entirely.
         test_tier3_varlen_mixed_selectivity {
             pattern: "(a.|b){1,50}c",
-            memory: 1129,
+            memory: 1169,
             min_tier: 3,
             inputs: [
                 ("axc", true),
@@ -9908,7 +9908,7 @@ mod tests {
         // range merge at 10 origins, 1000 max iterations.
         test_tier3_varlen_large_body_high_count {
             pattern: ".{0,1000}(.{1,10}){0,1000}c",
-            memory: 1790,
+            memory: 1830,
             min_tier: 3,
             inputs: [
                 ("c", true),
@@ -9921,7 +9921,7 @@ mod tests {
         // with multi-origin range tracking.
         test_tier3_varlen_anchored {
             pattern: "^(ab|a){2,5}$",
-            memory: 1466,
+            memory: 1506,
             min_tier: 1,
             inputs: [
                 ("aa", true),
@@ -9939,7 +9939,7 @@ mod tests {
         // independently with its own set of origin ranges.
         test_tier3_varlen_two_counters {
             pattern: "(ab|a){1,50}(xy|x){1,50}z",
-            memory: 1072,
+            memory: 1112,
             min_tier: 3,
             inputs: [
                 ("axz", true),
@@ -9960,7 +9960,7 @@ mod tests {
         // lacked dedup, causing the counter to never reach its minimum.)
         test_tier3_varlen_plus_body_dedup {
             pattern: ".a+{9,28}",
-            memory: 1063,
+            memory: 1103,
             min_tier: 3,
             inputs: [
                 ("aaaaaaaaaa", true),      // 10 a's: . + a+{9} (each a+ = 1 a)
@@ -9986,7 +9986,7 @@ mod tests {
         // tracker detects this when counter 0 breaks.
         test_tier3_post_break_tail_literal {
             pattern: "^a.{3}b$",
-            memory: 1128,
+            memory: 1168,
             min_tier: 1,
             inputs: [
                 ("a123b", true),
@@ -10002,7 +10002,7 @@ mod tests {
         // `$ → Match`.
         test_tier3_post_break_tail_wildcard {
             pattern: "^.{3,5}.$",
-            memory: 1227,
+            memory: 1267,
             min_tier: 1,
             inputs: [
                 ("abcd", true),
@@ -10017,7 +10017,7 @@ mod tests {
         // through the two-hop path `b → c → $ → Match`.
         test_tier3_post_break_tail_two_hop {
             pattern: "^.{2,4}bc$",
-            memory: 1227,
+            memory: 1267,
             min_tier: 1,
             inputs: [
                 ("aabc", true),
@@ -10041,7 +10041,7 @@ mod tests {
         // the Advance-action origin's `target_is_match_at_end` was ignored.
         test_tier3_counter_free_mae_advance {
             pattern: "^(.{0,2}.a?)?$",
-            memory: 1227,
+            memory: 1267,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -10066,7 +10066,7 @@ mod tests {
         // break paths) and track `nb_counter_free_mae` separately.
         test_tier3_counter_free_mae_multi_counter {
             pattern: "^c{2,12}.{6,6}(a?)?$",
-            memory: 1986,
+            memory: 2026,
             min_tier: 1,
             inputs: [
                 ("ccaaaaaa", true),
@@ -10083,7 +10083,7 @@ mod tests {
         }
         test_tier3_counter_free_mae_two_counters_optional {
             pattern: "^.{0,2}.{4,4}a?$",
-            memory: 1293,
+            memory: 1333,
             min_tier: 1,
             inputs: [
                 ("aaaa", true),
@@ -10105,7 +10105,7 @@ mod tests {
         // was overwritten to false on every byte, causing false negatives.
         test_tier3_counter_free_mae_optional_skip {
             pattern: "([b-ed-ie-f].{4,43})?$",
-            memory: 1352,
+            memory: 1392,
             min_tier: 2,
             inputs: [
                 ("zzz", true),       // optional group skipped, $ matches at end
@@ -10125,7 +10125,7 @@ mod tests {
         // the fix, finish() missed the `$ → Match` path.
         test_tier3_post_break_advance_mae {
             pattern: "^.{7,23}.a?$",
-            memory: 1162,
+            memory: 1202,
             min_tier: 2,
             inputs: [
                 ("aaaaaaaa", true),    // len=8: min+1, match via $ after .
@@ -10143,7 +10143,7 @@ mod tests {
         // rejects such patterns from tier 2/3 (demoted to tier 4).
         test_counter_self_loop_possessive_plus {
             pattern: "^.{6,9}++$",
-            memory: 1425,
+            memory: 1465,
             min_tier: 1,
             inputs: [
                 ("aaaaaa", true),       // len=6: one rep of 6
@@ -10157,7 +10157,7 @@ mod tests {
         // Same self-loop via {6,9}+ parsed as possessive (one-or-more).
         test_counter_self_loop_possessive {
             pattern: "^.{6,9}+$",
-            memory: 1392,
+            memory: 1432,
             min_tier: 1,
             inputs: [
                 ("aaaaaa", true),       // len=6
@@ -10172,7 +10172,7 @@ mod tests {
         // Same self-loop via * wrapping counted repetition.
         test_counter_self_loop_star {
             pattern: "^.{6,9}*$",
-            memory: 1392,
+            memory: 1432,
             min_tier: 1,
             inputs: [
                 ("", true),             // len=0: zero reps
@@ -10186,7 +10186,7 @@ mod tests {
         // Same self-loop via +* wrapping counted repetition.
         test_counter_self_loop_plus_star {
             pattern: "^.{6,9}+*$",
-            memory: 1425,
+            memory: 1465,
             min_tier: 1,
             inputs: [
                 ("", true),             // len=0: * allows zero reps
@@ -10200,7 +10200,7 @@ mod tests {
         // with >= 6 chars matches (a 6-9 substring always exists).
         test_counter_self_loop_unanchored {
             pattern: ".{6,9}+",
-            memory: 1326,
+            memory: 1366,
             min_tier: 1,
             inputs: [
                 ("aaaaaa", true),       // len=6: exact match
@@ -10224,7 +10224,7 @@ mod tests {
         // counter 1 at value 1.
         test_tier3_seed_filtering_revert {
             pattern: "^(0{8,31}(0+x{6,50}1y?)?(a?a?)?)?$",
-            memory: 1303,
+            memory: 1343,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -10255,7 +10255,7 @@ mod tests {
         // handoff.
         test_tier3_counter_dep_seed_false_positive {
             pattern: "^(.{6,39}.0?.{8,8}a?)?$",
-            memory: 1525,
+            memory: 1565,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -10288,7 +10288,7 @@ mod tests {
         // (Tier 2), L=6 (Tier 2), and L=6..16 (Tier 3).
         test_deferred_assert_before_counter_l2_body {
             pattern: r"^...\B(ee){6,40}$",
-            memory: 1228,
+            memory: 1268,
             min_tier: 2,
             inputs: [
                 ("aaaeeeeeeeeeeee", true),     // 3 + 12 = 15 (6 iterations of ee)
@@ -10301,7 +10301,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_l6_body {
             pattern: r"^...\Be{6,6}{6,40}$",
-            memory: 1360,
+            memory: 1400,
             min_tier: 2,
             inputs: [
                 ("aaaeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", true), // 3+36=39 (6 iters)
@@ -10312,7 +10312,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_varlen_body {
             pattern: r"^...\Be{6,16}{6,40}$",
-            memory: 2020,
+            memory: 2060,
             min_tier: 3,
             inputs: [
                 ("aaaeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", true), // 3+36=39
@@ -10323,7 +10323,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_two_counters {
             pattern: r"^.{3,5}\Be{6,16}{6,40}c{6,33}$",
-            memory: 2252,
+            memory: 2292,
             min_tier: 3,
             inputs: [
                 // 3 a's + 36 e's + 6 c's = 45: min scenario (3 prefix, 6*6 e body, 6 c's)
@@ -10345,7 +10345,7 @@ mod tests {
         // classifying resolved seeds as break-gated.
         test_deferred_assert_rwb_break_seed {
             pattern: r"^\b(b{2,8})?.{9,9}$",
-            memory: 1788,
+            memory: 1828,
             min_tier: 1,
             inputs: [
                 ("aaaaaaaaa", true),       // \b satisfied, (b{2,8})? zero iters, .{9,9} matches
@@ -10360,7 +10360,7 @@ mod tests {
         }
         test_deferred_assert_rwb_break_seed_star {
             pattern: r"^\b(b{2,8}b)*.{9,9}$",
-            memory: 1821,
+            memory: 1861,
             min_tier: 1,
             inputs: [
                 ("aaaaaaaaa", true),        // zero iters of (b{2,8}b)*, .{9,9}
@@ -10379,7 +10379,7 @@ mod tests {
         // a false negative.
         test_deferred_assert_inside_counter_break_consuming {
             pattern: r"^(a\B){4,4}a$",
-            memory: 1004,
+            memory: 1044,
             min_tier: 1,
             inputs: [
                 ("aaaaa", true),       // 4 × a\B + a$
@@ -10390,7 +10390,7 @@ mod tests {
         }
         test_deferred_assert_inside_counter_break_consuming_varlen {
             pattern: r"^(a\B){2,5}a$",
-            memory: 1169,
+            memory: 1209,
             min_tier: 1,
             inputs: [
                 ("aaa", true),         // 2 × a\B + a$
@@ -10417,7 +10417,7 @@ mod tests {
         // counters to complete).
         test_tier3_with_break_counter_free_mae_false_positive {
             pattern: r"^(.{10,40}{2,2})?a?$",
-            memory: 1262,
+            memory: 1302,
             min_tier: 3,
             inputs: [
                 ("", true),             // optional group skips, a? skips, $ matches
@@ -10434,7 +10434,7 @@ mod tests {
         // original fuzz artifact).
         test_tier3_with_break_counter_free_mae_8_counters {
             pattern: r"^(.{7,40}{8,8})?a?$",
-            memory: 1862,
+            memory: 1902,
             min_tier: 3,
             inputs: [
                 ("", true),
@@ -10460,7 +10460,7 @@ mod tests {
         // counter breaks.
         test_tier3_clean_counter_free_mae_preserves_legit {
             pattern: r"^(.{0,2}|d+)$",
-            memory: 1194,
+            memory: 1234,
             min_tier: 1,
             inputs: [
                 ("", true),        // optional .{0,2} matches empty via 0-count
@@ -10484,7 +10484,7 @@ mod tests {
         // gives a false negative.
         test_tier3_single_counter_break_path_mae {
             pattern: r"^.{0,36}c{2,12}e?((a?a?)?(a?a?)?)?$",
-            memory: 2251,
+            memory: 2291,
             min_tier: 2,
             inputs: [
                 ("cc", true),       // .{0,36} = "", c{2,12} = "cc"
@@ -10519,7 +10519,7 @@ mod tests {
         // an origin is genuinely reachable without counter breaks.
         test_tier3_contaminated_no_break_chain_false_positive {
             pattern: r"^(.{7,25}.{7,25})?((a?a?)?(a?a?)?)?$",
-            memory: 1559,
+            memory: 1599,
             min_tier: 3,
             inputs: [
                 ("", true),              // optional group skips, suffix skips, $ matches
@@ -10556,7 +10556,7 @@ mod tests {
         // step_from_dead, matching the fast-path logic.
         test_tier3_non_counting_mae_false_positive {
             pattern: r"c{2,12}c{2,12}f$",
-            memory: 2159,
+            memory: 2199,
             min_tier: 1,
             inputs: [
                 ("ccf", false),               // only 2 c's, need ≥4 (2+2)
@@ -10587,7 +10587,7 @@ mod tests {
         // in the post-transition clean_nb state.
         test_tier3_contaminated_cf_mae_empty_nfa {
             pattern: r"^(.{8,8}|f{5,26}|f{5,26})$",
-            memory: 1493,
+            memory: 1533,
             min_tier: 3,
             inputs: [
                 ("fffffabc", true),            // Bug 24: .{8,8} via counter-free path
@@ -10619,7 +10619,7 @@ mod tests {
         // are handled by `break_seeds` and `post_break_tails` at runtime.
         test_tier3_break_closure_stops_at_ci {
             pattern: "^.{1,2}.{4,4}$",
-            memory: 1194,
+            memory: 1234,
             min_tier: 1,
             inputs: [
                 ("aaaaa", true),
@@ -10645,7 +10645,7 @@ mod tests {
         // k ∈ {4, 6, 8, 10, …}.  Odd-length 'a' runs (5, 7) are invalid.
         test_tier3_range_contiguity_anchored {
             pattern: r"^(a|aaa){4,4}b",
-            memory: 1367,
+            memory: 1407,
             min_tier: 1,
             inputs: [
                 ("aaaab", true),
@@ -10663,7 +10663,7 @@ mod tests {
         // the same parity-gap phantoms appear.
         test_tier3_range_contiguity_prefix {
             pattern: r"c(a|aaa){4,4}b",
-            memory: 1367,
+            memory: 1407,
             min_tier: 1,
             inputs: [
                 ("caaaab", true),
@@ -10681,7 +10681,7 @@ mod tests {
         // — producing false negatives on long inputs.
         test_tier3_instance_dedup_self_loop {
             pattern: r".a+{9,28}",
-            memory: 1063,
+            memory: 1103,
             min_tier: 3,
             inputs: [
                 ("aaaaaaaaa", false),
@@ -10700,7 +10700,7 @@ mod tests {
         // The `?` makes every input match via the empty-to-`$` path.
         test_tier3_counter_free_mae_optional_group {
             pattern: r"([b-e].+{4,43})?$",
-            memory: 1385,
+            memory: 1425,
             min_tier: 3,
             inputs: [
                 ("zzz", true),
@@ -10718,7 +10718,7 @@ mod tests {
         // the triggering counter didn't break (Bug 14).
         test_tier3_optional_anchored_false_positive {
             pattern: r"^(a?.{2,2}\Bx{2,2})?$",
-            memory: 1227,
+            memory: 1267,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -10741,7 +10741,7 @@ mod tests {
         // flag must be replaced by the clean chain's flag.
         test_tier3_contaminated_no_break_is_match {
             pattern: r"^.{0,46}x{10,35}f",
-            memory: 1196,
+            memory: 1236,
             min_tier: 3,
             inputs: [
                 ("xxxxxxxxxf", false),          // 9 x's — c1 max count 9 < min 10
@@ -10763,7 +10763,7 @@ mod tests {
         // pass (prev='c' word, next='a' word → non-boundary).
         test_tier3_counter_break_deferred_assert_mid_input {
             pattern: r".{2,38}c{4,10}\B",
-            memory: 1558,
+            memory: 1598,
             min_tier: 2,
             inputs: [
                 ("cccccca", true),              // 6c + a: c1 breaks, \B(c,a) passes
@@ -10785,7 +10785,7 @@ mod tests {
         // false match_at_end.
         test_tier3_break_seed_deferred_assert_gate {
             pattern: r"^.{0,13}\b.{2,2}$",
-            memory: 1920,
+            memory: 1960,
             min_tier: 1,
             inputs: [
                 ("abc", false),                 // all word chars — no \b boundary
@@ -10805,7 +10805,7 @@ mod tests {
         // never seeded through that path.
         test_tier3_pending_break_seed {
             pattern: r"^f{3,4}\b.{5,10}a?$",
-            memory: 1722,
+            memory: 1762,
             min_tier: 1,
             inputs: [
                 ("fff abcde", true),            // \b between 'f' and ' '
@@ -10824,7 +10824,7 @@ mod tests {
         // without the fix, `\B`-gated seeds fire incorrectly.
         test_tier3_pending_break_seed_non_word_boundary {
             pattern: r"^(a?.{2,2}\Bx{2,2})?$",
-            memory: 1227,
+            memory: 1267,
             min_tier: 1,
             inputs: [
                 ("xxxx", true),                 // \B between x and x (same word class)
@@ -10842,7 +10842,7 @@ mod tests {
         // match was missed — producing a false negative.
         test_tier3_post_break_tail_advance_match {
             pattern: r"^c{3,5}c{1,5}cee?",
-            memory: 1334,
+            memory: 1374,
             min_tier: 1,
             inputs: [
                 ("ccccce", true),               // ccc + c + c + e (+ empty e?)
@@ -10872,7 +10872,7 @@ mod tests {
         // filtered because they have no break_seeds fallback.
         test_tier3_contaminated_counter_free_seeds {
             pattern: r"^((a{8,13}d*)?.?a?.{6,6}a?)?$",
-            memory: 2085,
+            memory: 2125,
             min_tier: 1,
             inputs: [
                 ("aaaaaaaaa", true),                                     // 9 'a's: matches (a{8}+.?=a → 9)
@@ -10896,7 +10896,7 @@ mod tests {
         // Fix: add a `visited` bitvec to both epsilon walk functions.
         test_epsilon_cycle_assert_oom {
             pattern: r"^a{2,5}(\b|\B)*b$",
-            memory: 1136,
+            memory: 1176,
             min_tier: 1,
             inputs: [
                 ("aab", true),
@@ -10922,7 +10922,7 @@ mod tests {
         // Fix: include ByteTable states in break_consuming_tails.
         test_tier3_byte_table_break_tail {
             pattern: r"^(c{2,48}c?y?b1)?((a?a?)?(a?a?)?)?$",
-            memory: 2425,
+            memory: 2465,
             min_tier: 2,
             inputs: [
                 ("cccccccccccccccccccccccccccccccccccccccccyb1", true), // 41 c's + yb1: Bug 35 crash case
@@ -10948,7 +10948,7 @@ mod tests {
         // Fix: deposit target_deferred_asserts in the Some(None) arm.
         test_tier3_tail_none_target_deferred_asserts {
             pattern: r"^1{2,30}c{9,48}y\b$",
-            memory: 973,
+            memory: 1013,
             min_tier: 2,
             inputs: [
                 ("1111111cccccccccccccy", true),    // 7 ones + 13 c's + y: Bug 34 crash case
@@ -10973,7 +10973,7 @@ mod tests {
         // passes, which properly handles the downstream \B chain.
         test_tier3_chained_assert_target_deferred {
             pattern: r"^.{7,7}(.\b\Ba?(a?a?)?)?$",
-            memory: 1557,
+            memory: 1597,
             min_tier: 1,
             inputs: [
                 ("cy1aacc", true),              // 7 chars, optional group empty, $ matches
@@ -11001,7 +11001,7 @@ mod tests {
         // Increment arm when value >= min, so the DFA selects `with_break`.
         test_tier3_tail_cinc_handoff_break {
             pattern: r"^(.{1,3}.{0,0} )+$",
-            memory: 1194,
+            memory: 1234,
             min_tier: 1,
             inputs: [
                 ("ax a ", true),            // Bug 36 minimal crash case: 2-char body + space, 1-char body + space
@@ -11032,7 +11032,7 @@ mod tests {
         // of tail processing instead of the static array.
         test_tier3_byte_table_tail_mae {
             pattern: r"^0{3,43}((a?c)*x(a?a?)?(a?a?)?)?$",
-            memory: 2359,
+            memory: 2399,
             min_tier: 2,
             inputs: [
                 ("000x", true),                // Bug 37 crash case: 3 zeros + x
@@ -11062,7 +11062,7 @@ mod tests {
         // break paths with correct byte timing.
         test_tier3_phase2_break_seed_false_positive {
             pattern: r"^e{4,5}e{4,5}ee{4,5}$",
-            memory: 1334,
+            memory: 1374,
             min_tier: 1,
             inputs: [
                 ("eeeeeeeeeeee", false),       // 12 e's: Bug 38 crash case (< min 13)
@@ -11089,7 +11089,7 @@ mod tests {
         // even with no consuming states downstream.
         test_tier3_dead_target_byte_table_mae {
             pattern: r"^(.{6,36}a{0,4}e*c)?$",
-            memory: 5555,
+            memory: 5595,
             min_tier: 2,
             inputs: [
                 ("xxxcbd ccac", true),          // Bug 39 crash case
@@ -11120,7 +11120,7 @@ mod tests {
         // correct byte timing.
         test_tier3_assert_gated_counter_seeding {
             pattern: r"^((.1?\B.{3,28}){3,3}|(a?a?)?)$",
-            memory: 1857,
+            memory: 1897,
             min_tier: 3,
             inputs: [
                 ("aaaaaaaaaa", false),            // Bug 40 crash: 10 a's, too short for 3 reps
@@ -11145,7 +11145,7 @@ mod tests {
         // deposited via target_deferred_asserts into verified_deferred_asserts.
         test_tier3_contaminated_deferred_assert {
             pattern: r"^.{0,44}1{3,38}f\ba?$",
-            memory: 1328,
+            memory: 1368,
             min_tier: 3,
             inputs: [
                 ("111f", true),                 // c1=3 ≥ min, break, 'f' consumed, \b passes at EOI
@@ -11168,7 +11168,7 @@ mod tests {
         // to persist until EOI where they would incorrectly pass.
         test_tier3_stale_deferred_assert_fast_path {
             pattern: r"\bc{2,12}\b",
-            memory: 1433,
+            memory: 1473,
             min_tier: 1,
             inputs: [
                 ("cc", true),                      // 2 c's, \b at both ends
@@ -11193,7 +11193,7 @@ mod tests {
         // spurious match_at_end at EOI.
         test_tier3_pending_break_tails {
             pattern: r"^a{8,8}((a{2,2}\b)?(a?a?)?)?$",
-            memory: 1301,
+            memory: 1341,
             min_tier: 1,
             inputs: [
                 ("aaaaaaaa", true),         // exactly 8 a's, skip optional → match
@@ -11219,7 +11219,7 @@ mod tests {
         // blocks the path.
         test_tier3_chained_contradictory_asserts {
             pattern: r"^.{2,26}\b\B(a?)?$",
-            memory: 1228,
+            memory: 1268,
             min_tier: 2,
             inputs: [
                 ("cc", false),              // \b passes at EOI but \B fails → never matches
@@ -11249,7 +11249,7 @@ mod tests {
         // always false for consuming states).
         test_tier3_pending_tail_consume {
             pattern: r"^.{2,13}\Ba?((a?a?)?(a?a?)?)?$",
-            memory: 2217,
+            memory: 2257,
             min_tier: 1,
             inputs: [
                 ("yxaayca", true),       // original fuzz input
@@ -11274,7 +11274,7 @@ mod tests {
         // of firing unconditionally.
         test_tier3_pure_break_mae_with_sibling_deferred {
             pattern: r"^.{1,11}((\B|a?))?$",
-            memory: 1821,
+            memory: 1861,
             min_tier: 1,
             inputs: [
                 ("aa", true),           // original minimal: .{1,} → skip group → $
@@ -11299,7 +11299,7 @@ mod tests {
         // deferred assertions so each tail is gated individually.
         test_tier3_per_tail_deferred_assert_gate {
             pattern: r"^.{2,10}\by?(\B ?(a?a?)?(a?a?)?)?$",
-            memory: 2118,
+            memory: 2158,
             min_tier: 1,
             inputs: [
                 ("xa1  y ", false),    // Bug 46: \b passes but \B fails for ' ' tail → false positive
@@ -11324,7 +11324,7 @@ mod tests {
         // target reached Match directly were never detected.
         test_tier3_byte_table_tail_direct_match {
             pattern: r"c{0,32}.{6,36}a?c?x",
-            memory: 2319,
+            memory: 2359,
             min_tier: 3,
             inputs: [
                 ("aaaaaax", true),      // Bug 47: ByteTable tail 'x' → Match
@@ -11351,7 +11351,7 @@ mod tests {
         // Fix: guard pre_seeds against contamination (mirror Bug 32).
         test_tier3_contaminated_pre_seeds_false_mae {
             pattern: r"^.{0,26}\B((x{7,7}a?)?(a?a?)?)?$",
-            memory: 1657,
+            memory: 1697,
             min_tier: 2,
             inputs: [
                 ("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", false),  // Bug 48: 50 x's, false positive
@@ -11381,7 +11381,7 @@ mod tests {
         // a shorter path is found.
         test_tier3_deferred_path_shortcut {
             pattern: r"^.{7,36}\B(\ba{0,0})?((a?a?)?(a?a?)?)?$",
-            memory: 1525,
+            memory: 1565,
             min_tier: 2,
             inputs: [
                 ("aaaaaaaa", true),         // Bug 49: 8 a's, false negative
@@ -11404,7 +11404,7 @@ mod tests {
         // Fix: only remap when the target is a consuming state.
         test_tier3_resolved_seed_nonconsume_remap {
             pattern: r"^(\b(0*a{2,8}){7,7})?$",
-            memory: 1368,
+            memory: 1408,
             min_tier: 3,
             inputs: [
                 ("00aa00aa00aa00aa00aa00aa00aa", true),  // Bug 50: 7 groups of "00aa"
@@ -11432,7 +11432,7 @@ mod tests {
         // so value=0 >= min → immediate break → break_is_match_at_end.
         test_tier3_cov_pending_break_seed_eoi {
             pattern: r"^c{3,5}\b.{0,3}$",
-            memory: 1425,
+            memory: 1465,
             min_tier: 1,
             inputs: [
                 ("ccc", true),           // c0=3, \b pending at EOI, passes (word→end), c1 seed value=0 ≥ min=0
@@ -11453,7 +11453,7 @@ mod tests {
         // value 0→1 < min 3.  Instance continues counting (no immediate break).
         test_tier3_cov_tail_cinc_handoff_continue {
             pattern: r"^.{2,5}bc{3,6}$",
-            memory: 1557,
+            memory: 1597,
             min_tier: 1,
             inputs: [
                 ("aabccc", true),        // c0=2, tail 'b', handoff to c1, c1 counts to 3
@@ -11473,7 +11473,7 @@ mod tests {
         // breaks.  The break path has \b as a deferred assert.
         test_tier3_cov_tail_cinc_handoff_break_deferred {
             pattern: r"^a{3,5}b.{1,4}\b$",
-            memory: 1491,
+            memory: 1531,
             min_tier: 1,
             inputs: [
                 ("aaabx", true),         // c0=3, tail 'b', handoff c1=1, break, \b at EOI passes
@@ -11494,7 +11494,7 @@ mod tests {
         // new post-break tails that must advance through 'c' then 'd'.
         test_tier3_cov_multi_hop_tail_chain {
             pattern: r"^a{3,5}b.{1,3}cd$",
-            memory: 1458,
+            memory: 1498,
             min_tier: 1,
             inputs: [
                 ("aaabxcd", true),       // c0=3, tail 'b', c1 handoff, c1=1 breaks, tails 'c','d'
@@ -11512,7 +11512,7 @@ mod tests {
         // Advance deposits \b, resolved on NEXT byte (' ') mid-input.
         test_tier3_cov_advance_tail_deferred_mid_input {
             pattern: r"^.{2,5}.{2,5}c\b x",
-            memory: 1590,
+            memory: 1630,
             min_tier: 1,
             inputs: [
                 ("aaaac x", true),       // c0=2,c1=2, tail 'c', \b(c,' ') passes, ' ' consumed, 'x' consumed
@@ -11528,7 +11528,7 @@ mod tests {
         // resolved on the NEXT byte (' ').
         test_tier3_cov_counter_break_wb_mid_input {
             pattern: r"^c{4,10}\b x",
-            memory: 1301,
+            memory: 1341,
             min_tier: 1,
             inputs: [
                 ("cccc x", true),        // c0=4, \b(c,' ') passes mid-input, ' ' and 'x' consumed
@@ -11545,7 +11545,7 @@ mod tests {
         // \B at EOI fails (word→end = boundary, \B requires non-boundary).
         test_tier3_cov_none_target_deferred_fail {
             pattern: r"^.{2,30}c{9,48}y\B$",
-            memory: 1229,
+            memory: 1269,
             min_tier: 3,
             inputs: [
                 ("aaccccccccccy", false),    // c0=2, c1=10, tail 'y', \B at EOI fails
@@ -11562,7 +11562,7 @@ mod tests {
         // should return true.
         test_tier3_cov_contaminated_clean_nb_deferred_pass {
             pattern: r"^(.{3,10}.{3,10}|x+)\b$",
-            memory: 2217,
+            memory: 2257,
             min_tier: 1,
             inputs: [
                 ("xxx", true),           // x+ path, \b at EOI, counter-free
@@ -11579,7 +11579,7 @@ mod tests {
         // where contamination is present and the match is legitimate.
         test_tier3_cov_contamination_true_match {
             pattern: r"^.{3,5}.{3,5}a?$",
-            memory: 1491,
+            memory: 1531,
             min_tier: 1,
             inputs: [
                 ("aaaaaa", true),        // 3+3=6, both complete, a? skips
@@ -11597,7 +11597,7 @@ mod tests {
         // At EOI, \B(word, end) fails — word→end is a boundary.
         test_tier3_cov_verified_deferred_fail_eoi {
             pattern: r"^.{3,5}b\B$",
-            memory: 1260,
+            memory: 1300,
             min_tier: 1,
             inputs: [
                 ("aaab", false),         // \B at word(b)→EOI fails
@@ -11613,7 +11613,7 @@ mod tests {
         // Tests that cf_mae uses clean_nb_cf_mae correctly.
         test_tier3_cov_fast_path_contaminated {
             pattern: r"^(.{3,5}.{3,5})?$",
-            memory: 1458,
+            memory: 1498,
             min_tier: 1,
             inputs: [
                 ("aaaaaa", true),        // 3+3, ? matches, $
