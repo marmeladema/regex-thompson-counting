@@ -2617,6 +2617,10 @@ pub struct Tier3DfaMatcher<'a> {
     /// during the last `step_slow()`.  These are assertions (e.g. `\b`)
     /// on the path to `$ → Match` from a counter that actually broke with
     /// enough value.  Evaluated in `finish()` at end-of-input.
+    ///
+    /// TODO(effects): replace with `PendingEffect` entries carrying
+    /// `EffectAtom::Match` / `EffectAtom::MatchAtEnd` and an assertion-chain
+    /// guard (Phase 7).
     verified_deferred_asserts: Vec<StateIdx>,
     /// Pending break seeds whose deferred assertions (e.g. `\b`) could not
     /// be evaluated at break time because the next byte was unknown (Bug 28).
@@ -2624,6 +2628,10 @@ pub struct Tier3DfaMatcher<'a> {
     /// the triggering counter, the seed to apply, and the word-ness of the
     /// byte at the break position.  Resolved at the start of the next byte
     /// (in `chunk()`) or at end-of-input (in `finish()`).
+    ///
+    /// TODO(effects): replace with `PendingEffect` entries carrying
+    /// `EffectAtom::AddSeed` with `EffectTiming::NextByte` and assertion-chain
+    /// guard (Phase 5).
     pending_break_seeds: Vec<(CounterIdx, CounterIdx, StateIdx, u32, bool)>,
     /// Pending post-break tails whose deferred assertions have not yet been
     /// evaluated (Bug 42).  When a counter breaks with `break_deferred_asserts`,
@@ -2635,12 +2643,21 @@ pub struct Tier3DfaMatcher<'a> {
     /// Bug 46: each entry carries its own per-tail deferred assertions
     /// (the assertions on the specific path from the break output to this
     /// consuming state).  ALL of these must pass for the tail to be promoted.
+    ///
+    /// TODO(effects): replace with `PendingEffect` entries carrying
+    /// `EffectAtom::AddTail` with `EffectTiming::NextByte` and per-tail
+    /// assertion-chain guard (Phase 6).
     pending_break_tails: Vec<(StateIdx, Box<[StateIdx]>)>,
     /// Bug 44: tails and match_at_end resulting from resolving pending
     /// break tails in the pre-step code.  These can't be injected into
     /// `post_break_tails` / `match_at_end` before step_slow because
     /// step_slow clears them.  Injected after step_slow returns.
+    ///
+    /// TODO(effects): remove once `pending_break_tails` is replaced by
+    /// `PendingEffect` entries — the effect applier should handle injection
+    /// timing directly (Phase 6).
     pending_resolved_tails: Vec<StateIdx>,
+    /// TODO(effects): remove together with `pending_resolved_tails` (Phase 6).
     pending_resolved_mae: bool,
     /// True when the current DFA state (`self.current`) was reached via a
     /// `with_break` transition and may contain NFA consuming states that
