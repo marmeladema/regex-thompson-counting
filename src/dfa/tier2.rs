@@ -1324,8 +1324,6 @@ fn break_path_match_kind(start: StateIdx, states: &[State]) -> (bool, bool) {
     (direct, at_end)
 }
 
-
-
 /// Compute a bitmask of counters reachable via CInc from deferred
 /// assertions in a closure result.  When a deferred assertion gates
 /// the path to CInc, the transition is classified as non-counting

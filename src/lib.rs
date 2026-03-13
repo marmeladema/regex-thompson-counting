@@ -5098,7 +5098,13 @@ mod tests {
                 }
                 out.push(byte);
                 if gen_walk_rec(
-                    regex, next, schedule, counter_counts, out, GEN_EPSILON_BUDGET, steps,
+                    regex,
+                    next,
+                    schedule,
+                    counter_counts,
+                    out,
+                    GEN_EPSILON_BUDGET,
+                    steps,
                 ) {
                     true
                 } else {
@@ -5113,7 +5119,13 @@ mod tests {
                 }
                 out.push(byte);
                 if gen_walk_rec(
-                    regex, next, schedule, counter_counts, out, GEN_EPSILON_BUDGET, steps,
+                    regex,
+                    next,
+                    schedule,
+                    counter_counts,
+                    out,
+                    GEN_EPSILON_BUDGET,
+                    steps,
                 ) {
                     true
                 } else {
@@ -5135,7 +5147,13 @@ mod tests {
                 let Some(byte) = byte else { return false };
                 out.push(byte);
                 if gen_walk_rec(
-                    regex, next, schedule, counter_counts, out, GEN_EPSILON_BUDGET, steps,
+                    regex,
+                    next,
+                    schedule,
+                    counter_counts,
+                    out,
+                    GEN_EPSILON_BUDGET,
+                    steps,
                 ) {
                     true
                 } else {
@@ -5157,8 +5175,13 @@ mod tests {
                         out.push(byte);
                         let saved_counts: Vec<usize> = counter_counts.to_vec();
                         if gen_walk_rec(
-                            regex, target, schedule, counter_counts, out,
-                            GEN_EPSILON_BUDGET, steps,
+                            regex,
+                            target,
+                            schedule,
+                            counter_counts,
+                            out,
+                            GEN_EPSILON_BUDGET,
+                            steps,
                         ) {
                             return true;
                         }
@@ -5175,8 +5198,13 @@ mod tests {
                         out.push(byte);
                         let saved_counts: Vec<usize> = counter_counts.to_vec();
                         if gen_walk_rec(
-                            regex, target, schedule, counter_counts, out,
-                            GEN_EPSILON_BUDGET, steps,
+                            regex,
+                            target,
+                            schedule,
+                            counter_counts,
+                            out,
+                            GEN_EPSILON_BUDGET,
+                            steps,
                         ) {
                             return true;
                         }
@@ -11260,6 +11288,30 @@ mod tests {
             ],
         }
 
+        // Bug 46: per-tail deferred assertion gating.
+        // Pattern: `^.{2,10}\by?(\B ?(a?a?)?(a?a?)?)?$`
+        // Input: "xa1  y " (7 chars)
+        // Root cause: the break path from the counter goes through `\b`
+        // first, then branches.  Some consuming tails (e.g. state 8
+        // `Byte(' ')`) are behind BOTH `\b` AND `\B`.  When `\b` passes
+        // at runtime, ALL pending_break_tails were promoted — including
+        // those that also need `\B` to pass.  The fix tracks per-tail
+        // deferred assertions so each tail is gated individually.
+        test_tier3_per_tail_deferred_assert_gate {
+            pattern: r"^.{2,10}\by?(\B ?(a?a?)?(a?a?)?)?$",
+            memory: 2118,
+            min_tier: 1,
+            inputs: [
+                ("xa1  y ", false),    // Bug 46: \b passes but \B fails for ' ' tail → false positive
+                ("xa", true),          // .{2} then $ (skip optional group)
+                ("xaa", true),         // .{3}$ works
+                ("ab cd", true),       // .{2}\by? + \B passes (word→non-word via 'b'→' ')
+                ("x", false),          // too short for .{2,10}
+                ("", false),           // empty
+                ("ab ", false),        // \b at b→' ', \B at ' '→end fails
+            ],
+        }
+
         // ---------------------------------------------------------------
         // Coverage expansion: lock down Tier 3 code paths that were
         // previously untested or only partially tested.  These tests
@@ -12201,5 +12253,4 @@ mod tests {
             .translate(pattern, &ast)
             .ok()
     }
-
 }
