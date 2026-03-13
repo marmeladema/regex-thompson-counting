@@ -772,7 +772,7 @@ pub(crate) fn compile_target_effects(
             break_consuming_states: _,
             break_consuming_pure,
             break_consuming_deferred,
-            break_assert_chain_id: _,
+            break_deferred_chain_ids: _,
         } => {
             let step = TargetStep::Increment {
                 counter: *counter,
@@ -824,33 +824,34 @@ pub(crate) fn compile_target_effects(
             // `eval_assert_chain` with downstream reachability checks at
             // the next byte boundary and at end-of-input.
             //
-            // The effect representation captures this as a guarded
-            // MatchAtEnd — the assertion chain determines whether the
-            // match fires.  This covers three cases:
-            // 1. break_is_match_at_end=true with deferred asserts
-            //    (e.g. `\b → $ → Match`)
-            // 2. Deferred asserts lead to Match without break_is_match
-            //    (e.g. `\b → Match`)
-            // 3. Both Match and $ → Match behind the same chain
+            // Bug 51: break_deferred_asserts contains independent
+            // assertion entry points from different NFA paths (OR
+            // semantics: any one passing = match).  Each must be
+            // interned as a separate 1-element chain so they are
+            // evaluated independently.  Previously they were interned
+            // as a single chain (AND semantics), causing false negatives
+            // when paths had contradictory assertions like `\B` and `\b`.
             if !break_deferred_asserts.is_empty() {
-                let chain_id = arena.intern(break_deferred_asserts);
-                guarded.push(GuardedEffect {
-                    timing: EffectTiming::NextByte,
-                    guard: EffectGuard {
-                        required_breaks: 1u64 << counter.idx(),
-                        assert_chain: chain_id,
-                    },
-                    atoms: vec![EffectAtom::MatchAtEnd].into_boxed_slice(),
-                });
-                // Also an EndOnly variant for finish().
-                guarded.push(GuardedEffect {
-                    timing: EffectTiming::EndOnly,
-                    guard: EffectGuard {
-                        required_breaks: 1u64 << counter.idx(),
-                        assert_chain: chain_id,
-                    },
-                    atoms: vec![EffectAtom::MatchAtEnd].into_boxed_slice(),
-                });
+                for assert_state in break_deferred_asserts.iter() {
+                    let chain_id = arena.intern(&[*assert_state]);
+                    guarded.push(GuardedEffect {
+                        timing: EffectTiming::NextByte,
+                        guard: EffectGuard {
+                            required_breaks: 1u64 << counter.idx(),
+                            assert_chain: chain_id,
+                        },
+                        atoms: vec![EffectAtom::MatchAtEnd].into_boxed_slice(),
+                    });
+                    // Also an EndOnly variant for finish().
+                    guarded.push(GuardedEffect {
+                        timing: EffectTiming::EndOnly,
+                        guard: EffectGuard {
+                            required_breaks: 1u64 << counter.idx(),
+                            assert_chain: chain_id,
+                        },
+                        atoms: vec![EffectAtom::MatchAtEnd].into_boxed_slice(),
+                    });
+                }
             }
 
             // Per-tail deferred assertions: each tail has its own chain.
@@ -911,6 +912,7 @@ pub(crate) fn compile_target_effects(
 /// Returns `(per-target effects, per-state chain IDs for target deferred
 /// asserts, populated assertion chain arena)`.
 #[allow(clippy::type_complexity)]
+#[cfg_attr(not(debug_assertions), allow(unused_variables))]
 pub(crate) fn compile_all_target_effects(
     analysis: &super::Tier3Analysis,
     states: &[crate::State],

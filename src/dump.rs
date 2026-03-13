@@ -7,8 +7,8 @@
 
 use std::fmt;
 
-use crate::dfa::Tier3OriginKind;
 use crate::dfa::tier3_effects::{AssertChainArena, CompiledTargetEffects};
+use crate::dfa::Tier3OriginKind;
 use crate::{AssertKind, ByteClass, ByteMap, Regex, State, StateIdx};
 
 // ---------------------------------------------------------------------------
@@ -574,7 +574,7 @@ impl DumpRegex<'_> {
                             break_consuming_states,
                             break_consuming_pure,
                             break_consuming_deferred,
-                            break_assert_chain_id,
+                            break_deferred_chain_ids,
                         } => {
                             writeln!(f, "    state {i}: Increment(c{counter}, {{{min},{max}}})",)?;
                             writeln!(
@@ -602,13 +602,17 @@ impl DumpRegex<'_> {
                             )?;
                             writeln!(
                                 f,
-                                "      break_deferred_asserts: [{}] ({})",
+                                "      break_deferred_asserts: [{}] chains=[{}]",
                                 break_deferred_asserts
                                     .iter()
                                     .map(|s| s.to_string())
                                     .collect::<Vec<_>>()
                                     .join(", "),
-                                break_assert_chain_id,
+                                break_deferred_chain_ids
+                                    .iter()
+                                    .map(|c| c.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
                             )?;
                             writeln!(
                                 f,

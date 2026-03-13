@@ -11288,6 +11288,29 @@ mod tests {
             ],
         }
 
+        // Bug 51: break_deferred_asserts OR semantics.
+        // Pattern: `^c{2,49}((a?\B)?\b)*\b$`
+        // Input: "ccccccccccccccc" (15 c's)
+        // Root cause: break_deferred_asserts contains independent assertion
+        // entry points from different NFA paths — `\B` and `\b` — which
+        // have OR semantics (any one passing = match).  They were interned
+        // as a single assertion chain (AND semantics), requiring ALL to
+        // pass simultaneously — impossible for contradictory assertions
+        // like `\B` and `\b`.  Fix: intern each entry as a separate
+        // 1-element chain and emit one PendingEffect per chain.
+        test_tier3_break_deferred_or_semantics {
+            pattern: r"^c{2,49}((a?\B)?\b)*\b$",
+            memory: 1094,
+            min_tier: 2,
+            inputs: [
+                ("ccccccccccccccc", true),  // 15 c's: original fuzz crash
+                ("cc", true),               // min counter value
+                ("c", false),               // below min
+                ("", false),                // empty
+                ("cca", false),             // 'a' at end, no word boundary match
+            ],
+        }
+
         // Bug 46: per-tail deferred assertion gating.
         // Pattern: `^.{2,10}\by?(\B ?(a?a?)?(a?a?)?)?$`
         // Input: "xa1  y " (7 chars)
