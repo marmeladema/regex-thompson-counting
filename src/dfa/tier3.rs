@@ -830,7 +830,7 @@ pub(crate) fn compute_tier3_analysis(
 
     // -- Step 9: compile typed target effects ----------------------------------
     let (target_effects, target_assert_chain_ids, mut assert_chain_arena) =
-        tier3_effects::compile_all_target_effects(&analysis);
+        tier3_effects::compile_all_target_effects(&analysis, states);
     analysis.target_effects = target_effects;
     analysis.target_assert_chain_ids = target_assert_chain_ids;
 

@@ -15,8 +15,8 @@
 //!   signal a match, etc.)
 //! - **guard** ([`EffectGuard`]): under what condition the effect is valid
 //!   (unconditional, counter-break-gated, assertion-chain-gated, or both)
-//! - **timing** ([`EffectTiming`]): when the effect becomes actionable (now,
-//!   next byte boundary, or end-of-input only)
+//! - **timing** ([`EffectTiming`]): when the effect becomes actionable
+//!   (next byte boundary or end-of-input only)
 //!
 //! Local counter stepping (`Advance` vs `Increment`) is kept separate in
 //! [`TargetStep`] because the counter storage backends answer local
@@ -59,9 +59,6 @@ pub(crate) type BreakMask = u64;
 /// When an effect becomes actionable relative to the current byte boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum EffectTiming {
-    /// Apply immediately during the current step.
-    #[allow(dead_code)]
-    Now,
     /// Defer until the next byte boundary (when the next byte is known).
     NextByte,
     /// Defer until end-of-input processing.
@@ -71,7 +68,6 @@ pub(crate) enum EffectTiming {
 impl fmt::Display for EffectTiming {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Now => write!(f, "now"),
             Self::NextByte => write!(f, "next_byte"),
             Self::EndOnly => write!(f, "end_only"),
         }
@@ -188,27 +184,10 @@ pub(crate) struct EffectGuard {
     pub(crate) assert_chain: AssertChainId,
 }
 
-#[allow(dead_code)]
 impl EffectGuard {
-    /// Unconditional guard: counter-free, no assertions.
-    pub(crate) const ALWAYS: Self = Self {
-        required_breaks: 0,
-        assert_chain: AssertChainId::NONE,
-    };
-
-    /// Whether this guard is unconditional.
+    /// Whether this guard is unconditional (counter-free and no assertions).
     pub(crate) fn is_always(&self) -> bool {
         self.required_breaks == 0 && self.assert_chain == AssertChainId::NONE
-    }
-
-    /// Whether this guard requires at least one counter break.
-    pub(crate) fn is_break_gated(&self) -> bool {
-        self.required_breaks != 0
-    }
-
-    /// Whether this guard requires an assertion chain.
-    pub(crate) fn is_assert_gated(&self) -> bool {
-        self.assert_chain != AssertChainId::NONE
     }
 }
 
@@ -318,9 +297,6 @@ impl fmt::Display for GuardedEffect {
 /// [`Tier3OriginKind`]: super::Tier3OriginKind
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TargetStep {
-    /// No counter motion — the target is dead or unreachable.
-    #[allow(dead_code)]
-    None,
     /// The entry advances without incrementing: epsilon closure from the
     /// target did not reach `CInc`.  The entry keeps its counter value
     /// and moves to the listed consuming origins.
@@ -348,7 +324,6 @@ pub(crate) enum TargetStep {
 impl fmt::Display for TargetStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::None => write!(f, "None"),
             Self::Advance { new_origins } => {
                 write!(f, "Advance → [")?;
                 for (i, o) in new_origins.iter().enumerate() {
@@ -513,14 +488,6 @@ pub(crate) struct ResolvedActions {
     pub(crate) set_match: bool,
     /// Whether a match-at-end was signaled.
     pub(crate) set_match_at_end: bool,
-}
-
-impl ResolvedActions {
-    /// Whether any action was produced.
-    #[allow(dead_code)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.seeds.is_empty() && self.tails.is_empty() && !self.set_match && !self.set_match_at_end
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -699,7 +666,6 @@ pub(crate) fn resolve_pending(
 /// The `is_consuming` closure should return `true` for states that are
 /// consuming (Byte, ByteTable, etc.).
 #[cfg(debug_assertions)]
-#[allow(dead_code)]
 pub(crate) fn debug_assert_origins_consuming(
     effects: &CompiledTargetEffects,
     is_consuming: impl Fn(StateIdx) -> bool,
@@ -721,7 +687,6 @@ pub(crate) fn debug_assert_origins_consuming(
 }
 
 #[cfg(debug_assertions)]
-#[allow(dead_code)]
 fn assert_atom_origins_consuming(atom: &EffectAtom, is_consuming: &impl Fn(StateIdx) -> bool) {
     match atom {
         EffectAtom::AddSeed { origin, .. } => {
@@ -948,6 +913,7 @@ pub(crate) fn compile_target_effects(
 #[allow(clippy::type_complexity)]
 pub(crate) fn compile_all_target_effects(
     analysis: &super::Tier3Analysis,
+    states: &[crate::State],
 ) -> (
     Box<[Option<CompiledTargetEffects>]>,
     Box<[Box<[AssertChainId]>]>,
@@ -960,7 +926,23 @@ pub(crate) fn compile_all_target_effects(
         .enumerate()
         .map(|(i, target)| {
             target.as_ref().map(|kind| {
-                compile_target_effects(StateIdx(i as u32), kind, &analysis.break_seeds, &mut arena)
+                let eff = compile_target_effects(
+                    StateIdx(i as u32),
+                    kind,
+                    &analysis.break_seeds,
+                    &mut arena,
+                );
+                #[cfg(debug_assertions)]
+                debug_assert_origins_consuming(&eff, |s| {
+                    matches!(
+                        states[s.idx()],
+                        crate::State::Byte { .. }
+                            | crate::State::ByteCI { .. }
+                            | crate::State::ByteClass { .. }
+                            | crate::State::ByteTable { .. }
+                    )
+                });
+                eff
             })
         })
         .collect();
@@ -1034,49 +1016,28 @@ mod tests {
     }
 
     #[test]
-    fn test_effect_guard_always() {
-        let g = EffectGuard::ALWAYS;
-        assert!(g.is_always());
-        assert!(!g.is_break_gated());
-        assert!(!g.is_assert_gated());
-    }
+    fn test_effect_guard_is_always() {
+        let always = EffectGuard {
+            required_breaks: 0,
+            assert_chain: AssertChainId::NONE,
+        };
+        assert!(always.is_always());
 
-    #[test]
-    fn test_effect_guard_break_gated() {
-        let g = EffectGuard {
+        let break_gated = EffectGuard {
             required_breaks: 1,
             assert_chain: AssertChainId::NONE,
         };
-        assert!(!g.is_always());
-        assert!(g.is_break_gated());
-        assert!(!g.is_assert_gated());
-    }
+        assert!(!break_gated.is_always());
 
-    #[test]
-    fn test_effect_guard_assert_gated() {
-        let g = EffectGuard {
+        let assert_gated = EffectGuard {
             required_breaks: 0,
             assert_chain: AssertChainId(0),
         };
-        assert!(!g.is_always());
-        assert!(!g.is_break_gated());
-        assert!(g.is_assert_gated());
-    }
-
-    #[test]
-    fn test_effect_guard_both_gated() {
-        let g = EffectGuard {
-            required_breaks: 3,
-            assert_chain: AssertChainId(1),
-        };
-        assert!(!g.is_always());
-        assert!(g.is_break_gated());
-        assert!(g.is_assert_gated());
+        assert!(!assert_gated.is_always());
     }
 
     #[test]
     fn test_effect_timing_display() {
-        assert_eq!(format!("{}", EffectTiming::Now), "now");
         assert_eq!(format!("{}", EffectTiming::NextByte), "next_byte");
         assert_eq!(format!("{}", EffectTiming::EndOnly), "end_only");
     }
@@ -1134,7 +1095,10 @@ mod tests {
     fn test_pending_effect_display() {
         let pe = PendingEffect {
             timing: EffectTiming::NextByte,
-            guard: EffectGuard::ALWAYS,
+            guard: EffectGuard {
+                required_breaks: 0,
+                assert_chain: AssertChainId::NONE,
+            },
             atoms: vec![EffectAtom::AddTail {
                 origin: StateIdx(3),
             }]
@@ -1150,8 +1114,6 @@ mod tests {
 
     #[test]
     fn test_target_step_display() {
-        assert_eq!(format!("{}", TargetStep::None), "None");
-
         let adv = TargetStep::Advance {
             new_origins: vec![StateIdx(1)].into_boxed_slice(),
         };
