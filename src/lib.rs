@@ -4923,6 +4923,326 @@ mod tests {
 
         // Assert memory size matches the compiled regex.
         assert_memory_size(pattern, &re, memory);
+
+        // NFA-guided input generation: walk the NFA with counter-boundary
+        // schedules to produce structurally meaningful inputs.  The regex
+        // crate oracle determines expected results — no manual hints needed.
+        let generated = generate_nfa_inputs(&re, 1000);
+        test_generated(pattern, &re, &oracle, &generated, unroll_limit);
+        if unroll_limit > 0 {
+            let re_nu = build_regex_with_unroll(pattern, 0);
+            let generated_nu = generate_nfa_inputs(&re_nu, 1000);
+            test_generated(pattern, &re_nu, &oracle, &generated_nu, 0);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // NFA-walk input generator
+    // -------------------------------------------------------------------
+
+    /// Maximum byte-length of a generated input.  Keeps runtime bounded
+    /// for patterns with large counter ranges or unbounded repetitions.
+    const GEN_MAX_INPUT_LEN: usize = 200;
+
+    /// Generate test inputs by walking the NFA with different counter
+    /// schedules.
+    ///
+    /// For each counter, boundary values `{min-1, min, max, max+1}` are
+    /// tried (where applicable).  The cross-product of boundary values
+    /// across all counters forms the set of schedules, capped at
+    /// `max_inputs`.  Each schedule drives a deterministic NFA walk that
+    /// emits a byte string.
+    ///
+    /// The generated inputs exercise counter-boundary edge cases that
+    /// hand-picked inputs might miss: off-by-one at min, off-by-one at
+    /// max, and combinatorial interactions between multiple counters.
+    fn generate_nfa_inputs(regex: &Regex, max_inputs: usize) -> Vec<Vec<u8>> {
+        // Build boundary values for each counter.
+        let boundary_values: Vec<Vec<usize>> = regex
+            .counter_info
+            .iter()
+            .map(|&(min, max, _)| {
+                let mut vals = Vec::new();
+                if min > 0 {
+                    vals.push(min - 1);
+                }
+                vals.push(min);
+                if max > min {
+                    vals.push(max);
+                }
+                if max < usize::MAX - 1 {
+                    vals.push(max + 1);
+                }
+                vals.sort();
+                vals.dedup();
+                vals
+            })
+            .collect();
+
+        let schedules = if boundary_values.is_empty() {
+            // No counters — single empty schedule.
+            vec![vec![]]
+        } else {
+            gen_cross_product(&boundary_values, max_inputs)
+        };
+
+        let mut inputs: Vec<Vec<u8>> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for schedule in &schedules {
+            if let Some(input) = gen_walk_nfa(regex, schedule) {
+                if seen.insert(input.clone()) {
+                    inputs.push(input);
+                }
+            }
+            if inputs.len() >= max_inputs {
+                break;
+            }
+        }
+        inputs
+    }
+
+    /// Cartesian product of boundary-value lists, capped at `max`.
+    fn gen_cross_product(values: &[Vec<usize>], max: usize) -> Vec<Vec<usize>> {
+        let mut result = vec![vec![]];
+        for vals in values {
+            let mut next = Vec::new();
+            for existing in &result {
+                for &v in vals {
+                    let mut combined = existing.clone();
+                    combined.push(v);
+                    next.push(combined);
+                    if next.len() >= max {
+                        return next;
+                    }
+                }
+            }
+            result = next;
+        }
+        result
+    }
+
+    /// Walk the NFA from `start` to `Match` using the given counter
+    /// schedule (target iteration count per counter).  Returns the byte
+    /// string consumed along the path, or `None` if no path to `Match`
+    /// exists with this schedule.
+    fn gen_walk_nfa(regex: &Regex, schedule: &[usize]) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut counter_counts = vec![0usize; regex.num_counters];
+        let mut steps = 0u32;
+        if gen_walk_rec(
+            regex,
+            regex.start,
+            schedule,
+            &mut counter_counts,
+            &mut out,
+            GEN_EPSILON_BUDGET,
+            &mut steps,
+        ) {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// Recursive NFA walk.  Returns `true` if `Match` is reachable from
+    /// `idx` under the given counter schedule.  Bytes consumed along the
+    /// path are appended to `out`.
+    ///
+    /// `epsilon_budget` limits consecutive epsilon (non-consuming) steps.
+    /// Each consuming state resets it.  This prevents infinite loops
+    /// through zero-width repetitions like `(a{0,2})+`.
+    const GEN_EPSILON_BUDGET: usize = 200;
+
+    /// Global step budget per NFA walk.  Limits total work (including
+    /// backtracking) to prevent combinatorial explosion on patterns with
+    /// deep nesting or many Split nodes.
+    const GEN_MAX_STEPS: u32 = 50_000;
+
+    fn gen_walk_rec(
+        regex: &Regex,
+        idx: StateIdx,
+        schedule: &[usize],
+        counter_counts: &mut [usize],
+        out: &mut Vec<u8>,
+        epsilon_budget: usize,
+        steps: &mut u32,
+    ) -> bool {
+        *steps += 1;
+        if *steps > GEN_MAX_STEPS || epsilon_budget == 0 || idx == StateIdx::NONE {
+            return false;
+        }
+        if idx.idx() >= regex.states.len() {
+            return false;
+        }
+
+        let eb = epsilon_budget - 1; // decremented for epsilon states
+        match regex.states[idx] {
+            State::Match => true,
+
+            State::Split { out: o1, out1: o2 } => {
+                // Try first branch; backtrack to second on failure.
+                let saved_len = out.len();
+                let saved_counts: Vec<usize> = counter_counts.to_vec();
+                if gen_walk_rec(regex, o1, schedule, counter_counts, out, eb, steps) {
+                    return true;
+                }
+                out.truncate(saved_len);
+                counter_counts.copy_from_slice(&saved_counts);
+                gen_walk_rec(regex, o2, schedule, counter_counts, out, eb, steps)
+            }
+
+            // Consuming states reset the epsilon budget.
+            State::Byte { byte, out: next } => {
+                if out.len() >= GEN_MAX_INPUT_LEN {
+                    return false;
+                }
+                out.push(byte);
+                if gen_walk_rec(
+                    regex, next, schedule, counter_counts, out, GEN_EPSILON_BUDGET, steps,
+                ) {
+                    true
+                } else {
+                    out.pop();
+                    false
+                }
+            }
+
+            State::ByteCI { byte, out: next } => {
+                if out.len() >= GEN_MAX_INPUT_LEN {
+                    return false;
+                }
+                out.push(byte);
+                if gen_walk_rec(
+                    regex, next, schedule, counter_counts, out, GEN_EPSILON_BUDGET, steps,
+                ) {
+                    true
+                } else {
+                    out.pop();
+                    false
+                }
+            }
+
+            State::ByteClass { class, out: next } => {
+                if out.len() >= GEN_MAX_INPUT_LEN {
+                    return false;
+                }
+                let bc = &regex.classes[class.idx()];
+                // Prefer 'a' (word char), then '0', ' ', then first match.
+                let byte = [b'a', b'0', b' ']
+                    .into_iter()
+                    .find(|&b| bc[b])
+                    .or_else(|| (0..=255u8).find(|&b| bc[b]));
+                let Some(byte) = byte else { return false };
+                out.push(byte);
+                if gen_walk_rec(
+                    regex, next, schedule, counter_counts, out, GEN_EPSILON_BUDGET, steps,
+                ) {
+                    true
+                } else {
+                    out.pop();
+                    false
+                }
+            }
+
+            State::ByteTable { table } => {
+                if out.len() >= GEN_MAX_INPUT_LEN {
+                    return false;
+                }
+                let bt = &regex.byte_tables[table.idx()];
+                // Try preferred bytes first, then scan.
+                let candidates = [b'a', b'0', b' '];
+                for &byte in &candidates {
+                    let target = bt[byte];
+                    if target != StateIdx::NONE {
+                        out.push(byte);
+                        let saved_counts: Vec<usize> = counter_counts.to_vec();
+                        if gen_walk_rec(
+                            regex, target, schedule, counter_counts, out,
+                            GEN_EPSILON_BUDGET, steps,
+                        ) {
+                            return true;
+                        }
+                        out.pop();
+                        counter_counts.copy_from_slice(&saved_counts);
+                    }
+                }
+                for byte in 0..=255u8 {
+                    if candidates.contains(&byte) {
+                        continue;
+                    }
+                    let target = bt[byte];
+                    if target != StateIdx::NONE {
+                        out.push(byte);
+                        let saved_counts: Vec<usize> = counter_counts.to_vec();
+                        if gen_walk_rec(
+                            regex, target, schedule, counter_counts, out,
+                            GEN_EPSILON_BUDGET, steps,
+                        ) {
+                            return true;
+                        }
+                        out.pop();
+                        counter_counts.copy_from_slice(&saved_counts);
+                    }
+                }
+                false
+            }
+
+            // Epsilon states decrement the budget.
+            State::Assert { out: next, .. } => {
+                gen_walk_rec(regex, next, schedule, counter_counts, out, eb, steps)
+            }
+
+            State::CounterInstance { counter, out: next } => {
+                counter_counts[counter.idx()] = 0;
+                gen_walk_rec(regex, next, schedule, counter_counts, out, eb, steps)
+            }
+
+            State::CounterIncrement {
+                counter,
+                out: cont,
+                out1: break_out,
+                ..
+            } => {
+                let c = counter.idx();
+                let target = schedule.get(c).copied().unwrap_or(1);
+                counter_counts[c] += 1;
+                if counter_counts[c] < target {
+                    gen_walk_rec(regex, cont, schedule, counter_counts, out, eb, steps)
+                } else {
+                    gen_walk_rec(regex, break_out, schedule, counter_counts, out, eb, steps)
+                }
+            }
+        }
+    }
+
+    /// Test NFA-generated inputs against the oracle on all eligible tiers.
+    fn test_generated(
+        pattern: &str,
+        re: &Regex,
+        oracle: &regex::bytes::Regex,
+        inputs: &[Vec<u8>],
+        unroll: usize,
+    ) {
+        for input_bytes in inputs {
+            let input = match std::str::from_utf8(input_bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let expected = oracle.is_match(input.as_bytes());
+            test_nfa(pattern, re, input, expected, unroll);
+            if re.dfa_eligible {
+                test_tier1(pattern, re, input, expected, unroll);
+            }
+            if re.tier2_eligible {
+                test_tier2(pattern, re, input, expected, unroll);
+            }
+            if re.tier3_eligible {
+                test_tier3(pattern, re, input, expected, unroll);
+            }
+            if re.tier4_eligible {
+                test_tier4(pattern, re, input, expected, unroll);
+            }
+        }
     }
 
     /// Resolve unroll_limit: if specified use it, otherwise use the default.
