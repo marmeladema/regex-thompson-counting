@@ -882,7 +882,7 @@ pub(crate) fn compile_target_effects(
             }
 
             // Per-tail deferred assertions: each tail has its own chain.
-            for &(tail, ref per_tail_asserts) in break_consuming_deferred.iter() {
+            for &(tail, ref per_tail_asserts, _) in break_consuming_deferred.iter() {
                 if per_tail_asserts.is_empty() {
                     // Pure tail — already handled above.
                     continue;
@@ -1210,8 +1210,8 @@ fn validate_one_target(
             // appears in the lowered data with an assertion chain.
             let deferred_only: Vec<StateIdx> = break_consuming_deferred
                 .iter()
-                .filter(|(_, asserts)| !asserts.is_empty())
-                .map(|(s, _)| *s)
+                .filter(|(_, asserts, _)| !asserts.is_empty())
+                .map(|(s, _, _)| *s)
                 .collect();
             let mut lowered_deferred_tails: Vec<StateIdx> = lowered
                 .break_consuming_deferred

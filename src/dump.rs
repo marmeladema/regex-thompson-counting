@@ -634,7 +634,7 @@ impl DumpRegex<'_> {
                                     "      break_consuming_deferred: [{}]",
                                     break_consuming_deferred
                                         .iter()
-                                        .map(|(s, asserts)| {
+                                        .map(|(s, asserts, _)| {
                                             format!(
                                                 "{}(?@[{}])",
                                                 s,
