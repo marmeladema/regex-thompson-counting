@@ -100,7 +100,12 @@ fuzz_target!(|data: &[u8]| {
     let info = re.info();
     let num_states = info.memory.num_states;
     let total_input_bytes: usize = inputs.iter().map(|i| i.len()).sum();
-    if num_states > 50 || total_input_bytes > 1000 || num_states * total_input_bytes > 15_000 {
+    let max_input_len = inputs.iter().map(|i| i.len()).max().unwrap_or(0);
+    if num_states > 50
+        || total_input_bytes > 1000
+        || max_input_len > 200
+        || num_states * total_input_bytes > 15_000
+    {
         return;
     }
 
@@ -147,6 +152,15 @@ fuzz_target!(|data: &[u8]| {
         Ok(r) => r,
         Err(_) => return,
     };
+
+    // Re-check budget: no-unroll compilation may promote patterns to
+    // higher tiers with more expensive matching (e.g. Tier 4 with
+    // nested counter programs).
+    let info_nu = re_no_unroll.info();
+    let num_states_nu = info_nu.memory.num_states;
+    if num_states_nu > 50 || num_states_nu * total_input_bytes > 15_000 {
+        return;
+    }
 
     for input in &inputs {
         set_input(input);

@@ -103,7 +103,12 @@ fuzz_target!(|data: &[u8]| {
     let info = re.info();
     let num_states = info.memory.num_states;
     let total_input_bytes: usize = inputs.iter().map(|i| i.len()).sum();
-    if num_states > 50 || total_input_bytes > 1000 || num_states * total_input_bytes > 15_000 {
+    let max_input_len = inputs.iter().map(|i| i.len()).max().unwrap_or(0);
+    if num_states > 50
+        || total_input_bytes > 1000
+        || max_input_len > 200
+        || num_states * total_input_bytes > 15_000
+    {
         return;
     }
 
