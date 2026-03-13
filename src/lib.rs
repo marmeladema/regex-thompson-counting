@@ -10835,6 +10835,213 @@ mod tests {
                 (" ccccccccccccz ", false),         // 12 c's + z after space: no \b at c/z boundary
             ],
         }
+
+        // ---------------------------------------------------------------
+        // Coverage expansion: lock down Tier 3 code paths that were
+        // previously untested or only partially tested.  These tests
+        // exist to catch regressions when fixing future bugs.
+        // ---------------------------------------------------------------
+
+        // PATH 14: finish() pending break seeds at EOI.
+        // When c0 breaks on the last input byte, the break seed for c1
+        // has a deferred \b that can't be evaluated yet (no next byte).
+        // It goes into pending_break_seeds and is resolved in finish().
+        // With unroll_limit=0, .{0,3} stays as a counter.  c1 has min=0,
+        // so value=0 >= min → immediate break → break_is_match_at_end.
+        test_tier3_cov_pending_break_seed_eoi {
+            pattern: r"^c{3,5}\b.{0,3}$",
+            memory: 1425,
+            min_tier: 1,
+            inputs: [
+                ("ccc", true),           // c0=3, \b pending at EOI, passes (word→end), c1 seed value=0 ≥ min=0
+                ("cccc", true),          // c0=4
+                ("ccccc", true),         // c0=5 (max)
+                ("cc", false),           // c0=2 < min=3
+                ("cccccc", false),       // c0=5 then extra 'c': c0 max exceeded
+                ("ccc ", true),          // c0=3, \b(c, ' ') passes mid-input, c1 seeded, ' ' consumed
+                ("ccc  ", true),         // c0=3, \b mid, c1 counts 2 spaces
+                ("ccc   ", true),        // c0=3, \b mid, c1 counts 3 spaces
+                ("ccc    ", false),      // c0=3, \b mid, c1 max=3 exceeded
+                ("ccca", false),         // \b(c,a) fails (both word)
+            ],
+        }
+
+        // PATH 2a: tail→CInc handoff where value+1 < min (continue only).
+        // c0 (.{2,5}) breaks, tail 'b' consumed, tail hits c1's CInc with
+        // value 0→1 < min 3.  Instance continues counting (no immediate break).
+        test_tier3_cov_tail_cinc_handoff_continue {
+            pattern: r"^.{2,5}bc{3,6}$",
+            memory: 1557,
+            min_tier: 1,
+            inputs: [
+                ("aabccc", true),        // c0=2, tail 'b', handoff to c1, c1 counts to 3
+                ("aabcccccc", true),      // c0=2, c1=6 (max)
+                ("aabcc", false),         // c1=2 < min=3
+                ("aab", false),           // no bytes for c1
+                ("aabccccccc", false),    // c1=7 > max=6
+                ("aaaaabccc", true),      // c0=5, tail 'b', handoff c1=3
+                ("aaaaabcccccc", true),   // c0=5, c1=6
+                ("abccc", false),         // c0=1 < min=2
+            ],
+        }
+
+        // PATH 2b: tail→CInc handoff with break_deferred_asserts.
+        // c0 (a{3,5}) breaks, tail 'b' consumed, tail hits c1's CInc.
+        // c1 (.{1,4}) has min=1, so the handoff (value 0→1) immediately
+        // breaks.  The break path has \b as a deferred assert.
+        test_tier3_cov_tail_cinc_handoff_break_deferred {
+            pattern: r"^a{3,5}b.{1,4}\b$",
+            memory: 1491,
+            min_tier: 1,
+            inputs: [
+                ("aaabx", true),         // c0=3, tail 'b', handoff c1=1, break, \b at EOI passes
+                ("aaabxy", true),        // c1=2, \b at EOI
+                ("aaabxyz", true),       // c1=3
+                ("aaabxyzw", true),      // c1=4 (max)
+                ("aaab", false),         // no byte for c1 body
+                ("aab", false),          // c0=2 < min=3
+                ("aaaaabx", true),       // c0=5 (max), tail 'b', handoff c1=1
+                ("aaabxyzwq", false),    // c1=5 > max=4
+            ],
+        }
+
+        // PATH 2c: multi-hop tail chain (tail→CInc→break→new tails).
+        // c0 (a{3,5}) breaks, tail 'b' consumed, tail hits c1's CInc
+        // (.{1,3}).  c1 has min=1, so the handoff immediately breaks.
+        // The break path has consuming states 'c','d'.  These become
+        // new post-break tails that must advance through 'c' then 'd'.
+        test_tier3_cov_multi_hop_tail_chain {
+            pattern: r"^a{3,5}b.{1,3}cd$",
+            memory: 1458,
+            min_tier: 1,
+            inputs: [
+                ("aaabxcd", true),       // c0=3, tail 'b', c1 handoff, c1=1 breaks, tails 'c','d'
+                ("aaabxycd", true),      // c1=2
+                ("aaabxyzcd", true),     // c1=3 (max)
+                ("aaabcd", false),       // no byte for c1 body (c1 min=1 requires at least 1)
+                ("aaab", false),         // no bytes after tail 'b'
+                ("aaabxyzwcd", false),   // c1=4 > max=3
+                ("aab", false),          // c0=2 < min=3
+            ],
+        }
+
+        // PATH 1a: Advance tail with target_deferred_asserts resolved
+        // mid-input.  c0,c1 (.{2,5} each) break, tail 'c' consumed,
+        // Advance deposits \b, resolved on NEXT byte (' ') mid-input.
+        test_tier3_cov_advance_tail_deferred_mid_input {
+            pattern: r"^.{2,5}.{2,5}c\b x",
+            memory: 1590,
+            min_tier: 1,
+            inputs: [
+                ("aaaac x", true),       // c0=2,c1=2, tail 'c', \b(c,' ') passes, ' ' consumed, 'x' consumed
+                ("aaaaac x", true),      // c0+c1 split across 5 chars
+                ("aaaaaac x", true),     // c0=3,c1=3
+                ("aaaacax", false),      // \b(c,a) fails (both word)
+                ("aac x", false),        // total=2+2+3=7 min, "aac x" is 5 chars: too short
+            ],
+        }
+
+        // PATH 5a: counter break \b deferred assert resolved mid-input.
+        // c0 (c{4,10}) breaks, \b deposited in verified_deferred_asserts,
+        // resolved on the NEXT byte (' ').
+        test_tier3_cov_counter_break_wb_mid_input {
+            pattern: r"^c{4,10}\b x",
+            memory: 1301,
+            min_tier: 1,
+            inputs: [
+                ("cccc x", true),        // c0=4, \b(c,' ') passes mid-input, ' ' and 'x' consumed
+                ("ccccc x", true),       // c0=5
+                ("cccccccccc x", true),  // c0=10 (max)
+                ("ccccx", false),        // \b(c,x) fails (both word)
+                ("ccc x", false),        // c0=3 < min=4
+                ("ccccccccccc x", false), // c0=11 > max=10
+            ],
+        }
+
+        // PATH 3b: None target with deferred asserts that FAIL.
+        // c0,c1 break, tail 'y' consumed, None target deposits \B,
+        // \B at EOI fails (word→end = boundary, \B requires non-boundary).
+        test_tier3_cov_none_target_deferred_fail {
+            pattern: r"^.{2,30}c{9,48}y\B$",
+            memory: 1229,
+            min_tier: 3,
+            inputs: [
+                ("aaccccccccccy", false),    // c0=2, c1=10, tail 'y', \B at EOI fails
+                ("aacccccccccccccy", false),  // c0=2, c1=13
+                ("aacccccccccy", false),      // c0=2, c1=9 (min)
+                ("aaccccccccy", false),       // c1=8 < min=9
+            ],
+        }
+
+        // PATH 13a: contaminated clean_nb deferred assert that PASSES.
+        // The x+ alternation provides a counter-free path to \b$.
+        // When both counters break (contaminated state), clean_nb has
+        // the x+ path's deferred \b.  clean_nb.resolve_deferred_at_end
+        // should return true.
+        test_tier3_cov_contaminated_clean_nb_deferred_pass {
+            pattern: r"^(.{3,10}.{3,10}|x+)\b$",
+            memory: 2217,
+            min_tier: 1,
+            inputs: [
+                ("xxx", true),           // x+ path, \b at EOI, counter-free
+                ("aaaaaa", true),         // counter path 3+3=6, contaminated, clean_nb \b passes
+                ("aaaaaaaaaa", true),     // counter path 5+5=10
+                ("aaa", false),           // too short for both counters (min 3+3=6)
+                ("aa", false),            // even shorter
+                ("", false),             // empty: x+ needs at least 1
+            ],
+        }
+
+        // PATH 6a: contamination correctly resolves to a TRUE match.
+        // 2 counters → contaminated state.  Inputs exercise the case
+        // where contamination is present and the match is legitimate.
+        test_tier3_cov_contamination_true_match {
+            pattern: r"^.{3,5}.{3,5}a?$",
+            memory: 1491,
+            min_tier: 1,
+            inputs: [
+                ("aaaaaa", true),        // 3+3=6, both complete, a? skips
+                ("aaaaaaa", true),       // 3+4 or 4+3
+                ("aaaaaaaa", true),      // 4+4
+                ("aaaaaaaaa", true),     // 4+5 or 5+4
+                ("aaaaaaaaaa", true),    // 5+5
+                ("aaaaa", false),        // 5 chars: can't split into 3+3 minimum
+                ("aaa", false),          // too short
+            ],
+        }
+
+        // PATH 15a: verified_deferred_asserts at EOI that FAILS.
+        // Counter breaks, tail deposits \B into verified_deferred_asserts.
+        // At EOI, \B(word, end) fails — word→end is a boundary.
+        test_tier3_cov_verified_deferred_fail_eoi {
+            pattern: r"^.{3,5}b\B$",
+            memory: 1260,
+            min_tier: 1,
+            inputs: [
+                ("aaab", false),         // \B at word(b)→EOI fails
+                ("aaaab", false),        // c0=4
+                ("aaaaab", false),       // c0=5 (max)
+                ("aab", false),          // c0=2 < min=3
+            ],
+        }
+
+        // PATH 16a: inline fast path with contamination.
+        // After both counters complete, subsequent bytes (or EOI) go
+        // through the fast path while the state is contaminated.
+        // Tests that cf_mae uses clean_nb_cf_mae correctly.
+        test_tier3_cov_fast_path_contaminated {
+            pattern: r"^(.{3,5}.{3,5})?$",
+            memory: 1458,
+            min_tier: 1,
+            inputs: [
+                ("aaaaaa", true),        // 3+3, ? matches, $
+                ("aaaaaaa", true),       // 3+4
+                ("aaaaaaaaaa", true),    // 5+5
+                ("", true),              // ? skips entirely
+                ("aaaaa", false),        // 5 chars: can't split into 3+3
+                ("aaaaaaaaaaa", false),  // 11 chars: 5+5=10 max + 1 extra
+            ],
+        }
     }
 
     /// Tier 2 encodes counter identity in `u64` bitmasks, so patterns with
