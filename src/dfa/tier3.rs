@@ -3765,39 +3765,43 @@ impl fmt::Debug for Tier3DfaMatcher<'_> {
 
 impl fmt::Display for Tier3DfaMatcher<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // --- Line 1: core DFA state ---
         if self.current == DfaStateId::DEAD {
-            write!(f, "DFA[T3] state=DEAD matched={}", self.ever_matched)?;
-            if self.has_live_instances {
-                write!(f, " live")?;
-            }
-            return Ok(());
+            write!(f, "DFA[T3] state=DEAD")?;
+        } else {
+            let state = &self.cache.inner.states[self.current.idx()];
+            write!(
+                f,
+                "DFA[T3] state={} nfa={{{}}} is_match={}",
+                self.current.0,
+                state
+                    .nfa_states
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                state.is_match,
+            )?;
         }
-        let state = &self.cache.inner.states[self.current.idx()];
+        // Always-show flags (never hidden when false/empty).
         write!(
             f,
-            "DFA[T3] state={} nfa={{{}}} matched={}",
-            self.current.0,
-            state
-                .nfa_states
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-                .join(","),
+            " matched={} mae={} cf_mae={} break_extras={} live={}",
             self.ever_matched,
+            self.match_at_end,
+            self.last_nb_counter_free_mae,
+            self.current_has_break_extras,
+            self.has_live_instances,
         )?;
-        if state.is_match {
-            write!(f, " is_match")?;
+        write!(f, " pending_mae={}", self.pending_break_mae)?;
+        // No-break DFA state (always shown).
+        if self.no_break_current == DfaStateId::DEAD {
+            write!(f, " nb=DEAD")?;
+        } else {
+            write!(f, " nb={}", self.no_break_current.0)?;
         }
-        if self.match_at_end {
-            write!(f, " mae")?;
-        }
-        if self.last_nb_counter_free_mae {
-            write!(f, " cf_mae")?;
-        }
-        if self.current_has_break_extras {
-            write!(f, " break_extras")?;
-        }
-        // Clean chain state (only shown when contaminated or divergent).
+        // Clean chain state (always shown when multi-counter pattern has
+        // break extras; shown as "n/a" otherwise so absence is explicit).
         if self.current_has_break_extras && self.regex.num_counters > 1 {
             if self.clean_nb == DfaStateId::DEAD {
                 write!(f, " clean_nb=DEAD")?;
@@ -3814,110 +3818,94 @@ impl fmt::Display for Tier3DfaMatcher<'_> {
                         .join(","),
                 )?;
             }
-            if self.clean_nb_is_match {
-                write!(f, " clean_is_match")?;
+            write!(
+                f,
+                " clean_is_match={} clean_cf_mae={}",
+                self.clean_nb_is_match, self.clean_nb_cf_mae,
+            )?;
+        }
+        // --- Counter summary (always shown, even when empty) ---
+        if self.use_ranges {
+            let rc = &self.ranged_counters;
+            for ci in 0..rc.num_counters() {
+                let entries = rc.entries(ci);
+                let count = entries.len();
+                write!(f, "\n  c{ci}: {count} range(s) [")?;
+                for (j, entry) in entries.iter().enumerate() {
+                    if j > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(
+                        f,
+                        "origin:{}={}-{}",
+                        entry.origin, entry.min_val, entry.max_val
+                    )?;
+                }
+                write!(f, "]")?;
             }
-            if self.clean_nb_cf_mae {
-                write!(f, " clean_cf_mae")?;
+        } else {
+            let ic = &self.inst_counters;
+            for ci in 0..ic.num_counters() {
+                let entries = ic.entries(ci);
+                let count = entries.len();
+                write!(f, "\n  c{ci}: {count} inst [")?;
+                for (j, entry) in entries.iter().enumerate() {
+                    if j > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}@{}", entry.origin, entry.value)?;
+                }
+                write!(f, "]")?;
             }
         }
-        // Counter summary.
-        if self.has_live_instances {
-            if self.use_ranges {
-                let rc = &self.ranged_counters;
-                for ci in 0..rc.num_counters() {
-                    let entries = rc.entries(ci);
-                    if entries.is_empty() {
-                        continue;
-                    }
-                    let count = entries.len();
-                    write!(f, "\n  c{ci}: {count} range(s) [")?;
-                    for (j, entry) in entries.iter().enumerate() {
-                        if j > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(
-                            f,
-                            "origin:{}={}-{}",
-                            entry.origin, entry.min_val, entry.max_val
-                        )?;
-                    }
-                    write!(f, "]")?;
-                }
+        // --- Tails (always shown) ---
+        write!(
+            f,
+            "\n  tails: [{}]",
+            self.post_break_tails
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )?;
+        // --- Verified deferred asserts (always shown) ---
+        write!(f, "\n  deferred: [")?;
+        for (i, &da) in self.verified_deferred_asserts.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            if let State::Assert { kind, .. } = self.regex.states[da] {
+                write!(f, "{}@{}", kind.label(), da)?;
             } else {
-                let ic = &self.inst_counters;
-                for ci in 0..ic.num_counters() {
-                    let entries = ic.entries(ci);
-                    if entries.is_empty() {
-                        continue;
-                    }
-                    let count = entries.len();
-                    write!(f, "\n  c{ci}: {count} inst [")?;
-                    for (j, entry) in entries.iter().enumerate() {
-                        if j > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{}@{}", entry.origin, entry.value)?;
-                    }
-                    write!(f, "]")?;
-                }
+                write!(f, "?@{da}")?;
             }
         }
-        if !self.post_break_tails.is_empty() {
+        write!(f, "]")?;
+        // --- Pending break tails (always shown) ---
+        write!(
+            f,
+            "\n  pending_tails: [{}]",
+            self.pending_break_tails
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )?;
+        // --- Pending break seeds (always shown) ---
+        write!(f, "\n  pending_seeds: [")?;
+        for (i, &(trigger, counter, origin, value, prev_word)) in
+            self.pending_break_seeds.iter().enumerate()
+        {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
             write!(
                 f,
-                "\n  tails: [{}]",
-                self.post_break_tails
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
+                "c{}→c{}@{}(val={},pw={})",
+                trigger, counter, origin, value, prev_word
             )?;
         }
-        if !self.verified_deferred_asserts.is_empty() {
-            write!(f, "\n  deferred: [")?;
-            for (i, &da) in self.verified_deferred_asserts.iter().enumerate() {
-                if i > 0 {
-                    write!(f, ", ")?;
-                }
-                if let State::Assert { kind, .. } = self.regex.states[da] {
-                    write!(f, "{}@{}", kind.label(), da)?;
-                } else {
-                    write!(f, "?@{da}")?;
-                }
-            }
-            write!(f, "]")?;
-        }
-        if !self.pending_break_tails.is_empty() {
-            write!(
-                f,
-                "\n  pending_tails: [{}]",
-                self.pending_break_tails
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )?;
-            if self.pending_break_mae {
-                write!(f, " +mae")?;
-            }
-        }
-        if !self.pending_break_seeds.is_empty() {
-            write!(f, "\n  pending_seeds: [")?;
-            for (i, &(trigger, counter, origin, value, prev_word)) in
-                self.pending_break_seeds.iter().enumerate()
-            {
-                if i > 0 {
-                    write!(f, ", ")?;
-                }
-                write!(
-                    f,
-                    "c{}→c{}@{}(val={},pw={})",
-                    trigger, counter, origin, value, prev_word
-                )?;
-            }
-            write!(f, "]")?;
-        }
+        write!(f, "]")?;
         Ok(())
     }
 }

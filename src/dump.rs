@@ -369,6 +369,23 @@ impl DumpRegex<'_> {
                     .join(", ")
             )?;
 
+            // target_is_match
+            let tim_indices: Vec<usize> = t3
+                .target_is_match
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &v)| if v { Some(i) } else { None })
+                .collect();
+            writeln!(
+                f,
+                "  target_is_match: [{}]",
+                tim_indices
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
+
             // target_is_match_at_end
             let mae_indices: Vec<usize> = t3
                 .target_is_match_at_end
@@ -386,16 +403,41 @@ impl DumpRegex<'_> {
                     .join(", ")
             )?;
 
-            // break_seeds
-            if !t3.break_seeds.is_empty() {
+            // target_deferred_asserts (non-empty entries only)
+            let tda_entries: Vec<(usize, &[StateIdx])> = t3
+                .target_deferred_asserts
+                .iter()
+                .enumerate()
+                .filter(|(_, da)| !da.is_empty())
+                .map(|(i, da)| (i, da.as_ref()))
+                .collect();
+            if !tda_entries.is_empty() {
+                writeln!(f, "  target_deferred_asserts:")?;
+                for (i, asserts) in tda_entries {
+                    let labels: Vec<String> = asserts
+                        .iter()
+                        .map(|&da| {
+                            if let State::Assert { kind, .. } = r.states.0[da] {
+                                format!("{}@{}", kind.label(), da)
+                            } else {
+                                format!("?@{da}")
+                            }
+                        })
+                        .collect();
+                    writeln!(f, "    state {i}: [{}]", labels.join(", "))?;
+                }
+            } else {
+                writeln!(f, "  target_deferred_asserts: (none)")?;
+            }
+
+            // break_seeds (always shown, even when empty)
+            if t3.break_seeds.is_empty() {
+                writeln!(f, "  break_seeds: (none)")?;
+            } else {
                 writeln!(f, "  break_seeds:")?;
                 for bs in t3.break_seeds.iter() {
-                    if bs.deferred_asserts.is_empty() {
-                        writeln!(
-                            f,
-                            "    trigger:c{} → seed c{} at origin:{}",
-                            bs.trigger, bs.counter, bs.origin
-                        )?;
+                    let gates_str = if bs.deferred_asserts.is_empty() {
+                        String::new()
                     } else {
                         let gates: Vec<String> = bs
                             .deferred_asserts
@@ -408,15 +450,13 @@ impl DumpRegex<'_> {
                                 }
                             })
                             .collect();
-                        writeln!(
-                            f,
-                            "    trigger:c{} → seed c{} at origin:{} (gated by {})",
-                            bs.trigger,
-                            bs.counter,
-                            bs.origin,
-                            gates.join(", ")
-                        )?;
-                    }
+                        format!(" (gated by {})", gates.join(", "))
+                    };
+                    writeln!(
+                        f,
+                        "    trigger:c{} → seed c{} at origin:{}{}",
+                        bs.trigger, bs.counter, bs.origin, gates_str
+                    )?;
                 }
             }
 
@@ -454,10 +494,13 @@ impl DumpRegex<'_> {
                 writeln!(f, "  targets:")?;
                 for (i, kind) in target_entries {
                     match kind {
-                        Tier3OriginKind::Advance { new_origins, .. } => {
+                        Tier3OriginKind::Advance {
+                            new_origins,
+                            is_match_at_end,
+                        } => {
                             writeln!(
                                 f,
-                                "    state {i}: Advance → [{}]",
+                                "    state {i}: Advance → [{}] mae={is_match_at_end}",
                                 new_origins
                                     .iter()
                                     .map(|s| s.to_string())
@@ -477,17 +520,15 @@ impl DumpRegex<'_> {
                             break_consuming_states,
                         } => {
                             writeln!(f, "    state {i}: Increment(c{counter}, {{{min},{max}}})",)?;
-                            if !advance_origins.is_empty() {
-                                writeln!(
-                                    f,
-                                    "      advance_origins: [{}]",
-                                    advance_origins
-                                        .iter()
-                                        .map(|s| s.to_string())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                )?;
-                            }
+                            writeln!(
+                                f,
+                                "      advance_origins: [{}]",
+                                advance_origins
+                                    .iter()
+                                    .map(|s| s.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )?;
                             writeln!(
                                 f,
                                 "      continue_origins: [{}]",
@@ -502,28 +543,24 @@ impl DumpRegex<'_> {
                                 "      break_is_match: {break_is_match}, \
                                  break_is_match_at_end: {break_is_match_at_end}",
                             )?;
-                            if !break_deferred_asserts.is_empty() {
-                                writeln!(
-                                    f,
-                                    "      break_deferred_asserts: [{}]",
-                                    break_deferred_asserts
-                                        .iter()
-                                        .map(|s| s.to_string())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                )?;
-                            }
-                            if !break_consuming_states.is_empty() {
-                                writeln!(
-                                    f,
-                                    "      break_consuming_states: [{}]",
-                                    break_consuming_states
-                                        .iter()
-                                        .map(|s| s.to_string())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                )?;
-                            }
+                            writeln!(
+                                f,
+                                "      break_deferred_asserts: [{}]",
+                                break_deferred_asserts
+                                    .iter()
+                                    .map(|s| s.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )?;
+                            writeln!(
+                                f,
+                                "      break_consuming_states: [{}]",
+                                break_consuming_states
+                                    .iter()
+                                    .map(|s| s.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )?;
                         }
                     }
                 }
