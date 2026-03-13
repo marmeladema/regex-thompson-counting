@@ -11206,6 +11206,37 @@ mod tests {
             ],
         }
 
+        // Bug 44 regression: Tier 3 false negative when counter break
+        // has a deferred assertion (`\B`) that blocks the epsilon closure.
+        // The pending break tails are correctly deferred (Bug 42) and
+        // promoted when the assertion passes on the next byte.  However,
+        // the promoted tails are consuming NFA states NOT in the current
+        // DFA state (the deferred assertion blocked the closure), so
+        // step_slow_impl can't find them in the transition's origin_keys.
+        // Fix: consume the byte directly via analysis targets in the
+        // pre-step resolution code, depositing results into
+        // pending_resolved_tails for injection after step_slow.
+        // Also: resolve_deferred_for_pending must not prune consuming
+        // states via state_can_reach_match (which is epsilon-only and
+        // always false for consuming states).
+        test_tier3_pending_tail_consume {
+            pattern: r"^.{2,13}\Ba?((a?a?)?(a?a?)?)?$",
+            memory: 2217,
+            min_tier: 1,
+            inputs: [
+                ("yxaayca", true),       // original fuzz input
+                ("yxa", true),           // minimal: .{2} + \B passes + a consumed
+                ("yxaa", true),          // .{2} + \B + two tail a's
+                ("aaaaaaa", true),       // all a's, \B passes between a's
+                ("aa", false),           // below counter min for matching path
+                ("bb", false),           // b's don't match tail a's, \B at EOI fails
+                ("ab", false),           // \B fails: a (word) → b (word) passes,
+                                         // but then tail needs a, gets b
+                ("ba", false),           // \B fails: b→a both word → passes,
+                                         // only 2 chars, counter needs 2 + \B + tail
+            ],
+        }
+
         // ---------------------------------------------------------------
         // Coverage expansion: lock down Tier 3 code paths that were
         // previously untested or only partially tested.  These tests

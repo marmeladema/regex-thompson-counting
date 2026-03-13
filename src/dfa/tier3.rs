@@ -2493,6 +2493,12 @@ pub struct Tier3DfaMatcher<'a> {
     /// `break_is_match_at_end` was deferred.  Promoted to `match_at_end`
     /// when the deferred assertion passes.
     pending_break_mae: bool,
+    /// Bug 44: tails and match_at_end resulting from resolving pending
+    /// break tails in the pre-step code.  These can't be injected into
+    /// `post_break_tails` / `match_at_end` before step_slow because
+    /// step_slow clears them.  Injected after step_slow returns.
+    pending_resolved_tails: Vec<StateIdx>,
+    pending_resolved_mae: bool,
     /// True when the current DFA state (`self.current`) was reached via a
     /// `with_break` transition and may contain NFA consuming states that
     /// entered through a counter break path.  When true, the precomputed
@@ -3050,6 +3056,8 @@ impl<'a> Tier3DfaMatcher<'a> {
             pending_break_seeds: Vec::new(),
             pending_break_tails: Vec::new(),
             pending_break_mae: false,
+            pending_resolved_tails: Vec::new(),
+            pending_resolved_mae: false,
             // The start state may include NFA states from break paths
             // (the start closure is computed with follow_break=true), but
             // these are freshly seeded — not from a previous counter break.
@@ -3095,6 +3103,8 @@ impl<'a> Tier3DfaMatcher<'a> {
         self.post_break_tails.clear();
         self.pending_break_tails.clear();
         self.pending_break_mae = false;
+        self.pending_resolved_tails.clear();
+        self.pending_resolved_mae = false;
 
         let trans = self.cache.populate(
             self.memory,
@@ -3229,23 +3239,149 @@ impl<'a> Tier3DfaMatcher<'a> {
             // to survive indefinitely and fire at end-of-input.
             self.verified_deferred_asserts.clear();
 
-            // Bug 42: resolve pending break tails and match_at_end from
-            // the previous step's counter breaks with deferred assertions.
-            // If the deferred assertion passed, promote the pending tails
-            // to active post_break_tails and set match_at_end.  Otherwise
-            // discard — the tails are invalid because the assertion failed.
+            // Bug 42 + Bug 44: resolve pending break tails and match_at_end
+            // from the previous step's counter breaks with deferred assertions.
+            //
+            // If the deferred assertion passed, the tails need to consume
+            // the current byte `b` immediately.  They can't simply be
+            // promoted to post_break_tails because the current DFA state
+            // may not include them (the deferred assertion blocked the
+            // epsilon closure at compile time), so step_slow_impl can't
+            // look them up in the transition's origin_keys (Bug 44).
+            //
+            // Instead, we consume `b` directly using the static analysis
+            // targets, applying the same Advance/Increment/None logic as
+            // step_slow's tail loop.  Tails that can't consume `b` are
+            // kept as post_break_tails for the next step.
             if !self.pending_break_tails.is_empty() || self.pending_break_mae {
                 if any_assert_passed {
-                    for &tail in &self.pending_break_tails {
-                        if !self.post_break_tails.contains(&tail) {
-                            self.post_break_tails.push(tail);
+                    // Snapshot the pending tails into a temp buffer so the
+                    // Increment branch can re-pend new tails into
+                    // pending_break_tails without aliasing issues.
+                    let snapshot: Vec<StateIdx> =
+                        self.pending_break_tails.drain(..).collect();
+                    for &tail in &snapshot {
+                        if let Some(target) = consume_byte(tail, b, self.regex) {
+                            match self.analysis.targets[target.idx()] {
+                                Some(Tier3OriginKind::Advance {
+                                    ref new_origins,
+                                    is_match_at_end,
+                                }) => {
+                                    // Put advanced tails into pending_resolved
+                                    // (injected after step_slow to avoid
+                                    // double-consumption).
+                                    for &new_o in new_origins.iter() {
+                                        if !self.pending_resolved_tails.contains(&new_o) {
+                                            self.pending_resolved_tails.push(new_o);
+                                        }
+                                    }
+                                    if is_match_at_end {
+                                        self.pending_resolved_mae = true;
+                                    }
+                                    for &da in
+                                        self.analysis.target_deferred_asserts[tail.idx()].iter()
+                                    {
+                                        if !self.verified_deferred_asserts.contains(&da) {
+                                            self.verified_deferred_asserts.push(da);
+                                        }
+                                    }
+                                    if self.analysis.target_is_match[tail.idx()] {
+                                        self.ever_matched = true;
+                                    }
+                                }
+                                Some(Tier3OriginKind::Increment {
+                                    counter,
+                                    min,
+                                    max,
+                                    ref continue_origins,
+                                    break_is_match,
+                                    break_is_match_at_end,
+                                    ref break_deferred_asserts,
+                                    ref break_consuming_states,
+                                    ..
+                                }) => {
+                                    // Tail hit CInc — hand off to counter.
+                                    // Value starts at 0, increment to 1.
+                                    let pbt_value: u32 = 0;
+                                    if pbt_value + 1 < max {
+                                        for &new_o in continue_origins.iter() {
+                                            if self.use_ranges {
+                                                self.ranged_counters.insert(
+                                                    counter.idx(),
+                                                    new_o,
+                                                    pbt_value + 1,
+                                                    pbt_value + 1,
+                                                );
+                                            } else {
+                                                self.inst_counters.seed(
+                                                    counter.idx(),
+                                                    new_o,
+                                                    pbt_value + 1,
+                                                );
+                                            }
+                                            self.has_live_instances = true;
+                                        }
+                                    }
+                                    if pbt_value + 1 >= min {
+                                        if !break_deferred_asserts.is_empty() {
+                                            for &da in break_deferred_asserts.iter() {
+                                                if !self.verified_deferred_asserts.contains(&da) {
+                                                    self.verified_deferred_asserts.push(da);
+                                                }
+                                            }
+                                            if break_is_match_at_end {
+                                                self.pending_break_mae = true;
+                                            }
+                                            for &new_o in break_consuming_states.iter() {
+                                                if !self.pending_break_tails.contains(&new_o) {
+                                                    self.pending_break_tails.push(new_o);
+                                                }
+                                            }
+                                        } else {
+                                            if break_is_match {
+                                                self.ever_matched = true;
+                                            }
+                                            if break_is_match_at_end {
+                                                self.pending_resolved_mae = true;
+                                            }
+                                            for &new_o in break_consuming_states.iter() {
+                                                if !self.pending_resolved_tails.contains(&new_o) {
+                                                    self.pending_resolved_tails.push(new_o);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                None => {
+                                    if self.analysis.target_is_match_at_end[tail.idx()] {
+                                        self.pending_resolved_mae = true;
+                                    }
+                                    if self.analysis.target_is_match[tail.idx()] {
+                                        self.ever_matched = true;
+                                    }
+                                    for &da in
+                                        self.analysis.target_deferred_asserts[tail.idx()].iter()
+                                    {
+                                        if !self.verified_deferred_asserts.contains(&da) {
+                                            self.verified_deferred_asserts.push(da);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Tail can't consume this byte — add to resolved
+                        // tails so it survives step_slow and becomes a
+                        // post_break_tail for the next step.
+                        else if !self.pending_resolved_tails.contains(&tail) {
+                            self.pending_resolved_tails.push(tail);
                         }
                     }
                     if self.pending_break_mae {
-                        self.match_at_end = true;
+                        self.pending_resolved_mae = true;
                     }
+                } else {
+                    self.pending_break_tails.clear();
                 }
-                self.pending_break_tails.clear();
                 self.pending_break_mae = false;
             }
 
@@ -3417,6 +3553,22 @@ impl<'a> Tier3DfaMatcher<'a> {
             } else {
                 self.step_slow_instances(slot, b);
             }
+            // Bug 44: inject tails and flags that were computed during
+            // the pre-step pending tail resolution.  These results
+            // couldn't be injected before step_slow because step_slow
+            // clears match_at_end and next_post_break_tails at its start.
+            if self.pending_resolved_mae {
+                self.match_at_end = true;
+                self.pending_resolved_mae = false;
+            }
+            if !self.pending_resolved_tails.is_empty() {
+                for &t in &self.pending_resolved_tails {
+                    if !self.post_break_tails.contains(&t) {
+                        self.post_break_tails.push(t);
+                    }
+                }
+                self.pending_resolved_tails.clear();
+            }
         }
     }
 
@@ -3490,7 +3642,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                 let mut stack = vec![out];
                 while let Some(idx) = stack.pop() {
                     let i = idx.idx();
-                    if i >= num_states || visited[i] || !self.regex.state_can_reach_match[i] {
+                    if i >= num_states || visited[i] {
                         continue;
                     }
                     visited[i] = true;
@@ -3509,7 +3661,10 @@ impl<'a> Tier3DfaMatcher<'a> {
                             stack.push(o);
                         }
                         // Consuming states are reachable — these are
-                        // the tail candidates.
+                        // the tail candidates.  Note: we cannot prune
+                        // with state_can_reach_match here because that
+                        // flag tracks epsilon-only reachability and is
+                        // always false for consuming states (Bug 44).
                         State::Byte { .. }
                         | State::ByteCI { .. }
                         | State::ByteClass { .. }
@@ -3758,6 +3913,11 @@ impl fmt::Debug for Tier3DfaMatcher<'_> {
                 &self.pending_break_tails.len(),
             )
             .field("pending_break_mae", &self.pending_break_mae)
+            .field(
+                "pending_resolved_tails_len",
+                &self.pending_resolved_tails.len(),
+            )
+            .field("pending_resolved_mae", &self.pending_resolved_mae)
             .field("use_ranges", &self.use_ranges);
         s.finish()
     }
