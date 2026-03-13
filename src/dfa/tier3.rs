@@ -3212,7 +3212,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             let any_assert_passed = if !self.pending_break_tails.is_empty()
                 || self.pending_break_mae
             {
-                self.any_deferred_assert_passes(false, Some(b))
+                self.resolve_deferred_for_pending(false, Some(b))
             } else {
                 false
             };
@@ -3456,20 +3456,67 @@ impl<'a> Tier3DfaMatcher<'a> {
         false
     }
 
-    /// Check if any counter-break deferred assertion passes (ignoring match
-    /// reachability).  Used by Bug 42 to decide whether pending break tails
-    /// and pending break match_at_end should be promoted.
-    fn any_deferred_assert_passes(&self, at_end: bool, next: Option<u8>) -> bool {
+    /// Check if any counter-break deferred assertion passes AND consuming
+    /// states or Match are reachable through the full assertion chain.
+    ///
+    /// Unlike the simpler "does the first assertion pass" check, this walks
+    /// epsilon transitions from the assertion's output, evaluating ALL
+    /// intermediate assertions (e.g. `\b → \B → ...`).  This correctly
+    /// rejects contradictory chains like `\b\B` (Bug 43).
+    ///
+    /// Returns `true` if at least one deferred assertion entry passes and
+    /// some downstream consuming state (for tail promotion) or Match (for
+    /// mae promotion) is reachable.
+    fn resolve_deferred_for_pending(
+        &self,
+        at_end: bool,
+        next: Option<u8>,
+    ) -> bool {
         if self.verified_deferred_asserts.is_empty() || self.current == DfaStateId::DEAD {
             return false;
         }
         let state = &self.cache.inner.states[self.current.idx()];
         let prev = state.prev_byte_representative();
+        let states = &self.regex.states;
+        let num_states = states.len();
         for &assert_idx in &self.verified_deferred_asserts {
-            if let State::Assert { kind, .. } = self.regex.states[assert_idx]
+            if let State::Assert { kind, out } = states[assert_idx]
                 && kind.eval(false, at_end, prev, next) == AssertEval::Pass
             {
-                return true;
+                // Walk epsilon transitions from `out` to check if any
+                // consuming state or Match is reachable (evaluating
+                // intermediate assertions dynamically).
+                let mut visited = vec![false; num_states];
+                let mut stack = vec![out];
+                while let Some(idx) = stack.pop() {
+                    let i = idx.idx();
+                    if i >= num_states || visited[i] || !self.regex.state_can_reach_match[i] {
+                        continue;
+                    }
+                    visited[i] = true;
+                    match states[idx] {
+                        State::Match => return true,
+                        State::Assert { kind: k, out: o } => {
+                            if k.eval(false, at_end, prev, next) == AssertEval::Pass {
+                                stack.push(o);
+                            }
+                        }
+                        State::Split { out: o, out1 } => {
+                            stack.push(o);
+                            stack.push(out1);
+                        }
+                        State::CounterInstance { out: o, .. } => {
+                            stack.push(o);
+                        }
+                        // Consuming states are reachable — these are
+                        // the tail candidates.
+                        State::Byte { .. }
+                        | State::ByteCI { .. }
+                        | State::ByteClass { .. }
+                        | State::ByteTable { .. } => return true,
+                        State::CounterIncrement { .. } => return true,
+                    }
+                }
             }
         }
         false
@@ -3654,7 +3701,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         // reach `$ → Match` at end-of-input.  This is checked via
         // `target_is_match_at_end`.
         if (!self.pending_break_tails.is_empty() || self.pending_break_mae)
-            && self.any_deferred_assert_passes(true, None)
+            && self.resolve_deferred_for_pending(true, None)
         {
             if self.pending_break_mae {
                 return true;
@@ -3840,6 +3887,20 @@ impl fmt::Display for Tier3DfaMatcher<'_> {
                 }
             }
             write!(f, "]")?;
+        }
+        if !self.pending_break_tails.is_empty() {
+            write!(
+                f,
+                "\n  pending_tails: [{}]",
+                self.pending_break_tails
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )?;
+            if self.pending_break_mae {
+                write!(f, " +mae")?;
+            }
         }
         if !self.pending_break_seeds.is_empty() {
             write!(f, "\n  pending_seeds: [")?;

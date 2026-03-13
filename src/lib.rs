@@ -11180,6 +11180,32 @@ mod tests {
             ],
         }
 
+        // Bug 43 regression: Tier 3 false positive when counter break
+        // has chained contradictory assertions (`\b\B`).  The
+        // `break_deferred_asserts` only records the first assertion
+        // (`\b`) as the entry point; the second (`\B`) is handled
+        // dynamically.  `resolve_deferred_for_pending` must walk the
+        // full epsilon chain from the entry assertion's output,
+        // evaluating ALL intermediate assertions.  Without this, the
+        // pending tails are promoted when `\b` passes even though `\B`
+        // blocks the path.
+        test_tier3_chained_contradictory_asserts {
+            pattern: r"^.{2,26}\b\B(a?)?$",
+            memory: 1228,
+            min_tier: 2,
+            inputs: [
+                ("cc", false),              // \b passes at EOI but \B fails → never matches
+                ("c ", false),              // \b passes (c→space) but \B fails
+                ("ccdac0d", false),          // original fuzz input
+                ("aa", false),              // word chars, \b passes at EOI, \B blocks
+                ("a ", false),              // \b passes (a→space), \B fails
+                ("  ", false),              // \b fails (space→EOI), irrelevant
+                ("a", false),               // below min (1 < 2)
+                ("ab", false),              // \b passes (a→b? no, both word), hmm
+                ("a0", false),              // both word, \b fails mid-input
+            ],
+        }
+
         // ---------------------------------------------------------------
         // Coverage expansion: lock down Tier 3 code paths that were
         // previously untested or only partially tested.  These tests
