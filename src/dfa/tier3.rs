@@ -2445,19 +2445,23 @@ fn break_consuming_tails(
     // (no deferred asserts) AND via a deferred path, the pure path wins
     // (empty asserts).
     let mut per_tail_asserts: Vec<Option<Vec<StateIdx>>> = vec![None; n];
-    let mut visited = vec![0u8; n]; // 0=unvisited, 1=visited-deferred, 2=visited-pure
+    // Bug 49: track minimum deferred length at each visited node.
+    // A node reachable via path with N deferred asserts may also be
+    // reachable via a shorter path with M < N deferred asserts.  The
+    // shorter path must be explored so that downstream consuming states
+    // get the minimal deferred set.  `best_deferred[i]` holds the
+    // smallest deferred length seen so far (u32::MAX = unvisited).
+    let mut best_deferred: Vec<u32> = vec![u32::MAX; n];
     while let Some((idx, deferred)) = stack.pop() {
         let i = idx.idx();
+        let d_len = deferred.len() as u32;
+        // Skip if already visited via a path with equal or fewer
+        // deferred asserts.
+        if d_len >= best_deferred[i] {
+            continue;
+        }
+        best_deferred[i] = d_len;
         let is_pure = deferred.is_empty();
-        // Skip if already visited via a pure path (best case).
-        if visited[i] == 2 {
-            continue;
-        }
-        // Skip if visited via deferred and this is also deferred.
-        if visited[i] == 1 && !is_pure {
-            continue;
-        }
-        visited[i] = if is_pure { 2 } else { 1 };
         match states[idx] {
             State::Split { out, out1 } => {
                 stack.push((out1, deferred.clone()));

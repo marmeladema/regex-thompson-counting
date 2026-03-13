@@ -11364,6 +11364,35 @@ mod tests {
             ],
         }
 
+        // Bug 49: Deferred path shortcutting in break_consuming_tails.
+        // Pattern: `^.{7,36}\B(\ba{0,0})?((a?a?)?(a?a?)?)?$` — c0 breaks
+        // after 7+ chars through `\B` (state 4).  The optional `(\b...)` group
+        // means consuming tails (7, 9, 12, 14) are reachable via two paths:
+        //   Path A: \B@4 → \b@5 → Split → tails — deferred [4, 5]
+        //   Path B: \B@4 → Split → tails — deferred [4]
+        // Path B has fewer deferred asserts, but break_consuming_tails
+        // explored Path A first (due to Split stack ordering) and marked
+        // intermediate nodes as "visited-deferred".  When Path B reached
+        // them, it was skipped because the visited check only distinguished
+        // pure vs deferred, not deferred-length.  All tails got [4, 5]
+        // instead of [4], making them unreachable (\B and \b are
+        // contradictory).
+        // Fix: track minimum deferred length per node and re-explore when
+        // a shorter path is found.
+        test_tier3_deferred_path_shortcut {
+            pattern: r"^.{7,36}\B(\ba{0,0})?((a?a?)?(a?a?)?)?$",
+            memory: 1525,
+            min_tier: 2,
+            inputs: [
+                ("aaaaaaaa", true),         // Bug 49: 8 a's, false negative
+                ("aaaaaaaaaaaaaaaa", true),  // 16 a's: same issue
+                ("aaaaaaa", false),          // 7 a's: c0 min=7 reached but no room for \B + optional
+                ("", false),                // empty: c0 needs 7+ chars
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true),  // 38 a's: c0≤36 + \B + a?a?a?a?
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false),  // 41 a's: exceeds c0(36)+\B+4 optional
+            ],
+        }
+
         // ---------------------------------------------------------------
         // Coverage expansion: lock down Tier 3 code paths that were
         // previously untested or only partially tested.  These tests
