@@ -1735,9 +1735,27 @@ impl Tier3DfaCache {
                 if !is_pre && !is_break_gated {
                     // Remap origin if Phase 1 consumed this seed's
                     // origin byte (Bug 16).
+                    //
+                    // Bug 50: only remap when the target is a consuming
+                    // state.  For L=1 bodies with a non-consuming loop
+                    // (e.g. `0*` preceding the counted body), the
+                    // post-consumption target is a Split/Assert/CI node
+                    // that will never appear in a subsequent transition's
+                    // origin_keys.  Remapping to such a target kills the
+                    // instance on the next step (action=None).  Keep the
+                    // original consuming origin so the instance survives.
                     let remapped_origin = resolved_body_targets
                         .iter()
                         .find(|&&(from, _)| from == s.1)
+                        .filter(|&&(_, to)| {
+                            matches!(
+                                regex.states[to],
+                                State::Byte { .. }
+                                    | State::ByteCI { .. }
+                                    | State::ByteClass { .. }
+                                    | State::ByteTable { .. }
+                            )
+                        })
                         .map_or(s.1, |&(_, to)| to);
                     let rs = (s.0, remapped_origin, s.2);
                     if !seeds
@@ -1820,10 +1838,22 @@ impl Tier3DfaCache {
             // Merge resolved seeds with origin remapping for L>1
             // bodies (Bug 16): Phase 1 consumed the first body byte,
             // so the seed should start at the post-consumption target.
+            //
+            // Bug 50: same guard as the counting path — only remap when
+            // the target is a consuming state.
             for s in &resolved_seeds {
                 let remapped_origin = resolved_body_targets
                     .iter()
                     .find(|&&(from, _)| from == s.1)
+                    .filter(|&&(_, to)| {
+                        matches!(
+                            regex.states[to],
+                            State::Byte { .. }
+                                | State::ByteCI { .. }
+                                | State::ByteClass { .. }
+                                | State::ByteTable { .. }
+                        )
+                    })
                     .map_or(s.1, |&(_, to)| to);
                 let rs = (s.0, remapped_origin, s.2);
                 if !seeds
@@ -2865,7 +2895,11 @@ macro_rules! step_slow_impl {
                 if pre_seed_contaminated {
                     if let Some(cn_slot) = self.clean_nb_trans_slot {
                         let cn_t = &self.cache.transitions[cn_slot];
-                        if !cn_t.pre_seeds.iter().any(|s| s.0 == counter && s.1 == origin) {
+                        if !cn_t
+                            .pre_seeds
+                            .iter()
+                            .any(|s| s.0 == counter && s.1 == origin)
+                        {
                             continue;
                         }
                     }

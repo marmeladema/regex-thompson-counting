@@ -11393,6 +11393,31 @@ mod tests {
             ],
         }
 
+        // Bug 50: Resolved seed remapped to non-consuming target.
+        // Pattern: `^(\b(0*a{2,8}){7,7})?$` — c0 body is `0*a{2,8}` (with
+        // c1 unrolled).  The `\b` is a deferred assertion on the start
+        // state.  When resolved on byte '0', the resolved seed at origin 2
+        // (Byte('0')) was remapped to target 3 (Split, the `0*` loop entry).
+        // Split is not a consuming state, so origin 3 never appeared in
+        // subsequent transitions' origin_keys → action=None → instance
+        // dropped immediately.  All counter instances died after one step.
+        // Fix: only remap when the target is a consuming state.
+        test_tier3_resolved_seed_nonconsume_remap {
+            pattern: r"^(\b(0*a{2,8}){7,7})?$",
+            memory: 1368,
+            min_tier: 3,
+            inputs: [
+                ("00aa00aa00aa00aa00aa00aa00aa", true),  // Bug 50: 7 groups of "00aa"
+                ("0aa0aa0aa0aa0aa0aa0aa", true),        // 7 groups of "0aa"
+                ("aaaaaaaaaaaaaaaa", true),              // 16 a's: 7 groups of aa + 2 extra
+                ("aaaaaaaaaaaaaa", true),                // 14 a's: exactly 7 groups of aa
+                ("", true),                             // empty: optional group matches
+                ("aaaaaaa", false),                     // 7 a's: can't form 7 groups of a{2,8}
+                ("aaaaaaaaaaaaa", false),               // 13 a's: 6.5 groups
+                ("0", false),                           // single 0: no a's for c1
+            ],
+        }
+
         // ---------------------------------------------------------------
         // Coverage expansion: lock down Tier 3 code paths that were
         // previously untested or only partially tested.  These tests
