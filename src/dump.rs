@@ -7,6 +7,7 @@
 
 use std::fmt;
 
+use crate::dfa::tier3_effects::{AssertChainArena, CompiledTargetEffects};
 use crate::dfa::Tier3OriginKind;
 use crate::{AssertKind, ByteClass, ByteMap, Regex, State, StateIdx};
 
@@ -158,6 +159,58 @@ impl fmt::Display for DumpState<'_> {
             State::Match => write!(f, "Match"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Effect dump helpers
+// ---------------------------------------------------------------------------
+
+/// Format compiled target effects for dump output.
+///
+/// Displays the assertion chain arena contents followed by each non-`None`
+/// target effect entry.  Used by the Tier 3 DFA analysis dump section.
+fn fmt_target_effects(
+    f: &mut fmt::Formatter<'_>,
+    target_effects: &[Option<CompiledTargetEffects>],
+    arena: &AssertChainArena,
+    states: &[State],
+) -> fmt::Result {
+    // Assertion chain arena.
+    if arena.len() > 0 {
+        writeln!(f, "  assert_chains:")?;
+        for i in 0..arena.len() {
+            let chain = arena.get(crate::dfa::tier3_effects::AssertChainId(i as u32));
+            let labels: Vec<String> = chain
+                .iter()
+                .map(|&s| {
+                    if let State::Assert { kind, .. } = states[s] {
+                        format!("{}@{}", kind.label(), s)
+                    } else {
+                        format!("?@{s}")
+                    }
+                })
+                .collect();
+            writeln!(f, "    chain#{i}: [{}]", labels.join(", "))?;
+        }
+    } else {
+        writeln!(f, "  assert_chains: (none)")?;
+    }
+
+    // Per-target effects.
+    let entries: Vec<(usize, &CompiledTargetEffects)> = target_effects
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| e.as_ref().map(|eff| (i, eff)))
+        .collect();
+    if !entries.is_empty() {
+        writeln!(f, "  target_effects:")?;
+        for (i, eff) in entries {
+            writeln!(f, "    state {i}: {eff}")?;
+        }
+    } else {
+        writeln!(f, "  target_effects: (none)")?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -26,6 +26,7 @@
 mod tier1;
 mod tier2;
 mod tier3;
+pub(crate) mod tier3_effects;
 mod tier4;
 
 use indexmap::Equivalent;
