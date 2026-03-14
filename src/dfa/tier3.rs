@@ -1040,7 +1040,9 @@ struct Transition {
     /// Parallel arrays: `origin_keys[i]` is the consuming NFA state;
     /// `origin_targets[i]` is the post-consumption NFA target state.
     /// The target's structural action is looked up from
-    /// [`Tier3Analysis::targets`] at runtime, avoiding cloned boxed slices.
+    /// [`Tier3Analysis::target_effects`] at runtime via
+    /// `target_effects[origin_targets[i].idx()]`.  The NFA state index
+    /// serves as the lookup key into the compiled effects table.
     origin_keys: Box<[StateIdx]>,
     origin_targets: Box<[StateIdx]>,
     /// True if any origin's byte-consumption target reaches `$ → Match`
@@ -1782,7 +1784,9 @@ impl Tier3DfaCache {
         // produces exactly one target, so `targets[0]` is the lookup key.
         // We store the target index instead of cloning the full
         // `Option<Tier3OriginKind>` — the structural action is looked up
-        // from `analysis.targets` at runtime.
+        // from `analysis.target_effects` at runtime.  The NFA state index
+        // serves as a de facto effect template ID (no separate newtype;
+        // deduplication is moot since each state has at most one CTE).
         let mut origin_keys = Vec::new();
         let mut origin_targets_vec = Vec::new();
         for &(origin, ref targets) in &targets_per_origin {
@@ -2786,7 +2790,7 @@ pub struct Tier3DfaMatcher<'a> {
     /// These track the post-counter "tail" (e.g. a trailing `.` or
     /// literal before `$ → Match`).  Updated each step: each tail is
     /// advanced through its target action.  When a tail's action is
-    /// `None` (dead) and `target_is_match_at_end` is true, `match_at_end` is set.
+    /// `None` (dead), match flags are checked via `origin_effects`.
     ///
     /// This replaces the use of DFA-level `is_match_at_end` for counting
     /// transitions, which is overly optimistic because the DFA state
