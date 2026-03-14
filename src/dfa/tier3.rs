@@ -361,8 +361,7 @@ pub(crate) fn compute_tier3_analysis(
         pure_tails: Box<[StateIdx]>,
         per_tail_deferred: Box<[tier3_effects::DeferredTail]>,
     }
-    let mut per_counter_break: Vec<Option<PerCounterBreakData>> =
-        (0..64).map(|_| None).collect();
+    let mut per_counter_break: Vec<Option<PerCounterBreakData>> = (0..64).map(|_| None).collect();
 
     for idx in 0..n {
         if let Some(Tier3OriginKind::Increment { counter, .. }) = &targets_vec[idx] {
@@ -401,10 +400,17 @@ pub(crate) fn compute_tier3_analysis(
             let bc = break_closure(&cinc_break_outs, states, state_can_reach_match);
             let (all_tails, pure_tails, per_tail_deferred) = if !cinc_break_outs.is_empty() {
                 let (a, p, d) = break_consuming_tails(&cinc_break_outs, states, &targets_vec);
-                (a.into_boxed_slice(), p.into_boxed_slice(), d.into_boxed_slice())
+                (
+                    a.into_boxed_slice(),
+                    p.into_boxed_slice(),
+                    d.into_boxed_slice(),
+                )
             } else {
-                (Box::new([]) as Box<[StateIdx]>, Box::new([]) as Box<[StateIdx]>,
-                 Box::new([]) as Box<[tier3_effects::DeferredTail]>)
+                (
+                    Box::new([]) as Box<[StateIdx]>,
+                    Box::new([]) as Box<[StateIdx]>,
+                    Box::new([]) as Box<[tier3_effects::DeferredTail]>,
+                )
             };
             per_counter_break[c] = Some(PerCounterBreakData {
                 deferred_asserts: bc.deferred_asserts,
@@ -941,22 +947,24 @@ pub(crate) fn compute_tier3_analysis(
             {
                 let c = counter.idx();
                 if counter_to_id[c] == tier3_effects::BreakEffectsId::NONE {
-                    let pcd = per_counter_break[c].take().unwrap_or_else(|| PerCounterBreakData {
-                        deferred_asserts: Box::new([]),
-                        all_tails: Box::new([]),
-                        pure_tails: Box::new([]),
-                        per_tail_deferred: Box::new([]),
-                    });
+                    let pcd = per_counter_break[c]
+                        .take()
+                        .unwrap_or_else(|| PerCounterBreakData {
+                            deferred_asserts: Box::new([]),
+                            all_tails: Box::new([]),
+                            pure_tails: Box::new([]),
+                            per_tail_deferred: Box::new([]),
+                        });
 
                     // Intern each deferred assert as an independent
                     // 1-element chain (OR semantics: any one passing = match).
                     // Bug 51: these must be separate chains, not one AND chain.
-                    let break_deferred_chain_ids: Box<[tier3_effects::AssertChainId]> =
-                        pcd.deferred_asserts
-                            .iter()
-                            .map(|&assert_idx| assert_chain_arena.intern(&[assert_idx]))
-                            .collect::<Vec<_>>()
-                            .into_boxed_slice();
+                    let break_deferred_chain_ids: Box<[tier3_effects::AssertChainId]> = pcd
+                        .deferred_asserts
+                        .iter()
+                        .map(|&assert_idx| assert_chain_arena.intern(&[assert_idx]))
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
 
                     // Intern per-tail deferred assertion chains.
                     let mut per_tail_with_chains = pcd.per_tail_deferred.into_vec();
@@ -1109,8 +1117,6 @@ impl Transition {
         }
     }
 }
-
-
 
 // ---------------------------------------------------------------------------
 // CounterStorage trait — abstracts over range-compressed and per-instance paths
@@ -1832,7 +1838,10 @@ impl Tier3DfaCache {
         if !is_counting {
             for rs in &mut resolved_seeds {
                 if let Some(pos) = origin_keys.iter().position(|&k| k == rs.1)
-                    && matches!(analysis.targets[origin_targets_vec[pos].idx()], Some(Tier3OriginKind::Increment { .. }))
+                    && matches!(
+                        analysis.targets[origin_targets_vec[pos].idx()],
+                        Some(Tier3OriginKind::Increment { .. })
+                    )
                 {
                     rs.2 = 1;
                 }
@@ -2046,8 +2055,10 @@ impl Tier3DfaCache {
                     .iter()
                     .zip(origin_targets_vec.iter())
                     .any(|(&origin, &target)| {
-                        !matches!(analysis.targets[target.idx()], Some(Tier3OriginKind::Increment { .. }))
-                            && analysis.target_is_match_at_end[origin.idx()]
+                        !matches!(
+                            analysis.targets[target.idx()],
+                            Some(Tier3OriginKind::Increment { .. })
+                        ) && analysis.target_is_match_at_end[origin.idx()]
                             && analysis.reachable_without_break[origin.idx()]
                     });
 
@@ -2775,12 +2786,10 @@ fn break_consuming_tails(
     // assertion chain arena is built in Step 9.
     let per_tail: Vec<tier3_effects::DeferredTail> = per_tail_raw
         .into_iter()
-        .map(|(origin, deferred)| {
-            tier3_effects::DeferredTail {
-                origin,
-                assert_states: deferred.into_boxed_slice(),
-                chain_id: tier3_effects::AssertChainId::NONE,
-            }
+        .map(|(origin, deferred)| tier3_effects::DeferredTail {
+            origin,
+            assert_states: deferred.into_boxed_slice(),
+            chain_id: tier3_effects::AssertChainId::NONE,
         })
         .collect();
     (all_result, pure_result, per_tail)
@@ -2926,6 +2935,12 @@ pub struct Tier3DfaMatcher<'a> {
     /// Reusable scratch for epsilon-walk reachability checks in
     /// `eval_assert_chain` → `can_reach_match_{mid,at_end}`.
     reach_scratch: super::ReachScratch,
+    /// Reusable scratch for tails resolved from pending effects.
+    /// Cleared per byte in `chunk()` instead of reallocated.
+    resolved_tails: Vec<StateIdx>,
+    /// Reusable scratch for the output of [`tier3_effects::resolve_pending()`].
+    /// Cleared per call instead of reallocated.
+    resolved_actions: tier3_effects::ResolvedActions,
 }
 
 // ---------------------------------------------------------------------------
@@ -3043,7 +3058,11 @@ macro_rules! step_slow_impl {
                                                     self.next_post_break_tails.push(*origin);
                                                 }
                                             }
-                                            tier3_effects::EffectAtom::AddSeed { counter: sc, origin: so, value: sv } => {
+                                            tier3_effects::EffectAtom::AddSeed {
+                                                counter: sc,
+                                                origin: so,
+                                                value: sv,
+                                            } => {
                                                 self.$next.seed(sc.idx(), *so, *sv);
                                             }
                                         }
@@ -3121,7 +3140,9 @@ macro_rules! step_slow_impl {
                         .origin_keys
                         .iter()
                         .position(|&k| k == origin)
-                        .and_then(|i| self.analysis.target_effects[t.origin_targets[i].idx()].as_ref());
+                        .and_then(|i| {
+                            self.analysis.target_effects[t.origin_targets[i].idx()].as_ref()
+                        });
 
                     match effects {
                         Some(effects) => match &effects.step {
@@ -3167,7 +3188,11 @@ macro_rules! step_slow_impl {
                                                     self.next_post_break_tails.push(*origin);
                                                 }
                                             }
-                                            tier3_effects::EffectAtom::AddSeed { counter: sc, origin: so, value: sv } => {
+                                            tier3_effects::EffectAtom::AddSeed {
+                                                counter: sc,
+                                                origin: so,
+                                                value: sv,
+                                            } => {
                                                 self.$next.seed(sc.idx(), *so, *sv);
                                             }
                                         }
@@ -3388,6 +3413,8 @@ impl<'a> Tier3DfaMatcher<'a> {
             pending_effects_current: Vec::new(),
             pending_effects_next: Vec::new(),
             reach_scratch: super::ReachScratch::new(),
+            resolved_tails: Vec::new(),
+            resolved_actions: tier3_effects::ResolvedActions::default(),
         }
     }
 
@@ -3536,10 +3563,10 @@ impl<'a> Tier3DfaMatcher<'a> {
             //
             // Tails that can't consume `b` are kept as post_break_tails
             // for the next step (injected after step_slow).
-            let mut resolved_tails: Vec<StateIdx> = Vec::new();
+            self.resolved_tails.clear();
             let mut resolved_mae = false;
             if !self.pending_effects_current.is_empty() {
-                let actions = tier3_effects::resolve_pending(
+                tier3_effects::resolve_pending(
                     &self.pending_effects_current,
                     tier3_effects::EffectTiming::NextByte,
                     &self.analysis.assert_chain_arena,
@@ -3547,7 +3574,9 @@ impl<'a> Tier3DfaMatcher<'a> {
                     Some(b), // next byte is known
                     self.regex,
                     &mut self.reach_scratch,
+                    &mut self.resolved_actions,
                 );
+                let actions = &self.resolved_actions;
                 // Apply match signals from deferred assertions.
                 if actions.set_match {
                     self.ever_matched = true;
@@ -3573,8 +3602,8 @@ impl<'a> Tier3DfaMatcher<'a> {
                             Some(effects) => match &effects.step {
                                 tier3_effects::TargetStep::Advance { new_origins } => {
                                     for &new_o in new_origins.iter() {
-                                        if !resolved_tails.contains(&new_o) {
-                                            resolved_tails.push(new_o);
+                                        if !self.resolved_tails.contains(&new_o) {
+                                            self.resolved_tails.push(new_o);
                                         }
                                     }
                                     // Apply immediate atoms from compiled Advance.
@@ -3631,13 +3660,22 @@ impl<'a> Tier3DfaMatcher<'a> {
                                                     resolved_mae = true;
                                                 }
                                                 tier3_effects::EffectAtom::AddTail { origin } => {
-                                                    if !resolved_tails.contains(origin) {
-                                                        resolved_tails.push(*origin);
+                                                    if !self.resolved_tails.contains(origin) {
+                                                        self.resolved_tails.push(*origin);
                                                     }
                                                 }
-                                                tier3_effects::EffectAtom::AddSeed { counter: sc, origin: so, value: sv } => {
+                                                tier3_effects::EffectAtom::AddSeed {
+                                                    counter: sc,
+                                                    origin: so,
+                                                    value: sv,
+                                                } => {
                                                     if self.use_ranges {
-                                                        self.ranged_counters.insert(sc.idx(), *so, *sv, *sv);
+                                                        self.ranged_counters.insert(
+                                                            sc.idx(),
+                                                            *so,
+                                                            *sv,
+                                                            *sv,
+                                                        );
                                                     } else {
                                                         self.inst_counters.seed(sc.idx(), *so, *sv);
                                                     }
@@ -3673,8 +3711,8 @@ impl<'a> Tier3DfaMatcher<'a> {
                         }
                     }
                     // Tail can't consume this byte — keep as post_break_tail.
-                    else if !resolved_tails.contains(&tail) {
-                        resolved_tails.push(tail);
+                    else if !self.resolved_tails.contains(&tail) {
+                        self.resolved_tails.push(tail);
                     }
                 }
                 // Clear resolved effects, then swap next→current so
@@ -3791,8 +3829,8 @@ impl<'a> Tier3DfaMatcher<'a> {
                 if resolved_mae {
                     self.match_at_end = true;
                 }
-                if !resolved_tails.is_empty() {
-                    for &tail in &resolved_tails {
+                if !self.resolved_tails.is_empty() {
+                    for &tail in &self.resolved_tails {
                         if !self.post_break_tails.contains(&tail) {
                             self.post_break_tails.push(tail);
                         }
@@ -3813,8 +3851,8 @@ impl<'a> Tier3DfaMatcher<'a> {
             if resolved_mae {
                 self.match_at_end = true;
             }
-            if !resolved_tails.is_empty() {
-                for &t in &resolved_tails {
+            if !self.resolved_tails.is_empty() {
+                for &t in &self.resolved_tails {
                     if !self.post_break_tails.contains(&t) {
                         self.post_break_tails.push(t);
                     }
@@ -3958,7 +3996,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         //   whose assertion chains are evaluated with at_end=true and
         //   downstream reachability checked via can_reach_match_at_end.
         if !self.pending_effects_current.is_empty() {
-            let actions = tier3_effects::resolve_pending(
+            tier3_effects::resolve_pending(
                 &self.pending_effects_current,
                 tier3_effects::EffectTiming::NextByte,
                 &self.analysis.assert_chain_arena,
@@ -3966,7 +4004,9 @@ impl<'a> Tier3DfaMatcher<'a> {
                 None, // no next byte
                 self.regex,
                 &mut self.reach_scratch,
+                &mut self.resolved_actions,
             );
+            let actions = &self.resolved_actions;
             // Seeds at EOI: check immediate-break match.
             //
             // Over-approximate scan: we iterate ALL target_effects looking for
@@ -3982,9 +4022,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             for &(counter, _origin, value) in &actions.seeds {
                 for effects in self.analysis.target_effects.iter().flatten() {
                     if let tier3_effects::TargetStep::Increment {
-                        counter: tc,
-                        min,
-                        ..
+                        counter: tc, min, ..
                     } = &effects.step
                         && *tc == counter
                         && value >= *min
@@ -4052,10 +4090,7 @@ impl fmt::Debug for Tier3DfaMatcher<'_> {
                 "pending_effects_current_len",
                 &self.pending_effects_current.len(),
             )
-            .field(
-                "pending_effects_next_len",
-                &self.pending_effects_next.len(),
-            );
+            .field("pending_effects_next_len", &self.pending_effects_next.len());
         s.finish()
     }
 }

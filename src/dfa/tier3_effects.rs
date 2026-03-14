@@ -765,6 +765,16 @@ pub(crate) struct ResolvedActions {
     pub(crate) set_match_at_end: bool,
 }
 
+impl ResolvedActions {
+    /// Reset all fields for reuse without deallocating.
+    pub(crate) fn clear(&mut self) {
+        self.seeds.clear();
+        self.tails.clear();
+        self.set_match = false;
+        self.set_match_at_end = false;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Effect resolution: evaluate pending effects at a boundary
 // ---------------------------------------------------------------------------
@@ -863,6 +873,7 @@ pub(crate) fn eval_assert_chain(
 /// - `regex`: the compiled regex.
 ///
 /// Effects whose guards fail are silently dropped (they are consumed).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_pending(
     pending: &[PendingEffect],
     timing_filter: EffectTiming,
@@ -871,8 +882,9 @@ pub(crate) fn resolve_pending(
     next: Option<u8>,
     regex: &Regex,
     scratch: &mut super::ReachScratch,
-) -> ResolvedActions {
-    let mut actions = ResolvedActions::default();
+    actions: &mut ResolvedActions,
+) {
+    actions.clear();
 
     for pe in pending {
         if pe.timing != timing_filter {
@@ -928,8 +940,6 @@ pub(crate) fn resolve_pending(
             }
         }
     }
-
-    actions
 }
 
 // ---------------------------------------------------------------------------
@@ -1485,7 +1495,8 @@ mod tests {
             prev_was_word: false,
         }];
         // Should resolve regardless of boundary context.
-        let actions = resolve_pending(
+        let mut actions = ResolvedActions::default();
+        resolve_pending(
             &effects,
             EffectTiming::NextByte,
             &arena,
@@ -1493,6 +1504,7 @@ mod tests {
             Some(b'x'),
             &regex,
             &mut scratch(),
+            &mut actions,
         );
         assert!(actions.set_match, "unconditional Match should resolve");
         assert!(!actions.set_match_at_end);
@@ -1522,7 +1534,8 @@ mod tests {
             prev_was_word: true,
         }];
         // next byte is non-word → boundary exists → \b passes
-        let actions = resolve_pending(
+        let mut actions = ResolvedActions::default();
+        resolve_pending(
             &effects,
             EffectTiming::NextByte,
             &arena,
@@ -1530,6 +1543,7 @@ mod tests {
             Some(b' '),
             &regex,
             &mut scratch(),
+            &mut actions,
         );
         assert!(
             !actions.tails.is_empty(),
@@ -1556,7 +1570,8 @@ mod tests {
             prev_was_word: true,
         }];
         // next byte is also word → no boundary → \b fails
-        let actions = resolve_pending(
+        let mut actions = ResolvedActions::default();
+        resolve_pending(
             &effects,
             EffectTiming::NextByte,
             &arena,
@@ -1564,6 +1579,7 @@ mod tests {
             Some(b'a'),
             &regex,
             &mut scratch(),
+            &mut actions,
         );
         assert!(
             actions.tails.is_empty(),
@@ -1612,7 +1628,8 @@ mod tests {
 
         // Word → non-word: \b passes, \B fails — one tail should resolve.
         let effects1 = make_effects();
-        let actions = resolve_pending(
+        let mut actions = ResolvedActions::default();
+        resolve_pending(
             &effects1,
             EffectTiming::NextByte,
             &arena,
@@ -1620,6 +1637,7 @@ mod tests {
             Some(b' '),
             &regex,
             &mut scratch(),
+            &mut actions,
         );
         assert!(
             !actions.tails.is_empty(),
@@ -1632,7 +1650,8 @@ mod tests {
 
         // Word → word: \b fails, \B passes — other tail should resolve.
         let effects2 = make_effects();
-        let actions2 = resolve_pending(
+        let mut actions2 = ResolvedActions::default();
+        resolve_pending(
             &effects2,
             EffectTiming::NextByte,
             &arena,
@@ -1640,6 +1659,7 @@ mod tests {
             Some(b'a'),
             &regex,
             &mut scratch(),
+            &mut actions2,
         );
         assert!(
             !actions2.tails.is_empty(),
@@ -1676,7 +1696,8 @@ mod tests {
         }];
 
         // Word → non-word: \b passes but \B fails → AND fails.
-        let actions = resolve_pending(
+        let mut actions = ResolvedActions::default();
+        resolve_pending(
             &effects,
             EffectTiming::NextByte,
             &arena,
@@ -1684,6 +1705,7 @@ mod tests {
             Some(b' '),
             &regex,
             &mut scratch(),
+            &mut actions,
         );
         assert!(
             actions.tails.is_empty(),
@@ -1691,7 +1713,8 @@ mod tests {
         );
 
         // Word → word: \b fails → AND fails immediately.
-        let actions2 = resolve_pending(
+        let mut actions2 = ResolvedActions::default();
+        resolve_pending(
             &effects,
             EffectTiming::NextByte,
             &arena,
@@ -1699,6 +1722,7 @@ mod tests {
             Some(b'a'),
             &regex,
             &mut scratch(),
+            &mut actions2,
         );
         assert!(
             actions2.tails.is_empty(),
@@ -1718,7 +1742,8 @@ mod tests {
             },
             prev_was_word: false,
         }];
-        let actions = resolve_pending(
+        let mut actions = ResolvedActions::default();
+        resolve_pending(
             &effects,
             EffectTiming::NextByte,
             &arena,
@@ -1726,6 +1751,7 @@ mod tests {
             Some(b'x'),
             &regex,
             &mut scratch(),
+            &mut actions,
         );
         assert_eq!(actions.tails, vec![StateIdx(5)]);
         assert!(!actions.set_match);
@@ -1745,7 +1771,8 @@ mod tests {
             },
             prev_was_word: false,
         }];
-        let actions = resolve_pending(
+        let mut actions = ResolvedActions::default();
+        resolve_pending(
             &effects,
             EffectTiming::NextByte,
             &arena,
@@ -1753,6 +1780,7 @@ mod tests {
             Some(b'x'),
             &regex,
             &mut scratch(),
+            &mut actions,
         );
         assert_eq!(actions.seeds.len(), 1);
         assert_eq!(actions.seeds[0], (CounterIdx(0), StateIdx(3), 1));
@@ -1770,7 +1798,8 @@ mod tests {
             atom: EffectAtom::MatchAtEnd,
             prev_was_word: false,
         }];
-        let actions = resolve_pending(
+        let mut actions = ResolvedActions::default();
+        resolve_pending(
             &effects,
             EffectTiming::NextByte,
             &arena,
@@ -1778,6 +1807,7 @@ mod tests {
             Some(b'x'),
             &regex,
             &mut scratch(),
+            &mut actions,
         );
         assert!(!actions.set_match, "MatchAtEnd should not set set_match");
         assert!(
@@ -1822,7 +1852,8 @@ mod tests {
             prev_was_word: true,
         }];
         // At EOI: EndLF passes (at_end=true).
-        let actions = resolve_pending(
+        let mut actions = ResolvedActions::default();
+        resolve_pending(
             &effects,
             EffectTiming::NextByte,
             &arena,
@@ -1830,6 +1861,7 @@ mod tests {
             None, // no next byte
             &regex,
             &mut scratch(),
+            &mut actions,
         );
         assert!(actions.set_match, "EndLF should pass at EOI");
     }
@@ -1863,7 +1895,8 @@ mod tests {
             prev_was_word: true,
         }];
         // Mid-input with next='\n': EndLF should pass.
-        let actions = resolve_pending(
+        let mut actions = ResolvedActions::default();
+        resolve_pending(
             &effects,
             EffectTiming::NextByte,
             &arena,
@@ -1871,6 +1904,7 @@ mod tests {
             Some(b'\n'), // next byte is newline
             &regex,
             &mut scratch(),
+            &mut actions,
         );
         assert!(actions.set_match, "EndLF should pass when next is newline");
     }
@@ -1904,7 +1938,8 @@ mod tests {
             prev_was_word: false,
         }];
         // Mid-input with next='x': EndLF should fail.
-        let actions = resolve_pending(
+        let mut actions = ResolvedActions::default();
+        resolve_pending(
             &effects,
             EffectTiming::NextByte,
             &arena,
@@ -1912,6 +1947,7 @@ mod tests {
             Some(b'x'), // next byte is not newline
             &regex,
             &mut scratch(),
+            &mut actions,
         );
         assert!(
             !actions.set_match,
@@ -1956,7 +1992,8 @@ mod tests {
                 prev_was_word: false,
             },
         ];
-        let actions = resolve_pending(
+        let mut actions = ResolvedActions::default();
+        resolve_pending(
             &effects,
             EffectTiming::NextByte,
             &arena,
@@ -1964,6 +2001,7 @@ mod tests {
             Some(b'x'),
             &regex,
             &mut scratch(),
+            &mut actions,
         );
         // All three atom kinds should be collected.
         assert_eq!(actions.seeds.len(), 1, "one seed");
@@ -2021,7 +2059,8 @@ mod tests {
                 prev_was_word: true,
             },
         ];
-        let actions = resolve_pending(
+        let mut actions = ResolvedActions::default();
+        resolve_pending(
             &effects,
             EffectTiming::NextByte,
             &arena,
@@ -2029,6 +2068,7 @@ mod tests {
             Some(b'a'), // word char → word→word, \b fails
             &regex,
             &mut scratch(),
+            &mut actions,
         );
         assert!(actions.seeds.is_empty(), "seed should be dropped");
         assert!(actions.tails.is_empty(), "tail should be dropped");
