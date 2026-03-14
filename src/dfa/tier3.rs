@@ -2907,129 +2907,106 @@ macro_rules! step_slow_impl {
             self.next_post_break_tails.clear();
             for &pbo in &self.post_break_tails {
                 let pos = t.origin_keys.iter().position(|&k| k == pbo);
-                match pos.map(|i| &self.analysis.targets[t.origin_targets[i].idx()]) {
-                    Some(Some(Tier3OriginKind::Advance {
-                        new_origins,
-                        is_match_at_end,
-                        is_match,
-                    })) => {
-                        for &new_o in new_origins.iter() {
-                            if !self.next_post_break_tails.contains(&new_o) {
-                                self.next_post_break_tails.push(new_o);
-                            }
-                        }
-                        // Bug 30: deposit target deferred asserts as
-                        // PendingEffect entries with Match atoms.
-                        // These are non-End Assert states on the epsilon
-                        // path from pbo's target, which would otherwise
-                        // only fire via the contaminated no_break_current
-                        // DFA state.
-                        tier3_effects::enqueue_target_deferred_match(
-                            &mut self.pending_effects_current,
-                            &self.analysis.target_assert_chain_ids[pbo.idx()],
-                            crate::is_word_byte(byte),
-                        );
-                        // Bug 37 + Bug 47: use the byte-specific
-                        // is_match_at_end and is_match from the Advance
-                        // action instead of the static arrays.  ByteTable
-                        // origins have per-byte targets, so the static
-                        // arrays (which skip ByteTable) were always false
-                        // for ByteTable states.
-                        if *is_match_at_end {
-                            self.match_at_end = true;
-                        }
-                        if *is_match {
-                            self.ever_matched = true;
-                        }
-                    }
-                    Some(Some(Tier3OriginKind::Increment {
-                        counter,
-                        min,
-                        max,
-                        continue_origins,
-                        break_is_match,
-                        break_is_match_at_end,
-                        break_effects_id,
-                        ..
-                    })) => {
-                        let be = &self.analysis.break_effects[break_effects_id.idx()];
-                        // Tail hit a CInc — hand off to the counter
-                        // instance machinery.  The post-break tail
-                        // consumed this byte, entering the CInc for the
-                        // first time (value 0 → incremented to 1).
-                        //
-                        // Insert the continued instance directly into
-                        // `$next` to avoid double-counting: the counter
-                        // loop (below) processes `$current`, and we
-                        // don't want this byte to be counted twice.
-                        //
-                        // This handoff is needed when counter-dependent
-                        // unconditional seeds are filtered out (Bug 15
-                        // fix): the post-break tail is the only way
-                        // the downstream counter gets its first instance.
-                        let pbt_value: u32 = 0;
-                        // Check continue (value after increment < max).
-                        if pbt_value + 1 < *max {
-                            for &new_o in continue_origins.iter() {
-                                self.$next.seed(counter.idx(), new_o, pbt_value + 1);
-                            }
-                        }
-                        // Check break (value after increment >= min).
-                        // Bug 36: the tail→CInc handoff IS a counter
-                        // break — set any_can_break and counter_broke so
-                        // the DFA selects with_break (which includes
-                        // post-break NFA origins) and break_seeds fire.
-                        // Without this, the DFA goes to the no_break
-                        // state and subsequent tails are dropped because
-                        // their origin isn't in the no_break closure.
-                        if pbt_value + 1 >= *min {
-                            any_can_break = true;
-                            counter_broke |= 1u64 << counter.idx();
-                            // Bug 45: pure flags fire unconditionally.
-                            if *break_is_match {
-                                self.ever_matched = true;
-                            }
-                            if *break_is_match_at_end {
-                                self.match_at_end = true;
-                            }
-                            if be.has_deferred {
-                                // Bug 51: OR semantics — one PendingEffect per chain.
-                                tier3_effects::enqueue_break_deferred_match(
-                                    &mut self.pending_effects_current,
-                                    &be.break_deferred_chain_ids,
-                                    crate::is_word_byte(byte),
-                                );
-                                // Bug 45: pure tails go immediately.
-                                for &new_o in be.break_consuming_pure.iter() {
+                match pos.map(|i| &self.analysis.target_effects[t.origin_targets[i].idx()]) {
+                    Some(Some(effects)) => {
+                        match &effects.step {
+                            tier3_effects::TargetStep::Advance { new_origins } => {
+                                for &new_o in new_origins.iter() {
                                     if !self.next_post_break_tails.contains(&new_o) {
                                         self.next_post_break_tails.push(new_o);
                                     }
                                 }
-                                // Bug 46: deferred tails with per-tail assertions.
-                                tier3_effects::enqueue_deferred_tail(
+                                // Bug 30: deposit target deferred asserts as
+                                // PendingEffect entries with Match atoms.
+                                tier3_effects::enqueue_target_deferred_match(
                                     &mut self.pending_effects_current,
-                                    &be.break_consuming_deferred,
+                                    &self.analysis.target_assert_chain_ids[pbo.idx()],
                                     crate::is_word_byte(byte),
-                                    true, // dedup
                                 );
-                            } else {
-                                for &new_o in be.break_consuming_states.iter() {
-                                    if !self.next_post_break_tails.contains(&new_o) {
-                                        self.next_post_break_tails.push(new_o);
+                                // Bug 37 + Bug 47: apply byte-specific
+                                // immediate effects from the compiled Advance.
+                                for atom in effects.immediate.iter() {
+                                    match atom {
+                                        tier3_effects::EffectAtom::MatchAtEnd => {
+                                            self.match_at_end = true;
+                                        }
+                                        tier3_effects::EffectAtom::Match => {
+                                            self.ever_matched = true;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            tier3_effects::TargetStep::Increment {
+                                counter,
+                                min,
+                                max,
+                                continue_origins,
+                                ..
+                            } => {
+                                // Tail hit a CInc — hand off to the counter
+                                // instance machinery.  The post-break tail
+                                // consumed this byte, entering the CInc for the
+                                // first time (value 0 → incremented to 1).
+                                //
+                                // Insert the continued instance directly into
+                                // `$next` to avoid double-counting: the counter
+                                // loop (below) processes `$current`, and we
+                                // don't want this byte to be counted twice.
+                                let pbt_value: u32 = 0;
+                                // Check continue (value after increment < max).
+                                if pbt_value + 1 < *max {
+                                    for &new_o in continue_origins.iter() {
+                                        self.$next.seed(counter.idx(), new_o, pbt_value + 1);
+                                    }
+                                }
+                                // Check break (value after increment >= min).
+                                // Bug 36: the tail→CInc handoff IS a counter
+                                // break — set any_can_break and counter_broke so
+                                // the DFA selects with_break and break_seeds fire.
+                                if pbt_value + 1 >= *min {
+                                    any_can_break = true;
+                                    counter_broke |= 1u64 << counter.idx();
+                                    // Apply on_break atoms (skip AddSeed — transition-level).
+                                    for atom in effects.on_break.iter() {
+                                        match atom {
+                                            tier3_effects::EffectAtom::Match => {
+                                                self.ever_matched = true;
+                                            }
+                                            tier3_effects::EffectAtom::MatchAtEnd => {
+                                                self.match_at_end = true;
+                                            }
+                                            tier3_effects::EffectAtom::AddTail { origin } => {
+                                                if !self.next_post_break_tails.contains(origin) {
+                                                    self.next_post_break_tails.push(*origin);
+                                                }
+                                            }
+                                            tier3_effects::EffectAtom::AddSeed { .. } => {
+                                                // Handled by transition-level break_seeds (until 8F).
+                                            }
+                                        }
+                                    }
+                                    // Deposit guarded effects (skip AddSeed — transition-level).
+                                    let pw = crate::is_word_byte(byte);
+                                    for ge in effects.guarded.iter() {
+                                        debug_assert_eq!(ge.atoms.len(), 1);
+                                        let atom = &ge.atoms[0];
+                                        if matches!(atom, tier3_effects::EffectAtom::AddSeed { .. }) {
+                                            continue;
+                                        }
+                                        self.pending_effects_current.push(tier3_effects::PendingEffect {
+                                            timing: ge.timing,
+                                            guard: ge.guard,
+                                            atom: atom.clone(),
+                                            prev_was_word: pw,
+                                        });
                                     }
                                 }
                             }
                         }
                     }
                     Some(None) => {
-                        // `None` target — the tail consumed this byte
-                        // but the post-consumption epsilon path has no
-                        // consuming states or CInc (only asserts and/or
-                        // Match).  Still need to deposit deferred asserts
-                        // (Bug 34: `y\b$` after counter break was lost
-                        // because analyze_target returned None for the
-                        // assert-only path).
-                        // Deposit as PendingEffect with Match atom.
+                        // `None` target — deposit deferred asserts (Bug 34).
                         tier3_effects::enqueue_target_deferred_match(
                             &mut self.pending_effects_current,
                             &self.analysis.target_assert_chain_ids[pbo.idx()],
@@ -3083,83 +3060,79 @@ macro_rules! step_slow_impl {
             for c_idx in 0..num_counters {
                 for entry in self.$current.entries(c_idx) {
                     let origin = entry.origin;
-                    let action = t
+                    let effects = t
                         .origin_keys
                         .iter()
                         .position(|&k| k == origin)
-                        .and_then(|i| self.analysis.targets[t.origin_targets[i].idx()].as_ref());
+                        .and_then(|i| self.analysis.target_effects[t.origin_targets[i].idx()].as_ref());
 
-                    match action {
-                        Some(Tier3OriginKind::Advance { new_origins, .. }) => {
-                            for &new_o in new_origins.iter() {
-                                self.$next.advance(c_idx, entry, new_o);
+                    match effects {
+                        Some(effects) => match &effects.step {
+                            tier3_effects::TargetStep::Advance { new_origins } => {
+                                for &new_o in new_origins.iter() {
+                                    self.$next.advance(c_idx, entry, new_o);
+                                }
                             }
-                        }
+                            tier3_effects::TargetStep::Increment {
+                                advance_origins,
+                                min,
+                                max,
+                                continue_origins,
+                                ..
+                            } => {
+                                // Advance-or-increment: entry survives at
+                                // advance_origins with the same values.
+                                for &new_o in advance_origins.iter() {
+                                    self.$next.advance(c_idx, entry, new_o);
+                                }
+
+                                // Continue: incremented entry stays in the loop.
+                                if self.$current.can_continue(entry, *max) {
+                                    for &new_o in continue_origins.iter() {
+                                        self.$next.insert_continued(c_idx, entry, new_o, *max);
+                                    }
+                                }
+
+                                // Break: entry has reached the minimum threshold.
+                                if self.$current.can_break(entry, *min) {
+                                    any_can_break = true;
+                                    counter_broke |= 1u64 << c_idx;
+                                    // Apply on_break atoms (skip AddSeed — transition-level).
+                                    for atom in effects.on_break.iter() {
+                                        match atom {
+                                            tier3_effects::EffectAtom::Match => {
+                                                self.ever_matched = true;
+                                            }
+                                            tier3_effects::EffectAtom::MatchAtEnd => {
+                                                self.match_at_end = true;
+                                            }
+                                            tier3_effects::EffectAtom::AddTail { origin } => {
+                                                if !self.next_post_break_tails.contains(origin) {
+                                                    self.next_post_break_tails.push(*origin);
+                                                }
+                                            }
+                                            tier3_effects::EffectAtom::AddSeed { .. } => {}
+                                        }
+                                    }
+                                    // Deposit guarded effects (skip AddSeed — transition-level).
+                                    let pw = crate::is_word_byte(byte);
+                                    for ge in effects.guarded.iter() {
+                                        debug_assert_eq!(ge.atoms.len(), 1);
+                                        let atom = &ge.atoms[0];
+                                        if matches!(atom, tier3_effects::EffectAtom::AddSeed { .. }) {
+                                            continue;
+                                        }
+                                        self.pending_effects_current.push(tier3_effects::PendingEffect {
+                                            timing: ge.timing,
+                                            guard: ge.guard,
+                                            atom: atom.clone(),
+                                            prev_was_word: pw,
+                                        });
+                                    }
+                                }
+                            }
+                        },
                         None => {}
-                        Some(Tier3OriginKind::Increment {
-                            advance_origins,
-                            min,
-                            max,
-                            continue_origins,
-                            break_is_match,
-                            break_is_match_at_end,
-                            break_effects_id,
-                            ..
-                        }) => {
-                            let be = &self.analysis.break_effects[break_effects_id.idx()];
-                            // Advance-or-increment: entry survives at
-                            // advance_origins with the same values.
-                            for &new_o in advance_origins.iter() {
-                                self.$next.advance(c_idx, entry, new_o);
-                            }
-
-                            // Continue: incremented entry stays in the loop.
-                            if self.$current.can_continue(entry, *max) {
-                                for &new_o in continue_origins.iter() {
-                                    self.$next.insert_continued(c_idx, entry, new_o, *max);
-                                }
-                            }
-
-                            // Break: entry has reached the minimum threshold.
-                            if self.$current.can_break(entry, *min) {
-                                any_can_break = true;
-                                counter_broke |= 1u64 << c_idx;
-                                // Bug 45: pure flags fire unconditionally.
-                                if *break_is_match {
-                                    self.ever_matched = true;
-                                }
-                                if *break_is_match_at_end {
-                                    self.match_at_end = true;
-                                }
-                                if be.has_deferred {
-                                    // Bug 51: OR semantics — one PendingEffect per chain.
-                                    tier3_effects::enqueue_break_deferred_match(
-                                        &mut self.pending_effects_current,
-                                        &be.break_deferred_chain_ids,
-                                        crate::is_word_byte(byte),
-                                    );
-                                    // Bug 45: pure tails go immediately.
-                                    for &new_o in be.break_consuming_pure.iter() {
-                                        if !self.next_post_break_tails.contains(&new_o) {
-                                            self.next_post_break_tails.push(new_o);
-                                        }
-                                    }
-                                    // Bug 46: deferred tails with per-tail assertions.
-                                    tier3_effects::enqueue_deferred_tail(
-                                        &mut self.pending_effects_current,
-                                        &be.break_consuming_deferred,
-                                        crate::is_word_byte(byte),
-                                        true, // dedup
-                                    );
-                                } else {
-                                    for &new_o in be.break_consuming_states.iter() {
-                                        if !self.next_post_break_tails.contains(&new_o) {
-                                            self.next_post_break_tails.push(new_o);
-                                        }
-                                    }
-                                }
-                            }
-                        }
                     }
                 }
             }
@@ -3580,106 +3553,100 @@ impl<'a> Tier3DfaMatcher<'a> {
                 // tail using static analysis targets.
                 for &tail in &actions.tails {
                     if let Some(target) = consume_byte(tail, b, self.regex) {
-                        match self.analysis.targets[target.idx()] {
-                            Some(Tier3OriginKind::Advance {
-                                ref new_origins,
-                                is_match_at_end,
-                                is_match,
-                            }) => {
-                                for &new_o in new_origins.iter() {
-                                    if !resolved_tails.contains(&new_o) {
-                                        resolved_tails.push(new_o);
-                                    }
-                                }
-                                if is_match_at_end {
-                                    resolved_mae = true;
-                                }
-                                // Second-order: target deferred asserts
-                                // go to pending_effects_next to survive
-                                // the post-resolution clear.
-                                tier3_effects::enqueue_target_deferred_match(
-                                    &mut self.pending_effects_next,
-                                    &self.analysis.target_assert_chain_ids[tail.idx()],
-                                    crate::is_word_byte(b),
-                                );
-                                // Bug 47: use byte-specific is_match from
-                                // the Advance action (handles ByteTable).
-                                if is_match {
-                                    self.ever_matched = true;
-                                }
-                            }
-                            Some(Tier3OriginKind::Increment {
-                                counter,
-                                min,
-                                max,
-                                ref continue_origins,
-                                break_is_match,
-                                break_is_match_at_end,
-                                break_effects_id,
-                                ..
-                            }) => {
-                                let be = &self.analysis.break_effects[break_effects_id.idx()];
-                                // Tail hit CInc — hand off to counter.
-                                // Value starts at 0, increment to 1.
-                                let pbt_value: u32 = 0;
-                                if pbt_value + 1 < max {
-                                    for &new_o in continue_origins.iter() {
-                                        if self.use_ranges {
-                                            self.ranged_counters.insert(
-                                                counter.idx(),
-                                                new_o,
-                                                pbt_value + 1,
-                                                pbt_value + 1,
-                                            );
-                                        } else {
-                                            self.inst_counters.seed(
-                                                counter.idx(),
-                                                new_o,
-                                                pbt_value + 1,
-                                            );
+                        match &self.analysis.target_effects[target.idx()] {
+                            Some(effects) => match &effects.step {
+                                tier3_effects::TargetStep::Advance { new_origins } => {
+                                    for &new_o in new_origins.iter() {
+                                        if !resolved_tails.contains(&new_o) {
+                                            resolved_tails.push(new_o);
                                         }
-                                        self.has_live_instances = true;
                                     }
+                                    // Apply immediate atoms from compiled Advance.
+                                    for atom in effects.immediate.iter() {
+                                        match atom {
+                                            tier3_effects::EffectAtom::MatchAtEnd => {
+                                                resolved_mae = true;
+                                            }
+                                            tier3_effects::EffectAtom::Match => {
+                                                self.ever_matched = true;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    // Second-order: target deferred asserts
+                                    // go to pending_effects_next.
+                                    tier3_effects::enqueue_target_deferred_match(
+                                        &mut self.pending_effects_next,
+                                        &self.analysis.target_assert_chain_ids[tail.idx()],
+                                        crate::is_word_byte(b),
+                                    );
                                 }
-                                if pbt_value + 1 >= min {
-                                    // Bug 45: pure flags fire unconditionally.
-                                    if break_is_match {
-                                        self.ever_matched = true;
+                                tier3_effects::TargetStep::Increment {
+                                    counter,
+                                    min,
+                                    max,
+                                    continue_origins,
+                                    ..
+                                } => {
+                                    // Tail hit CInc — hand off to counter.
+                                    // Value starts at 0, increment to 1.
+                                    let pbt_value: u32 = 0;
+                                    if pbt_value + 1 < *max {
+                                        for &new_o in continue_origins.iter() {
+                                            if self.use_ranges {
+                                                self.ranged_counters.insert(
+                                                    counter.idx(),
+                                                    new_o,
+                                                    pbt_value + 1,
+                                                    pbt_value + 1,
+                                                );
+                                            } else {
+                                                self.inst_counters.seed(
+                                                    counter.idx(),
+                                                    new_o,
+                                                    pbt_value + 1,
+                                                );
+                                            }
+                                            self.has_live_instances = true;
+                                        }
                                     }
-                                    if break_is_match_at_end {
-                                        resolved_mae = true;
-                                    }
-                                    if be.has_deferred {
-                                        // Bug 42/51: OR semantics — one PendingEffect per chain.
-                                        // Second-order: goes to pending_effects_next.
-                                        tier3_effects::enqueue_break_deferred_match(
-                                            &mut self.pending_effects_next,
-                                            &be.break_deferred_chain_ids,
-                                            crate::is_word_byte(b),
-                                        );
-                                        // Bug 45: pure tails go immediately.
-                                        for &new_o in be.break_consuming_pure.iter() {
-                                            if !resolved_tails.contains(&new_o) {
-                                                resolved_tails.push(new_o);
+                                    if pbt_value + 1 >= *min {
+                                        // Apply on_break atoms (skip AddSeed).
+                                        for atom in effects.on_break.iter() {
+                                            match atom {
+                                                tier3_effects::EffectAtom::Match => {
+                                                    self.ever_matched = true;
+                                                }
+                                                tier3_effects::EffectAtom::MatchAtEnd => {
+                                                    resolved_mae = true;
+                                                }
+                                                tier3_effects::EffectAtom::AddTail { origin } => {
+                                                    if !resolved_tails.contains(origin) {
+                                                        resolved_tails.push(*origin);
+                                                    }
+                                                }
+                                                tier3_effects::EffectAtom::AddSeed { .. } => {}
                                             }
                                         }
-                                        // Bug 46: re-pend deferred tails.
+                                        // Deposit guarded effects (skip AddSeed).
                                         // Second-order: goes to pending_effects_next.
-                                        tier3_effects::enqueue_deferred_tail(
-                                            &mut self.pending_effects_next,
-                                            &be.break_consuming_deferred,
-                                            crate::is_word_byte(b),
-                                            false, // no dedup — freshly-cleared next queue
-                                        );
-                                    } else {
-                                        for &new_o in be.break_consuming_states.iter() {
-                                            if !resolved_tails.contains(&new_o) {
-                                                resolved_tails.push(new_o);
+                                        let pw = crate::is_word_byte(b);
+                                        for ge in effects.guarded.iter() {
+                                            debug_assert_eq!(ge.atoms.len(), 1);
+                                            let atom = &ge.atoms[0];
+                                            if matches!(atom, tier3_effects::EffectAtom::AddSeed { .. }) {
+                                                continue;
                                             }
+                                            self.pending_effects_next.push(tier3_effects::PendingEffect {
+                                                timing: ge.timing,
+                                                guard: ge.guard,
+                                                atom: atom.clone(),
+                                                prev_was_word: pw,
+                                            });
                                         }
                                     }
                                 }
-                            }
+                            },
                             None => {
                                 if self.analysis.target_is_match_at_end[tail.idx()] {
                                     resolved_mae = true;
@@ -3985,17 +3952,21 @@ impl<'a> Tier3DfaMatcher<'a> {
             );
             // Seeds at EOI: check immediate-break match.
             for &(counter, _origin, value) in &actions.seeds {
-                for target_action in self.analysis.targets.iter().flatten() {
-                    if let Tier3OriginKind::Increment {
+                for effects in self.analysis.target_effects.iter().flatten() {
+                    if let tier3_effects::TargetStep::Increment {
                         counter: tc,
                         min,
-                        break_is_match_at_end,
-                        break_is_match,
                         ..
-                    } = target_action
+                    } = &effects.step
                         && *tc == counter
                         && value >= *min
-                        && (*break_is_match_at_end || *break_is_match)
+                        && effects.on_break.iter().any(|a| {
+                            matches!(
+                                a,
+                                tier3_effects::EffectAtom::Match
+                                    | tier3_effects::EffectAtom::MatchAtEnd
+                            )
+                        })
                     {
                         return true;
                     }

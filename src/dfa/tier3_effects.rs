@@ -295,6 +295,11 @@ pub(crate) struct DeferredTail {
 #[derive(Clone, Debug)]
 pub(crate) struct BreakEffects {
     /// Whether the break path has deferred assertions (`\b`, `\B`, etc.).
+    ///
+    /// No longer read at runtime after 8E — the `on_break`/`guarded`
+    /// decomposition in `CompiledTargetEffects` encodes this statically.
+    /// Still used by `compile_target_effects()` during build.
+    #[allow(dead_code)]
     pub(crate) has_deferred: bool,
     /// Per-entry assertion chain IDs for break-deferred asserts (OR
     /// semantics, parallel to the original `break_deferred_asserts`).
@@ -681,6 +686,10 @@ pub(crate) fn enqueue_target_deferred_match(
 /// **Used for:** break-deferred asserts from counter break paths in
 /// post-break tail processing, the main counter step, and effect
 /// resolution.
+/// After 8E, break-deferred matches are deposited via the generic
+/// `on_break`/`guarded` dispatch from `CompiledTargetEffects`.
+/// This helper is retained for reference; will be removed in 8G.
+#[allow(dead_code)]
 pub(crate) fn enqueue_break_deferred_match(
     queue: &mut Vec<PendingEffect>,
     chain_ids: &[AssertChainId],
@@ -714,6 +723,10 @@ pub(crate) fn enqueue_break_deferred_match(
 ///
 /// **Used for:** break-consuming deferred tails in post-break tail
 /// processing, the main counter step, and effect resolution.
+///
+/// After 8E, deferred tails are deposited via the generic `guarded`
+/// dispatch from `CompiledTargetEffects`.  Will be removed in 8G.
+#[allow(dead_code)]
 pub(crate) fn enqueue_deferred_tail(
     queue: &mut Vec<PendingEffect>,
     deferred: &[DeferredTail],
