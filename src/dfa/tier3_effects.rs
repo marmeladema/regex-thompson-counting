@@ -99,11 +99,18 @@ pub(crate) type BreakMask = u64;
 
 /// When an effect becomes actionable relative to the current byte boundary.
 ///
-/// Currently only `NextByte` exists.  An `EndOnly` variant was planned
-/// (for effects resolved only at end-of-input) but was removed because
-/// the runtime never populated the `pending_effects_end_only` queue.
-/// If compiled effects become the runtime authority, `EndOnly` can be
-/// reintroduced alongside a dedicated end-of-input resolution path.
+/// Only `NextByte` exists.  An `EndOnly` variant is unnecessary because:
+///
+/// - **`MatchAtEnd` atoms** in `on_break`/`immediate` handle `$ → Match`
+///   paths directly by setting `self.match_at_end = true` during the step
+///   loop, without going through the pending queue.
+/// - **Pending effects from the last byte** are resolved at EOI by
+///   `finish()` calling `resolve_pending(NextByte, at_end=true, next=None)`.
+///   Assertion chains that include `$` naturally pass at EOI, and the
+///   reachability check uses `can_reach_match_at_end`.
+/// - Effects deposited on byte N−1 that fail mid-input resolution on byte N
+///   are correctly dropped — their `MatchAtEnd` semantics are already
+///   captured by the `match_at_end` flag from on_break atoms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum EffectTiming {
     /// Defer until the next byte boundary (when the next byte is known).
