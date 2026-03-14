@@ -570,11 +570,6 @@ impl DumpRegex<'_> {
                             continue_origins,
                             break_is_match,
                             break_is_match_at_end,
-                            break_deferred_asserts,
-                            break_consuming_states,
-                            break_consuming_pure,
-                            break_consuming_deferred,
-                            break_deferred_chain_ids,
                             break_effects_id,
                         } => {
                             writeln!(f, "    state {i}: Increment(c{counter}, {{{min},{max}}}, {break_effects_id})",)?;
@@ -601,60 +596,47 @@ impl DumpRegex<'_> {
                                 "      break_is_match: {break_is_match}, \
                                  break_is_match_at_end: {break_is_match_at_end}",
                             )?;
-                            writeln!(
-                                f,
-                                "      break_deferred_asserts: [{}] chains=[{}]",
-                                break_deferred_asserts
+                            // Break-path details come from the BreakEffects table.
+                            let be = &t3.break_effects[break_effects_id.idx()];
+                            let chain_str: String = be
+                                .break_deferred_chain_ids
+                                .iter()
+                                .map(|c| c.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            writeln!(f, "      break_deferred_chains: [{chain_str}]")?;
+                            let bcs_str: String = be
+                                .break_consuming_states
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            writeln!(f, "      break_consuming_states: [{bcs_str}]")?;
+                            if !be.break_consuming_pure.is_empty() {
+                                let bcp_str: String = be
+                                    .break_consuming_pure
                                     .iter()
                                     .map(|s| s.to_string())
                                     .collect::<Vec<_>>()
-                                    .join(", "),
-                                break_deferred_chain_ids
-                                    .iter()
-                                    .map(|c| c.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
-                            )?;
-                            writeln!(
-                                f,
-                                "      break_consuming_states: [{}]",
-                                break_consuming_states
-                                    .iter()
-                                    .map(|s| s.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )?;
-                            if !break_consuming_pure.is_empty() {
-                                writeln!(
-                                    f,
-                                    "      break_consuming_pure: [{}]",
-                                    break_consuming_pure
-                                        .iter()
-                                        .map(|s| s.to_string())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                )?;
+                                    .join(", ");
+                                writeln!(f, "      break_consuming_pure: [{bcp_str}]")?;
                             }
-                            if !break_consuming_deferred.is_empty() {
-                                writeln!(
-                                    f,
-                                    "      break_consuming_deferred: [{}]",
-                                    break_consuming_deferred
-                                        .iter()
-                                        .map(|(s, asserts, _)| {
-                                            format!(
-                                                "{}(?@[{}])",
-                                                s,
-                                                asserts
-                                                    .iter()
-                                                    .map(|a| a.to_string())
-                                                    .collect::<Vec<_>>()
-                                                    .join(",")
-                                            )
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                )?;
+                            if !be.break_consuming_deferred.is_empty() {
+                                let bcd_str: String = be
+                                    .break_consuming_deferred
+                                    .iter()
+                                    .map(|dt| {
+                                        let a_str: String = dt
+                                            .assert_states
+                                            .iter()
+                                            .map(|a| a.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(",");
+                                        format!("{}(?@[{a_str}])", dt.origin)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                writeln!(f, "      break_consuming_deferred: [{bcd_str}]")?;
                             }
                         }
                     }

@@ -243,6 +243,34 @@ impl fmt::Display for BreakEffectsId {
     }
 }
 
+/// A consuming "tail" state on a counter break path gated by zero or
+/// more deferred assertions.
+///
+/// Each entry represents a single consuming NFA state reachable from a
+/// CInc break output.  If the path to the tail passes through non-End
+/// assertion states (`\b`, `\B`, etc.), those are recorded as deferred
+/// assertions that must pass at runtime before the tail is deposited.
+///
+/// - `origin`: the consuming NFA state (byte/byte-class/byte-table).
+/// - `assert_states`: deferred assertion NFA state indices on the
+///   epsilon path from the CInc break output to `origin`.
+/// - `chain_id`: interned [`AssertChainId`] for runtime evaluation.
+///   Initialized to [`AssertChainId::NONE`] during analysis and
+///   populated when the assertion chain arena is built.
+///
+/// **Semantics: AND per tail.**  All assertions in `assert_states`
+/// must pass for this tail to be deposited.  Different `DeferredTail`
+/// entries are independent (OR across entries).
+#[derive(Clone, Debug)]
+pub(crate) struct DeferredTail {
+    /// The consuming NFA state on the break path.
+    pub(crate) origin: StateIdx,
+    /// Deferred assertion NFA state indices gating this tail.
+    pub(crate) assert_states: Box<[StateIdx]>,
+    /// Interned assertion chain for runtime evaluation.
+    pub(crate) chain_id: AssertChainId,
+}
+
 /// Pre-interned break-path effect data for a counter's CInc break.
 ///
 /// Extracted from `Tier3OriginKind::Increment`'s break-* fields and
@@ -274,10 +302,9 @@ pub(crate) struct BreakEffects {
     /// Consuming states reachable from the break path WITHOUT passing
     /// through any deferred assertion.  Deposited immediately at runtime.
     pub(crate) break_consuming_pure: Box<[StateIdx]>,
-    /// Per-tail deferred assertions: `(origin, assert_states, chain_id)`.
-    /// Each tail is gated on its own assertion chain (AND per tail).
-    #[allow(clippy::type_complexity)]
-    pub(crate) break_consuming_deferred: Box<[(StateIdx, Box<[StateIdx]>, AssertChainId)]>,
+    /// Per-tail deferred assertions.  Each tail is gated on its own
+    /// assertion chain (AND per tail, OR across entries).
+    pub(crate) break_consuming_deferred: Box<[DeferredTail]>,
     /// All consuming states on the break path (used when `has_deferred`
     /// is `false` — no assertion splitting needed).
     pub(crate) break_consuming_states: Box<[StateIdx]>,
@@ -694,11 +721,13 @@ pub(crate) fn enqueue_break_deferred_match(
 /// processing, the main counter step, and effect resolution.
 pub(crate) fn enqueue_deferred_tail(
     queue: &mut Vec<PendingEffect>,
-    deferred: &[(StateIdx, Box<[StateIdx]>, AssertChainId)],
+    deferred: &[DeferredTail],
     prev_was_word: bool,
     dedup: bool,
 ) {
-    for &(origin, _, chain_id) in deferred {
+    for dt in deferred {
+        let origin = dt.origin;
+        let chain_id = dt.chain_id;
         if chain_id == AssertChainId::NONE {
             continue;
         }
@@ -1016,6 +1045,7 @@ pub(crate) fn compile_target_effects(
     _target_idx: StateIdx,
     origin_kind: &super::Tier3OriginKind,
     break_seeds: &[super::Tier3BreakSeed],
+    break_effects: &[BreakEffects],
     arena: &mut AssertChainArena,
 ) -> CompiledTargetEffects {
     match origin_kind {
@@ -1054,12 +1084,7 @@ pub(crate) fn compile_target_effects(
             continue_origins,
             break_is_match,
             break_is_match_at_end,
-            break_deferred_asserts,
-            break_consuming_states: _,
-            break_consuming_pure,
-            break_consuming_deferred,
-            break_deferred_chain_ids: _,
-            break_effects_id: _,
+            break_effects_id,
         } => {
             let step = TargetStep::Increment {
                 counter: *counter,
@@ -1068,6 +1093,9 @@ pub(crate) fn compile_target_effects(
                 max: *max,
                 continue_origins: continue_origins.clone(),
             };
+
+            // Look up the pre-interned break effects for this counter.
+            let be = &break_effects[break_effects_id.idx()];
 
             // --- on_break: immediate effects gated on counter break ---
             let mut on_break = Vec::new();
@@ -1078,13 +1106,13 @@ pub(crate) fn compile_target_effects(
             }
 
             // Break-path match-at-end (only when no deferred asserts gate it).
-            if *break_is_match_at_end && break_deferred_asserts.is_empty() {
+            if *break_is_match_at_end && !be.has_deferred {
                 on_break.push(EffectAtom::MatchAtEnd);
             }
 
             // Pure tails: consuming states reachable from break path
             // WITHOUT deferred assertions — deposited immediately on break.
-            for &tail in break_consuming_pure.iter() {
+            for &tail in be.break_consuming_pure.iter() {
                 on_break.push(EffectAtom::AddTail { origin: tail });
             }
 
@@ -1104,12 +1132,12 @@ pub(crate) fn compile_target_effects(
 
             // Break-path deferred assertions.
             //
-            // When break_deferred_asserts is non-empty, the break path
-            // includes assertions (e.g. `\b`, `\B`) that gate access to
-            // Match or $ → Match.  At runtime, these are emitted as
-            // PendingEffect entries with Match atoms and evaluated via
-            // `eval_assert_chain` with downstream reachability checks at
-            // the next byte boundary and at end-of-input.
+            // When the break path has deferred assertions (e.g. `\b`,
+            // `\B`), they gate access to Match or $ → Match.  At
+            // runtime, these are emitted as PendingEffect entries with
+            // Match atoms and evaluated via `eval_assert_chain` with
+            // downstream reachability checks at the next byte boundary
+            // and at end-of-input.
             //
             // We emit `EffectAtom::Match` (not `MatchAtEnd`) to align
             // with the runtime, which sets `ever_matched` when the
@@ -1119,39 +1147,36 @@ pub(crate) fn compile_target_effects(
             // `$ → Match` paths), not for assertion-gated break paths that
             // may resolve mid-input.
             //
-            // Bug 51: break_deferred_asserts contains independent
-            // assertion entry points from different NFA paths (OR
-            // semantics: any one passing = match).  Each must be
-            // interned as a separate 1-element chain so they are
-            // evaluated independently.  Previously they were interned
-            // as a single chain (AND semantics), causing false negatives
-            // when paths had contradictory assertions like `\B` and `\b`.
-            if !break_deferred_asserts.is_empty() {
-                for assert_state in break_deferred_asserts.iter() {
-                    let chain_id = arena.intern(&[*assert_state]);
-                    guarded.push(GuardedEffect {
-                        timing: EffectTiming::NextByte,
-                        guard: EffectGuard {
-                            assert_chain: chain_id,
-                        },
-                        atoms: vec![EffectAtom::Match].into_boxed_slice(),
-                    });
-                }
-            }
-
-            // Per-tail deferred assertions: each tail has its own chain.
-            for &(tail, ref per_tail_asserts, _) in break_consuming_deferred.iter() {
-                if per_tail_asserts.is_empty() {
-                    // Pure tail — already handled above.
-                    continue;
-                }
-                let chain_id = arena.intern(per_tail_asserts);
+            // Bug 51: break_deferred_chain_ids contains independent
+            // assertion chains from different NFA paths (OR semantics:
+            // any one passing = match).  Each is a separate 1-element
+            // chain so they are evaluated independently.  Previously
+            // they were interned as a single chain (AND semantics),
+            // causing false negatives when paths had contradictory
+            // assertions like `\B` and `\b`.
+            for &chain_id in be.break_deferred_chain_ids.iter() {
                 guarded.push(GuardedEffect {
                     timing: EffectTiming::NextByte,
                     guard: EffectGuard {
                         assert_chain: chain_id,
                     },
-                    atoms: vec![EffectAtom::AddTail { origin: tail }].into_boxed_slice(),
+                    atoms: vec![EffectAtom::Match].into_boxed_slice(),
+                });
+            }
+
+            // Per-tail deferred assertions: each tail has its own
+            // pre-interned chain.  Skip pure tails (chain_id == NONE).
+            for dt in be.break_consuming_deferred.iter() {
+                if dt.chain_id == AssertChainId::NONE {
+                    // Pure tail — already handled above.
+                    continue;
+                }
+                guarded.push(GuardedEffect {
+                    timing: EffectTiming::NextByte,
+                    guard: EffectGuard {
+                        assert_chain: dt.chain_id,
+                    },
+                    atoms: vec![EffectAtom::AddTail { origin: dt.origin }].into_boxed_slice(),
                 });
             }
 
@@ -1192,19 +1217,23 @@ pub(crate) fn compile_target_effects(
 /// chain so that deposit sites can emit [`PendingEffect`] entries with
 /// proper chain guards.
 ///
+/// The `arena` is passed in pre-populated with break-effect chains
+/// (from [`BreakEffects`] construction).  Additional chains (target
+/// deferred asserts, break-seed deferred asserts) are interned into
+/// the same arena during compilation.
+///
 /// Returns `(per-target effects, per-state chain IDs for target deferred
-/// asserts, populated assertion chain arena)`.
+/// asserts)`.  The caller retains ownership of the arena.
 #[allow(clippy::type_complexity)]
 #[cfg_attr(not(debug_assertions), allow(unused_variables))]
 pub(crate) fn compile_all_target_effects(
     analysis: &super::Tier3Analysis,
     states: &[crate::State],
+    arena: &mut AssertChainArena,
 ) -> (
     Box<[Option<CompiledTargetEffects>]>,
     Box<[Box<[AssertChainId]>]>,
-    AssertChainArena,
 ) {
-    let mut arena = AssertChainArena::new();
     let effects: Vec<Option<CompiledTargetEffects>> = analysis
         .targets
         .iter()
@@ -1215,7 +1244,8 @@ pub(crate) fn compile_all_target_effects(
                     StateIdx(i as u32),
                     kind,
                     &analysis.break_seeds,
-                    &mut arena,
+                    &analysis.break_effects,
+                    arena,
                 );
                 #[cfg(debug_assertions)]
                 debug_assert_origins_consuming(&eff, |s| {
@@ -1250,7 +1280,6 @@ pub(crate) fn compile_all_target_effects(
     (
         effects.into_boxed_slice(),
         target_chain_ids.into_boxed_slice(),
-        arena,
     )
 }
 

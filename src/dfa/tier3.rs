@@ -228,6 +228,12 @@ pub(crate) enum Tier3OriginKind {
     },
     /// Epsilon closure from the target reached CInc.  Counter is
     /// incremented; min/max determine continue vs. break.
+    ///
+    /// Break-path data (deferred assertions, consuming tails, etc.) is
+    /// stored in the [`BreakEffects`](tier3_effects::BreakEffects) table
+    /// on [`Tier3Analysis`] and looked up by [`break_effects_id`] at
+    /// runtime.  All `Increment` entries for the same counter share the
+    /// same `BreakEffectsId`.
     Increment {
         /// The counter being incremented.
         counter: CounterIdx,
@@ -241,57 +247,12 @@ pub(crate) enum Tier3OriginKind {
         break_is_match: bool,
         /// True if the break path reaches `Match` through `$`.
         break_is_match_at_end: bool,
-        /// Deferred assertion NFA state indices on the break path to
-        /// `$ → Match`.  Non-empty when the break path includes
-        /// assertions like `\b` or `\B` before reaching `$ → Match`.
-        /// These must be evaluated at end-of-input before confirming
-        /// the match.  Empty when `break_is_match_at_end` comes from
-        /// a pure `$ → Match` path (no deferred assertions).
-        ///
-        /// **Semantics: AlternativeChains (OR).**  Each entry is an
-        /// independent NFA assertion state from a distinct epsilon path
-        /// to `$ → Match`.  Any one passing means a match (Bug 51).
-        /// The parallel `break_deferred_chain_ids` array interns each
-        /// as a separate 1-element chain for independent evaluation.
-        break_deferred_asserts: Box<[StateIdx]>,
-        /// Non-counter consuming states on the CInc break path.
-        /// These form the "post-counter tail" that must be tracked
-        /// at runtime to detect `$ → Match` after additional bytes.
-        break_consuming_states: Box<[StateIdx]>,
-        /// Subset of `break_consuming_states` that are reachable from
-        /// the break path WITHOUT passing through any deferred assertion
-        /// (`\b`, `\B`, etc.).  Bug 45: these should be deposited
-        /// immediately at runtime, not gated behind assertion resolution.
-        break_consuming_pure: Box<[StateIdx]>,
-        /// Per-tail deferred assertions.  For each consuming state in
-        /// `break_consuming_states`, the deferred assertion NFA indices
-        /// on the path from the break output to that consuming state,
-        /// plus the interned [`AssertChainId`] for runtime effect
-        /// evaluation.
-        ///
-        /// **Semantics: PerTailChain (AND per tail).**  Each tuple
-        /// `(tail, asserts, chain_id)` represents ONE tail with ONE
-        /// ordered assertion chain.  All assertions in the chain must
-        /// pass (AND) for that tail to be deposited.  Different tails
-        /// are independent (OR across tuples).
-        ///
-        /// Bug 46: used to gate each tail individually — a tail behind
-        /// `\b` AND `\B` must have BOTH pass, not just the top-level `\b`.
-        break_consuming_deferred: Box<[(StateIdx, Box<[StateIdx]>, tier3_effects::AssertChainId)]>,
-        /// Per-entry assertion chain IDs for `break_deferred_asserts`.
-        ///
-        /// **Semantics: AlternativeChains (OR) — parallel to
-        /// `break_deferred_asserts`.**  Each entry is a 1-element chain
-        /// interned in the assertion chain arena, so that each deferred
-        /// assertion is evaluated independently (any one passing means
-        /// a match).  Populated during [`compute_tier3_analysis`] after
-        /// the assertion chain arena is built.
-        break_deferred_chain_ids: Box<[tier3_effects::AssertChainId]>,
         /// Index into [`Tier3Analysis::break_effects`] for the pre-interned
-        /// break-path data.  All `Increment` entries for the same counter
-        /// share the same ID.  Initialized to
+        /// break-path data (deferred assertions, consuming tails, etc.).
+        /// All `Increment` entries for the same counter share the same ID.
+        /// Initialized to
         /// [`BreakEffectsId::NONE`](tier3_effects::BreakEffectsId::NONE) in
-        /// `analyze_target()` and populated at the end of
+        /// `analyze_target()` and populated during
         /// [`compute_tier3_analysis`].
         break_effects_id: tier3_effects::BreakEffectsId,
     },
@@ -380,12 +341,31 @@ pub(crate) fn compute_tier3_analysis(
         targets_vec[idx] = analyze_target(target, states, state_can_reach_match);
     }
 
-    // -- Step 2b: populate break_consuming_states (post-pass) ------------------
+    // -- Step 2b: compute per-counter break data (post-pass) --------------------
     // Now that all targets are known, re-derive each Increment target's
     // CInc break outputs and compute "true tail" consuming states — those
     // whose byte-consumption target does NOT lead to another CInc.
+    //
+    // Break-path data is stored in a per-counter side table and later
+    // interned into the `BreakEffects` table.  All Increment entries for
+    // the same counter share the same CInc break path, so we compute once
+    // per counter.
+    struct PerCounterBreakData {
+        deferred_asserts: Box<[StateIdx]>,
+        all_tails: Box<[StateIdx]>,
+        pure_tails: Box<[StateIdx]>,
+        per_tail_deferred: Box<[tier3_effects::DeferredTail]>,
+    }
+    let mut per_counter_break: Vec<Option<PerCounterBreakData>> =
+        (0..64).map(|_| None).collect();
+
     for idx in 0..n {
-        if let Some(Tier3OriginKind::Increment { .. }) = &targets_vec[idx] {
+        if let Some(Tier3OriginKind::Increment { counter, .. }) = &targets_vec[idx] {
+            let c = counter.idx();
+            if per_counter_break[c].is_some() {
+                // Already computed for this counter.
+                continue;
+            }
             // Walk from the target state itself (not a consuming state's
             // `out`) through epsilon transitions to find CInc break outputs.
             // `idx` is already the post-consumption target — it may be a
@@ -412,22 +392,21 @@ pub(crate) fn compute_tier3_analysis(
                     _ => {}
                 }
             }
-            if !cinc_break_outs.is_empty() {
-                let (all_tails, pure_tails, per_tail_deferred) =
-                    break_consuming_tails(&cinc_break_outs, states, &targets_vec);
-                // Update the Increment with the computed tails.
-                if let Some(Tier3OriginKind::Increment {
-                    break_consuming_states,
-                    break_consuming_pure,
-                    break_consuming_deferred,
-                    ..
-                }) = &mut targets_vec[idx]
-                {
-                    *break_consuming_states = all_tails.into_boxed_slice();
-                    *break_consuming_pure = pure_tails.into_boxed_slice();
-                    *break_consuming_deferred = per_tail_deferred.into_boxed_slice();
-                }
-            }
+            // Compute break closure (deferred asserts) and consuming tails.
+            let bc = break_closure(&cinc_break_outs, states, state_can_reach_match);
+            let (all_tails, pure_tails, per_tail_deferred) = if !cinc_break_outs.is_empty() {
+                let (a, p, d) = break_consuming_tails(&cinc_break_outs, states, &targets_vec);
+                (a.into_boxed_slice(), p.into_boxed_slice(), d.into_boxed_slice())
+            } else {
+                (Box::new([]) as Box<[StateIdx]>, Box::new([]) as Box<[StateIdx]>,
+                 Box::new([]) as Box<[tier3_effects::DeferredTail]>)
+            };
+            per_counter_break[c] = Some(PerCounterBreakData {
+                deferred_asserts: bc.deferred_asserts,
+                all_tails,
+                pure_tails,
+                per_tail_deferred,
+            });
         }
     }
 
@@ -890,75 +869,56 @@ pub(crate) fn compute_tier3_analysis(
         break_effects: Box::new([]),
     };
 
-    // -- Step 9: compile typed target effects ----------------------------------
-    let (target_effects, target_assert_chain_ids, mut assert_chain_arena) =
-        tier3_effects::compile_all_target_effects(&analysis, states);
-    analysis.target_effects = target_effects;
-    analysis.target_assert_chain_ids = target_assert_chain_ids;
-
-    // Populate assert_chain_id on each break seed by interning its
-    // deferred_asserts into the (already-populated) arena.  The arena
-    // deduplicates, so these are no-ops for chains already interned
-    // during effect compilation — they just return the existing ID.
-    for bs in analysis.break_seeds.iter_mut() {
-        bs.assert_chain_id = assert_chain_arena.intern(&bs.deferred_asserts);
-    }
-
-    // Populate assert_chain_id on each per-tail deferred entry and
-    // break_deferred_chain_ids for the per-entry break deferred asserts.
-    for target in analysis.targets.iter_mut().flatten() {
-        if let Tier3OriginKind::Increment {
-            break_deferred_asserts,
-            break_consuming_deferred,
-            break_deferred_chain_ids,
-            ..
-        } = target
-        {
-            for (_, asserts, chain_id) in break_consuming_deferred.iter_mut() {
-                *chain_id = assert_chain_arena.intern(asserts);
-            }
-            // Intern each break deferred assert as an independent
-            // 1-element chain (OR semantics: any one passing = match).
-            *break_deferred_chain_ids = break_deferred_asserts
-                .iter()
-                .map(|&assert_idx| assert_chain_arena.intern(&[assert_idx]))
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-        }
-    }
-    analysis.assert_chain_arena = assert_chain_arena;
-
-    // -- Step 10: build pre-interned break effects table -----------------------
-    // Extract break-path data from each Increment target into a shared
-    // BreakEffects table, indexed by BreakEffectsId.  All Increment entries
-    // for the same counter share the same CInc break path, so we intern
-    // one entry per counter.
+    // -- Step 9: build BreakEffects table and assertion chain arena -------------
+    // Build the per-counter break-effects table from the side data computed
+    // in Step 2b.  Intern assertion chains into the arena so that all chain
+    // IDs are available before compiled effects are generated in Step 10.
+    let mut assert_chain_arena = tier3_effects::AssertChainArena::new();
     {
+        let mut break_effects_vec: Vec<tier3_effects::BreakEffects> = Vec::new();
         let mut counter_to_id: Vec<tier3_effects::BreakEffectsId> =
             vec![tier3_effects::BreakEffectsId::NONE; 64];
-        let mut break_effects_vec: Vec<tier3_effects::BreakEffects> = Vec::new();
 
         for target in analysis.targets.iter_mut().flatten() {
             if let Tier3OriginKind::Increment {
                 counter,
-                break_deferred_asserts,
-                break_consuming_states,
-                break_consuming_pure,
-                break_consuming_deferred,
-                break_deferred_chain_ids,
                 break_effects_id,
                 ..
             } = target
             {
                 let c = counter.idx();
                 if counter_to_id[c] == tier3_effects::BreakEffectsId::NONE {
+                    let pcd = per_counter_break[c].take().unwrap_or_else(|| PerCounterBreakData {
+                        deferred_asserts: Box::new([]),
+                        all_tails: Box::new([]),
+                        pure_tails: Box::new([]),
+                        per_tail_deferred: Box::new([]),
+                    });
+
+                    // Intern each deferred assert as an independent
+                    // 1-element chain (OR semantics: any one passing = match).
+                    // Bug 51: these must be separate chains, not one AND chain.
+                    let break_deferred_chain_ids: Box<[tier3_effects::AssertChainId]> =
+                        pcd.deferred_asserts
+                            .iter()
+                            .map(|&assert_idx| assert_chain_arena.intern(&[assert_idx]))
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice();
+
+                    // Intern per-tail deferred assertion chains.
+                    let mut per_tail_with_chains = pcd.per_tail_deferred.into_vec();
+                    for dt in per_tail_with_chains.iter_mut() {
+                        dt.chain_id = assert_chain_arena.intern(&dt.assert_states);
+                    }
+                    let per_tail_boxed = per_tail_with_chains.into_boxed_slice();
+
                     let id = tier3_effects::BreakEffectsId(break_effects_vec.len() as u16);
                     break_effects_vec.push(tier3_effects::BreakEffects {
-                        has_deferred: !break_deferred_asserts.is_empty(),
-                        break_deferred_chain_ids: break_deferred_chain_ids.clone(),
-                        break_consuming_pure: break_consuming_pure.clone(),
-                        break_consuming_deferred: break_consuming_deferred.clone(),
-                        break_consuming_states: break_consuming_states.clone(),
+                        has_deferred: !pcd.deferred_asserts.is_empty(),
+                        break_deferred_chain_ids,
+                        break_consuming_pure: pcd.pure_tails,
+                        break_consuming_deferred: per_tail_boxed,
+                        break_consuming_states: pcd.all_tails,
                     });
                     counter_to_id[c] = id;
                 }
@@ -968,6 +928,20 @@ pub(crate) fn compute_tier3_analysis(
 
         analysis.break_effects = break_effects_vec.into_boxed_slice();
     }
+
+    // Populate assert_chain_id on each break seed by interning its
+    // deferred_asserts into the arena.  The arena deduplicates, so
+    // chains already interned above are reused.
+    for bs in analysis.break_seeds.iter_mut() {
+        bs.assert_chain_id = assert_chain_arena.intern(&bs.deferred_asserts);
+    }
+
+    // -- Step 10: compile typed target effects ---------------------------------
+    let (target_effects, target_assert_chain_ids) =
+        tier3_effects::compile_all_target_effects(&analysis, states, &mut assert_chain_arena);
+    analysis.target_effects = target_effects;
+    analysis.target_assert_chain_ids = target_assert_chain_ids;
+    analysis.assert_chain_arena = assert_chain_arena;
 
     analysis
 }
@@ -2467,15 +2441,8 @@ fn analyze_target(
             continue_origins: continue_origins.into_boxed_slice(),
             break_is_match: bc.is_match,
             break_is_match_at_end: bc.is_match_at_end,
-            break_deferred_asserts: bc.deferred_asserts,
-            // Populated in a post-pass by compute_tier3_analysis after all
-            // targets are known (break_consuming_tails needs the targets array).
-            break_consuming_states: Box::new([]),
-            break_consuming_pure: Box::new([]),
-            break_consuming_deferred: Box::new([]),
-            // Populated after the assertion chain arena is built.
-            break_deferred_chain_ids: Box::new([]),
-            // Populated at the end of compute_tier3_analysis.
+            // Populated during compute_tier3_analysis after the
+            // BreakEffects table is built.
             break_effects_id: tier3_effects::BreakEffectsId::NONE,
         })
     } else if advance_origins.is_empty() {
@@ -2649,7 +2616,6 @@ fn break_closure(
 ///
 /// Bug 45: pure consuming states should be deposited immediately at runtime,
 /// while deferred-only states need assertion resolution first.
-#[allow(clippy::type_complexity)]
 fn break_consuming_tails(
     break_seeds: &[StateIdx],
     states: &[State],
@@ -2657,7 +2623,7 @@ fn break_consuming_tails(
 ) -> (
     Vec<StateIdx>,
     Vec<StateIdx>,
-    Vec<(StateIdx, Box<[StateIdx]>, tier3_effects::AssertChainId)>,
+    Vec<tier3_effects::DeferredTail>,
 ) {
     let mut all_result = Vec::new();
     let mut pure_result = Vec::new();
@@ -2729,16 +2695,20 @@ fn break_consuming_tails(
     pure_result.sort_unstable_by_key(|s| s.0);
     pure_result.dedup();
     // Build per-tail deferred asserts list.
-    // The AssertChainId is a placeholder (NONE) — populated after the
+    // The chain_id is a placeholder (NONE) — populated after the
     // assertion chain arena is built in Step 9.
-    let per_tail: Vec<(StateIdx, Box<[StateIdx]>, tier3_effects::AssertChainId)> = all_result
+    let per_tail: Vec<tier3_effects::DeferredTail> = all_result
         .iter()
         .map(|&s| {
-            let asserts = per_tail_asserts[s.idx()]
+            let assert_states = per_tail_asserts[s.idx()]
                 .take()
                 .unwrap_or_default()
                 .into_boxed_slice();
-            (s, asserts, tier3_effects::AssertChainId::NONE)
+            tier3_effects::DeferredTail {
+                origin: s,
+                assert_states,
+                chain_id: tier3_effects::AssertChainId::NONE,
+            }
         })
         .collect();
     (all_result, pure_result, per_tail)
