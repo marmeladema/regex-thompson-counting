@@ -767,6 +767,10 @@ pub(crate) fn enqueue_deferred_tail(
 ///
 /// **Used for:** break-seeds with deferred assertions in the break-seeds
 /// processing loop.
+///
+/// After 8F, deferred seeds are deposited via the `guarded` dispatch
+/// from `CompiledTargetEffects`.  Will be removed in 8G.
+#[allow(dead_code)]
 pub(crate) fn enqueue_deferred_seed(
     queue: &mut Vec<PendingEffect>,
     chain_id: AssertChainId,

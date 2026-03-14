@@ -977,11 +977,6 @@ struct Transition {
     /// 1 for seeds from resolved deferred assertions on non-counting
     /// transitions whose origin already consumed the resolving byte).
     seeds: Box<[(CounterIdx, StateIdx, u32)]>,
-    /// Additional seeds reachable only through CInc break paths.
-    /// Each entry is `(trigger, counter, origin, initial_value)`:
-    /// the seed for `counter` at `origin` is only applied when `trigger`
-    /// (the counter whose CInc break leads to this CI) actually breaks.
-    break_seeds: Box<[(CounterIdx, CounterIdx, StateIdx, u32)]>,
     /// Parallel arrays: `origin_keys[i]` is the consuming NFA state;
     /// `origin_targets[i]` is the post-consumption NFA target state.
     /// The target's structural action is looked up from
@@ -1017,7 +1012,6 @@ impl Transition {
             is_counting: false,
             pre_seeds: Box::new([]),
             seeds: Box::new([]),
-            break_seeds: Box::new([]),
             origin_keys: Box::new([]),
             origin_targets: Box::new([]),
             counter_free_match_at_end: false,
@@ -1934,11 +1928,8 @@ impl Tier3DfaCache {
             // to it — the seed is only applied when that specific counter's
             // instance actually breaks.
             //
-            // Break seeds that duplicate unconditional seeds are excluded:
-            // the unconditional seed already fires every time, so the
-            // break-gated duplicate is redundant.  Keeping it would cause
-            // double-seeding when the trigger counter actually breaks.
-            let break_seeds = Self::compute_break_seeds(&seeds, analysis);
+            // Break seeds are now handled per-instance through the
+            // on_break/guarded atoms in CompiledTargetEffects (8F).
 
             // Compute counter-free match-at-end: true if any origin's
             // target reaches `$ → Match` without going through CInc,
@@ -1980,7 +1971,6 @@ impl Tier3DfaCache {
                 is_counting: true,
                 pre_seeds: pre_seeds.into(),
                 seeds: seeds.into(),
-                break_seeds: break_seeds.into(),
                 origin_keys: origin_keys.into_boxed_slice(),
                 origin_targets: origin_targets_vec.into_boxed_slice(),
                 counter_free_match_at_end: counter_free_mae,
@@ -2037,7 +2027,6 @@ impl Tier3DfaCache {
                 is_counting: false,
                 pre_seeds: Box::new([]),
                 seeds: seeds.into(),
-                break_seeds: Box::new([]),
                 origin_keys: origin_keys.into_boxed_slice(),
                 origin_targets: origin_targets_vec.into_boxed_slice(),
                 counter_free_match_at_end: false, // Not used for non-counting transitions.
@@ -2134,40 +2123,6 @@ impl Tier3DfaCache {
             let s = &self.inner.states[id.idx()];
             (s.is_match, s.is_match_at_end)
         }
-    }
-
-    /// Compute break seeds for a counting transition.
-    ///
-    /// Uses the precomputed [`Tier3Analysis::break_seeds`] table.
-    /// Break seeds already present in the unconditional `seeds` list are
-    /// excluded — the unconditional seed fires every time, making the
-    /// break-gated duplicate redundant.
-    ///
-    /// Including ALL other precomputed break seeds (not just those reachable
-    /// from the current targets) is safe: at runtime, each break seed is
-    /// gated on `counter_broke[trigger]`, and unreachable triggers never
-    /// break.
-    fn compute_break_seeds(
-        seeds: &[(CounterIdx, StateIdx, u32)],
-        analysis: &Tier3Analysis,
-    ) -> Vec<(CounterIdx, CounterIdx, StateIdx, u32)> {
-        let _ = seeds; // Bug 32: previously skipped break_seeds that duplicated
-        // unconditional seeds.  Now we keep all break_seeds because
-        // the runtime seed filter (Bug 32) may suppress the
-        // unconditional seed when the DFA state is contaminated.
-        // Double-seeding is harmless: `seed()` deduplicates via
-        // `contains()`.
-        let mut result: Vec<(CounterIdx, CounterIdx, StateIdx, u32)> = Vec::new();
-        for bs in analysis.break_seeds.iter() {
-            let entry = (bs.trigger, bs.counter, bs.origin, 0u32);
-            if !result
-                .iter()
-                .any(|e| e.0 == entry.0 && e.1 == entry.1 && e.2 == entry.2 && e.3 == entry.3)
-            {
-                result.push(entry);
-            }
-        }
-        result
     }
 
     // -----------------------------------------------------------------------
@@ -2902,7 +2857,9 @@ macro_rules! step_slow_impl {
                 };
             }
             let mut any_can_break = false;
-            let mut counter_broke: u64 = 0;
+            // counter_broke bitmask removed in 8F — was only used by the
+            // transition-level break_seeds loop.  any_can_break is still
+            // used for DFA successor selection.
 
             self.next_post_break_tails.clear();
             for &pbo in &self.post_break_tails {
@@ -2962,12 +2919,11 @@ macro_rules! step_slow_impl {
                                 }
                                 // Check break (value after increment >= min).
                                 // Bug 36: the tail→CInc handoff IS a counter
-                                // break — set any_can_break and counter_broke so
-                                // the DFA selects with_break and break_seeds fire.
+                                // break — set any_can_break so the DFA
+                                // selects with_break.
                                 if pbt_value + 1 >= *min {
                                     any_can_break = true;
-                                    counter_broke |= 1u64 << counter.idx();
-                                    // Apply on_break atoms (skip AddSeed — transition-level).
+                                    // Apply on_break atoms from CompiledTargetEffects.
                                     for atom in effects.on_break.iter() {
                                         match atom {
                                             tier3_effects::EffectAtom::Match => {
@@ -2981,23 +2937,19 @@ macro_rules! step_slow_impl {
                                                     self.next_post_break_tails.push(*origin);
                                                 }
                                             }
-                                            tier3_effects::EffectAtom::AddSeed { .. } => {
-                                                // Handled by transition-level break_seeds (until 8F).
+                                            tier3_effects::EffectAtom::AddSeed { counter: sc, origin: so, value: sv } => {
+                                                self.$next.seed(sc.idx(), *so, *sv);
                                             }
                                         }
                                     }
-                                    // Deposit guarded effects (skip AddSeed — transition-level).
+                                    // Deposit guarded effects as PendingEffects.
                                     let pw = crate::is_word_byte(byte);
                                     for ge in effects.guarded.iter() {
                                         debug_assert_eq!(ge.atoms.len(), 1);
-                                        let atom = &ge.atoms[0];
-                                        if matches!(atom, tier3_effects::EffectAtom::AddSeed { .. }) {
-                                            continue;
-                                        }
                                         self.pending_effects_current.push(tier3_effects::PendingEffect {
                                             timing: ge.timing,
                                             guard: ge.guard,
-                                            atom: atom.clone(),
+                                            atom: ge.atoms[0].clone(),
                                             prev_was_word: pw,
                                         });
                                     }
@@ -3050,9 +3002,9 @@ macro_rules! step_slow_impl {
                 self.$current.seed(counter.idx(), origin, value);
             }
 
-            // Note: any_can_break and counter_broke are declared ABOVE
-            // the tail loop (Bug 36) so that tail→CInc handoffs that
-            // produce a break can set them before the counter loop.
+            // Note: any_can_break is declared ABOVE the tail loop (Bug 36)
+            // so that tail→CInc handoffs that produce a break can set it
+            // before the counter loop.
             let num_counters = self.$current.num_counters();
             debug_assert!(num_counters <= 64);
 
@@ -3096,8 +3048,7 @@ macro_rules! step_slow_impl {
                                 // Break: entry has reached the minimum threshold.
                                 if self.$current.can_break(entry, *min) {
                                     any_can_break = true;
-                                    counter_broke |= 1u64 << c_idx;
-                                    // Apply on_break atoms (skip AddSeed — transition-level).
+                                    // Apply on_break atoms from CompiledTargetEffects.
                                     for atom in effects.on_break.iter() {
                                         match atom {
                                             tier3_effects::EffectAtom::Match => {
@@ -3111,21 +3062,19 @@ macro_rules! step_slow_impl {
                                                     self.next_post_break_tails.push(*origin);
                                                 }
                                             }
-                                            tier3_effects::EffectAtom::AddSeed { .. } => {}
+                                            tier3_effects::EffectAtom::AddSeed { counter: sc, origin: so, value: sv } => {
+                                                self.$next.seed(sc.idx(), *so, *sv);
+                                            }
                                         }
                                     }
-                                    // Deposit guarded effects (skip AddSeed — transition-level).
+                                    // Deposit guarded effects as PendingEffects.
                                     let pw = crate::is_word_byte(byte);
                                     for ge in effects.guarded.iter() {
                                         debug_assert_eq!(ge.atoms.len(), 1);
-                                        let atom = &ge.atoms[0];
-                                        if matches!(atom, tier3_effects::EffectAtom::AddSeed { .. }) {
-                                            continue;
-                                        }
                                         self.pending_effects_current.push(tier3_effects::PendingEffect {
                                             timing: ge.timing,
                                             guard: ge.guard,
-                                            atom: atom.clone(),
+                                            atom: ge.atoms[0].clone(),
                                             prev_was_word: pw,
                                         });
                                     }
@@ -3251,14 +3200,13 @@ macro_rules! step_slow_impl {
             // the clean chain are truly counter-free.
             //
             // Non-counting transitions are NOT filtered: their seeds come
-            // from the full probe closure (follow_break=true) and there
-            // are no break_seeds to fall back on.  Filtering them would
-            // kill legitimate downstream counter seeds (regression on
-            // `^(a{1,17}b){2,3}$` / "abab").
+            // from the full probe closure (follow_break=true).  Filtering
+            // them would kill legitimate downstream counter seeds
+            // (regression on `^(a{1,17}b){2,3}$` / "abab").
             //
-            // Suppressed seeds are still available as break_seeds (Bug 32
-            // part 2: `compute_break_seeds` no longer deduplicates against
-            // unconditional seeds on counting transitions, so the break
+            // Suppressed seeds on counting transitions are still reachable
+            // through the per-instance on_break/guarded AddSeed atoms in
+            // CompiledTargetEffects (Bug 32 part 2: the per-instance break
             // path fires when the triggering counter actually breaks).
             for &(counter, origin, value) in t.seeds.iter() {
                 if t.is_counting {
@@ -3271,43 +3219,9 @@ macro_rules! step_slow_impl {
                 }
                 self.$current.seed(counter.idx(), origin, value);
             }
-            // Break seeds gated on the triggering counter.
-            // Bug 27: break seeds with deferred assertions (e.g. `\b`) on
-            // the path from the trigger's CInc break to the seed's CI.
-            // Bug 28: the assertion is at the position AFTER consuming
-            // `byte` (between `byte` and the next input byte).  Since the
-            // next byte is unknown at break time, the assertion must be
-            // DEFERRED — stored as a `PendingEffect` with `NextByte` timing
-            // and evaluated at the start of the next byte (or at
-            // end-of-input in `finish()`).
-            for &(trigger, counter, origin, value) in t.break_seeds.iter() {
-                if counter_broke & (1u64 << trigger.idx()) != 0 {
-                    // Look up the pre-interned assert chain ID for this
-                    // break seed from the analysis table.
-                    let bs_entry = self.analysis.break_seeds.iter().find(|bs| {
-                        bs.trigger == trigger && bs.counter == counter && bs.origin == origin
-                    });
-                    let has_deferred = bs_entry.is_some_and(|bs| !bs.deferred_asserts.is_empty());
-                    if has_deferred {
-                        let chain_id = bs_entry.unwrap().assert_chain_id;
-                        // Defer: schedule as a PendingEffect with the
-                        // word-ness of the break position (= `byte`, the
-                        // byte just consumed by the body) for later
-                        // evaluation.
-                        tier3_effects::enqueue_deferred_seed(
-                            &mut self.pending_effects_current,
-                            chain_id,
-                            counter,
-                            origin,
-                            value,
-                            crate::is_word_byte(byte),
-                        );
-                    } else {
-                        // No assertions on break path — apply immediately.
-                        self.$current.seed(counter.idx(), origin, value);
-                    }
-                }
-            }
+            // Break seeds: now handled per-instance through on_break
+            // (ungated AddSeed) and guarded (gated AddSeed) atoms in
+            // CompiledTargetEffects.  Transition.break_seeds removed in 8F.
 
             // Update has_live_instances flag.
             self.has_live_instances = self.$current.any_live();
@@ -3611,7 +3525,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                                         }
                                     }
                                     if pbt_value + 1 >= *min {
-                                        // Apply on_break atoms (skip AddSeed).
+                                        // Apply on_break atoms from CompiledTargetEffects.
                                         for atom in effects.on_break.iter() {
                                             match atom {
                                                 tier3_effects::EffectAtom::Match => {
@@ -3625,22 +3539,25 @@ impl<'a> Tier3DfaMatcher<'a> {
                                                         resolved_tails.push(*origin);
                                                     }
                                                 }
-                                                tier3_effects::EffectAtom::AddSeed { .. } => {}
+                                                tier3_effects::EffectAtom::AddSeed { counter: sc, origin: so, value: sv } => {
+                                                    if self.use_ranges {
+                                                        self.ranged_counters.insert(sc.idx(), *so, *sv, *sv);
+                                                    } else {
+                                                        self.inst_counters.seed(sc.idx(), *so, *sv);
+                                                    }
+                                                    self.has_live_instances = true;
+                                                }
                                             }
                                         }
-                                        // Deposit guarded effects (skip AddSeed).
+                                        // Deposit guarded effects as PendingEffects.
                                         // Second-order: goes to pending_effects_next.
                                         let pw = crate::is_word_byte(b);
                                         for ge in effects.guarded.iter() {
                                             debug_assert_eq!(ge.atoms.len(), 1);
-                                            let atom = &ge.atoms[0];
-                                            if matches!(atom, tier3_effects::EffectAtom::AddSeed { .. }) {
-                                                continue;
-                                            }
                                             self.pending_effects_next.push(tier3_effects::PendingEffect {
                                                 timing: ge.timing,
                                                 guard: ge.guard,
-                                                atom: atom.clone(),
+                                                atom: ge.atoms[0].clone(),
                                                 prev_was_word: pw,
                                             });
                                         }
@@ -3972,12 +3889,17 @@ impl<'a> Tier3DfaMatcher<'a> {
                     }
                 }
             }
-            // Tails at EOI: check if target reaches `$ → Match`.
-            for &tail in &actions.tails {
-                if self.analysis.target_is_match_at_end[tail.idx()] {
-                    return true;
-                }
-            }
+            // Tails at EOI: tails are unconsumed consuming NFA states.
+            // At EOI, no byte can be consumed, so tails cannot advance
+            // to their post-consumption target.  Do NOT check
+            // target_is_match_at_end here — that would claim a match
+            // based on a byte consumption that never happened.
+            //
+            // Previously this block checked target_is_match_at_end for
+            // each resolved tail, which was safe only because deferred
+            // tails rarely appeared in pending effects at EOI.  After 8E
+            // (authority flip), guarded AddTail atoms resolve at EOI more
+            // often, exposing this false positive.
             // Counter-dependent deferred assertions are resolved as
             // Match effects within the same resolve_pending
             // call.  If any assertion chain passed with downstream

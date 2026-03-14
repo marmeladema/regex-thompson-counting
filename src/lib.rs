@@ -11207,6 +11207,33 @@ mod tests {
             ],
         }
 
+        // EOI tail false positive regression (8E): pattern with a per-tail
+        // deferred assertion on a break consuming state.  When has_deferred
+        // is false (no break-deferred match assertions), the old runtime
+        // deposited ALL break_consuming_states as immediate tails.  After
+        // the 8E authority flip, guarded AddTail atoms resolve at EOI via
+        // pending effects, producing tails in actions.tails.  The finish()
+        // code then checked target_is_match_at_end on those unconsumed
+        // tails, claiming a match for a byte that was never consumed.
+        //
+        // Fix: remove the tails-at-EOI match check — unconsumed consuming
+        // states cannot contribute to match_at_end at end-of-input.
+        test_tier3_eoi_tail_false_positive {
+            pattern: r"a{1,2}(.|\b|\b|a)c$",
+            memory: 1365,
+            min_tier: 1,
+            inputs: [
+                ("a", false),                   // 8E regression: \b(a,EOI) passes but c never consumed
+                ("ac", false),                  // a{1} then nothing left for (.|\b|\b|a) + c$
+                ("aac", true),                  // a{1} then a matches (a alt) then c$
+                ("abc", true),                  // a{1} then b matches (.) then c$
+                ("aabc", true),                 // a{2} then b matches (.) then c$
+                ("aaxc", true),                 // a{2} then x matches (.) then c$
+                ("abcd", false),                // trailing d after c$
+                ("c", false),                   // no a prefix
+            ],
+        }
+
         // Bug 42 regression: Tier 3 false positive when counter break
         // tails are deposited unconditionally despite pending deferred
         // assertions.  Pattern `a{2,2}\b` inside an optional group
