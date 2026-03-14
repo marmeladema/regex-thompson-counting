@@ -169,10 +169,10 @@ impl DfaState {
         scratch.prepare(num_states, start);
         while let Some(idx) = scratch.stack.pop() {
             let i = idx.idx();
-            if i >= num_states || scratch.visited[i] || !regex.state_can_reach_match[i] {
+            if i >= num_states || scratch.is_visited(i) || !regex.state_can_reach_match[i] {
                 continue;
             }
-            scratch.visited[i] = true;
+            scratch.mark_visited(i);
             match states[idx] {
                 State::Match => return true,
                 State::Assert { kind, out } => {
@@ -207,7 +207,11 @@ impl DfaState {
 /// allocate once and reuse across calls, avoiding per-call `vec![false; n]`
 /// allocations on the hot path.
 pub(super) struct ReachScratch {
-    visited: Vec<bool>,
+    /// Epoch-stamped visited array.  `visited[i] == generation` means
+    /// state `i` has been visited in the current query.
+    visited: Vec<u32>,
+    /// Current generation counter.
+    generation: u32,
     stack: Vec<StateIdx>,
 }
 
@@ -216,18 +220,35 @@ impl ReachScratch {
     pub(super) fn new() -> Self {
         Self {
             visited: Vec::new(),
+            generation: 0,
             stack: Vec::new(),
         }
     }
 
-    /// Reset for a new reachability query.  Ensures `visited` has at least
-    /// `num_states` entries (all false) and clears the stack.
+    /// Reset for a new reachability query.  Bumps the generation counter
+    /// instead of clearing the visited array — O(1) instead of O(num_states).
+    /// On the first call (or after the array is too small), the array is
+    /// grown to `num_states` entries.
     #[inline]
     fn prepare(&mut self, num_states: usize, start: StateIdx) {
-        self.visited.clear();
-        self.visited.resize(num_states, false);
+        self.generation = self.generation.wrapping_add(1);
+        if self.visited.len() < num_states {
+            self.visited.resize(num_states, 0);
+        }
         self.stack.clear();
         self.stack.push(start);
+    }
+
+    /// Check if a state has been visited in the current generation.
+    #[inline]
+    fn is_visited(&self, i: usize) -> bool {
+        self.visited[i] == self.generation
+    }
+
+    /// Mark a state as visited in the current generation.
+    #[inline]
+    fn mark_visited(&mut self, i: usize) {
+        self.visited[i] = self.generation;
     }
 }
 

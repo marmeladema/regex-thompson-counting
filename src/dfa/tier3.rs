@@ -3905,10 +3905,10 @@ impl<'a> Tier3DfaMatcher<'a> {
         scratch.prepare(num_states, start);
         while let Some(idx) = scratch.stack.pop() {
             let i = idx.idx();
-            if i >= num_states || scratch.visited[i] || !regex.state_can_reach_match[i] {
+            if i >= num_states || scratch.is_visited(i) || !regex.state_can_reach_match[i] {
                 continue;
             }
-            scratch.visited[i] = true;
+            scratch.mark_visited(i);
             match states[idx] {
                 State::Match => return true,
                 State::Assert { kind, out } => {
