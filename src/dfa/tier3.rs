@@ -3578,170 +3578,11 @@ impl<'a> Tier3DfaMatcher<'a> {
             // for the next step (injected after step_slow).
             self.resolved_tails.clear();
             self.tail_epoch = self.tail_epoch.wrapping_add(1);
-            let mut resolved_mae = false;
-            if !self.pending_effects_current.is_empty() {
-                tier3_effects::resolve_pending(
-                    &self.pending_effects_current,
-                    tier3_effects::EffectTiming::NextByte,
-                    &self.analysis.assert_chain_arena,
-                    false,   // at_end = false (mid-input)
-                    Some(b), // next byte is known
-                    self.regex,
-                    &mut self.reach_scratch,
-                    &mut self.resolved_actions,
-                );
-                let actions = &self.resolved_actions;
-                // Apply match signals from deferred assertions.
-                if actions.set_match {
-                    self.ever_matched = true;
-                }
-                if actions.set_match_at_end {
-                    resolved_mae = true;
-                }
-                // Apply resolved seeds.
-                for &(counter, origin, value) in &actions.seeds {
-                    if self.use_ranges {
-                        self.ranged_counters
-                            .insert(counter.idx(), origin, value, value);
-                    } else {
-                        self.inst_counters.seed(counter.idx(), origin, value);
-                    }
-                    self.has_live_instances = true;
-                }
-                // Process resolved tails: consume byte `b` through each
-                // tail using static analysis targets.
-                for &tail in &actions.tails {
-                    if let Some(target) = consume_byte(tail, b, self.regex) {
-                        match &self.analysis.target_effects[target.idx()] {
-                            Some(effects) => match &effects.step {
-                                tier3_effects::TargetStep::Advance { new_origins } => {
-                                    for &new_o in new_origins.iter() {
-                                        if self.tail_seen[new_o.idx()] != self.tail_epoch {
-                                            self.tail_seen[new_o.idx()] = self.tail_epoch;
-                                            self.resolved_tails.push(new_o);
-                                        }
-                                    }
-                                    // Apply immediate atoms from compiled Advance.
-                                    tier3_effects::apply_immediate_atoms(
-                                        &effects.immediate,
-                                        &mut self.ever_matched,
-                                        &mut resolved_mae,
-                                    );
-                                    // Second-order: origin deferred asserts
-                                    // go to pending_effects_next.
-                                    tier3_effects::enqueue_guarded_effects(
-                                        &mut self.pending_effects_next,
-                                        &self.analysis.origin_effects[tail.idx()].guarded,
-                                        b_is_word,
-                                    );
-                                }
-                                tier3_effects::TargetStep::Increment {
-                                    counter,
-                                    min,
-                                    max,
-                                    continue_origins,
-                                    ..
-                                } => {
-                                    // Tail hit CInc — hand off to counter.
-                                    // Value starts at 0, increment to 1.
-                                    let pbt_value: u32 = 0;
-                                    if pbt_value + 1 < *max {
-                                        for &new_o in continue_origins.iter() {
-                                            if self.use_ranges {
-                                                self.ranged_counters.insert(
-                                                    counter.idx(),
-                                                    new_o,
-                                                    pbt_value + 1,
-                                                    pbt_value + 1,
-                                                );
-                                            } else {
-                                                self.inst_counters.seed(
-                                                    counter.idx(),
-                                                    new_o,
-                                                    pbt_value + 1,
-                                                );
-                                            }
-                                            self.has_live_instances = true;
-                                        }
-                                    }
-                                    if pbt_value + 1 >= *min {
-                                        // Apply on_break atoms from CompiledTargetEffects.
-                                        for atom in effects.on_break.iter() {
-                                            match atom {
-                                                tier3_effects::EffectAtom::Match => {
-                                                    self.ever_matched = true;
-                                                }
-                                            tier3_effects::EffectAtom::MatchAtEnd => {
-                                                self.match_at_end = true;
-                                            }
-                                            tier3_effects::EffectAtom::AddTail { origin } => {
-                                                if self.tail_seen[origin.idx()] != self.tail_epoch {
-                                                    self.tail_seen[origin.idx()] = self.tail_epoch;
-                                                    self.next_post_break_tails.push(*origin);
-                                                }
-                                            }
-                                            tier3_effects::EffectAtom::AddSeed {
-                                                counter: sc,
-                                                    origin: so,
-                                                    value: sv,
-                                                } => {
-                                                    if self.use_ranges {
-                                                        self.ranged_counters.insert(
-                                                            sc.idx(),
-                                                            *so,
-                                                            *sv,
-                                                            *sv,
-                                                        );
-                                                    } else {
-                                                        self.inst_counters.seed(sc.idx(), *so, *sv);
-                                                    }
-                                                    self.has_live_instances = true;
-                                                }
-                                            }
-                                        }
-                                        // Deposit guarded effects as PendingEffects.
-                                        // Second-order: goes to pending_effects_next.
-                                        tier3_effects::enqueue_guarded_effects(
-                                            &mut self.pending_effects_next,
-                                            &effects.guarded,
-                                            b_is_word,
-                                        );
-                                    }
-                                }
-                            },
-                            None => {
-                                let oe = &self.analysis.origin_effects[tail.idx()];
-                                tier3_effects::apply_immediate_atoms(
-                                    &oe.immediate,
-                                    &mut self.ever_matched,
-                                    &mut resolved_mae,
-                                );
-                                // Second-order: origin deferred asserts
-                                // go to pending_effects_next.
-                                tier3_effects::enqueue_guarded_effects(
-                                    &mut self.pending_effects_next,
-                                    &oe.guarded,
-                                    b_is_word,
-                                );
-                            }
-                        }
-                    }
-                    // Tail can't consume this byte — keep as post_break_tail.
-                    else if self.tail_seen[tail.idx()] != self.tail_epoch {
-                        self.tail_seen[tail.idx()] = self.tail_epoch;
-                        self.resolved_tails.push(tail);
-                    }
-                }
-                // Clear resolved effects, then swap next→current so
-                // second-order deferred effects survive to the next
-                // boundary.  step_slow will append first-order effects
-                // to pending_effects_current after this.
-                self.pending_effects_current.clear();
-                std::mem::swap(
-                    &mut self.pending_effects_current,
-                    &mut self.pending_effects_next,
-                );
-            }
+            let resolved_mae = if !self.pending_effects_current.is_empty() {
+                self.resolve_pending_effects(b, b_is_word)
+            } else {
+                false
+            };
 
             // --- Inline fast path ---
             if self.current == DfaStateId::DEAD {
@@ -3929,6 +3770,181 @@ impl<'a> Tier3DfaMatcher<'a> {
             }
         }
         false
+    }
+
+    /// Resolve pending effects from the previous step.
+    ///
+    /// This is the cold path for bytes where `pending_effects_current` is
+    /// non-empty.  Extracted from the hot `chunk()` loop to keep the loop
+    /// body compact and improve instruction-cache behavior on the common
+    /// (no-pending-effects) path.
+    ///
+    /// Returns `true` if any resolved effect set `match_at_end`.
+    #[cold]
+    fn resolve_pending_effects(&mut self, b: u8, b_is_word: bool) -> bool {
+        let mut resolved_mae = false;
+        tier3_effects::resolve_pending(
+            &self.pending_effects_current,
+            tier3_effects::EffectTiming::NextByte,
+            &self.analysis.assert_chain_arena,
+            false,   // at_end = false (mid-input)
+            Some(b), // next byte is known
+            self.regex,
+            &mut self.reach_scratch,
+            &mut self.resolved_actions,
+        );
+        let actions = &self.resolved_actions;
+        // Apply match signals from deferred assertions.
+        if actions.set_match {
+            self.ever_matched = true;
+        }
+        if actions.set_match_at_end {
+            resolved_mae = true;
+        }
+        // Apply resolved seeds.
+        for &(counter, origin, value) in &actions.seeds {
+            if self.use_ranges {
+                self.ranged_counters
+                    .insert(counter.idx(), origin, value, value);
+            } else {
+                self.inst_counters.seed(counter.idx(), origin, value);
+            }
+            self.has_live_instances = true;
+        }
+        // Process resolved tails: consume byte `b` through each
+        // tail using static analysis targets.
+        for &tail in &actions.tails {
+            if let Some(target) = consume_byte(tail, b, self.regex) {
+                match &self.analysis.target_effects[target.idx()] {
+                    Some(effects) => match &effects.step {
+                        tier3_effects::TargetStep::Advance { new_origins } => {
+                            for &new_o in new_origins.iter() {
+                                if self.tail_seen[new_o.idx()] != self.tail_epoch {
+                                    self.tail_seen[new_o.idx()] = self.tail_epoch;
+                                    self.resolved_tails.push(new_o);
+                                }
+                            }
+                            // Apply immediate atoms from compiled Advance.
+                            tier3_effects::apply_immediate_atoms(
+                                &effects.immediate,
+                                &mut self.ever_matched,
+                                &mut resolved_mae,
+                            );
+                            // Second-order: origin deferred asserts
+                            // go to pending_effects_next.
+                            tier3_effects::enqueue_guarded_effects(
+                                &mut self.pending_effects_next,
+                                &self.analysis.origin_effects[tail.idx()].guarded,
+                                b_is_word,
+                            );
+                        }
+                        tier3_effects::TargetStep::Increment {
+                            counter,
+                            min,
+                            max,
+                            continue_origins,
+                            ..
+                        } => {
+                            // Tail hit CInc — hand off to counter.
+                            // Value starts at 0, increment to 1.
+                            let pbt_value: u32 = 0;
+                            if pbt_value + 1 < *max {
+                                for &new_o in continue_origins.iter() {
+                                    if self.use_ranges {
+                                        self.ranged_counters.insert(
+                                            counter.idx(),
+                                            new_o,
+                                            pbt_value + 1,
+                                            pbt_value + 1,
+                                        );
+                                    } else {
+                                        self.inst_counters.seed(
+                                            counter.idx(),
+                                            new_o,
+                                            pbt_value + 1,
+                                        );
+                                    }
+                                    self.has_live_instances = true;
+                                }
+                            }
+                            if pbt_value + 1 >= *min {
+                                // Apply on_break atoms from CompiledTargetEffects.
+                                for atom in effects.on_break.iter() {
+                                    match atom {
+                                        tier3_effects::EffectAtom::Match => {
+                                            self.ever_matched = true;
+                                        }
+                                        tier3_effects::EffectAtom::MatchAtEnd => {
+                                            self.match_at_end = true;
+                                        }
+                                        tier3_effects::EffectAtom::AddTail { origin } => {
+                                            if self.tail_seen[origin.idx()] != self.tail_epoch {
+                                                self.tail_seen[origin.idx()] = self.tail_epoch;
+                                                self.next_post_break_tails.push(*origin);
+                                            }
+                                        }
+                                        tier3_effects::EffectAtom::AddSeed {
+                                            counter: sc,
+                                            origin: so,
+                                            value: sv,
+                                        } => {
+                                            if self.use_ranges {
+                                                self.ranged_counters.insert(
+                                                    sc.idx(),
+                                                    *so,
+                                                    *sv,
+                                                    *sv,
+                                                );
+                                            } else {
+                                                self.inst_counters.seed(sc.idx(), *so, *sv);
+                                            }
+                                            self.has_live_instances = true;
+                                        }
+                                    }
+                                }
+                                // Deposit guarded effects as PendingEffects.
+                                // Second-order: goes to pending_effects_next.
+                                tier3_effects::enqueue_guarded_effects(
+                                    &mut self.pending_effects_next,
+                                    &effects.guarded,
+                                    b_is_word,
+                                );
+                            }
+                        }
+                    },
+                    None => {
+                        let oe = &self.analysis.origin_effects[tail.idx()];
+                        tier3_effects::apply_immediate_atoms(
+                            &oe.immediate,
+                            &mut self.ever_matched,
+                            &mut resolved_mae,
+                        );
+                        // Second-order: origin deferred asserts
+                        // go to pending_effects_next.
+                        tier3_effects::enqueue_guarded_effects(
+                            &mut self.pending_effects_next,
+                            &oe.guarded,
+                            b_is_word,
+                        );
+                    }
+                }
+            }
+            // Tail can't consume this byte — keep as post_break_tail.
+            else if self.tail_seen[tail.idx()] != self.tail_epoch {
+                self.tail_seen[tail.idx()] = self.tail_epoch;
+                self.resolved_tails.push(tail);
+            }
+        }
+        // Clear resolved effects, then swap next→current so
+        // second-order deferred effects survive to the next
+        // boundary.  step_slow will append first-order effects
+        // to pending_effects_current after this.
+        self.pending_effects_current.clear();
+        std::mem::swap(
+            &mut self.pending_effects_current,
+            &mut self.pending_effects_next,
+        );
+        resolved_mae
     }
 
     pub fn finish(mut self) -> bool {
