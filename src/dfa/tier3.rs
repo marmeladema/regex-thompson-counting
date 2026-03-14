@@ -2869,6 +2869,9 @@ pub struct Tier3DfaMatcher<'a> {
     /// for the next boundary.  See [`pending_effects_current`] for the
     /// full lifecycle.
     pending_effects_next: Vec<tier3_effects::PendingEffect>,
+    /// Reusable scratch for epsilon-walk reachability checks in
+    /// `eval_assert_chain` → `can_reach_match_{mid,at_end}`.
+    reach_scratch: super::ReachScratch,
 }
 
 // ---------------------------------------------------------------------------
@@ -3352,6 +3355,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             prefilter: regex.prefilter,
             pending_effects_current: Vec::new(),
             pending_effects_next: Vec::new(),
+            reach_scratch: super::ReachScratch::new(),
         }
     }
 
@@ -3509,6 +3513,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                     false,   // at_end = false (mid-input)
                     Some(b), // next byte is known
                     self.regex,
+                    &mut self.reach_scratch,
                 );
                 // Apply match signals from deferred assertions.
                 if actions.set_match {
@@ -3806,30 +3811,30 @@ impl<'a> Tier3DfaMatcher<'a> {
         prev: Option<u8>,
         next: Option<u8>,
         regex: &Regex,
+        scratch: &mut super::ReachScratch,
     ) -> bool {
         let states = &regex.states;
         let num_states = states.len();
-        let mut visited = vec![false; num_states];
-        let mut stack = vec![start];
-        while let Some(idx) = stack.pop() {
+        scratch.prepare(num_states, start);
+        while let Some(idx) = scratch.stack.pop() {
             let i = idx.idx();
-            if i >= num_states || visited[i] || !regex.state_can_reach_match[i] {
+            if i >= num_states || scratch.visited[i] || !regex.state_can_reach_match[i] {
                 continue;
             }
-            visited[i] = true;
+            scratch.visited[i] = true;
             match states[idx] {
                 State::Match => return true,
                 State::Assert { kind, out } => {
                     if kind.eval(false, false, prev, next) == AssertEval::Pass {
-                        stack.push(out);
+                        scratch.stack.push(out);
                     }
                 }
                 State::Split { out, out1 } => {
-                    stack.push(out);
-                    stack.push(out1);
+                    scratch.stack.push(out);
+                    scratch.stack.push(out1);
                 }
                 State::CounterInstance { out, .. } => {
-                    stack.push(out);
+                    scratch.stack.push(out);
                 }
                 // Consuming states don't fire here — the assert resolution
                 // is about reaching Match through epsilon transitions only.
@@ -3839,7 +3844,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         false
     }
 
-    pub fn finish(self) -> bool {
+    pub fn finish(mut self) -> bool {
         if self.ever_matched {
             return true;
         }
@@ -3901,7 +3906,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         let from_contaminated = self.current_has_break_extras && self.regex.num_counters > 1;
         if self.no_break_current != DfaStateId::DEAD && !from_contaminated {
             let nb_state = &self.cache.inner.states[self.no_break_current.idx()];
-            if nb_state.resolve_deferred_at_end(self.regex) {
+            if nb_state.resolve_deferred_at_end(self.regex, &mut self.reach_scratch) {
                 return true;
             }
         }
@@ -3909,7 +3914,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         // asserts (clean_nb excludes break-gated origins).
         if from_contaminated && self.clean_nb != DfaStateId::DEAD {
             let clean_state = &self.cache.inner.states[self.clean_nb.idx()];
-            if clean_state.resolve_deferred_at_end(self.regex) {
+            if clean_state.resolve_deferred_at_end(self.regex, &mut self.reach_scratch) {
                 return true;
             }
         }
@@ -3930,6 +3935,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                 true, // at_end = true
                 None, // no next byte
                 self.regex,
+                &mut self.reach_scratch,
             );
             // Seeds at EOI: check immediate-break match.
             //

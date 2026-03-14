@@ -784,6 +784,8 @@ pub(crate) struct ResolvedActions {
 ///   reachability checks).
 /// - `check_reachability`: whether to verify downstream match reachability
 ///   after each assertion passes.
+/// - `scratch`: reusable buffers for epsilon-walk reachability checks.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_assert_chain(
     chain_id: AssertChainId,
     arena: &AssertChainArena,
@@ -792,6 +794,7 @@ pub(crate) fn eval_assert_chain(
     next: Option<u8>,
     regex: &Regex,
     check_reachability: bool,
+    scratch: &mut super::ReachScratch,
 ) -> bool {
     if chain_id == AssertChainId::NONE {
         return true;
@@ -809,13 +812,15 @@ pub(crate) fn eval_assert_chain(
                     // `out` can still reach a match.  This handles chained
                     // assertions (e.g. `\b → \B → $ → Match`).
                     if at_end {
-                        if !super::DfaState::can_reach_match_at_end(out, prev, regex) {
+                        if !super::DfaState::can_reach_match_at_end(out, prev, regex, scratch) {
                             return false;
                         }
                     } else {
                         // Mid-input: check if can_reach_match_mid from the
                         // assertion's out.
-                        if !super::Tier3DfaMatcher::can_reach_match_mid(out, prev, next, regex) {
+                        if !super::Tier3DfaMatcher::can_reach_match_mid(
+                            out, prev, next, regex, scratch,
+                        ) {
                             return false;
                         }
                     }
@@ -856,6 +861,7 @@ pub(crate) fn resolve_pending(
     at_end: bool,
     next: Option<u8>,
     regex: &Regex,
+    scratch: &mut super::ReachScratch,
 ) -> ResolvedActions {
     let mut actions = ResolvedActions::default();
 
@@ -886,6 +892,7 @@ pub(crate) fn resolve_pending(
             next,
             regex,
             has_match_atom,
+            scratch,
         ) {
             continue;
         }
@@ -1400,6 +1407,11 @@ mod tests {
     // Semantic tests for resolve_pending() and eval_assert_chain()
     // -----------------------------------------------------------------------
 
+    /// Create a fresh [`ReachScratch`] (test helper).
+    fn scratch() -> super::super::ReachScratch {
+        super::super::ReachScratch::new()
+    }
+
     /// Build a compiled `Regex` from a pattern string (test helper).
     fn build_regex(pattern: &str) -> crate::Regex {
         use regex_syntax::ast::parse::ParserBuilder;
@@ -1452,6 +1464,7 @@ mod tests {
             false,
             Some(b'x'),
             &regex,
+            &mut scratch(),
         );
         assert!(actions.set_match, "unconditional Match should resolve");
         assert!(!actions.set_match_at_end);
@@ -1488,6 +1501,7 @@ mod tests {
             false,
             Some(b' '),
             &regex,
+            &mut scratch(),
         );
         assert!(
             !actions.tails.is_empty(),
@@ -1521,6 +1535,7 @@ mod tests {
             false,
             Some(b'a'),
             &regex,
+            &mut scratch(),
         );
         assert!(
             actions.tails.is_empty(),
@@ -1576,6 +1591,7 @@ mod tests {
             false,
             Some(b' '),
             &regex,
+            &mut scratch(),
         );
         assert!(
             !actions.tails.is_empty(),
@@ -1595,6 +1611,7 @@ mod tests {
             false,
             Some(b'a'),
             &regex,
+            &mut scratch(),
         );
         assert!(
             !actions2.tails.is_empty(),
@@ -1638,6 +1655,7 @@ mod tests {
             false,
             Some(b' '),
             &regex,
+            &mut scratch(),
         );
         assert!(
             actions.tails.is_empty(),
@@ -1652,6 +1670,7 @@ mod tests {
             false,
             Some(b'a'),
             &regex,
+            &mut scratch(),
         );
         assert!(
             actions2.tails.is_empty(),
@@ -1678,6 +1697,7 @@ mod tests {
             false,
             Some(b'x'),
             &regex,
+            &mut scratch(),
         );
         assert_eq!(actions.tails, vec![StateIdx(5)]);
         assert!(!actions.set_match);
@@ -1704,6 +1724,7 @@ mod tests {
             false,
             Some(b'x'),
             &regex,
+            &mut scratch(),
         );
         assert_eq!(actions.seeds.len(), 1);
         assert_eq!(actions.seeds[0], (CounterIdx(0), StateIdx(3), 1));
@@ -1728,6 +1749,7 @@ mod tests {
             false,
             Some(b'x'),
             &regex,
+            &mut scratch(),
         );
         assert!(!actions.set_match, "MatchAtEnd should not set set_match");
         assert!(

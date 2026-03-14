@@ -1740,7 +1740,8 @@ impl<'a> Tier2DfaMatcher<'a> {
             }
             // Standard deferred resolution: handles assertions outside
             // counter bodies (deferred assert -> Match path).
-            if state.resolve_deferred_at_end(self.regex) {
+            let mut scratch = super::ReachScratch::new();
+            if state.resolve_deferred_at_end(self.regex, &mut scratch) {
                 return true;
             }
             // Tier 2 specific: handle deferred assertions inside counter

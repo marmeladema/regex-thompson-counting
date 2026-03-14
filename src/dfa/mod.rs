@@ -135,7 +135,7 @@ impl DfaState {
     /// Resolve deferred assertions at end-of-input.  Returns true if any
     /// deferred assertion passes and `Match` is reachable from its `out`.
     #[inline]
-    fn resolve_deferred_at_end(&self, regex: &Regex) -> bool {
+    fn resolve_deferred_at_end(&self, regex: &Regex, scratch: &mut ReachScratch) -> bool {
         if self.deferred_asserts.is_empty() {
             return false;
         }
@@ -143,7 +143,7 @@ impl DfaState {
         for &assert_idx in self.deferred_asserts.iter() {
             if let State::Assert { kind, out } = regex.states[assert_idx]
                 && kind.eval(false, true, prev, None) == AssertEval::Pass
-                && Self::can_reach_match_at_end(out, prev, regex)
+                && Self::can_reach_match_at_end(out, prev, regex, scratch)
             {
                 return true;
             }
@@ -158,38 +158,76 @@ impl DfaState {
     /// Unlike the static `state_can_reach_match` precomputation, this
     /// correctly handles adjacent assertions like `\b\B` which are
     /// statically reachable but dynamically impossible at the same position.
-    pub(super) fn can_reach_match_at_end(start: StateIdx, prev: Option<u8>, regex: &Regex) -> bool {
+    pub(super) fn can_reach_match_at_end(
+        start: StateIdx,
+        prev: Option<u8>,
+        regex: &Regex,
+        scratch: &mut ReachScratch,
+    ) -> bool {
         let states = &regex.states;
         let num_states = states.len();
-        let mut visited = vec![false; num_states];
-        let mut stack = vec![start];
-        while let Some(idx) = stack.pop() {
+        scratch.prepare(num_states, start);
+        while let Some(idx) = scratch.stack.pop() {
             let i = idx.idx();
-            // Quick static check: if Match is unreachable from this state
-            // at all, skip it.
-            if i >= num_states || visited[i] || !regex.state_can_reach_match[i] {
+            if i >= num_states || scratch.visited[i] || !regex.state_can_reach_match[i] {
                 continue;
             }
-            visited[i] = true;
+            scratch.visited[i] = true;
             match states[idx] {
                 State::Match => return true,
                 State::Assert { kind, out } => {
                     if kind.eval(false, true, prev, None) == AssertEval::Pass {
-                        stack.push(out);
+                        scratch.stack.push(out);
                     }
                 }
                 State::Split { out, out1 } => {
-                    stack.push(out);
-                    stack.push(out1);
+                    scratch.stack.push(out);
+                    scratch.stack.push(out1);
                 }
                 State::CounterInstance { out, .. } => {
-                    stack.push(out);
+                    scratch.stack.push(out);
                 }
-                // Consuming states cannot fire at end-of-input.
                 _ => {}
             }
         }
         false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reusable scratch for epsilon-walk reachability checks
+// ---------------------------------------------------------------------------
+
+/// Reusable scratch buffers for [`DfaState::can_reach_match_at_end`] and
+/// [`Tier3DfaMatcher::can_reach_match_mid`].
+///
+/// Both functions walk epsilon transitions from a start state, checking
+/// whether `Match` is reachable with assertions passing.  They need a
+/// per-NFA-state visited set and a work stack.  This struct lets callers
+/// allocate once and reuse across calls, avoiding per-call `vec![false; n]`
+/// allocations on the hot path.
+pub(super) struct ReachScratch {
+    visited: Vec<bool>,
+    stack: Vec<StateIdx>,
+}
+
+impl ReachScratch {
+    /// Create empty scratch (no allocation until first `prepare()`).
+    pub(super) fn new() -> Self {
+        Self {
+            visited: Vec::new(),
+            stack: Vec::new(),
+        }
+    }
+
+    /// Reset for a new reachability query.  Ensures `visited` has at least
+    /// `num_states` entries (all false) and clears the stack.
+    #[inline]
+    fn prepare(&mut self, num_states: usize, start: StateIdx) {
+        self.visited.clear();
+        self.visited.resize(num_states, false);
+        self.stack.clear();
+        self.stack.push(start);
     }
 }
 

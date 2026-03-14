@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use crate::{Prefilter, Regex, State, StateIdx, byte_match_ci, is_word_byte};
+use crate::{byte_match_ci, is_word_byte, Prefilter, Regex, State, StateIdx};
 
 use super::{DfaCache, DfaMemory, DfaStateId};
 
@@ -225,7 +225,11 @@ impl Tier1DfaCache {
                         State::ByteClass { class, out } if regex.classes[class][byte] => Some(out),
                         State::ByteTable { table } => {
                             let t = regex.byte_tables[table][byte];
-                            if t != StateIdx::NONE { Some(t) } else { None }
+                            if t != StateIdx::NONE {
+                                Some(t)
+                            } else {
+                                None
+                            }
                         }
                         _ => None,
                     };
@@ -258,7 +262,11 @@ impl Tier1DfaCache {
                         State::ByteClass { class, out } if regex.classes[class][byte] => Some(out),
                         State::ByteTable { table } => {
                             let t = regex.byte_tables[table][byte];
-                            if t != StateIdx::NONE { Some(t) } else { None }
+                            if t != StateIdx::NONE {
+                                Some(t)
+                            } else {
+                                None
+                            }
                         }
                         _ => None,
                     };
@@ -340,7 +348,11 @@ impl Tier1DfaCache {
                     State::ByteClass { class, out } if regex.classes[class][byte] => Some(out),
                     State::ByteTable { table } => {
                         let t = regex.byte_tables[table][byte];
-                        if t != StateIdx::NONE { Some(t) } else { None }
+                        if t != StateIdx::NONE {
+                            Some(t)
+                        } else {
+                            None
+                        }
                     }
                     _ => None,
                 };
@@ -624,7 +636,8 @@ impl<'a> DfaMatcher<'a> {
             }
 
             // Check deferred assertions at end-of-input.
-            if state.resolve_deferred_at_end(self.regex) {
+            let mut scratch = super::ReachScratch::new();
+            if state.resolve_deferred_at_end(self.regex, &mut scratch) {
                 return true;
             }
         }
