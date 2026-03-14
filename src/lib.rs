@@ -10834,6 +10834,33 @@ mod tests {
             ],
         }
 
+        // Bug 52: break-seed dedup discards ungated path.
+        // Pattern: `^a{1,2}(\b)?.{4,16}$`
+        // The optional `(\b)?` creates a Split in c0's break epsilon
+        // closure with two paths to CI(c1):
+        //   Split → Assert(\b) → CI(c1)   [gated by \b]
+        //   Split → CI(c1)                 [ungated — skips \b]
+        // Both paths have the same (trigger, counter, origin) key.
+        // The ci_visited flag prevented the CI from recording seeds
+        // for the second arrival, and the dedup merged entries by key
+        // only, losing the ungated path.  Without the ungated seed,
+        // c1 was never seeded and the match was missed.
+        test_tier3_break_seed_ungated_or_path {
+            pattern: r"^a{1,2}(\b)?.{4,16}$",
+            memory: 2124,
+            min_tier: 1,
+            inputs: [
+                ("aaaaa", true),               // a{1} + skip \b + .{4} = 5 bytes
+                ("aaaaaa", true),              // a{1} + skip \b + .{5} = 6 bytes
+                ("aaaaaaaaaa", true),           // a{2} + skip \b + .{8} = 10 bytes
+                ("aa a", false),               // too short for .{4,16}
+                ("a", false),                  // only 1 byte: c1 never reaches min=4
+                ("aa", false),                 // 2 bytes: too short
+                ("a aaaa", true),              // a{1} + \b passes (word→nonword) + .{5}
+                ("aabcde", true),              // a{1} + skip \b + .{5} (bcde)
+            ],
+        }
+
         // Bug 29: post-break tail Advance branch missing target_is_match check.
         // The tail at state 8 (Byte('e')) consumes 'e' and advances to {9}
         // (new_origins), but the epsilon closure of its target includes

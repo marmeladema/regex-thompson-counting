@@ -290,12 +290,15 @@ pub(crate) struct Tier3BreakSeed {
     /// the path has no assertions.
     ///
     /// **Semantics: PathChain (AND).**  One ordered path from the trigger's
-    /// break output to this seed's CI.  All assertions must pass in
-    /// sequence.  The `break_seeds_raw` dedup at lines ~490 merges seeds
-    /// with the same `(trigger, counter, origin)` — since a seed's assertion
-    /// path is uniquely determined by these three keys (the epsilon walk from
-    /// a specific CInc break through a specific CI is deterministic), the
-    /// dedup is semantics-preserving.
+    /// break output to this seed's CI.  All assertions in the chain must
+    /// pass in sequence.
+    ///
+    /// **OR across seeds:** Multiple `Tier3BreakSeed` entries can share the
+    /// same `(trigger, counter, origin)` but carry different assertion
+    /// chains — e.g. when a Split in the epsilon closure creates paths
+    /// that both reach the same CI, one through an assertion and one not.
+    /// Each entry is compiled into a separate effect atom (`on_break` if
+    /// ungated, `guarded` if gated); any one firing suffices (Bug 52).
     pub(crate) deferred_asserts: Box<[StateIdx]>,
     /// Interned assertion chain ID for the deferred assertions.
     /// [`AssertChainId::NONE`] when `deferred_asserts` is empty.
@@ -467,18 +470,26 @@ pub(crate) fn compute_tier3_analysis(
         let mut break_consuming: Vec<StateIdx> = Vec::new();
         while let Some((idx, deferred)) = ci_stack.pop() {
             let i = idx.idx();
-            if ci_visited[i] {
-                continue;
-            }
+            let already_visited = ci_visited[i];
             ci_visited[i] = true;
             match states[idx] {
                 State::CounterInstance { counter, out } => {
+                    // Bug 52: always record seeds for every arrival path,
+                    // even if this CI was already visited via a different
+                    // path.  A Split in the closure can route both through
+                    // an assertion and directly to the same CI, producing
+                    // OR-alternative seeds with different deferred assertions.
                     let ci_consuming = consuming_states_from(out, states);
                     for c in ci_consuming {
                         break_seeds_raw.push((trigger, counter, c, deferred.clone()));
                     }
-                    ci_stack.push((out, deferred));
+                    // Only explore past the CI once — the downstream graph
+                    // is identical regardless of which path reached this CI.
+                    if !already_visited {
+                        ci_stack.push((out, deferred));
+                    }
                 }
+                _ if already_visited => continue,
                 State::Split { out, out1 } => {
                     ci_stack.push((out1, deferred.clone()));
                     ci_stack.push((out, deferred));
@@ -517,32 +528,44 @@ pub(crate) fn compute_tier3_analysis(
         // like `^e{4,5}e{4,5}ee{4,5}$` where the break path crosses
         // a consuming state before reaching the next counter's CI.
     }
-    // Dedup break seeds by (trigger, counter, origin).
+    // Dedup break seeds by (trigger, counter, origin, deferred_asserts).
     //
-    // Semantics-preserving: a seed's assertion path is uniquely determined
-    // by these three keys because the epsilon walk from a specific CInc's
-    // break output through a specific CI is deterministic.  Two raw entries
-    // with the same (trigger, counter, origin) will always have the same
-    // deferred assertion list, so dedup doesn't merge distinct OR-paths.
+    // A Split in the epsilon closure can create multiple paths from the
+    // same CInc break to the same CI, some through assertions and some
+    // bypassing them.  For example, `^a{1,2}(\b)?.{4,16}$` produces:
     //
-    // If the NFA ever produces multiple distinct assertion paths for the
-    // same (trigger, counter, origin) triple — e.g. via epsilon cycles
-    // or alternation in the epsilon closure — this dedup would need to be
-    // revised to preserve all distinct paths (OR semantics).
+    //   CInc(c0) break → Split → Assert(\b) → CI(c1)   [gated by \b]
+    //   CInc(c0) break → Split → CI(c1)                 [ungated]
+    //
+    // Both paths share (trigger=c0, counter=c1, origin=body_of_c1) but
+    // have different deferred assertion lists.  These are OR-alternatives:
+    // the seed should fire if ANY path's assertions pass.  An ungated path
+    // means the seed fires unconditionally.
+    //
+    // We preserve all distinct (key, assertions) pairs and let
+    // `compile_target_effects()` emit them as separate `on_break` (ungated)
+    // or `guarded` (gated) `AddSeed` atoms.  True duplicates (same key
+    // AND same assertions) are still removed.
+    //
+    // Bug 52: the previous dedup compared only the key, silently discarding
+    // ungated paths when a gated path for the same seed existed.
+    for entry in &mut break_seeds_raw {
+        entry.3.sort_unstable_by_key(|s| s.0);
+        entry.3.dedup();
+    }
     break_seeds_raw.sort_by_key(|e| (e.0.idx(), e.1.idx(), e.2.0));
-    break_seeds_raw.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+    break_seeds_raw.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3);
 
     let break_seeds: Vec<Tier3BreakSeed> = break_seeds_raw
         .into_iter()
         .map(|(trigger, counter, origin, deferred)| {
-            let mut da = deferred;
-            da.sort_unstable_by_key(|s| s.0);
-            da.dedup();
+            // deferred is already sorted + deduped (done above for the
+            // dedup_by comparison).
             Tier3BreakSeed {
                 trigger,
                 counter,
                 origin,
-                deferred_asserts: da.into_boxed_slice(),
+                deferred_asserts: deferred.into_boxed_slice(),
                 // Placeholder — populated after the assertion chain arena
                 // is built in Step 9.
                 assert_chain_id: tier3_effects::AssertChainId::NONE,
