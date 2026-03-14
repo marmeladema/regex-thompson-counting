@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use crate::dfa::tier3_effects::{AssertChainArena, CompiledTargetEffects};
+use crate::dfa::tier3_effects::{AssertChainArena, CompiledOriginEffects, CompiledTargetEffects};
 use crate::dfa::Tier3OriginKind;
 use crate::{AssertKind, ByteClass, ByteMap, Regex, State, StateIdx};
 
@@ -209,6 +209,35 @@ fn fmt_target_effects(
         }
     } else {
         writeln!(f, "  target_effects: (none)")?;
+    }
+    Ok(())
+}
+
+fn fmt_origin_effects(
+    f: &mut fmt::Formatter<'_>,
+    origin_effects: &[CompiledOriginEffects],
+    states: &[State],
+) -> fmt::Result {
+    // Only show origins that have non-empty effects.
+    let entries: Vec<(usize, &CompiledOriginEffects)> = origin_effects
+        .iter()
+        .enumerate()
+        .filter(|(_, oe)| !oe.immediate.is_empty() || !oe.guarded.is_empty())
+        .collect();
+    if !entries.is_empty() {
+        writeln!(f, "  origin_effects:")?;
+        for (i, oe) in entries {
+            let label = match states.get(i) {
+                Some(State::Byte { byte, .. }) => format!("Byte('{}')", *byte as char),
+                Some(State::ByteClass { .. }) => "ByteClass".to_string(),
+                Some(State::ByteTable { .. }) => "ByteTable".to_string(),
+                Some(State::ByteCI { .. }) => "ByteCI".to_string(),
+                _ => "?".to_string(),
+            };
+            writeln!(f, "    state {i} ({label}): {oe}")?;
+        }
+    } else {
+        writeln!(f, "  origin_effects: (none)")?;
     }
     Ok(())
 }
@@ -647,6 +676,7 @@ impl DumpRegex<'_> {
             writeln!(f)?;
             writeln!(f, "  --- Typed Effects ---")?;
             fmt_target_effects(f, &t3.target_effects, &t3.assert_chain_arena, &r.states.0)?;
+            fmt_origin_effects(f, &t3.origin_effects, &r.states.0)?;
         }
 
         Ok(())
