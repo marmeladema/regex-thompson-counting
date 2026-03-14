@@ -38,8 +38,8 @@
 //!
 //! Origins bridge the DFA (which tracks NFA state subsets) and per-counter
 //! instance tracking (which tracks repetition counts).  A cached DFA
-//! transition maps each origin to an [`OriginAction`] (`Option<Tier3OriginKind>`)
-//! that describes what happens structurally when a byte is consumed there.
+//! transition maps each origin to a target NFA state whose structural action
+//! (`Option<Tier3OriginKind>`) is looked up from [`Tier3Analysis::targets`].
 
 use std::fmt;
 
@@ -204,8 +204,7 @@ pub(crate) struct Tier3Analysis {
 
 /// What happens structurally when a byte is consumed at a given target.
 ///
-/// [`OriginAction`] is a type alias for `Option<Tier3OriginKind>`: dead targets
-/// are represented as `None` in both `Tier3Analysis::targets` and `Transition::origin_actions`.
+/// Dead targets are represented as `None` in `Tier3Analysis::targets`.
 #[derive(Clone, Debug)]
 #[allow(clippy::type_complexity)]
 pub(crate) enum Tier3OriginKind {
@@ -983,9 +982,12 @@ struct Transition {
     /// the seed for `counter` at `origin` is only applied when `trigger`
     /// (the counter whose CInc break leads to this CI) actually breaks.
     break_seeds: Box<[(CounterIdx, CounterIdx, StateIdx, u32)]>,
-    /// Parallel arrays: `origin_keys[i]` → `origin_actions[i]`.
+    /// Parallel arrays: `origin_keys[i]` is the consuming NFA state;
+    /// `origin_targets[i]` is the post-consumption NFA target state.
+    /// The target's structural action is looked up from
+    /// [`Tier3Analysis::targets`] at runtime, avoiding cloned boxed slices.
     origin_keys: Box<[StateIdx]>,
-    origin_actions: Box<[OriginAction]>,
+    origin_targets: Box<[StateIdx]>,
     /// True if any origin's byte-consumption target reaches `$ → Match`
     /// without going through a CInc node.  This is the "counter-free"
     /// subset of the DFA state's `is_match_at_end` — safe to propagate
@@ -1017,19 +1019,14 @@ impl Transition {
             seeds: Box::new([]),
             break_seeds: Box::new([]),
             origin_keys: Box::new([]),
-            origin_actions: Box::new([]),
+            origin_targets: Box::new([]),
             counter_free_match_at_end: false,
             nb_counter_free_mae: false,
         }
     }
 }
 
-/// Per-origin action in a cached [`Transition`].
-///
-/// `None` means the byte did not match at this origin — the instance
-/// dies.  `Some(kind)` carries the structural outcome (advance or
-/// increment) from [`Tier3Analysis::targets`].
-type OriginAction = Option<Tier3OriginKind>;
+
 
 // ---------------------------------------------------------------------------
 // CounterStorage trait — abstracts over range-compressed and per-instance paths
@@ -1724,19 +1721,21 @@ impl Tier3DfaCache {
 
         let is_counting = probe.encountered_cinc || resolved_cinc;
 
-        // Build per-origin actions from the precomputed analysis.
+        // Build per-origin target indices from the precomputed analysis.
         //
         // The analysis is indexed by *target* state (the NFA state
         // reached after byte consumption), not by origin.  Each origin
         // produces exactly one target, so `targets[0]` is the lookup key.
+        // We store the target index instead of cloning the full
+        // `Option<Tier3OriginKind>` — the structural action is looked up
+        // from `analysis.targets` at runtime.
         let mut origin_keys = Vec::new();
-        let mut origin_actions = Vec::new();
+        let mut origin_targets_vec = Vec::new();
         for &(origin, ref targets) in &targets_per_origin {
             debug_assert_eq!(targets.len(), 1);
             let target = targets[0];
-            let action = analysis.targets[target.idx()].clone();
             origin_keys.push(origin);
-            origin_actions.push(action);
+            origin_targets_vec.push(target);
         }
 
         // Compute seed initial values for non-counting transitions.
@@ -1747,7 +1746,7 @@ impl Tier3DfaCache {
         if !is_counting {
             for rs in &mut resolved_seeds {
                 if let Some(pos) = origin_keys.iter().position(|&k| k == rs.1)
-                    && matches!(origin_actions[pos], Some(Tier3OriginKind::Increment { .. }))
+                    && matches!(analysis.targets[origin_targets_vec[pos].idx()], Some(Tier3OriginKind::Increment { .. }))
                 {
                     rs.2 = 1;
                 }
@@ -1803,7 +1802,7 @@ impl Tier3DfaCache {
                         .iter()
                         .position(|&k| k == rs.1)
                         .is_some_and(|pos| {
-                            matches!(origin_actions[pos], Some(Tier3OriginKind::Increment { .. }))
+                            matches!(analysis.targets[origin_targets_vec[pos].idx()], Some(Tier3OriginKind::Increment { .. }))
                         })
                         // Bug 40: exclude break-gated seeds — origins NOT
                         // reachable_without_break are counter-break-
@@ -1962,9 +1961,9 @@ impl Tier3DfaCache {
             let counter_free_mae =
                 origin_keys
                     .iter()
-                    .zip(origin_actions.iter())
-                    .any(|(&origin, action)| {
-                        !matches!(action, Some(Tier3OriginKind::Increment { .. }))
+                    .zip(origin_targets_vec.iter())
+                    .any(|(&origin, &target)| {
+                        !matches!(analysis.targets[target.idx()], Some(Tier3OriginKind::Increment { .. }))
                             && analysis.target_is_match_at_end[origin.idx()]
                             && analysis.reachable_without_break[origin.idx()]
                     });
@@ -1983,7 +1982,7 @@ impl Tier3DfaCache {
                 seeds: seeds.into(),
                 break_seeds: break_seeds.into(),
                 origin_keys: origin_keys.into_boxed_slice(),
-                origin_actions: origin_actions.into_boxed_slice(),
+                origin_targets: origin_targets_vec.into_boxed_slice(),
                 counter_free_match_at_end: counter_free_mae,
                 nb_counter_free_mae,
             }
@@ -2040,7 +2039,7 @@ impl Tier3DfaCache {
                 seeds: seeds.into(),
                 break_seeds: Box::new([]),
                 origin_keys: origin_keys.into_boxed_slice(),
-                origin_actions: origin_actions.into_boxed_slice(),
+                origin_targets: origin_targets_vec.into_boxed_slice(),
                 counter_free_match_at_end: false, // Not used for non-counting transitions.
                 nb_counter_free_mae,
             }
@@ -2771,7 +2770,7 @@ pub struct Tier3DfaMatcher<'a> {
     /// NFA consuming states currently active from a counter break path.
     /// These track the post-counter "tail" (e.g. a trailing `.` or
     /// literal before `$ → Match`).  Updated each step: each tail is
-    /// advanced through its [`OriginAction`].  When a tail's action is
+    /// advanced through its target action.  When a tail's action is
     /// `None` (dead) and `target_is_match_at_end` is true, `match_at_end` is set.
     ///
     /// This replaces the use of DFA-level `is_match_at_end` for counting
@@ -2908,7 +2907,7 @@ macro_rules! step_slow_impl {
             self.next_post_break_tails.clear();
             for &pbo in &self.post_break_tails {
                 let pos = t.origin_keys.iter().position(|&k| k == pbo);
-                match pos.map(|i| &t.origin_actions[i]) {
+                match pos.map(|i| &self.analysis.targets[t.origin_targets[i].idx()]) {
                     Some(Some(Tier3OriginKind::Advance {
                         new_origins,
                         is_match_at_end,
@@ -3088,7 +3087,7 @@ macro_rules! step_slow_impl {
                         .origin_keys
                         .iter()
                         .position(|&k| k == origin)
-                        .and_then(|i| t.origin_actions[i].as_ref());
+                        .and_then(|i| self.analysis.targets[t.origin_targets[i].idx()].as_ref());
 
                     match action {
                         Some(Tier3OriginKind::Advance { new_origins, .. }) => {
