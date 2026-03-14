@@ -126,6 +126,12 @@ pub(crate) struct Tier3Analysis {
     /// lie on the epsilon path from its target.  Empty for non-consuming
     /// states or when no assertions are on the path.
     ///
+    /// **Semantics: AlternativeChains (OR).**  Each entry in the inner
+    /// slice is an independent assertion from a distinct epsilon path
+    /// to downstream Match/consuming states.  At runtime, each is interned
+    /// as a separate 1-element chain in `target_assert_chain_ids` and
+    /// emitted as its own `PendingEffect`, so any one passing suffices.
+    ///
     /// Used by the post-break tail tracker (Bug 30): when a tail advances
     /// through a consuming state, these assertions are emitted as
     /// [`PendingEffect`](tier3_effects::PendingEffect) entries with
@@ -170,11 +176,14 @@ pub(crate) struct Tier3Analysis {
 
     /// Per-consuming-state assertion chain IDs for `target_deferred_asserts`.
     ///
-    /// Indexed by NFA state index.  For each consuming state, contains one
+    /// **Semantics: AlternativeChains (OR) — parallel to
+    /// `target_deferred_asserts`.**  Indexed by NFA state index.  For
+    /// each consuming state, contains one
     /// [`AssertChainId`](tier3_effects::AssertChainId) per assert in
     /// `target_deferred_asserts[state]`.  Each individual assert index is
     /// interned as a 1-element chain so it can be used as a guard in
-    /// [`PendingEffect`](tier3_effects::PendingEffect) entries.
+    /// [`PendingEffect`](tier3_effects::PendingEffect) entries.  Any
+    /// one chain passing suffices for the associated match/tail effect.
     ///
     /// Populated alongside `target_effects` during
     /// [`compile_all_target_effects`](tier3_effects::compile_all_target_effects).
@@ -229,6 +238,12 @@ pub(crate) enum Tier3OriginKind {
         /// These must be evaluated at end-of-input before confirming
         /// the match.  Empty when `break_is_match_at_end` comes from
         /// a pure `$ → Match` path (no deferred assertions).
+        ///
+        /// **Semantics: AlternativeChains (OR).**  Each entry is an
+        /// independent NFA assertion state from a distinct epsilon path
+        /// to `$ → Match`.  Any one passing means a match (Bug 51).
+        /// The parallel `break_deferred_chain_ids` array interns each
+        /// as a separate 1-element chain for independent evaluation.
         break_deferred_asserts: Box<[StateIdx]>,
         /// Non-counter consuming states on the CInc break path.
         /// These form the "post-counter tail" that must be tracked
@@ -244,17 +259,24 @@ pub(crate) enum Tier3OriginKind {
         /// on the path from the break output to that consuming state,
         /// plus the interned [`AssertChainId`] for runtime effect
         /// evaluation.
+        ///
+        /// **Semantics: PerTailChain (AND per tail).**  Each tuple
+        /// `(tail, asserts, chain_id)` represents ONE tail with ONE
+        /// ordered assertion chain.  All assertions in the chain must
+        /// pass (AND) for that tail to be deposited.  Different tails
+        /// are independent (OR across tuples).
+        ///
         /// Bug 46: used to gate each tail individually — a tail behind
         /// `\b` AND `\B` must have BOTH pass, not just the top-level `\b`.
         break_consuming_deferred: Box<[(StateIdx, Box<[StateIdx]>, tier3_effects::AssertChainId)]>,
         /// Per-entry assertion chain IDs for `break_deferred_asserts`.
         ///
-        /// Each entry is a 1-element chain interned in the assertion chain
-        /// arena, so that each deferred assertion is evaluated independently
-        /// (OR semantics: any one passing means a match).  Parallel array
-        /// with `break_deferred_asserts`.  Populated during
-        /// [`compute_tier3_analysis`] after the assertion chain arena
-        /// is built.
+        /// **Semantics: AlternativeChains (OR) — parallel to
+        /// `break_deferred_asserts`.**  Each entry is a 1-element chain
+        /// interned in the assertion chain arena, so that each deferred
+        /// assertion is evaluated independently (any one passing means
+        /// a match).  Populated during [`compute_tier3_analysis`] after
+        /// the assertion chain arena is built.
         break_deferred_chain_ids: Box<[tier3_effects::AssertChainId]>,
     },
 }
@@ -272,6 +294,14 @@ pub(crate) struct Tier3BreakSeed {
     /// CInc break output to this seed's CI.  These assertions must pass at
     /// the break position before the seed is applied (Bug 27).  Empty when
     /// the path has no assertions.
+    ///
+    /// **Semantics: PathChain (AND).**  One ordered path from the trigger's
+    /// break output to this seed's CI.  All assertions must pass in
+    /// sequence.  The `break_seeds_raw` dedup at lines ~490 merges seeds
+    /// with the same `(trigger, counter, origin)` — since a seed's assertion
+    /// path is uniquely determined by these three keys (the epsilon walk from
+    /// a specific CInc break through a specific CI is deterministic), the
+    /// dedup is semantics-preserving.
     pub(crate) deferred_asserts: Box<[StateIdx]>,
     /// Interned assertion chain ID for the deferred assertions.
     /// [`AssertChainId::NONE`] when `deferred_asserts` is empty.
@@ -475,6 +505,18 @@ pub(crate) fn compute_tier3_analysis(
         // like `^e{4,5}e{4,5}ee{4,5}$` where the break path crosses
         // a consuming state before reaching the next counter's CI.
     }
+    // Dedup break seeds by (trigger, counter, origin).
+    //
+    // Semantics-preserving: a seed's assertion path is uniquely determined
+    // by these three keys because the epsilon walk from a specific CInc's
+    // break output through a specific CI is deterministic.  Two raw entries
+    // with the same (trigger, counter, origin) will always have the same
+    // deferred assertion list, so dedup doesn't merge distinct OR-paths.
+    //
+    // If the NFA ever produces multiple distinct assertion paths for the
+    // same (trigger, counter, origin) triple — e.g. via epsilon cycles
+    // or alternation in the epsilon closure — this dedup would need to be
+    // revised to preserve all distinct paths (OR semantics).
     break_seeds_raw.sort_by_key(|e| (e.0.idx(), e.1.idx(), e.2.0));
     break_seeds_raw.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
 
