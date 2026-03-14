@@ -371,7 +371,7 @@ impl fmt::Display for EffectGuard {
 /// Atoms are intentionally small — they describe *what happens*, not
 /// *when* or *under what condition*.  Timing and guards are attached at
 /// the [`GuardedEffect`] or [`CompiledTargetEffects`] level.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EffectAtom {
     /// Seed a new counter instance.
     AddSeed {
@@ -424,7 +424,7 @@ impl fmt::Display for EffectAtom {
 // ---------------------------------------------------------------------------
 
 /// A bundle of effect atoms sharing the same timing and guard.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GuardedEffect {
     /// When the effect becomes actionable.
     pub(crate) timing: EffectTiming,
@@ -659,7 +659,7 @@ impl fmt::Display for CompiledOriginEffects {
 /// `prev_was_word` captures the word-boundary context at the time the
 /// effect was scheduled, because deferred assertion evaluation needs the
 /// boundary context from the *scheduling* byte, not the *evaluation* byte.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct PendingEffect {
     /// When this effect should be evaluated.
     pub(crate) timing: EffectTiming,
@@ -717,7 +717,7 @@ pub(crate) fn enqueue_guarded_effects(
         queue.push(PendingEffect {
             timing: ge.timing,
             guard: ge.guard,
-            atom: ge.atom.clone(),
+            atom: ge.atom,
             prev_was_word,
         });
     }
