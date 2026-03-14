@@ -2709,8 +2709,8 @@ pub struct Tier3DfaMatcher<'a> {
     /// Scratch buffer for advancing `post_break_tails` (double-buffered).
     next_post_break_tails: Vec<StateIdx>,
     // Break seeds, break tails, resolved tails/mae, and deferred assertion
-    // match signals are all handled by `pending_effects_next_byte` and
-    // `pending_effects_end_only` via the typed effect system.  See
+    // match signals are all handled by `pending_effects_current` and
+    // `pending_effects_next` via the typed effect system.  See
     // `tier3_effects::resolve_pending()` and `tier3_effects::PendingEffect`.
     /// True when the current DFA state (`self.current`) was reached via a
     /// `with_break` transition and may contain NFA consuming states that
@@ -2751,12 +2751,34 @@ pub struct Tier3DfaMatcher<'a> {
     /// contaminated.
     clean_nb_trans_slot: Option<usize>,
     prefilter: Prefilter,
-    /// Pending effects with `EffectTiming::NextByte` — evaluated at the
-    /// start of the next byte in `chunk()`.
+    /// Pending effects to resolve at the next byte boundary.
     ///
-    /// Carries deferred seeds, tails, and match signals that require
-    /// assertion evaluation at a byte boundary before they can be applied.
-    pending_effects_next_byte: Vec<tier3_effects::PendingEffect>,
+    /// This buffer is the **read side** of a swap-buffer pair.  At each
+    /// byte boundary in `chunk()`:
+    ///
+    /// 1. `pending_effects_current` is resolved by
+    ///    [`tier3_effects::resolve_pending()`].
+    /// 2. Any second-order deferred effects deposited during resolution
+    ///    go into [`pending_effects_next`].
+    /// 3. `pending_effects_current` is cleared, then swapped with
+    ///    `pending_effects_next` — so second-order effects survive to
+    ///    the following boundary.
+    /// 4. `step_slow` appends first-order effects to
+    ///    `pending_effects_current` (which now contains only surviving
+    ///    second-order effects from step 3).
+    ///
+    /// This two-buffer design prevents second-order deferred effects
+    /// (deposited during resolution of a resolved tail or seed) from
+    /// being dropped by the post-resolution clear.
+    pending_effects_current: Vec<tier3_effects::PendingEffect>,
+    /// Pending effects deposited **during resolution** of
+    /// `pending_effects_current`.
+    ///
+    /// This is the **write side** of the swap-buffer pair.  After
+    /// resolution completes, it is swapped into `pending_effects_current`
+    /// for the next boundary.  See [`pending_effects_current`] for the
+    /// full lifecycle.
+    pending_effects_next: Vec<tier3_effects::PendingEffect>,
     /// Pending effects with `EffectTiming::EndOnly` — evaluated in
     /// `finish()` at end-of-input.
     pending_effects_end_only: Vec<tier3_effects::PendingEffect>,
@@ -2786,9 +2808,12 @@ macro_rules! step_slow_impl {
             let t = &self.cache.transitions[slot];
 
             // Reset next buffer and match flags.
+            // Note: pending_effects_current is NOT cleared here — it may
+            // contain second-order deferred effects from the resolution
+            // phase that precedes step_slow in the chunk() loop.  New
+            // deposits from this step are appended to pending_effects_current.
             self.$next.clear();
             self.match_at_end = false;
-            self.pending_effects_next_byte.clear();
 
             // Advance existing post-break tails through this transition.
             // Each tail is a consuming NFA state from a previous counter
@@ -2832,7 +2857,7 @@ macro_rules! step_slow_impl {
                         // only fire via the contaminated no_break_current
                         // DFA state.
                         for &chain_id in self.analysis.target_assert_chain_ids[pbo.idx()].iter() {
-                            self.pending_effects_next_byte.push(
+                            self.pending_effects_current.push(
                                 tier3_effects::PendingEffect {
                                     timing: tier3_effects::EffectTiming::NextByte,
                                     guard: tier3_effects::EffectGuard {
@@ -2914,7 +2939,7 @@ macro_rules! step_slow_impl {
                                 // a separate PendingEffect (OR semantics).
                                 for &chain_id in break_deferred_chain_ids.iter() {
                                     if chain_id != tier3_effects::AssertChainId::NONE {
-                                    self.pending_effects_next_byte.push(
+                                    self.pending_effects_current.push(
                                         tier3_effects::PendingEffect {
                                             timing: tier3_effects::EffectTiming::NextByte,
                                             guard: tier3_effects::EffectGuard {
@@ -2937,11 +2962,11 @@ macro_rules! step_slow_impl {
                                 // Emit as PendingEffect with AddTail.
                                 for &(tail, _, chain_id) in break_consuming_deferred.iter() {
                                     if chain_id != tier3_effects::AssertChainId::NONE
-                                        && !self.pending_effects_next_byte.iter().any(|pe| {
+                                        && !self.pending_effects_current.iter().any(|pe| {
                                             pe.atoms.iter().any(|a| matches!(a, tier3_effects::EffectAtom::AddTail { origin } if *origin == tail))
                                         })
                                     {
-                                        self.pending_effects_next_byte.push(
+                                        self.pending_effects_current.push(
                                             tier3_effects::PendingEffect {
                                                 timing: tier3_effects::EffectTiming::NextByte,
                                                 guard: tier3_effects::EffectGuard {
@@ -2975,7 +3000,7 @@ macro_rules! step_slow_impl {
                         // assert-only path).
                         // Deposit as PendingEffect with Match atom.
                         for &chain_id in self.analysis.target_assert_chain_ids[pbo.idx()].iter() {
-                            self.pending_effects_next_byte.push(
+                            self.pending_effects_current.push(
                                 tier3_effects::PendingEffect {
                                     timing: tier3_effects::EffectTiming::NextByte,
                                     guard: tier3_effects::EffectGuard {
@@ -3090,7 +3115,7 @@ macro_rules! step_slow_impl {
                                     // a separate PendingEffect (OR semantics).
                                     for &chain_id in break_deferred_chain_ids.iter() {
                                         if chain_id != tier3_effects::AssertChainId::NONE {
-                                        self.pending_effects_next_byte.push(
+                                        self.pending_effects_current.push(
                                             tier3_effects::PendingEffect {
                                                 timing: tier3_effects::EffectTiming::NextByte,
                                                 guard: tier3_effects::EffectGuard {
@@ -3113,11 +3138,11 @@ macro_rules! step_slow_impl {
                                 // Emit as PendingEffect with AddTail.
                                     for &(tail, _, chain_id) in break_consuming_deferred.iter() {
                                         if chain_id != tier3_effects::AssertChainId::NONE
-                                            && !self.pending_effects_next_byte.iter().any(|pe| {
+                                            && !self.pending_effects_current.iter().any(|pe| {
                                                 pe.atoms.iter().any(|a| matches!(a, tier3_effects::EffectAtom::AddTail { origin } if *origin == tail))
                                             })
                                         {
-                                            self.pending_effects_next_byte.push(
+                                            self.pending_effects_current.push(
                                                 tier3_effects::PendingEffect {
                                                     timing: tier3_effects::EffectTiming::NextByte,
                                                     guard: tier3_effects::EffectGuard {
@@ -3302,7 +3327,7 @@ macro_rules! step_slow_impl {
                         // word-ness of the break position (= `byte`, the
                         // byte just consumed by the body) for later
                         // evaluation.
-                        self.pending_effects_next_byte
+                        self.pending_effects_current
                             .push(tier3_effects::PendingEffect {
                                 timing: tier3_effects::EffectTiming::NextByte,
                                 guard: tier3_effects::EffectGuard {
@@ -3386,7 +3411,8 @@ impl<'a> Tier3DfaMatcher<'a> {
             inst_counters,
             next_instances,
             prefilter: regex.prefilter,
-            pending_effects_next_byte: Vec::new(),
+            pending_effects_current: Vec::new(),
+            pending_effects_next: Vec::new(),
             pending_effects_end_only: Vec::new(),
         }
     }
@@ -3413,7 +3439,8 @@ impl<'a> Tier3DfaMatcher<'a> {
         }
         self.match_at_end = false;
         self.post_break_tails.clear();
-        self.pending_effects_next_byte.clear();
+        self.pending_effects_current.clear();
+        self.pending_effects_next.clear();
         self.pending_effects_end_only.clear();
 
         let trans = self.cache.populate(
@@ -3537,9 +3564,9 @@ impl<'a> Tier3DfaMatcher<'a> {
             // for the next step (injected after step_slow).
             let mut resolved_tails: Vec<StateIdx> = Vec::new();
             let mut resolved_mae = false;
-            if !self.pending_effects_next_byte.is_empty() {
+            if !self.pending_effects_current.is_empty() {
                 let actions = tier3_effects::resolve_pending(
-                    &self.pending_effects_next_byte,
+                    &self.pending_effects_current,
                     tier3_effects::EffectTiming::NextByte,
                     &self.analysis.assert_chain_arena,
                     false,   // at_end = false (mid-input)
@@ -3583,10 +3610,13 @@ impl<'a> Tier3DfaMatcher<'a> {
                                 }
                                 // Deposit target deferred asserts
                                 // as PendingEffect with Match atom.
+                                // Second-order: deposited during resolution,
+                                // goes to pending_effects_next to survive
+                                // the post-resolution clear.
                                 for &chain_id in
                                     self.analysis.target_assert_chain_ids[tail.idx()].iter()
                                 {
-                                    self.pending_effects_next_byte.push(
+                                    self.pending_effects_next.push(
                                         tier3_effects::PendingEffect {
                                             timing: tier3_effects::EffectTiming::NextByte,
                                             guard: tier3_effects::EffectGuard {
@@ -3653,11 +3683,12 @@ impl<'a> Tier3DfaMatcher<'a> {
                                         // Bug 51: each entry is an independent
                                         // assertion (OR semantics) — emit one
                                         // PendingEffect per chain.
+                                        // Second-order: goes to pending_effects_next.
                                         for &chain_id in break_deferred_chain_ids.iter() {
                                             if chain_id
                                                 != tier3_effects::AssertChainId::NONE
                                             {
-                                                self.pending_effects_next_byte.push(
+                                                self.pending_effects_next.push(
                                                     tier3_effects::PendingEffect {
                                                         timing: tier3_effects::EffectTiming::NextByte,
                                                          guard: tier3_effects::EffectGuard {
@@ -3678,11 +3709,11 @@ impl<'a> Tier3DfaMatcher<'a> {
                                             }
                                         }
                                         // Bug 46: re-pend deferred tails.
-                                        // These get cleared by step_slow.
+                                        // Second-order: goes to pending_effects_next.
                                         for &(new_o, _, chain_id) in break_consuming_deferred.iter()
                                         {
                                             if chain_id != tier3_effects::AssertChainId::NONE {
-                                                self.pending_effects_next_byte.push(
+                                                self.pending_effects_next.push(
                                                     tier3_effects::PendingEffect {
                                                         timing:
                                                             tier3_effects::EffectTiming::NextByte,
@@ -3718,10 +3749,11 @@ impl<'a> Tier3DfaMatcher<'a> {
                                 }
                                 // Deposit target deferred asserts
                                 // as PendingEffect with Match atom.
+                                // Second-order: goes to pending_effects_next.
                                 for &chain_id in
                                     self.analysis.target_assert_chain_ids[tail.idx()].iter()
                                 {
-                                    self.pending_effects_next_byte.push(
+                                    self.pending_effects_next.push(
                                         tier3_effects::PendingEffect {
                                             timing: tier3_effects::EffectTiming::NextByte,
                                             guard: tier3_effects::EffectGuard {
@@ -3740,8 +3772,15 @@ impl<'a> Tier3DfaMatcher<'a> {
                         resolved_tails.push(tail);
                     }
                 }
-                // Bug 41: clear after resolution.
-                self.pending_effects_next_byte.clear();
+                // Clear resolved effects, then swap next→current so
+                // second-order deferred effects survive to the next
+                // boundary.  step_slow will append first-order effects
+                // to pending_effects_current after this.
+                self.pending_effects_current.clear();
+                std::mem::swap(
+                    &mut self.pending_effects_current,
+                    &mut self.pending_effects_next,
+                );
             }
 
             // --- Inline fast path ---
@@ -4005,9 +4044,9 @@ impl<'a> Tier3DfaMatcher<'a> {
         // - Counter-break deferred assertions: Match atoms
         //   whose assertion chains are evaluated with at_end=true and
         //   downstream reachability checked via can_reach_match_at_end.
-        if !self.pending_effects_next_byte.is_empty() {
+        if !self.pending_effects_current.is_empty() {
             let actions = tier3_effects::resolve_pending(
-                &self.pending_effects_next_byte,
+                &self.pending_effects_current,
                 tier3_effects::EffectTiming::NextByte,
                 &self.analysis.assert_chain_arena,
                 true, // at_end = true
@@ -4076,8 +4115,12 @@ impl fmt::Debug for Tier3DfaMatcher<'_> {
             .field("post_break_tails_len", &self.post_break_tails.len())
             .field("use_ranges", &self.use_ranges)
             .field(
-                "pending_effects_next_byte_len",
-                &self.pending_effects_next_byte.len(),
+                "pending_effects_current_len",
+                &self.pending_effects_current.len(),
+            )
+            .field(
+                "pending_effects_next_len",
+                &self.pending_effects_next.len(),
             )
             .field(
                 "pending_effects_end_only_len",
@@ -4193,10 +4236,21 @@ impl fmt::Display for Tier3DfaMatcher<'_> {
         )?;
         // --- Effect queues (always shown) ---
         // Break seeds, break tails, and deferred assertion match
-        // signals are all carried as pending effects.
+        // signals are all carried as pending effects.  Two-buffer
+        // swap pattern: current is resolved, next receives second-order.
         {
-            write!(f, "\n  eff_next_byte: [")?;
-            for (i, pe) in self.pending_effects_next_byte.iter().enumerate() {
+            write!(f, "\n  eff_current: [")?;
+            for (i, pe) in self.pending_effects_current.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{pe}")?;
+            }
+            write!(f, "]")?;
+        }
+        if !self.pending_effects_next.is_empty() {
+            write!(f, "\n  eff_next: [")?;
+            for (i, pe) in self.pending_effects_next.iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
                 }

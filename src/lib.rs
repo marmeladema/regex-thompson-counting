@@ -7192,7 +7192,7 @@ mod tests {
         // evaluate those assertions at EOI, causing false positives.
         //
         // Fix: use no_break_current for counter-free deferred assertions,
-        // and pending_effects_next_byte Match atoms for break-path deferred
+        // and pending_effects_current Match atoms for break-path deferred
         // assertions from counters that actually broke with enough value.
         // ---------------------------------------------------------------
 
@@ -11163,9 +11163,10 @@ mod tests {
         // When a counter breaks and deposits a deferred `\b` assert as a
         // PendingEffect Match atom, the effect is resolved on the NEXT byte.
         // If the assert fails (e.g. c→z = word→word, no boundary), the
-        // entry must be cleared.  The pending_effects_next_byte queue is
-        // cleared by step_slow; the fast path does not push new effects,
-        // and the queue is drained at the start of each byte's resolution.
+        // entry must be cleared.  The pending_effects_current queue is
+        // drained at the start of each byte's resolution in chunk(), and
+        // second-order effects deposited during resolution survive via
+        // the swap-buffer pattern (pending_effects_next → current).
         test_tier3_stale_deferred_assert_fast_path {
             pattern: r"\bc{2,12}\b",
             memory: 1489,
@@ -11450,7 +11451,7 @@ mod tests {
         // PATH 14: finish() pending break seeds at EOI.
         // When c0 breaks on the last input byte, the break seed for c1
         // has a deferred \b that can't be evaluated yet (no next byte).
-        // It goes into pending_effects_next_byte and is resolved in finish().
+        // It goes into pending_effects_current and is resolved in finish().
         // With unroll_limit=0, .{0,3} stays as a counter.  c1 has min=0,
         // so value=0 >= min → immediate break → break_is_match_at_end.
         test_tier3_cov_pending_break_seed_eoi {
