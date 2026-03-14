@@ -3343,14 +3343,20 @@ macro_rules! step_slow_impl {
             // through the per-instance on_break/guarded AddSeed atoms in
             // CompiledTargetEffects (Bug 32 part 2: the per-instance break
             // path fires when the triggering counter actually breaks).
+            // When counting + contaminated, build an epoch-stamped set of
+            // clean-chain seed origins for O(1) membership instead of
+            // O(|cn_t.seeds|) per main seed.
+            let filter_seeds = t.is_counting && self.clean_nb_trans_slot.is_some();
+            if filter_seeds {
+                self.tail_epoch = self.tail_epoch.wrapping_add(1);
+                let cn_t = &self.cache.transitions[self.clean_nb_trans_slot.unwrap()];
+                for &(_, cn_origin, _) in &cn_t.seeds {
+                    self.tail_seen[cn_origin.idx()] = self.tail_epoch;
+                }
+            }
             for &(counter, origin, value) in &t.seeds {
-                if t.is_counting {
-                    if let Some(cn_slot) = self.clean_nb_trans_slot {
-                        let cn_t = &self.cache.transitions[cn_slot];
-                        if !cn_t.seeds.iter().any(|s| s.0 == counter && s.1 == origin) {
-                            continue;
-                        }
-                    }
+                if filter_seeds && self.tail_seen[origin.idx()] != self.tail_epoch {
+                    continue;
                 }
                 self.$current.seed(counter.idx(), origin, value);
             }
