@@ -1079,30 +1079,8 @@ struct Transition {
     /// [`Tier3Analysis::target_effects`] at runtime via
     /// `target_effects[origin_targets[i].idx()]`.  The NFA state index
     /// serves as the lookup key into the compiled effects table.
-    ///
-    /// `origin_keys` is retained for dump/debug output; runtime uses
-    /// [`origin_map`](Self::origin_map) for O(1) lookup instead.
-    #[allow(dead_code)]
     origin_keys: Box<[StateIdx]>,
     origin_targets: Box<[StateIdx]>,
-    /// O(1) origin → target-index lookup.  Indexed by NFA state index.
-    /// `origin_map[state.idx()] == 0` means the origin is not in this
-    /// transition; a non-zero value `v` means `origin_targets[v - 1]`
-    /// is the corresponding target.
-    ///
-    /// This replaces the O(n) `origin_keys.iter().position()` search in
-    /// the per-byte step loop.  Memory cost: `num_nfa_states × 2 bytes`
-    /// per cached transition.
-    ///
-    /// Alternative approaches considered:
-    /// - **Sorted origin_keys + binary search:** Marginal win for typical
-    ///   origin counts (2–15); binary search overhead ≈ linear for n < 8.
-    /// - **Dense body-slot assignment:** Assign each counter-body consuming
-    ///   origin a compile-time dense slot; transitions operate on slot IDs.
-    ///   Higher payoff but requires compile-time slot analysis.  See
-    ///   `docs/tier3-performance-opportunities.md` Phase 4A.
-    /// - **Minimal perfect hash:** Attractive but complex for tiny arrays.
-    origin_map: Box<[u16]>,
     /// True if any origin's byte-consumption target reaches `$ → Match`
     /// without going through a CInc node.  This is the "counter-free"
     /// subset of the DFA state's `is_match_at_end` — safe to propagate
@@ -1134,7 +1112,6 @@ impl Transition {
             seeds: Box::new([]),
             origin_keys: Box::new([]),
             origin_targets: Box::new([]),
-            origin_map: Box::new([]),
             counter_free_match_at_end: false,
             nb_counter_free_mae: false,
         }
@@ -2089,7 +2066,6 @@ impl Tier3DfaCache {
             // successors' flags.  `resolved_is_match` applies
             // unconditionally (the DFA state that was transitioned FROM
             // already encodes the correct counter-aware path).
-            let origin_map = Self::build_origin_map(&origin_keys, regex.states.len());
             Transition {
                 no_break: nb_id,
                 no_break_is_match: nb_m || resolved_is_match,
@@ -2100,7 +2076,6 @@ impl Tier3DfaCache {
                 seeds: seeds.into(),
                 origin_keys: origin_keys.into_boxed_slice(),
                 origin_targets: origin_targets_vec.into_boxed_slice(),
-                origin_map,
                 counter_free_match_at_end: counter_free_mae,
                 nb_counter_free_mae,
             }
@@ -2147,7 +2122,6 @@ impl Tier3DfaCache {
             let nb_counter_free_mae =
                 self.counter_free_nb_mae(memory, mae, &targets_per_origin, regex, analysis, byte);
 
-            let origin_map = Self::build_origin_map(&origin_keys, regex.states.len());
             Transition {
                 no_break: id,
                 no_break_is_match: m || resolved_is_match,
@@ -2158,27 +2132,10 @@ impl Tier3DfaCache {
                 seeds: seeds.into(),
                 origin_keys: origin_keys.into_boxed_slice(),
                 origin_targets: origin_targets_vec.into_boxed_slice(),
-                origin_map,
                 counter_free_match_at_end: false, // Not used for non-counting transitions.
                 nb_counter_free_mae,
             }
         }
-    }
-
-    /// Build the O(1) origin → target-index lookup map for a transition.
-    ///
-    /// Returns a boxed slice indexed by NFA state index.  Non-zero values
-    /// encode `target_index + 1`; zero means "origin not in this transition".
-    fn build_origin_map(origin_keys: &[StateIdx], num_nfa_states: usize) -> Box<[u16]> {
-        let mut map = vec![0u16; num_nfa_states];
-        for (i, &key) in origin_keys.iter().enumerate() {
-            debug_assert!(
-                (i + 1) <= u16::MAX as usize,
-                "origin_keys too long for u16 encoding"
-            );
-            map[key.idx()] = (i + 1) as u16;
-        }
-        map.into_boxed_slice()
     }
 
     /// Compute counter-free no-break `is_match_at_end`.
@@ -3042,10 +2999,7 @@ macro_rules! step_slow_impl {
             self.next_post_break_tails.clear();
             self.tail_epoch = self.tail_epoch.wrapping_add(1);
             for &pbo in &self.post_break_tails {
-                let pos = {
-                    let v = t.origin_map[pbo.idx()];
-                    if v != 0 { Some((v - 1) as usize) } else { None }
-                };
+                let pos = t.origin_keys.iter().position(|&k| k == pbo);
                 match pos.map(|i| &self.analysis.target_effects[t.origin_targets[i].idx()]) {
                     Some(Some(effects)) => {
                         match &effects.step {
@@ -3192,14 +3146,13 @@ macro_rules! step_slow_impl {
             for c_idx in 0..num_counters {
                 for entry in self.$current.entries(c_idx) {
                     let origin = entry.origin;
-                    let effects = {
-                        let v = t.origin_map[origin.idx()];
-                        if v != 0 {
-                            self.analysis.target_effects[t.origin_targets[(v - 1) as usize].idx()].as_ref()
-                        } else {
-                            None
-                        }
-                    };
+                    let effects = t
+                        .origin_keys
+                        .iter()
+                        .position(|&k| k == origin)
+                        .and_then(|i| {
+                            self.analysis.target_effects[t.origin_targets[i].idx()].as_ref()
+                        });
 
                     match effects {
                         Some(effects) => match &effects.step {
