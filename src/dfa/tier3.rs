@@ -3910,7 +3910,15 @@ impl<'a> Tier3DfaMatcher<'a> {
         if self.last_nb_counter_free_mae {
             return true;
         }
-        // Deferred assertions from the no-break state.
+        // Deferred assertions from the no-break state (legacy DFA-state path).
+        //
+        // These are DFA-state deferred assertions from epsilon_closure(),
+        // NOT typed pending effects.  They coexist with the effect path
+        // below because they come from different sources:
+        //   - DFA-state: counter-free assertions from the no-break closure
+        //   - Pending effects: counter-dependent assertions from break paths
+        // See docs/tier3-eoi-unification-analysis.md for a detailed analysis
+        // of why these two paths coexist and how to unify them.
         //
         // Bug 30: when contaminated (break_extras && num_counters > 1),
         // `no_break_current` may include deferred assertions from
