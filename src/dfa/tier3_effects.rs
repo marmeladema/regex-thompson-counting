@@ -582,6 +582,75 @@ impl fmt::Display for CompiledTargetEffects {
 }
 
 // ---------------------------------------------------------------------------
+// Compiled per-origin effects
+// ---------------------------------------------------------------------------
+
+/// Per-consuming-state compiled origin effects.
+///
+/// Captures match flags and deferred assertion chain IDs that depend on the
+/// epsilon path from a consuming state's byte-consumption edge.  Indexed by
+/// the **origin** consuming state, NOT the post-consumption target — this is
+/// distinct from [`CompiledTargetEffects`] which is keyed by target.
+///
+/// Used at runtime for:
+/// - Dead-target fallback: when `target_effects[target.idx()]` is `None`,
+///   the origin's match flags determine whether `$ → Match` or direct
+///   `Match` is reachable from the consumption point.
+/// - Deferred assertion deposition: when a tail advances through a live
+///   target, its per-origin deferred assertions are deposited as
+///   [`PendingEffect`] entries with `Match` atoms.
+#[derive(Clone, Debug)]
+pub(crate) struct CompiledOriginEffects {
+    /// True if consuming a byte at this origin's state leads to
+    /// `$ → Match` through epsilon transitions.
+    pub(crate) is_match_at_end: bool,
+    /// True if consuming a byte at this origin's state leads directly
+    /// to `Match` through epsilon transitions (not through CInc).
+    pub(crate) is_match: bool,
+    /// Interned assertion chain IDs for deferred assertions on the
+    /// epsilon path from this origin's target to downstream consuming
+    /// states or `Match`.
+    ///
+    /// **Semantics: AlternativeChains (OR).**  Each chain ID is an
+    /// independent 1-element assertion chain.  At runtime, each is
+    /// emitted as its own `PendingEffect` with `EffectAtom::Match`;
+    /// any one chain passing suffices for the match to fire.
+    pub(crate) deferred_chain_ids: Box<[AssertChainId]>,
+}
+
+impl fmt::Display for CompiledOriginEffects {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut flags = Vec::new();
+        if self.is_match {
+            flags.push("match");
+        }
+        if self.is_match_at_end {
+            flags.push("mae");
+        }
+        if flags.is_empty() && self.deferred_chain_ids.is_empty() {
+            return write!(f, "(none)");
+        }
+        if !flags.is_empty() {
+            write!(f, "{}", flags.join("+"))?;
+        }
+        if !self.deferred_chain_ids.is_empty() {
+            if !flags.is_empty() {
+                write!(f, " ")?;
+            }
+            write!(f, "deferred=[")?;
+            for (i, &cid) in self.deferred_chain_ids.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{cid}")?;
+            }
+            write!(f, "]")?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pending effect (runtime)
 // ---------------------------------------------------------------------------
 
@@ -1104,7 +1173,6 @@ pub(crate) fn compile_target_effects(
 ///
 /// Returns `(per-target effects, per-state chain IDs for target deferred
 /// asserts)`.  The caller retains ownership of the arena.
-#[allow(clippy::type_complexity)]
 #[cfg_attr(not(debug_assertions), allow(unused_variables))]
 pub(crate) fn compile_all_target_effects(
     analysis: &super::Tier3Analysis,
@@ -1112,7 +1180,7 @@ pub(crate) fn compile_all_target_effects(
     arena: &mut AssertChainArena,
 ) -> (
     Box<[Option<CompiledTargetEffects>]>,
-    Box<[Box<[AssertChainId]>]>,
+    Box<[CompiledOriginEffects]>,
 ) {
     let effects: Vec<Option<CompiledTargetEffects>> = analysis
         .targets
@@ -1142,24 +1210,39 @@ pub(crate) fn compile_all_target_effects(
         })
         .collect();
 
-    // Intern each individual assert from target_deferred_asserts as a
-    // 1-element chain.  This allows deposit sites to create PendingEffect
-    // entries with the chain as a guard for Match atoms.
-    let target_chain_ids: Vec<Box<[AssertChainId]>> = analysis
-        .target_deferred_asserts
-        .iter()
-        .map(|asserts| {
-            asserts
-                .iter()
-                .map(|&assert_idx| arena.intern(&[assert_idx]))
-                .collect::<Vec<_>>()
-                .into_boxed_slice()
+    // Build per-origin compiled effects: consolidate match flags and
+    // deferred assertion chain IDs into a single structure per consuming
+    // state.  Each individual assert from target_deferred_asserts is
+    // interned as a 1-element chain so it can be used as a guard in
+    // PendingEffect entries.
+    let origin_effects: Vec<CompiledOriginEffects> = (0..states.len())
+        .map(|i| {
+            let chain_ids: Box<[AssertChainId]> = analysis
+                .target_deferred_asserts
+                .get(i)
+                .map(|asserts| {
+                    asserts
+                        .iter()
+                        .map(|&assert_idx| arena.intern(&[assert_idx]))
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice()
+                })
+                .unwrap_or_default();
+            CompiledOriginEffects {
+                is_match_at_end: analysis
+                    .target_is_match_at_end
+                    .get(i)
+                    .copied()
+                    .unwrap_or(false),
+                is_match: analysis.target_is_match.get(i).copied().unwrap_or(false),
+                deferred_chain_ids: chain_ids,
+            }
         })
         .collect();
 
     (
         effects.into_boxed_slice(),
-        target_chain_ids.into_boxed_slice(),
+        origin_effects.into_boxed_slice(),
     )
 }
 

@@ -11169,7 +11169,7 @@ mod tests {
         //
         // Fix: when contaminated, skip no_break_current deferred asserts
         // entirely; legitimate deferred asserts from post-break tails are
-        // emitted as PendingEffect Match atoms via target_assert_chain_ids.
+        // emitted as PendingEffect Match atoms via origin_effects.
         test_tier3_contaminated_deferred_assert {
             pattern: r"^.{0,44}1{3,38}f\ba?$",
             memory: 1400,

@@ -117,38 +117,28 @@ pub(crate) struct Tier3Analysis {
     /// target reaches `$ → Match` through epsilon transitions.
     ///
     /// Indexed by NFA state index.  Only meaningful for consuming states;
-    /// `false` for all others.  Used by the post-break tail tracker to
-    /// detect match-at-end when a tail's action is `None` (dead — its
-    /// target has no further consuming states but may have `$ → Match`).
+    /// `false` for all others.
+    ///
+    /// **Build-time only** — used by `populate()` for `counter_free_mae`
+    /// computation.  Runtime reads go through
+    /// [`origin_effects`](Self::origin_effects) instead.
     pub(crate) target_is_match_at_end: Box<[bool]>,
 
     /// Indexed by NFA state index.  True if consuming a byte at this state
     /// leads directly to `Match` through epsilon transitions (Split, Assert,
-    /// CI — but NOT through CInc).  Used by the post-break tail tracker to
-    /// detect direct matches (not just match-at-end) when a tail consumes
-    /// a byte and its target has no further consuming states (Bug 25).
+    /// CI — but NOT through CInc).
+    ///
+    /// **Build-time only** — used by `populate()`.  Runtime reads go
+    /// through [`origin_effects`](Self::origin_effects) instead.
     pub(crate) target_is_match: Box<[bool]>,
 
     /// Per-consuming-state deferred assertions on the epsilon path from
     /// the byte-consumption target to further consuming states or Match.
     ///
-    /// Indexed by NFA state index.  For each consuming state, contains the
-    /// NFA state indices of non-End Assert states (e.g. `\b`, `\B`) that
-    /// lie on the epsilon path from its target.  Empty for non-consuming
-    /// states or when no assertions are on the path.
-    ///
-    /// **Semantics: AlternativeChains (OR).**  Each entry in the inner
-    /// slice is an independent assertion from a distinct epsilon path
-    /// to downstream Match/consuming states.  At runtime, each is interned
-    /// as a separate 1-element chain in `target_assert_chain_ids` and
-    /// emitted as its own `PendingEffect`, so any one passing suffices.
-    ///
-    /// Used by the post-break tail tracker (Bug 30): when a tail advances
-    /// through a consuming state, these assertions are emitted as
-    /// [`PendingEffect`](tier3_effects::PendingEffect) entries with
-    /// `EffectAtom::Match` and the corresponding chain ID from
-    /// `target_assert_chain_ids`, rather than relying on the contaminated
-    /// `no_break_current` DFA state's deferred asserts.
+    /// **Build-time only** — consumed by
+    /// [`compile_all_target_effects`](tier3_effects::compile_all_target_effects)
+    /// to populate [`origin_effects`](Self::origin_effects).  Not read
+    /// at runtime.
     pub(crate) target_deferred_asserts: Box<[Box<[StateIdx]>]>,
 
     /// Per-NFA-state flag: true if the state is reachable from the start
@@ -187,20 +177,15 @@ pub(crate) struct Tier3Analysis {
     /// effects (matches, tails, seeds, deferred assertions).
     pub(crate) target_effects: Box<[Option<tier3_effects::CompiledTargetEffects>]>,
 
-    /// Per-consuming-state assertion chain IDs for `target_deferred_asserts`.
+    /// Per-consuming-state compiled origin effects.
     ///
-    /// **Semantics: AlternativeChains (OR) — parallel to
-    /// `target_deferred_asserts`.**  Indexed by NFA state index.  For
-    /// each consuming state, contains one
-    /// [`AssertChainId`](tier3_effects::AssertChainId) per assert in
-    /// `target_deferred_asserts[state]`.  Each individual assert index is
-    /// interned as a 1-element chain so it can be used as a guard in
-    /// [`PendingEffect`](tier3_effects::PendingEffect) entries.  Any
-    /// one chain passing suffices for the associated match/tail effect.
+    /// Consolidates match flags (`is_match`, `is_match_at_end`) and
+    /// deferred assertion chain IDs (previously `target_assert_chain_ids`)
+    /// into a single per-origin structure.  Indexed by NFA state index.
     ///
     /// Populated alongside `target_effects` during
     /// [`compile_all_target_effects`](tier3_effects::compile_all_target_effects).
-    pub(crate) target_assert_chain_ids: Box<[Box<[tier3_effects::AssertChainId]>]>,
+    pub(crate) origin_effects: Box<[tier3_effects::CompiledOriginEffects]>,
 
     /// Arena of interned assertion chains referenced by effect guards.
     pub(crate) assert_chain_arena: tier3_effects::AssertChainArena,
@@ -904,7 +889,7 @@ pub(crate) fn compute_tier3_analysis(
         all_counters_rangeable,
         // Placeholders — filled in below.
         target_effects: Box::new([]),
-        target_assert_chain_ids: Box::new([]),
+        origin_effects: Box::new([]),
         assert_chain_arena: tier3_effects::AssertChainArena::new(),
         break_effects: Box::new([]),
     };
@@ -976,10 +961,10 @@ pub(crate) fn compute_tier3_analysis(
     }
 
     // -- Step 10: compile typed target effects ---------------------------------
-    let (target_effects, target_assert_chain_ids) =
+    let (target_effects, origin_effects) =
         tier3_effects::compile_all_target_effects(&analysis, states, &mut assert_chain_arena);
     analysis.target_effects = target_effects;
-    analysis.target_assert_chain_ids = target_assert_chain_ids;
+    analysis.origin_effects = origin_effects;
     analysis.assert_chain_arena = assert_chain_arena;
 
     // -- Validate EOI seed invariant ------------------------------------------
@@ -2918,15 +2903,17 @@ macro_rules! step_slow_impl {
             // break.  If it consumed this byte and its target reaches
             // `$ → Match`, set match_at_end.
             //
-            // Shared match-flag check for Advance and None branches
-            // (Bug 29: ensures both branches check target_is_match and
-            // target_is_match_at_end consistently).
-            macro_rules! check_tail_match_flags {
+            // Shared match-flag check for dead-target (None) branches.
+            // (Bug 29: ensures consistent checking.)
+            // Uses origin_effects to consolidate what were previously
+            // separate target_is_match / target_is_match_at_end arrays.
+            macro_rules! check_origin_match_flags {
                 ($self:ident, $origin:expr) => {
-                    if $self.analysis.target_is_match_at_end[$origin.idx()] {
+                    let oe = &$self.analysis.origin_effects[$origin.idx()];
+                    if oe.is_match_at_end {
                         $self.match_at_end = true;
                     }
-                    if $self.analysis.target_is_match[$origin.idx()] {
+                    if oe.is_match {
                         $self.ever_matched = true;
                     }
                 };
@@ -2952,7 +2939,7 @@ macro_rules! step_slow_impl {
                                 // PendingEffect entries with Match atoms.
                                 tier3_effects::enqueue_target_deferred_match(
                                     &mut self.pending_effects_current,
-                                    &self.analysis.target_assert_chain_ids[pbo.idx()],
+                                    &self.analysis.origin_effects[pbo.idx()].deferred_chain_ids,
                                     crate::is_word_byte(byte),
                                 );
                                 // Bug 37 + Bug 47: apply byte-specific
@@ -3035,10 +3022,10 @@ macro_rules! step_slow_impl {
                         // `None` target — deposit deferred asserts (Bug 34).
                         tier3_effects::enqueue_target_deferred_match(
                             &mut self.pending_effects_current,
-                            &self.analysis.target_assert_chain_ids[pbo.idx()],
+                            &self.analysis.origin_effects[pbo.idx()].deferred_chain_ids,
                             crate::is_word_byte(byte),
                         );
-                        check_tail_match_flags!(self, pbo);
+                        check_origin_match_flags!(self, pbo);
                     }
                     None => {
                         // Origin not in transition — byte not accepted.
@@ -3564,7 +3551,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                                     // go to pending_effects_next.
                                     tier3_effects::enqueue_target_deferred_match(
                                         &mut self.pending_effects_next,
-                                        &self.analysis.target_assert_chain_ids[tail.idx()],
+                                        &self.analysis.origin_effects[tail.idx()].deferred_chain_ids,
                                         crate::is_word_byte(b),
                                     );
                                 }
@@ -3637,17 +3624,18 @@ impl<'a> Tier3DfaMatcher<'a> {
                                 }
                             },
                             None => {
-                                if self.analysis.target_is_match_at_end[tail.idx()] {
+                                let oe = &self.analysis.origin_effects[tail.idx()];
+                                if oe.is_match_at_end {
                                     resolved_mae = true;
                                 }
-                                if self.analysis.target_is_match[tail.idx()] {
+                                if oe.is_match {
                                     self.ever_matched = true;
                                 }
                                 // Second-order: target deferred asserts
                                 // go to pending_effects_next.
                                 tier3_effects::enqueue_target_deferred_match(
                                     &mut self.pending_effects_next,
-                                    &self.analysis.target_assert_chain_ids[tail.idx()],
+                                    &oe.deferred_chain_ids,
                                     crate::is_word_byte(b),
                                 );
                             }
