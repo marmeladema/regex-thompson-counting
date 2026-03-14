@@ -532,6 +532,154 @@ impl fmt::Display for PendingEffect {
 }
 
 // ---------------------------------------------------------------------------
+// Effect deposition helpers
+// ---------------------------------------------------------------------------
+//
+// These free functions replace the ~11 open-coded `PendingEffect`
+// construction sites scattered across `tier3.rs`.  Each helper captures
+// one semantic pattern of effect deposition.  Callers pass whichever
+// queue is appropriate (`pending_effects_current` for first-order deposits
+// during `step_slow`, `pending_effects_next` for second-order deposits
+// during effect resolution).
+//
+// By centralising the construction here, future semantic changes (e.g.
+// adjusting OR/AND guard semantics) require a single-site fix instead of
+// a multi-site audit.
+
+/// Deposit target-deferred match effects.
+///
+/// For each assertion chain in `chain_ids`, pushes a `PendingEffect` with
+/// a single [`EffectAtom::Match`] atom.  These represent non-End assertion
+/// states on the epsilon path from a target, which would otherwise only
+/// fire via the contaminated no_break_current DFA state.
+///
+/// **Used for:** Bug 30 / Bug 34 target deferred asserts in both the
+/// `Advance` and `Some(None)` arms of post-break tail processing and
+/// effect resolution.
+pub(crate) fn enqueue_target_deferred_match(
+    queue: &mut Vec<PendingEffect>,
+    chain_ids: &[AssertChainId],
+    prev_was_word: bool,
+) {
+    for &chain_id in chain_ids {
+        queue.push(PendingEffect {
+            timing: EffectTiming::NextByte,
+            guard: EffectGuard {
+                assert_chain: chain_id,
+            },
+            atoms: Box::new([EffectAtom::Match]),
+            prev_was_word,
+        });
+    }
+}
+
+/// Deposit break-deferred match effects (OR semantics).
+///
+/// For each assertion chain in `chain_ids` that is not [`AssertChainId::NONE`],
+/// pushes a **separate** `PendingEffect` with a single [`EffectAtom::Match`]
+/// atom.  One-per-chain deposition implements Bug 51's OR semantics: any
+/// single chain passing is sufficient to signal a match.
+///
+/// **Used for:** break-deferred asserts from counter break paths in
+/// post-break tail processing, the main counter step, and effect
+/// resolution.
+pub(crate) fn enqueue_break_deferred_match(
+    queue: &mut Vec<PendingEffect>,
+    chain_ids: &[AssertChainId],
+    prev_was_word: bool,
+) {
+    for &chain_id in chain_ids {
+        if chain_id != AssertChainId::NONE {
+            queue.push(PendingEffect {
+                timing: EffectTiming::NextByte,
+                guard: EffectGuard {
+                    assert_chain: chain_id,
+                },
+                atoms: Box::new([EffectAtom::Match]),
+                prev_was_word,
+            });
+        }
+    }
+}
+
+/// Deposit deferred-tail effects (Bug 46: per-tail assertions).
+///
+/// For each `(origin, _asserts, chain_id)` tuple in `deferred` where
+/// `chain_id` is not [`AssertChainId::NONE`], pushes a `PendingEffect`
+/// with a single [`EffectAtom::AddTail`] atom.
+///
+/// When `dedup` is `true`, skips entries whose `origin` already appears
+/// as an `AddTail` atom in the queue.  First-order deposits (step_slow)
+/// need dedup because the same tail can appear via multiple break paths;
+/// second-order deposits (effect resolution) operate on a freshly-cleared
+/// `pending_effects_next` and skip dedup.
+///
+/// **Used for:** break-consuming deferred tails in post-break tail
+/// processing, the main counter step, and effect resolution.
+pub(crate) fn enqueue_deferred_tail(
+    queue: &mut Vec<PendingEffect>,
+    deferred: &[(StateIdx, Box<[StateIdx]>, AssertChainId)],
+    prev_was_word: bool,
+    dedup: bool,
+) {
+    for &(origin, _, chain_id) in deferred {
+        if chain_id == AssertChainId::NONE {
+            continue;
+        }
+        if dedup
+            && queue.iter().any(|pe| {
+                pe.atoms
+                    .iter()
+                    .any(|a| matches!(a, EffectAtom::AddTail { origin: o } if *o == origin))
+            })
+        {
+            continue;
+        }
+        queue.push(PendingEffect {
+            timing: EffectTiming::NextByte,
+            guard: EffectGuard {
+                assert_chain: chain_id,
+            },
+            atoms: vec![EffectAtom::AddTail { origin }].into_boxed_slice(),
+            prev_was_word,
+        });
+    }
+}
+
+/// Deposit a deferred-seed effect (Bug 27/28: assertion-gated seed).
+///
+/// Pushes a single `PendingEffect` with an [`EffectAtom::AddSeed`] atom,
+/// gated on `chain_id`.  The assertion sits between the triggering
+/// counter's CInc break and the seeded counter's CI, so it must be
+/// deferred until the next byte boundary when the boundary context is
+/// available.
+///
+/// **Used for:** break-seeds with deferred assertions in the break-seeds
+/// processing loop.
+pub(crate) fn enqueue_deferred_seed(
+    queue: &mut Vec<PendingEffect>,
+    chain_id: AssertChainId,
+    counter: CounterIdx,
+    origin: StateIdx,
+    value: u32,
+    prev_was_word: bool,
+) {
+    queue.push(PendingEffect {
+        timing: EffectTiming::NextByte,
+        guard: EffectGuard {
+            assert_chain: chain_id,
+        },
+        atoms: vec![EffectAtom::AddSeed {
+            counter,
+            origin,
+            value,
+        }]
+        .into_boxed_slice(),
+        prev_was_word,
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Effect resolution results
 // ---------------------------------------------------------------------------
 

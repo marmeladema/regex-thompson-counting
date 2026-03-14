@@ -2895,18 +2895,11 @@ macro_rules! step_slow_impl {
                         // path from pbo's target, which would otherwise
                         // only fire via the contaminated no_break_current
                         // DFA state.
-                        for &chain_id in self.analysis.target_assert_chain_ids[pbo.idx()].iter() {
-                            self.pending_effects_current.push(
-                                tier3_effects::PendingEffect {
-                                    timing: tier3_effects::EffectTiming::NextByte,
-                                    guard: tier3_effects::EffectGuard {
-                                        assert_chain: chain_id,
-                                    },
-                                    atoms: Box::new([tier3_effects::EffectAtom::Match]),
-                                    prev_was_word: crate::is_word_byte(byte),
-                                },
-                            );
-                        }
+                        tier3_effects::enqueue_target_deferred_match(
+                            &mut self.pending_effects_current,
+                            &self.analysis.target_assert_chain_ids[pbo.idx()],
+                            crate::is_word_byte(byte),
+                        );
                         // Bug 37 + Bug 47: use the byte-specific
                         // is_match_at_end and is_match from the Advance
                         // action instead of the static arrays.  ByteTable
@@ -2974,52 +2967,25 @@ macro_rules! step_slow_impl {
                                 self.match_at_end = true;
                             }
                             if !break_deferred_asserts.is_empty() {
-                                // Bug 51: deposit each deferred assert as
-                                // a separate PendingEffect (OR semantics).
-                                for &chain_id in break_deferred_chain_ids.iter() {
-                                    if chain_id != tier3_effects::AssertChainId::NONE {
-                                    self.pending_effects_current.push(
-                                        tier3_effects::PendingEffect {
-                                            timing: tier3_effects::EffectTiming::NextByte,
-                                            guard: tier3_effects::EffectGuard {
-                                                assert_chain: chain_id,
-                                            },
-                                            atoms: Box::new([tier3_effects::EffectAtom::Match]),
-                                            prev_was_word: crate::is_word_byte(byte),
-                                        },
-                                    );
-                                    }
-                                }
+                                // Bug 51: OR semantics — one PendingEffect per chain.
+                                tier3_effects::enqueue_break_deferred_match(
+                                    &mut self.pending_effects_current,
+                                    break_deferred_chain_ids,
+                                    crate::is_word_byte(byte),
+                                );
                                 // Bug 45: pure tails go immediately.
                                 for &new_o in break_consuming_pure.iter() {
                                     if !self.next_post_break_tails.contains(&new_o) {
                                         self.next_post_break_tails.push(new_o);
                                     }
                                 }
-                                // Bug 46: deferred tails carry per-tail
-                                // assertions for individual resolution.
-                                // Emit as PendingEffect with AddTail.
-                                for &(tail, _, chain_id) in break_consuming_deferred.iter() {
-                                    if chain_id != tier3_effects::AssertChainId::NONE
-                                        && !self.pending_effects_current.iter().any(|pe| {
-                                            pe.atoms.iter().any(|a| matches!(a, tier3_effects::EffectAtom::AddTail { origin } if *origin == tail))
-                                        })
-                                    {
-                                        self.pending_effects_current.push(
-                                            tier3_effects::PendingEffect {
-                                                timing: tier3_effects::EffectTiming::NextByte,
-                                                guard: tier3_effects::EffectGuard {
-                                                    assert_chain: chain_id,
-                                                },
-                                                atoms: vec![tier3_effects::EffectAtom::AddTail {
-                                                    origin: tail,
-                                                }]
-                                                .into_boxed_slice(),
-                                                prev_was_word: crate::is_word_byte(byte),
-                                            },
-                                        );
-                                    }
-                                }
+                                // Bug 46: deferred tails with per-tail assertions.
+                                tier3_effects::enqueue_deferred_tail(
+                                    &mut self.pending_effects_current,
+                                    break_consuming_deferred,
+                                    crate::is_word_byte(byte),
+                                    true, // dedup
+                                );
                             } else {
                                 for &new_o in break_consuming_states.iter() {
                                     if !self.next_post_break_tails.contains(&new_o) {
@@ -3038,18 +3004,11 @@ macro_rules! step_slow_impl {
                         // because analyze_target returned None for the
                         // assert-only path).
                         // Deposit as PendingEffect with Match atom.
-                        for &chain_id in self.analysis.target_assert_chain_ids[pbo.idx()].iter() {
-                            self.pending_effects_current.push(
-                                tier3_effects::PendingEffect {
-                                    timing: tier3_effects::EffectTiming::NextByte,
-                                    guard: tier3_effects::EffectGuard {
-                                        assert_chain: chain_id,
-                                    },
-                                    atoms: Box::new([tier3_effects::EffectAtom::Match]),
-                                    prev_was_word: crate::is_word_byte(byte),
-                                },
-                            );
-                        }
+                        tier3_effects::enqueue_target_deferred_match(
+                            &mut self.pending_effects_current,
+                            &self.analysis.target_assert_chain_ids[pbo.idx()],
+                            crate::is_word_byte(byte),
+                        );
                         check_tail_match_flags!(self, pbo);
                     }
                     None => {
@@ -3150,52 +3109,25 @@ macro_rules! step_slow_impl {
                                     self.match_at_end = true;
                                 }
                                 if !break_deferred_asserts.is_empty() {
-                                    // Bug 51: deposit each deferred assert as
-                                    // a separate PendingEffect (OR semantics).
-                                    for &chain_id in break_deferred_chain_ids.iter() {
-                                        if chain_id != tier3_effects::AssertChainId::NONE {
-                                        self.pending_effects_current.push(
-                                            tier3_effects::PendingEffect {
-                                                timing: tier3_effects::EffectTiming::NextByte,
-                                                guard: tier3_effects::EffectGuard {
-                                                    assert_chain: chain_id,
-                                                },
-                                                atoms: Box::new([tier3_effects::EffectAtom::Match]),
-                                                prev_was_word: crate::is_word_byte(byte),
-                                            },
-                                        );
-                                        }
-                                    }
+                                    // Bug 51: OR semantics — one PendingEffect per chain.
+                                    tier3_effects::enqueue_break_deferred_match(
+                                        &mut self.pending_effects_current,
+                                        break_deferred_chain_ids,
+                                        crate::is_word_byte(byte),
+                                    );
                                     // Bug 45: pure tails go immediately.
                                     for &new_o in break_consuming_pure.iter() {
                                         if !self.next_post_break_tails.contains(&new_o) {
                                             self.next_post_break_tails.push(new_o);
                                         }
                                     }
-                                    // Bug 46: deferred tails carry per-tail
-                                    // assertions.
-                                // Emit as PendingEffect with AddTail.
-                                    for &(tail, _, chain_id) in break_consuming_deferred.iter() {
-                                        if chain_id != tier3_effects::AssertChainId::NONE
-                                            && !self.pending_effects_current.iter().any(|pe| {
-                                                pe.atoms.iter().any(|a| matches!(a, tier3_effects::EffectAtom::AddTail { origin } if *origin == tail))
-                                            })
-                                        {
-                                            self.pending_effects_current.push(
-                                                tier3_effects::PendingEffect {
-                                                    timing: tier3_effects::EffectTiming::NextByte,
-                                                    guard: tier3_effects::EffectGuard {
-                                                            assert_chain: chain_id,
-                                                    },
-                                                    atoms: vec![tier3_effects::EffectAtom::AddTail {
-                                                        origin: tail,
-                                                    }]
-                                                    .into_boxed_slice(),
-                                                    prev_was_word: crate::is_word_byte(byte),
-                                                },
-                                            );
-                                        }
-                                    }
+                                    // Bug 46: deferred tails with per-tail assertions.
+                                    tier3_effects::enqueue_deferred_tail(
+                                        &mut self.pending_effects_current,
+                                        break_consuming_deferred,
+                                        crate::is_word_byte(byte),
+                                        true, // dedup
+                                    );
                                 } else {
                                     for &new_o in break_consuming_states.iter() {
                                         if !self.next_post_break_tails.contains(&new_o) {
@@ -3366,20 +3298,14 @@ macro_rules! step_slow_impl {
                         // word-ness of the break position (= `byte`, the
                         // byte just consumed by the body) for later
                         // evaluation.
-                        self.pending_effects_current
-                            .push(tier3_effects::PendingEffect {
-                                timing: tier3_effects::EffectTiming::NextByte,
-                                guard: tier3_effects::EffectGuard {
-                                    assert_chain: chain_id,
-                                },
-                                atoms: vec![tier3_effects::EffectAtom::AddSeed {
-                                    counter,
-                                    origin,
-                                    value,
-                                }]
-                                .into_boxed_slice(),
-                                prev_was_word: crate::is_word_byte(byte),
-                            });
+                        tier3_effects::enqueue_deferred_seed(
+                            &mut self.pending_effects_current,
+                            chain_id,
+                            counter,
+                            origin,
+                            value,
+                            crate::is_word_byte(byte),
+                        );
                     } else {
                         // No assertions on break path — apply immediately.
                         self.$current.seed(counter.idx(), origin, value);
@@ -3645,25 +3571,14 @@ impl<'a> Tier3DfaMatcher<'a> {
                                 if is_match_at_end {
                                     resolved_mae = true;
                                 }
-                                // Deposit target deferred asserts
-                                // as PendingEffect with Match atom.
-                                // Second-order: deposited during resolution,
-                                // goes to pending_effects_next to survive
+                                // Second-order: target deferred asserts
+                                // go to pending_effects_next to survive
                                 // the post-resolution clear.
-                                for &chain_id in
-                                    self.analysis.target_assert_chain_ids[tail.idx()].iter()
-                                {
-                                    self.pending_effects_next.push(
-                                        tier3_effects::PendingEffect {
-                                            timing: tier3_effects::EffectTiming::NextByte,
-                                            guard: tier3_effects::EffectGuard {
-                                                assert_chain: chain_id,
-                                            },
-                                            atoms: Box::new([tier3_effects::EffectAtom::Match]),
-                                            prev_was_word: crate::is_word_byte(b),
-                                        },
-                                    );
-                                }
+                                tier3_effects::enqueue_target_deferred_match(
+                                    &mut self.pending_effects_next,
+                                    &self.analysis.target_assert_chain_ids[tail.idx()],
+                                    crate::is_word_byte(b),
+                                );
                                 // Bug 47: use byte-specific is_match from
                                 // the Advance action (handles ByteTable).
                                 if is_match {
@@ -3715,30 +3630,13 @@ impl<'a> Tier3DfaMatcher<'a> {
                                         resolved_mae = true;
                                     }
                                     if !break_deferred_asserts.is_empty() {
-                                        // Bug 42/51: deposit deferred asserts as
-                                        // PendingEffect with Match atom.
-                                        // Bug 51: each entry is an independent
-                                        // assertion (OR semantics) — emit one
-                                        // PendingEffect per chain.
+                                        // Bug 42/51: OR semantics — one PendingEffect per chain.
                                         // Second-order: goes to pending_effects_next.
-                                        for &chain_id in break_deferred_chain_ids.iter() {
-                                            if chain_id
-                                                != tier3_effects::AssertChainId::NONE
-                                            {
-                                                self.pending_effects_next.push(
-                                                    tier3_effects::PendingEffect {
-                                                        timing: tier3_effects::EffectTiming::NextByte,
-                                                         guard: tier3_effects::EffectGuard {
-                                                             assert_chain: chain_id,
-                                                         },
-                                                         atoms: Box::new([
-                                                             tier3_effects::EffectAtom::Match,
-                                                         ]),
-                                                         prev_was_word: crate::is_word_byte(b),
-                                                     },
-                                                 );
-                                             }
-                                         }
+                                        tier3_effects::enqueue_break_deferred_match(
+                                            &mut self.pending_effects_next,
+                                            break_deferred_chain_ids,
+                                            crate::is_word_byte(b),
+                                        );
                                         // Bug 45: pure tails go immediately.
                                         for &new_o in break_consuming_pure.iter() {
                                             if !resolved_tails.contains(&new_o) {
@@ -3747,27 +3645,12 @@ impl<'a> Tier3DfaMatcher<'a> {
                                         }
                                         // Bug 46: re-pend deferred tails.
                                         // Second-order: goes to pending_effects_next.
-                                        for &(new_o, _, chain_id) in break_consuming_deferred.iter()
-                                        {
-                                            if chain_id != tier3_effects::AssertChainId::NONE {
-                                                self.pending_effects_next.push(
-                                                    tier3_effects::PendingEffect {
-                                                        timing:
-                                                            tier3_effects::EffectTiming::NextByte,
-                                                        guard: tier3_effects::EffectGuard {
-                                                             assert_chain: chain_id,
-                                                         },
-                                                         atoms: vec![
-                                                             tier3_effects::EffectAtom::AddTail {
-                                                                 origin: new_o,
-                                                             },
-                                                         ]
-                                                        .into_boxed_slice(),
-                                                        prev_was_word: crate::is_word_byte(b),
-                                                    },
-                                                );
-                                            }
-                                        }
+                                        tier3_effects::enqueue_deferred_tail(
+                                            &mut self.pending_effects_next,
+                                            break_consuming_deferred,
+                                            crate::is_word_byte(b),
+                                            false, // no dedup — freshly-cleared next queue
+                                        );
                                     } else {
                                         for &new_o in break_consuming_states.iter() {
                                             if !resolved_tails.contains(&new_o) {
@@ -3784,23 +3667,13 @@ impl<'a> Tier3DfaMatcher<'a> {
                                 if self.analysis.target_is_match[tail.idx()] {
                                     self.ever_matched = true;
                                 }
-                                // Deposit target deferred asserts
-                                // as PendingEffect with Match atom.
-                                // Second-order: goes to pending_effects_next.
-                                for &chain_id in
-                                    self.analysis.target_assert_chain_ids[tail.idx()].iter()
-                                {
-                                    self.pending_effects_next.push(
-                                        tier3_effects::PendingEffect {
-                                            timing: tier3_effects::EffectTiming::NextByte,
-                                            guard: tier3_effects::EffectGuard {
-                                                assert_chain: chain_id,
-                                            },
-                                            atoms: Box::new([tier3_effects::EffectAtom::Match]),
-                                            prev_was_word: crate::is_word_byte(b),
-                                        },
-                                    );
-                                }
+                                // Second-order: target deferred asserts
+                                // go to pending_effects_next.
+                                tier3_effects::enqueue_target_deferred_match(
+                                    &mut self.pending_effects_next,
+                                    &self.analysis.target_assert_chain_ids[tail.idx()],
+                                    crate::is_word_byte(b),
+                                );
                             }
                         }
                     }
