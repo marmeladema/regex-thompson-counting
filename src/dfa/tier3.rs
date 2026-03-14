@@ -2631,6 +2631,9 @@ fn break_closure(
 ///   the deferred assertion NFA state indices on the path to reach it.
 ///   Bug 46: used at runtime to gate each tail individually, not just
 ///   by the top-level `break_deferred_asserts`.
+///   Multiple entries may share the same `origin` with different assertion
+///   chains (OR alternatives — Bug 51/52 lesson applied to tails).
+///   Each entry becomes a separate `GuardedEffect` with `AddTail`.
 ///
 /// Bug 45: pure consuming states should be deposited immediately at runtime,
 /// while deferred-only states need assertion resolution first.
@@ -2645,15 +2648,14 @@ fn break_consuming_tails(
 ) {
     let mut all_result = Vec::new();
     let mut pure_result = Vec::new();
+    // Collect (origin, normalized_deferred) pairs.  Multiple entries
+    // for the same origin with different deferred chains are preserved
+    // (OR semantics — Bug 51/52 lesson applied to tails).
+    let mut per_tail_raw: Vec<(StateIdx, Vec<StateIdx>)> = Vec::new();
     // Track (state, accumulated_deferred_asserts) pairs.
     let mut stack: Vec<(StateIdx, Vec<StateIdx>)> =
         break_seeds.iter().map(|&s| (s, Vec::new())).collect();
     let n = states.len();
-    // For each consuming state, the minimal set of deferred asserts
-    // on the path to reach it.  If a state is reachable via a pure path
-    // (no deferred asserts) AND via a deferred path, the pure path wins
-    // (empty asserts).
-    let mut per_tail_asserts: Vec<Option<Vec<StateIdx>>> = vec![None; n];
     // Bug 49: track minimum deferred length at each visited node.
     // A node reachable via path with N deferred asserts may also be
     // reachable via a shorter path with M < N deferred asserts.  The
@@ -2661,15 +2663,23 @@ fn break_consuming_tails(
     // get the minimal deferred set.  `best_deferred[i]` holds the
     // smallest deferred length seen so far (u32::MAX = unvisited).
     let mut best_deferred: Vec<u32> = vec![u32::MAX; n];
-    while let Some((idx, deferred)) = stack.pop() {
+    while let Some((idx, mut deferred)) = stack.pop() {
         let i = idx.idx();
+        // Normalize deferred asserts early so the length-based pruning
+        // and later dedup compare canonical forms.
+        deferred.sort_unstable();
+        deferred.dedup();
         let d_len = deferred.len() as u32;
-        // Skip if already visited via a path with equal or fewer
-        // deferred asserts.
-        if d_len >= best_deferred[i] {
+        // Skip if already visited via a path with strictly fewer
+        // deferred asserts.  Equal-length paths must be explored
+        // because they may carry different assertion sets (OR
+        // alternatives) — only strictly shorter paths dominate.
+        if d_len > best_deferred[i] {
             continue;
         }
-        best_deferred[i] = d_len;
+        if d_len < best_deferred[i] {
+            best_deferred[i] = d_len;
+        }
         let is_pure = deferred.is_empty();
         match states[idx] {
             State::Split { out, out1 } => {
@@ -2680,51 +2690,53 @@ fn break_consuming_tails(
                 // End assertions are NOT deferred — they're handled
                 // statically by break_is_match_at_end.  Non-End asserts
                 // (\b, \B, etc.) are deferred.
-                let mut d = deferred;
                 if kind != AssertKind::End {
-                    d.push(idx);
+                    deferred.push(idx);
                 }
-                stack.push((out, d));
+                stack.push((out, deferred));
             }
             State::CounterInstance { out, .. } => stack.push((out, deferred)),
             State::Byte { out, .. } | State::ByteCI { out, .. } | State::ByteClass { out, .. } => {
                 // Only include if the target's analysis is NOT Increment.
                 // Increment targets are handled by counter seeding.
                 if !matches!(targets[out.idx()], Some(Tier3OriginKind::Increment { .. })) {
-                    if is_pure {
+                    if is_pure && !pure_result.contains(&idx) {
                         pure_result.push(idx);
                     }
-                    all_result.push(idx);
-                    per_tail_asserts[i] = Some(deferred);
+                    if !all_result.contains(&idx) {
+                        all_result.push(idx);
+                    }
+                    per_tail_raw.push((idx, deferred));
                 }
             }
             State::ByteTable { .. } => {
-                if is_pure {
+                if is_pure && !pure_result.contains(&idx) {
                     pure_result.push(idx);
                 }
-                all_result.push(idx);
-                per_tail_asserts[i] = Some(deferred);
+                if !all_result.contains(&idx) {
+                    all_result.push(idx);
+                }
+                per_tail_raw.push((idx, deferred));
             }
             _ => {}
         }
     }
-    all_result.sort_unstable_by_key(|s| s.0);
-    all_result.dedup();
-    pure_result.sort_unstable_by_key(|s| s.0);
-    pure_result.dedup();
+    all_result.sort_unstable();
+    pure_result.sort_unstable();
+    // Dedup per-tail entries: keep distinct (origin, deferred) pairs
+    // but remove true duplicates.  This is the same OR-preserving
+    // dedup pattern used for break seeds (Bug 52).
+    per_tail_raw.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    per_tail_raw.dedup();
     // Build per-tail deferred asserts list.
     // The chain_id is a placeholder (NONE) — populated after the
     // assertion chain arena is built in Step 9.
-    let per_tail: Vec<tier3_effects::DeferredTail> = all_result
-        .iter()
-        .map(|&s| {
-            let assert_states = per_tail_asserts[s.idx()]
-                .take()
-                .unwrap_or_default()
-                .into_boxed_slice();
+    let per_tail: Vec<tier3_effects::DeferredTail> = per_tail_raw
+        .into_iter()
+        .map(|(origin, deferred)| {
             tier3_effects::DeferredTail {
-                origin: s,
-                assert_states,
+                origin,
+                assert_states: deferred.into_boxed_slice(),
                 chain_id: tier3_effects::AssertChainId::NONE,
             }
         })

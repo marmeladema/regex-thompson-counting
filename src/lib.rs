@@ -164,7 +164,7 @@ impl Index<u8> for ByteClass {
 }
 
 /// Index into the byte-class lookup tables ([`Regex::classes`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ClassIdx(usize);
 
 impl ClassIdx {
@@ -185,7 +185,7 @@ impl Index<ClassIdx> for [ByteClass] {
 }
 
 /// Index into the byte-dispatch tables ([`Regex::byte_tables`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ByteTableIdx(usize);
 
 impl ByteTableIdx {
@@ -632,7 +632,7 @@ impl State {
 ///
 /// [`StateIdx::NONE`] is used both as a "dangling/unpatched" marker
 /// during construction and as "no transition" in byte-table entries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct StateIdx(pub(crate) u32);
 
 impl StateIdx {
@@ -2900,7 +2900,7 @@ impl RegexBuilder {
 // ---------------------------------------------------------------------------
 
 /// Index into the counter variable array.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct CounterIdx(u8);
 
 impl CounterIdx {
