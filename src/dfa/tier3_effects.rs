@@ -1757,4 +1757,253 @@ mod tests {
             "MatchAtEnd should set set_match_at_end"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // EndLF deferred assertion test (non-word-boundary deferred assert)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_pending_endlf_at_end() {
+        // EndLF (`(?m:$)`) does not depend on `prev` at all — it checks
+        // `at_end || next == Some(b'\n')`.  When resolved at EOI with
+        // `at_end=true`, it should pass regardless of prev_was_word.
+        let regex = build_regex(r"(?m:a$)");
+        let mut arena = AssertChainArena::new();
+        // Find the EndLF assert state.
+        let endlf_idx = regex
+            .states
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    crate::State::Assert {
+                        kind: crate::AssertKind::EndLF,
+                        ..
+                    }
+                )
+            })
+            .expect("pattern should contain EndLF");
+        let chain_id = arena.intern(&[crate::StateIdx(endlf_idx as u32)]);
+
+        let effects = vec![PendingEffect {
+            timing: EffectTiming::NextByte,
+            guard: EffectGuard {
+                assert_chain: chain_id,
+            },
+            atom: EffectAtom::Match,
+            prev_was_word: true,
+        }];
+        // At EOI: EndLF passes (at_end=true).
+        let actions = resolve_pending(
+            &effects,
+            EffectTiming::NextByte,
+            &arena,
+            true, // at_end
+            None, // no next byte
+            &regex,
+            &mut scratch(),
+        );
+        assert!(actions.set_match, "EndLF should pass at EOI");
+    }
+
+    #[test]
+    fn test_resolve_pending_endlf_mid_input_newline() {
+        // EndLF passes mid-input when next byte is '\n'.
+        let regex = build_regex(r"(?m:a$)");
+        let mut arena = AssertChainArena::new();
+        let endlf_idx = regex
+            .states
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    crate::State::Assert {
+                        kind: crate::AssertKind::EndLF,
+                        ..
+                    }
+                )
+            })
+            .expect("pattern should contain EndLF");
+        let chain_id = arena.intern(&[crate::StateIdx(endlf_idx as u32)]);
+
+        let effects = vec![PendingEffect {
+            timing: EffectTiming::NextByte,
+            guard: EffectGuard {
+                assert_chain: chain_id,
+            },
+            atom: EffectAtom::Match,
+            prev_was_word: true,
+        }];
+        // Mid-input with next='\n': EndLF should pass.
+        let actions = resolve_pending(
+            &effects,
+            EffectTiming::NextByte,
+            &arena,
+            false,       // not at_end
+            Some(b'\n'), // next byte is newline
+            &regex,
+            &mut scratch(),
+        );
+        assert!(actions.set_match, "EndLF should pass when next is newline");
+    }
+
+    #[test]
+    fn test_resolve_pending_endlf_mid_input_non_newline() {
+        // EndLF fails mid-input when next byte is not '\n'.
+        let regex = build_regex(r"(?m:a$)");
+        let mut arena = AssertChainArena::new();
+        let endlf_idx = regex
+            .states
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    crate::State::Assert {
+                        kind: crate::AssertKind::EndLF,
+                        ..
+                    }
+                )
+            })
+            .expect("pattern should contain EndLF");
+        let chain_id = arena.intern(&[crate::StateIdx(endlf_idx as u32)]);
+
+        let effects = vec![PendingEffect {
+            timing: EffectTiming::NextByte,
+            guard: EffectGuard {
+                assert_chain: chain_id,
+            },
+            atom: EffectAtom::Match,
+            prev_was_word: false,
+        }];
+        // Mid-input with next='x': EndLF should fail.
+        let actions = resolve_pending(
+            &effects,
+            EffectTiming::NextByte,
+            &arena,
+            false,      // not at_end
+            Some(b'x'), // next byte is not newline
+            &regex,
+            &mut scratch(),
+        );
+        assert!(
+            !actions.set_match,
+            "EndLF should fail when next is not newline"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Queue lifecycle: second-order scheduling
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_pending_seeds_survive_resolution() {
+        // Verify that AddSeed atoms are collected by resolve_pending()
+        // and that the caller can feed them back into the counter system.
+        // This tests the queue contract: resolve → actions.seeds → deposit.
+        let regex = build_regex("a");
+        let arena = AssertChainArena::new();
+        let effects = vec![
+            PendingEffect {
+                timing: EffectTiming::NextByte,
+                guard: EffectGuard::ALWAYS,
+                atom: EffectAtom::AddSeed {
+                    counter: crate::CounterIdx(0),
+                    origin: crate::StateIdx(1),
+                    value: 0,
+                },
+                prev_was_word: false,
+            },
+            PendingEffect {
+                timing: EffectTiming::NextByte,
+                guard: EffectGuard::ALWAYS,
+                atom: EffectAtom::AddTail {
+                    origin: crate::StateIdx(2),
+                },
+                prev_was_word: false,
+            },
+            PendingEffect {
+                timing: EffectTiming::NextByte,
+                guard: EffectGuard::ALWAYS,
+                atom: EffectAtom::Match,
+                prev_was_word: false,
+            },
+        ];
+        let actions = resolve_pending(
+            &effects,
+            EffectTiming::NextByte,
+            &arena,
+            false,
+            Some(b'x'),
+            &regex,
+            &mut scratch(),
+        );
+        // All three atom kinds should be collected.
+        assert_eq!(actions.seeds.len(), 1, "one seed");
+        assert_eq!(actions.seeds[0].0, crate::CounterIdx(0));
+        assert_eq!(actions.seeds[0].1, crate::StateIdx(1));
+        assert_eq!(actions.seeds[0].2, 0);
+        assert_eq!(actions.tails.len(), 1, "one tail");
+        assert_eq!(actions.tails[0], crate::StateIdx(2));
+        assert!(actions.set_match, "match signal");
+    }
+
+    #[test]
+    fn test_resolve_pending_failed_guard_drops_all_atom_kinds() {
+        // Verify that when a guard fails, ALL atom kinds are dropped —
+        // not just Match but also AddSeed and AddTail.
+        let regex = build_regex(r"\ba");
+        let mut arena = AssertChainArena::new();
+        let wb_idx = regex
+            .states
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    crate::State::Assert {
+                        kind: crate::AssertKind::WordAscii,
+                        ..
+                    }
+                )
+            })
+            .expect("pattern should contain \\b");
+        let chain_id = arena.intern(&[crate::StateIdx(wb_idx as u32)]);
+
+        let effects = vec![
+            PendingEffect {
+                timing: EffectTiming::NextByte,
+                guard: EffectGuard {
+                    assert_chain: chain_id,
+                },
+                atom: EffectAtom::AddSeed {
+                    counter: crate::CounterIdx(0),
+                    origin: crate::StateIdx(1),
+                    value: 0,
+                },
+                // \b at word→word boundary: fails
+                prev_was_word: true,
+            },
+            PendingEffect {
+                timing: EffectTiming::NextByte,
+                guard: EffectGuard {
+                    assert_chain: chain_id,
+                },
+                atom: EffectAtom::AddTail {
+                    origin: crate::StateIdx(2),
+                },
+                prev_was_word: true,
+            },
+        ];
+        let actions = resolve_pending(
+            &effects,
+            EffectTiming::NextByte,
+            &arena,
+            false,
+            Some(b'a'), // word char → word→word, \b fails
+            &regex,
+            &mut scratch(),
+        );
+        assert!(actions.seeds.is_empty(), "seed should be dropped");
+        assert!(actions.tails.is_empty(), "tail should be dropped");
+        assert!(!actions.set_match);
+    }
 }

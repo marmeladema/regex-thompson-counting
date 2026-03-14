@@ -485,6 +485,20 @@ pub(crate) fn compute_tier3_analysis(
                     // byte to evaluate.  End asserts are handled separately
                     // by the break closure (break_is_match_at_end).
                     if kind != AssertKind::End {
+                        debug_assert!(
+                            matches!(
+                                kind,
+                                AssertKind::WordAscii
+                                    | AssertKind::WordAsciiNegate
+                                    | AssertKind::WordStartAscii
+                                    | AssertKind::WordEndAscii
+                                    | AssertKind::EndLF
+                            ),
+                            "unexpected deferred assert kind {:?} in break-seed closure; \
+                             PendingEffect.prev_was_word only supports word-boundary \
+                             family and EndLF",
+                            kind
+                        );
                         d.push(idx);
                     }
                     ci_stack.push((out, d));
@@ -769,6 +783,20 @@ pub(crate) fn compute_tier3_analysis(
                         // at runtime (they walk from the assert's `out`).
                         // End asserts are handled by target_is_match_at_end.
                         if kind != AssertKind::End {
+                            debug_assert!(
+                                matches!(
+                                    kind,
+                                    AssertKind::WordAscii
+                                        | AssertKind::WordAsciiNegate
+                                        | AssertKind::WordStartAscii
+                                        | AssertKind::WordEndAscii
+                                        | AssertKind::EndLF
+                                ),
+                                "unexpected deferred assert kind {:?} in target deferred; \
+                                 PendingEffect.prev_was_word only supports word-boundary \
+                                 family and EndLF",
+                                kind
+                            );
                             asserts.push(eidx);
                         }
                         // Do NOT push `out` — stop the walk here for this
@@ -2691,6 +2719,20 @@ fn break_consuming_tails(
                 // statically by break_is_match_at_end.  Non-End asserts
                 // (\b, \B, etc.) are deferred.
                 if kind != AssertKind::End {
+                    debug_assert!(
+                        matches!(
+                            kind,
+                            AssertKind::WordAscii
+                                | AssertKind::WordAsciiNegate
+                                | AssertKind::WordStartAscii
+                                | AssertKind::WordEndAscii
+                                | AssertKind::EndLF
+                        ),
+                        "unexpected deferred assert kind {:?} in break-tail closure; \
+                         PendingEffect.prev_was_word only supports word-boundary \
+                         family and EndLF",
+                        kind
+                    );
                     deferred.push(idx);
                 }
                 stack.push((out, deferred));
