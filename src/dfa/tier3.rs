@@ -982,6 +982,41 @@ pub(crate) fn compute_tier3_analysis(
     analysis.target_assert_chain_ids = target_assert_chain_ids;
     analysis.assert_chain_arena = assert_chain_arena;
 
+    // -- Validate EOI seed invariant ------------------------------------------
+    // The finish() EOI seed scan checks whether ANY target with a given counter
+    // has a match on its break path, ignoring the seed's specific origin.  This
+    // is safe because Tier 3 has exactly one CInc per counter: all Increment
+    // targets for the same counter share the same BreakEffects and thus the
+    // same on_break atoms.  Validate that invariant here.
+    #[cfg(debug_assertions)]
+    {
+        use std::collections::HashMap;
+        let mut counter_break_match: HashMap<usize, Option<bool>> = HashMap::new();
+        for effects in analysis.target_effects.iter().flatten() {
+            if let tier3_effects::TargetStep::Increment { counter, .. } = &effects.step {
+                let has_break_match = effects.on_break.iter().any(|a| {
+                    matches!(
+                        a,
+                        tier3_effects::EffectAtom::Match | tier3_effects::EffectAtom::MatchAtEnd
+                    )
+                });
+                match counter_break_match.get(&counter.idx()) {
+                    Some(Some(prev)) => {
+                        debug_assert_eq!(
+                            *prev, has_break_match,
+                            "EOI seed invariant violated: counter {} has targets with \
+                             inconsistent break-path match reachability",
+                            counter
+                        );
+                    }
+                    _ => {
+                        counter_break_match.insert(counter.idx(), Some(has_break_match));
+                    }
+                }
+            }
+        }
+    }
+
     analysis
 }
 
@@ -3908,6 +3943,17 @@ impl<'a> Tier3DfaMatcher<'a> {
                 self.regex,
             );
             // Seeds at EOI: check immediate-break match.
+            //
+            // Over-approximate scan: we iterate ALL target_effects looking for
+            // any Increment target with the same counter whose min is met and
+            // whose on_break has Match/MatchAtEnd.  The seed's `_origin` is
+            // ignored — we can't look up by origin because at EOI there's no
+            // byte to consume (can't call consume_byte to find the target).
+            //
+            // This is safe because Tier 3 has exactly one CInc per counter,
+            // so all Increment targets for the same counter share the same
+            // BreakEffects and thus the same on_break atoms.  The invariant
+            // is validated by a debug_assert in compute_tier3_analysis().
             for &(counter, _origin, value) in &actions.seeds {
                 for effects in self.analysis.target_effects.iter().flatten() {
                     if let tier3_effects::TargetStep::Increment {
