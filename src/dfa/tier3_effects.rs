@@ -285,9 +285,19 @@ pub(crate) enum EffectAtom {
         origin: StateIdx,
     },
     /// Signal an immediate match (`ever_matched = true`).
+    ///
+    /// Used for deferred assertion paths that gate access to a Match
+    /// state: when the assertion chain passes and downstream Match is
+    /// reachable, this atom fires.  This covers both break-deferred
+    /// assertions (counter break → `\b` → Match) and per-tail deferred
+    /// assertions (tail target → `\b` → Match).
     Match,
-    /// Signal a match-at-end (`match_at_end = true`, resolved at EOI or
-    /// via `$ → Match` deferred assertion path).
+    /// Signal a match-at-end (`match_at_end = true`).
+    ///
+    /// Reserved for contexts where the match is only valid at end-of-input
+    /// — specifically, counter-free `$ → Match` paths where the pattern
+    /// requires the end-of-string anchor.  **Not** used for deferred
+    /// assertion paths that may resolve mid-input; those use [`Match`].
     MatchAtEnd,
 }
 
@@ -876,6 +886,14 @@ pub(crate) fn compile_target_effects(
             // `eval_assert_chain` with downstream reachability checks at
             // the next byte boundary and at end-of-input.
             //
+            // We emit `EffectAtom::Match` (not `MatchAtEnd`) to align
+            // with the runtime, which sets `ever_matched` when the
+            // deferred assertion passes and downstream Match reachability
+            // exists.  `MatchAtEnd` is reserved for contexts where the
+            // match signal is only valid at end-of-input (e.g. counter-free
+            // `$ → Match` paths), not for assertion-gated break paths that
+            // may resolve mid-input.
+            //
             // Bug 51: break_deferred_asserts contains independent
             // assertion entry points from different NFA paths (OR
             // semantics: any one passing = match).  Each must be
@@ -891,7 +909,7 @@ pub(crate) fn compile_target_effects(
                         guard: EffectGuard {
                             assert_chain: chain_id,
                         },
-                        atoms: vec![EffectAtom::MatchAtEnd].into_boxed_slice(),
+                        atoms: vec![EffectAtom::Match].into_boxed_slice(),
                     });
                 }
             }
