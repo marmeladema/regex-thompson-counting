@@ -274,44 +274,32 @@ pub(crate) struct DeferredTail {
 /// Pre-interned break-path effect data for a counter's CInc break.
 ///
 /// Extracted from `Tier3OriginKind::Increment`'s break-* fields and
-/// stored once on [`Tier3Analysis`](super::Tier3Analysis).  At runtime,
-/// the matcher looks up break effects by [`BreakEffectsId`] instead of
-/// reading the (now removed) fields from the cloned transition cache,
-/// eliminating per-transition heap allocations from boxed-slice clones.
+/// stored once on [`Tier3Analysis`](super::Tier3Analysis).  **Build-time
+/// only** after Patch 8E — consumed by [`compile_target_effects()`] to
+/// produce `on_break`/`guarded` atoms in [`CompiledTargetEffects`], but
+/// not read at runtime.  Also used by `dump.rs`.
 ///
 /// # Field semantics
 ///
-/// - `has_deferred`: whether any assertions gate the break path.  When
-///   `true`, the matcher uses `break_deferred_chain_ids` and the deferred
-///   helpers; when `false`, it uses `break_consuming_states` directly.
 /// - `break_deferred_chain_ids`: **OR semantics** — each chain is an
 ///   independent assertion; any one passing suffices for a match.
 /// - `break_consuming_pure`: tails with no assertion gates (deposited
-///   immediately).
+///   immediately as `AddTail` in `on_break`).
 /// - `break_consuming_deferred`: tails with per-tail assertion gates
-///   (**AND per tail**, OR across tuples).
-/// - `break_consuming_states`: all consuming states (used only when
-///   `has_deferred` is `false`).
+///   (**AND per tail**, OR across tuples; compiled into `guarded`).
+/// - `break_consuming_states`: union of pure + deferred tails.
 #[derive(Clone, Debug)]
 pub(crate) struct BreakEffects {
-    /// Whether the break path has deferred assertions (`\b`, `\B`, etc.).
-    ///
-    /// No longer read at runtime after 8E — the `on_break`/`guarded`
-    /// decomposition in `CompiledTargetEffects` encodes this statically.
-    /// Still used by `compile_target_effects()` during build.
-    #[allow(dead_code)]
-    pub(crate) has_deferred: bool,
     /// Per-entry assertion chain IDs for break-deferred asserts (OR
     /// semantics, parallel to the original `break_deferred_asserts`).
     pub(crate) break_deferred_chain_ids: Box<[AssertChainId]>,
     /// Consuming states reachable from the break path WITHOUT passing
-    /// through any deferred assertion.  Deposited immediately at runtime.
+    /// through any deferred assertion.
     pub(crate) break_consuming_pure: Box<[StateIdx]>,
     /// Per-tail deferred assertions.  Each tail is gated on its own
     /// assertion chain (AND per tail, OR across entries).
     pub(crate) break_consuming_deferred: Box<[DeferredTail]>,
-    /// All consuming states on the break path (used when `has_deferred`
-    /// is `false` — no assertion splitting needed).
+    /// All consuming states on the break path (union of pure + deferred).
     pub(crate) break_consuming_states: Box<[StateIdx]>,
 }
 
@@ -345,8 +333,8 @@ pub(crate) struct EffectGuard {
 impl EffectGuard {
     /// A guard that is always satisfied (no assertions, no break requirement).
     ///
-    /// Currently unused — deposit sites construct `EffectGuard` inline.
-    /// Patch 7 (deposit helpers) will route through this constant.
+    /// Convenience constant for ungated effects (no assertion chain).
+    /// Used in tests only.
     #[allow(dead_code)]
     pub(crate) const ALWAYS: Self = Self {
         assert_chain: AssertChainId::NONE,
@@ -674,123 +662,6 @@ pub(crate) fn enqueue_target_deferred_match(
             prev_was_word,
         });
     }
-}
-
-/// Deposit break-deferred match effects (OR semantics).
-///
-/// For each assertion chain in `chain_ids` that is not [`AssertChainId::NONE`],
-/// pushes a **separate** `PendingEffect` with a single [`EffectAtom::Match`]
-/// atom.  One-per-chain deposition implements Bug 51's OR semantics: any
-/// single chain passing is sufficient to signal a match.
-///
-/// **Used for:** break-deferred asserts from counter break paths in
-/// post-break tail processing, the main counter step, and effect
-/// resolution.
-/// After 8E, break-deferred matches are deposited via the generic
-/// `on_break`/`guarded` dispatch from `CompiledTargetEffects`.
-/// This helper is retained for reference; will be removed in 8G.
-#[allow(dead_code)]
-pub(crate) fn enqueue_break_deferred_match(
-    queue: &mut Vec<PendingEffect>,
-    chain_ids: &[AssertChainId],
-    prev_was_word: bool,
-) {
-    for &chain_id in chain_ids {
-        if chain_id != AssertChainId::NONE {
-            queue.push(PendingEffect {
-                timing: EffectTiming::NextByte,
-                guard: EffectGuard {
-                    assert_chain: chain_id,
-                },
-                atom: EffectAtom::Match,
-                prev_was_word,
-            });
-        }
-    }
-}
-
-/// Deposit deferred-tail effects (Bug 46: per-tail assertions).
-///
-/// For each `(origin, _asserts, chain_id)` tuple in `deferred` where
-/// `chain_id` is not [`AssertChainId::NONE`], pushes a `PendingEffect`
-/// with a single [`EffectAtom::AddTail`] atom.
-///
-/// When `dedup` is `true`, skips entries whose `origin` already appears
-/// as an `AddTail` atom in the queue.  First-order deposits (step_slow)
-/// need dedup because the same tail can appear via multiple break paths;
-/// second-order deposits (effect resolution) operate on a freshly-cleared
-/// `pending_effects_next` and skip dedup.
-///
-/// **Used for:** break-consuming deferred tails in post-break tail
-/// processing, the main counter step, and effect resolution.
-///
-/// After 8E, deferred tails are deposited via the generic `guarded`
-/// dispatch from `CompiledTargetEffects`.  Will be removed in 8G.
-#[allow(dead_code)]
-pub(crate) fn enqueue_deferred_tail(
-    queue: &mut Vec<PendingEffect>,
-    deferred: &[DeferredTail],
-    prev_was_word: bool,
-    dedup: bool,
-) {
-    for dt in deferred {
-        let origin = dt.origin;
-        let chain_id = dt.chain_id;
-        if chain_id == AssertChainId::NONE {
-            continue;
-        }
-        if dedup
-            && queue
-                .iter()
-                .any(|pe| matches!(pe.atom, EffectAtom::AddTail { origin: o } if o == origin))
-        {
-            continue;
-        }
-        queue.push(PendingEffect {
-            timing: EffectTiming::NextByte,
-            guard: EffectGuard {
-                assert_chain: chain_id,
-            },
-            atom: EffectAtom::AddTail { origin },
-            prev_was_word,
-        });
-    }
-}
-
-/// Deposit a deferred-seed effect (Bug 27/28: assertion-gated seed).
-///
-/// Pushes a single `PendingEffect` with an [`EffectAtom::AddSeed`] atom,
-/// gated on `chain_id`.  The assertion sits between the triggering
-/// counter's CInc break and the seeded counter's CI, so it must be
-/// deferred until the next byte boundary when the boundary context is
-/// available.
-///
-/// **Used for:** break-seeds with deferred assertions in the break-seeds
-/// processing loop.
-///
-/// After 8F, deferred seeds are deposited via the `guarded` dispatch
-/// from `CompiledTargetEffects`.  Will be removed in 8G.
-#[allow(dead_code)]
-pub(crate) fn enqueue_deferred_seed(
-    queue: &mut Vec<PendingEffect>,
-    chain_id: AssertChainId,
-    counter: CounterIdx,
-    origin: StateIdx,
-    value: u32,
-    prev_was_word: bool,
-) {
-    queue.push(PendingEffect {
-        timing: EffectTiming::NextByte,
-        guard: EffectGuard {
-            assert_chain: chain_id,
-        },
-        atom: EffectAtom::AddSeed {
-            counter,
-            origin,
-            value,
-        },
-        prev_was_word,
-    });
 }
 
 // ---------------------------------------------------------------------------

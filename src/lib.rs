@@ -11188,10 +11188,10 @@ mod tests {
         // Compiled-effect MatchAtEnd regression: pattern whose CInc break
         // has BOTH a pure `$ → Match` path AND a deferred `\b` on a
         // sibling branch.  `break_is_match_at_end` is true (the `$` path
-        // is assertion-free), `has_deferred` is also true (the `\b`
-        // branch has a deferred assertion).  The effect compiler must emit
-        // `MatchAtEnd` in `on_break` regardless of `has_deferred`, since
-        // the two paths are independent via a Split.
+        // is assertion-free) and the sibling `\b` branch has a deferred
+        // assertion.  The effect compiler must emit `MatchAtEnd` in
+        // `on_break` unconditionally, since the two paths are independent
+        // via a Split.
         test_tier3_break_match_at_end_with_sibling_deferred {
             pattern: r"^.{2,5}(\b|$)",
             memory: 1365,
@@ -11208,9 +11208,9 @@ mod tests {
         }
 
         // EOI tail false positive regression (8E): pattern with a per-tail
-        // deferred assertion on a break consuming state.  When has_deferred
-        // is false (no break-deferred match assertions), the old runtime
-        // deposited ALL break_consuming_states as immediate tails.  After
+        // deferred assertion on a break consuming state.  When no break-
+        // deferred match assertions existed, the old runtime deposited ALL
+        // break_consuming_states as immediate tails.  After
         // the 8E authority flip, guarded AddTail atoms resolve at EOI via
         // pending effects, producing tails in actions.tails.  The finish()
         // code then checked target_is_match_at_end on those unconsumed

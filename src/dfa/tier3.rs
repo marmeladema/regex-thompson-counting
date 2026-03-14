@@ -73,6 +73,12 @@ pub(crate) struct Tier3Analysis {
     /// Indexed by NFA state index.  `targets[idx]` is `Some(kind)` when
     /// `idx` is a known post-consumption target; `None` for states that
     /// are never reached as byte-consumption targets.
+    ///
+    /// **Build-time only** after Patch 8E — used by `populate()` and
+    /// [`compile_target_effects()`](tier3_effects::compile_target_effects)
+    /// during compilation, but not read at runtime.  Runtime reads
+    /// [`target_effects`](Self::target_effects) instead.  Also used by
+    /// `dump.rs`.
     pub(crate) targets: Box<[Option<Tier3OriginKind>]>,
 
     /// Per-CI-output consuming states.
@@ -87,6 +93,11 @@ pub(crate) struct Tier3Analysis {
     /// Each entry records a seed that is only applied when a specific
     /// counter breaks: the seed for `counter` at `origin` is applied
     /// when `trigger`'s CInc break path is taken.
+    ///
+    /// **Build-time only** after Patch 8F — consumed by
+    /// [`compile_target_effects()`](tier3_effects::compile_target_effects)
+    /// to produce `AddSeed` atoms in `on_break`/`guarded`, but not read
+    /// at runtime.  Also used by `dump.rs`.
     pub(crate) break_seeds: Box<[Tier3BreakSeed]>,
 
     /// Maximum number of distinct consuming NFA states in any single
@@ -166,12 +177,14 @@ pub(crate) struct Tier3Analysis {
     /// over-approximate, so the per-instance fallback is used instead.
     pub(crate) all_counters_rangeable: bool,
 
-    /// Typed effects for each target state.
+    /// Typed effects for each target state — **runtime authoritative source**
+    /// for all nonlocal Tier 3 effects (since Patch 8E).
     ///
     /// Populated by [`tier3_effects::compile_all_target_effects`] from
-    /// the `targets` data.  Used at runtime by `resolve_pending()` to
-    /// evaluate deferred assertions and apply nonlocal consequences
-    /// (seeds, tails, matches) at the correct timing boundaries.
+    /// the `targets` and `break_effects` data.  At runtime, the step_slow
+    /// macro, effect resolution, and finish() read `TargetStep` for local
+    /// counter stepping and `on_break`/`guarded`/`immediate` for nonlocal
+    /// effects (matches, tails, seeds, deferred assertions).
     pub(crate) target_effects: Box<[Option<tier3_effects::CompiledTargetEffects>]>,
 
     /// Per-consuming-state assertion chain IDs for `target_deferred_asserts`.
@@ -199,6 +212,11 @@ pub(crate) struct Tier3Analysis {
     /// `Tier3OriginKind::Increment` entries for the same counter share
     /// the same `BreakEffectsId`.  Built at the end of
     /// [`compute_tier3_analysis`] after all break-* fields are populated.
+    ///
+    /// **Build-time only** after Patch 8E — consumed by
+    /// [`compile_target_effects()`](tier3_effects::compile_target_effects)
+    /// to produce [`CompiledTargetEffects`](tier3_effects::CompiledTargetEffects),
+    /// but not read at runtime.  Also used by `dump.rs`.
     pub(crate) break_effects: Box<[tier3_effects::BreakEffects]>,
 }
 
@@ -913,7 +931,6 @@ pub(crate) fn compute_tier3_analysis(
 
                     let id = tier3_effects::BreakEffectsId(break_effects_vec.len() as u16);
                     break_effects_vec.push(tier3_effects::BreakEffects {
-                        has_deferred: !pcd.deferred_asserts.is_empty(),
                         break_deferred_chain_ids,
                         break_consuming_pure: pcd.pure_tails,
                         break_consuming_deferred: per_tail_boxed,
