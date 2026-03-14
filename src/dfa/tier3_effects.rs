@@ -1092,8 +1092,21 @@ pub(crate) fn compile_target_effects(
                 on_break.push(EffectAtom::Match);
             }
 
-            // Break-path match-at-end (only when no deferred asserts gate it).
-            if *break_is_match_at_end && !be.has_deferred {
+            // Break-path match-at-end.
+            //
+            // `break_is_match_at_end` is ONLY true when `break_closure()`
+            // found a pure (assertion-free) `$ → Match` path from the CInc
+            // break output.  The `has_deferred` flag means OTHER branches
+            // of the break epsilon closure have deferred assertions — it
+            // does NOT mean the `$ → Match` sub-path is gated.  A CInc
+            // break can have both a pure `$ → Match` branch and a deferred
+            // `\b → consuming-state` branch via Split.
+            //
+            // Previous code gated this on `!be.has_deferred`, which
+            // incorrectly suppressed `MatchAtEnd` for patterns like
+            // `^.{2,5}(\b|$)` where the `$` branch is pure but the
+            // sibling `\b` branch causes `has_deferred = true`.
+            if *break_is_match_at_end {
                 on_break.push(EffectAtom::MatchAtEnd);
             }
 

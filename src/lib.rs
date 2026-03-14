@@ -11185,6 +11185,28 @@ mod tests {
             ],
         }
 
+        // Compiled-effect MatchAtEnd regression: pattern whose CInc break
+        // has BOTH a pure `$ → Match` path AND a deferred `\b` on a
+        // sibling branch.  `break_is_match_at_end` is true (the `$` path
+        // is assertion-free), `has_deferred` is also true (the `\b`
+        // branch has a deferred assertion).  The effect compiler must emit
+        // `MatchAtEnd` in `on_break` regardless of `has_deferred`, since
+        // the two paths are independent via a Split.
+        test_tier3_break_match_at_end_with_sibling_deferred {
+            pattern: r"^.{2,5}(\b|$)",
+            memory: 1365,
+            min_tier: 1,
+            inputs: [
+                ("ab", true),                   // 2 chars, $ matches at EOI
+                ("abc", true),                  // 3 chars, \b(c,EOI) passes + $ at EOI
+                ("abcd", true),                 // 4 chars, similar
+                ("abcde", true),                // 5 chars (max), $ at EOI
+                ("abcdef", false),              // 6 chars: exceeds max
+                ("a", false),                   // 1 char: below min
+                ("ab cd", true),                // \b at 'b'→' ' boundary
+            ],
+        }
+
         // Bug 42 regression: Tier 3 false positive when counter break
         // tails are deposited unconditionally despite pending deferred
         // assertions.  Pattern `a{2,2}\b` inside an optional group
