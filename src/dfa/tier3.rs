@@ -2958,6 +2958,7 @@ macro_rules! step_slow_impl {
             // deposits from this step are appended to pending_effects_current.
             self.$next.clear();
             self.match_at_end = false;
+            let byte_is_word = crate::is_word_byte(byte);
 
             // Advance existing post-break tails through this transition.
             // Each tail is a consuming NFA state from a previous counter
@@ -2989,7 +2990,7 @@ macro_rules! step_slow_impl {
                                 tier3_effects::enqueue_guarded_effects(
                                     &mut self.pending_effects_current,
                                     &self.analysis.origin_effects[pbo.idx()].guarded,
-                                    crate::is_word_byte(byte),
+                                    byte_is_word,
                                 );
                                 // Bug 37 + Bug 47: apply byte-specific
                                 // immediate effects from the compiled Advance.
@@ -3050,7 +3051,7 @@ macro_rules! step_slow_impl {
                                     tier3_effects::enqueue_guarded_effects(
                                         &mut self.pending_effects_current,
                                         &effects.guarded,
-                                        crate::is_word_byte(byte),
+                                        byte_is_word,
                                     );
                                 }
                             }
@@ -3067,7 +3068,7 @@ macro_rules! step_slow_impl {
                         tier3_effects::enqueue_guarded_effects(
                             &mut self.pending_effects_current,
                             &oe.guarded,
-                            crate::is_word_byte(byte),
+                            byte_is_word,
                         );
                     }
                     None => {
@@ -3174,7 +3175,7 @@ macro_rules! step_slow_impl {
                                     tier3_effects::enqueue_guarded_effects(
                                         &mut self.pending_effects_current,
                                         &effects.guarded,
-                                        crate::is_word_byte(byte),
+                                        byte_is_word,
                                     );
                                 }
                             }
@@ -3517,6 +3518,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             if self.ever_matched {
                 return;
             }
+            let b_is_word = crate::is_word_byte(b);
 
             // Resolve pending effects from the PREVIOUS step (Bug 26,
             // Bug 28, Bug 42, Bug 44, Bug 46).
@@ -3586,7 +3588,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                                     tier3_effects::enqueue_guarded_effects(
                                         &mut self.pending_effects_next,
                                         &self.analysis.origin_effects[tail.idx()].guarded,
-                                        crate::is_word_byte(b),
+                                        b_is_word,
                                     );
                                 }
                                 tier3_effects::TargetStep::Increment {
@@ -3648,7 +3650,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                                         tier3_effects::enqueue_guarded_effects(
                                             &mut self.pending_effects_next,
                                             &effects.guarded,
-                                            crate::is_word_byte(b),
+                                            b_is_word,
                                         );
                                     }
                                 }
@@ -3665,7 +3667,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                                 tier3_effects::enqueue_guarded_effects(
                                     &mut self.pending_effects_next,
                                     &oe.guarded,
-                                    crate::is_word_byte(b),
+                                    b_is_word,
                                 );
                             }
                         }
