@@ -423,7 +423,7 @@ pub(crate) fn compute_tier3_analysis(
 
     // -- Step 3: compute per-CI-output consuming states -----------------------
     let mut ci_origins_vec: Vec<Box<[StateIdx]>> = vec![Box::new([]); n];
-    for state in states.iter() {
+    for state in states {
         if let State::CounterInstance { out, .. } = *state
             && out != StateIdx::NONE
             && ci_origins_vec[out.idx()].is_empty()
@@ -437,7 +437,7 @@ pub(crate) fn compute_tier3_analysis(
     // Collect ALL CInc nodes in the NFA, then walk each break path for CI
     // seeds.
     let mut all_cinc_nodes: Vec<(CounterIdx, StateIdx)> = Vec::new();
-    for state in states.iter() {
+    for state in states {
         if let State::CounterIncrement { counter, out1, .. } = *state {
             all_cinc_nodes.push((counter, out1));
         }
@@ -590,7 +590,7 @@ pub(crate) fn compute_tier3_analysis(
     // per-instance fallback storage.
     let mut max_body_origins: usize = 0;
     let mut max_instance_stride: usize = 0;
-    for state in states.iter() {
+    for state in states {
         if let State::CounterInstance { counter, out } = *state {
             let mut count: usize = 0;
             let mut counter_max: usize = 0;
@@ -623,7 +623,7 @@ pub(crate) fn compute_tier3_analysis(
                     }
                     State::ByteTable { table } => {
                         count += 1;
-                        for &succ in byte_tables[table.idx()].0.iter() {
+                        for &succ in &byte_tables[table.idx()].0 {
                             if succ != StateIdx::NONE {
                                 stack.push(succ);
                             }
@@ -756,7 +756,7 @@ pub(crate) fn compute_tier3_analysis(
     // individual assert is interned as a 1-element chain in
     // `target_assert_chain_ids` during `compile_all_target_effects`.
     let mut target_da: Vec<Box<[StateIdx]>> = Vec::with_capacity(n);
-    for state in states.iter() {
+    for state in states {
         let target = match *state {
             State::Byte { out, .. } | State::ByteCI { out, .. } | State::ByteClass { out, .. } => {
                 if out != StateIdx::NONE {
@@ -1697,7 +1697,7 @@ impl Tier3DfaCache {
         // using the precomputed ci_origins table.
         let mut seed_instances: Vec<(CounterIdx, StateIdx)> = Vec::new();
         for &(counter, ci_out) in &memory.closure_seeds {
-            for &c in analysis.ci_origins[ci_out.idx()].iter() {
+            for &c in &analysis.ci_origins[ci_out.idx()] {
                 seed_instances.push((counter, c));
             }
         }
@@ -1772,7 +1772,7 @@ impl Tier3DfaCache {
                 // Phase 1 consumes the resolved closure's NFA states
                 // against `byte`.  Build a map from seed origin → target
                 // for later remapping of resolved seeds (Bug 16).
-                for &idx in cr.nfa_states.iter() {
+                for &idx in &cr.nfa_states {
                     if let Some(t) = consume_byte(idx, byte, regex) {
                         targets_per_origin.push((idx, vec![t]));
                         resolved_body_targets.push((idx, t));
@@ -1781,8 +1781,8 @@ impl Tier3DfaCache {
             }
 
             // Phase 2: consuming states in `from` consume `byte`.
-            let nfa_states = self.inner.states[from.idx()].nfa_states.clone();
-            for &idx in nfa_states.iter() {
+            let nfa_states = &self.inner.states[from.idx()].nfa_states;
+            for &idx in nfa_states {
                 if let Some(t) = consume_byte(idx, byte, regex) {
                     targets_per_origin.push((idx, vec![t]));
                 }
@@ -3004,7 +3004,7 @@ macro_rules! step_slow_impl {
                     Some(Some(effects)) => {
                         match &effects.step {
                             tier3_effects::TargetStep::Advance { new_origins } => {
-                                for &new_o in new_origins.iter() {
+                                for &new_o in new_origins {
                                     if self.tail_seen[new_o.idx()] != self.tail_epoch {
                                         self.tail_seen[new_o.idx()] = self.tail_epoch;
                                         self.next_post_break_tails.push(new_o);
@@ -3043,7 +3043,7 @@ macro_rules! step_slow_impl {
                                 let pbt_value: u32 = 0;
                                 // Check continue (value after increment < max).
                                 if pbt_value + 1 < *max {
-                                    for &new_o in continue_origins.iter() {
+                                    for &new_o in continue_origins {
                                         self.$next.seed(counter.idx(), new_o, pbt_value + 1);
                                     }
                                 }
@@ -3054,7 +3054,7 @@ macro_rules! step_slow_impl {
                                 if pbt_value + 1 >= *min {
                                     any_can_break = true;
                                     // Apply on_break atoms from CompiledTargetEffects.
-                                    for atom in effects.on_break.iter() {
+                                    for atom in &effects.on_break {
                                         match atom {
                                             tier3_effects::EffectAtom::Match => {
                                                 self.ever_matched = true;
@@ -3120,7 +3120,7 @@ macro_rules! step_slow_impl {
             // counter-free.
             let pre_seed_contaminated =
                 self.current_has_break_extras && self.regex.num_counters > 1;
-            for &(counter, origin, value) in t.pre_seeds.iter() {
+            for &(counter, origin, value) in &t.pre_seeds {
                 if pre_seed_contaminated {
                     if let Some(cn_slot) = self.clean_nb_trans_slot {
                         let cn_t = &self.cache.transitions[cn_slot];
@@ -3157,7 +3157,7 @@ macro_rules! step_slow_impl {
                     match effects {
                         Some(effects) => match &effects.step {
                             tier3_effects::TargetStep::Advance { new_origins } => {
-                                for &new_o in new_origins.iter() {
+                                for &new_o in new_origins {
                                     self.$next.advance(c_idx, entry, new_o);
                                 }
                             }
@@ -3170,13 +3170,13 @@ macro_rules! step_slow_impl {
                             } => {
                                 // Advance-or-increment: entry survives at
                                 // advance_origins with the same values.
-                                for &new_o in advance_origins.iter() {
+                                for &new_o in advance_origins {
                                     self.$next.advance(c_idx, entry, new_o);
                                 }
 
                                 // Continue: incremented entry stays in the loop.
                                 if self.$current.can_continue(entry, *max) {
-                                    for &new_o in continue_origins.iter() {
+                                    for &new_o in continue_origins {
                                         self.$next.insert_continued(c_idx, entry, new_o, *max);
                                     }
                                 }
@@ -3185,7 +3185,7 @@ macro_rules! step_slow_impl {
                                 if self.$current.can_break(entry, *min) {
                                     any_can_break = true;
                                     // Apply on_break atoms from CompiledTargetEffects.
-                                    for atom in effects.on_break.iter() {
+                                    for atom in &effects.on_break {
                                         match atom {
                                             tier3_effects::EffectAtom::Match => {
                                                 self.ever_matched = true;
@@ -3343,7 +3343,7 @@ macro_rules! step_slow_impl {
             // through the per-instance on_break/guarded AddSeed atoms in
             // CompiledTargetEffects (Bug 32 part 2: the per-instance break
             // path fires when the triggering counter actually breaks).
-            for &(counter, origin, value) in t.seeds.iter() {
+            for &(counter, origin, value) in &t.seeds {
                 if t.is_counting {
                     if let Some(cn_slot) = self.clean_nb_trans_slot {
                         let cn_t = &self.cache.transitions[cn_slot];
@@ -3381,7 +3381,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         let mut inst_counters = InstanceCounters::new(nc, inst_stride);
         let next_instances = InstanceCounters::new(nc, inst_stride);
 
-        for &(counter, origin, value) in cache.start_seeds.iter() {
+        for &(counter, origin, value) in &cache.start_seeds {
             if use_ranges {
                 ranged_counters.insert(counter.idx(), origin, value, value);
             } else {
@@ -3495,12 +3495,12 @@ impl<'a> Tier3DfaMatcher<'a> {
 
         // Seed instances.
         if self.use_ranges {
-            for &(counter, origin, value) in trans.seeds.iter() {
+            for &(counter, origin, value) in &trans.seeds {
                 self.ranged_counters
                     .insert(counter.idx(), origin, value, value);
             }
         } else {
-            for &(counter, origin, value) in trans.seeds.iter() {
+            for &(counter, origin, value) in &trans.seeds {
                 self.inst_counters
                     .push(counter.idx(), Instance { value, origin });
             }
@@ -3818,7 +3818,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                 match &self.analysis.target_effects[target.idx()] {
                     Some(effects) => match &effects.step {
                         tier3_effects::TargetStep::Advance { new_origins } => {
-                            for &new_o in new_origins.iter() {
+                            for &new_o in new_origins {
                                 if self.tail_seen[new_o.idx()] != self.tail_epoch {
                                     self.tail_seen[new_o.idx()] = self.tail_epoch;
                                     self.resolved_tails.push(new_o);
@@ -3849,7 +3849,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                             // Value starts at 0, increment to 1.
                             let pbt_value: u32 = 0;
                             if pbt_value + 1 < *max {
-                                for &new_o in continue_origins.iter() {
+                                for &new_o in continue_origins {
                                     if self.use_ranges {
                                         self.ranged_counters.insert(
                                             counter.idx(),
@@ -3869,7 +3869,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                             }
                             if pbt_value + 1 >= *min {
                                 // Apply on_break atoms from CompiledTargetEffects.
-                                for atom in effects.on_break.iter() {
+                                for atom in &effects.on_break {
                                     match atom {
                                         tier3_effects::EffectAtom::Match => {
                                             self.ever_matched = true;

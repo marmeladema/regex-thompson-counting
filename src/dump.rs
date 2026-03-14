@@ -7,8 +7,8 @@
 
 use std::fmt;
 
-use crate::dfa::tier3_effects::{AssertChainArena, CompiledOriginEffects, CompiledTargetEffects};
 use crate::dfa::Tier3OriginKind;
+use crate::dfa::tier3_effects::{AssertChainArena, CompiledOriginEffects, CompiledTargetEffects};
 use crate::{AssertKind, ByteClass, ByteMap, Regex, State, StateIdx};
 
 // ---------------------------------------------------------------------------
@@ -601,7 +601,10 @@ impl DumpRegex<'_> {
                             break_is_match_at_end,
                             break_effects_id,
                         } => {
-                            writeln!(f, "    state {i}: Increment(c{counter}, {{{min},{max}}}, {break_effects_id})",)?;
+                            writeln!(
+                                f,
+                                "    state {i}: Increment(c{counter}, {{{min},{max}}}, {break_effects_id})",
+                            )?;
                             writeln!(
                                 f,
                                 "      advance_origins: [{}]",
