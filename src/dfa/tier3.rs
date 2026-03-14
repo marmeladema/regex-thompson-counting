@@ -2941,6 +2941,13 @@ pub struct Tier3DfaMatcher<'a> {
     /// Reusable scratch for the output of [`tier3_effects::resolve_pending()`].
     /// Cleared per call instead of reallocated.
     resolved_actions: tier3_effects::ResolvedActions,
+    /// Epoch-stamped membership array for O(1) tail dedup.
+    /// Indexed by NFA state index.  `tail_seen[i] == tail_epoch` means
+    /// state `i` is already present in the current dedup scope.
+    tail_seen: Vec<u32>,
+    /// Current epoch for tail dedup.  Bumped at the start of each
+    /// dedup scope (next_post_break_tails, resolved_tails, injection).
+    tail_epoch: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -2990,6 +2997,7 @@ macro_rules! step_slow_impl {
             // used for DFA successor selection.
 
             self.next_post_break_tails.clear();
+            self.tail_epoch = self.tail_epoch.wrapping_add(1);
             for &pbo in &self.post_break_tails {
                 let pos = t.origin_keys.iter().position(|&k| k == pbo);
                 match pos.map(|i| &self.analysis.target_effects[t.origin_targets[i].idx()]) {
@@ -2997,7 +3005,8 @@ macro_rules! step_slow_impl {
                         match &effects.step {
                             tier3_effects::TargetStep::Advance { new_origins } => {
                                 for &new_o in new_origins.iter() {
-                                    if !self.next_post_break_tails.contains(&new_o) {
+                                    if self.tail_seen[new_o.idx()] != self.tail_epoch {
+                                        self.tail_seen[new_o.idx()] = self.tail_epoch;
                                         self.next_post_break_tails.push(new_o);
                                     }
                                 }
@@ -3054,7 +3063,8 @@ macro_rules! step_slow_impl {
                                                 self.match_at_end = true;
                                             }
                                             tier3_effects::EffectAtom::AddTail { origin } => {
-                                                if !self.next_post_break_tails.contains(origin) {
+                                                if self.tail_seen[origin.idx()] != self.tail_epoch {
+                                                    self.tail_seen[origin.idx()] = self.tail_epoch;
                                                     self.next_post_break_tails.push(*origin);
                                                 }
                                             }
@@ -3184,7 +3194,8 @@ macro_rules! step_slow_impl {
                                                 self.match_at_end = true;
                                             }
                                             tier3_effects::EffectAtom::AddTail { origin } => {
-                                                if !self.next_post_break_tails.contains(origin) {
+                                                if self.tail_seen[origin.idx()] != self.tail_epoch {
+                                                    self.tail_seen[origin.idx()] = self.tail_epoch;
                                                     self.next_post_break_tails.push(*origin);
                                                 }
                                             }
@@ -3415,6 +3426,8 @@ impl<'a> Tier3DfaMatcher<'a> {
             reach_scratch: super::ReachScratch::new(),
             resolved_tails: Vec::new(),
             resolved_actions: tier3_effects::ResolvedActions::default(),
+            tail_seen: vec![0; regex.states.len()],
+            tail_epoch: 0,
         }
     }
 
@@ -3564,6 +3577,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             // Tails that can't consume `b` are kept as post_break_tails
             // for the next step (injected after step_slow).
             self.resolved_tails.clear();
+            self.tail_epoch = self.tail_epoch.wrapping_add(1);
             let mut resolved_mae = false;
             if !self.pending_effects_current.is_empty() {
                 tier3_effects::resolve_pending(
@@ -3602,7 +3616,8 @@ impl<'a> Tier3DfaMatcher<'a> {
                             Some(effects) => match &effects.step {
                                 tier3_effects::TargetStep::Advance { new_origins } => {
                                     for &new_o in new_origins.iter() {
-                                        if !self.resolved_tails.contains(&new_o) {
+                                        if self.tail_seen[new_o.idx()] != self.tail_epoch {
+                                            self.tail_seen[new_o.idx()] = self.tail_epoch;
                                             self.resolved_tails.push(new_o);
                                         }
                                     }
@@ -3656,16 +3671,17 @@ impl<'a> Tier3DfaMatcher<'a> {
                                                 tier3_effects::EffectAtom::Match => {
                                                     self.ever_matched = true;
                                                 }
-                                                tier3_effects::EffectAtom::MatchAtEnd => {
-                                                    resolved_mae = true;
+                                            tier3_effects::EffectAtom::MatchAtEnd => {
+                                                self.match_at_end = true;
+                                            }
+                                            tier3_effects::EffectAtom::AddTail { origin } => {
+                                                if self.tail_seen[origin.idx()] != self.tail_epoch {
+                                                    self.tail_seen[origin.idx()] = self.tail_epoch;
+                                                    self.next_post_break_tails.push(*origin);
                                                 }
-                                                tier3_effects::EffectAtom::AddTail { origin } => {
-                                                    if !self.resolved_tails.contains(origin) {
-                                                        self.resolved_tails.push(*origin);
-                                                    }
-                                                }
-                                                tier3_effects::EffectAtom::AddSeed {
-                                                    counter: sc,
+                                            }
+                                            tier3_effects::EffectAtom::AddSeed {
+                                                counter: sc,
                                                     origin: so,
                                                     value: sv,
                                                 } => {
@@ -3711,7 +3727,8 @@ impl<'a> Tier3DfaMatcher<'a> {
                         }
                     }
                     // Tail can't consume this byte — keep as post_break_tail.
-                    else if !self.resolved_tails.contains(&tail) {
+                    else if self.tail_seen[tail.idx()] != self.tail_epoch {
+                        self.tail_seen[tail.idx()] = self.tail_epoch;
                         self.resolved_tails.push(tail);
                     }
                 }
@@ -3830,8 +3847,13 @@ impl<'a> Tier3DfaMatcher<'a> {
                     self.match_at_end = true;
                 }
                 if !self.resolved_tails.is_empty() {
+                    self.tail_epoch = self.tail_epoch.wrapping_add(1);
+                    for &existing in &self.post_break_tails {
+                        self.tail_seen[existing.idx()] = self.tail_epoch;
+                    }
                     for &tail in &self.resolved_tails {
-                        if !self.post_break_tails.contains(&tail) {
+                        if self.tail_seen[tail.idx()] != self.tail_epoch {
+                            self.tail_seen[tail.idx()] = self.tail_epoch;
                             self.post_break_tails.push(tail);
                         }
                     }
@@ -3852,8 +3874,13 @@ impl<'a> Tier3DfaMatcher<'a> {
                 self.match_at_end = true;
             }
             if !self.resolved_tails.is_empty() {
+                self.tail_epoch = self.tail_epoch.wrapping_add(1);
+                for &existing in &self.post_break_tails {
+                    self.tail_seen[existing.idx()] = self.tail_epoch;
+                }
                 for &t in &self.resolved_tails {
-                    if !self.post_break_tails.contains(&t) {
+                    if self.tail_seen[t.idx()] != self.tail_epoch {
+                        self.tail_seen[t.idx()] = self.tail_epoch;
                         self.post_break_tails.push(t);
                     }
                 }
