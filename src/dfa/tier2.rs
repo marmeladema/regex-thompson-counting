@@ -721,7 +721,7 @@ impl Tier2DfaCache {
                 seed_instances.push((counter, c));
             }
         }
-        seed_instances.sort_by_key(|&(c, s)| (c.idx(), s.0));
+        seed_instances.sort();
         seed_instances.dedup();
 
         ClosureResult {
@@ -893,7 +893,7 @@ impl Tier2DfaCache {
         // Resolved seeds from deferred-assertion resolution are NOT
         // merged into seed_list.  They go to pre_seeds (built below)
         // for correct phase alignment — see the pre_seed comment.
-        seed_list.sort_by_key(|&(c, _)| c.idx());
+        seed_list.sort_by_key(|&(c, _)| c);
         seed_list.dedup();
 
         // Compute DFA successors.
@@ -1030,7 +1030,7 @@ impl Tier2DfaCache {
                         seed_list.push((counter, 0));
                     }
                 }
-                seed_list.sort_by_key(|&(c, _)| c.idx());
+                seed_list.sort_by_key(|&(c, _)| c);
             }
 
             Transition {

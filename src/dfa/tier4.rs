@@ -712,7 +712,7 @@ impl Tier4DfaCache {
             "closure_ops_levels should have exactly one level (root)"
         );
 
-        self.closure_result.sort_unstable_by_key(|s| s.0);
+        self.closure_result.sort_unstable();
         self.closure_result.dedup();
 
         let ops = self.closure_ops.drain(..).collect();
@@ -970,7 +970,7 @@ impl Tier4DfaCache {
         merged.extend_from_slice(&seed_nfa);
 
         // Dedup merged NFA states.
-        merged.sort_unstable_by_key(|s| s.0);
+        merged.sort_unstable();
         merged.dedup();
 
         let origin_table_idx = self.intern_origin_table(origin_table);

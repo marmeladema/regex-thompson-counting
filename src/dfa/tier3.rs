@@ -549,10 +549,10 @@ pub(crate) fn compute_tier3_analysis(
     // Bug 52: the previous dedup compared only the key, silently discarding
     // ungated paths when a gated path for the same seed existed.
     for entry in &mut break_seeds_raw {
-        entry.3.sort_unstable_by_key(|s| s.0);
+        entry.3.sort_unstable();
         entry.3.dedup();
     }
-    break_seeds_raw.sort_by_key(|e| (e.0.idx(), e.1.idx(), e.2.0));
+    break_seeds_raw.sort_by_key(|e| (e.0, e.1, e.2));
     break_seeds_raw.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3);
 
     let break_seeds: Vec<Tier3BreakSeed> = break_seeds_raw
@@ -808,7 +808,7 @@ pub(crate) fn compute_tier3_analysis(
             }
         }
         // Deduplicate (shouldn't be needed but defensive).
-        asserts.sort_unstable_by_key(|s| s.0);
+        asserts.sort_unstable();
         asserts.dedup_by_key(|s| s.0);
         target_da.push(asserts.into_boxed_slice());
     }
@@ -1695,7 +1695,7 @@ impl Tier3DfaCache {
                 seed_instances.push((counter, c));
             }
         }
-        seed_instances.sort_by_key(|&(c, s)| (c.idx(), s.0));
+        seed_instances.sort();
         seed_instances.dedup();
 
         ClosureResult {
@@ -2462,7 +2462,7 @@ fn analyze_target(
     };
 
     if let Some((counter, min, max)) = found_cinc {
-        advance_origins.sort_unstable_by_key(|s| s.0);
+        advance_origins.sort_unstable();
         advance_origins.dedup();
 
         // Continue origins: consuming states reachable from CInc continue
@@ -2472,7 +2472,7 @@ fn analyze_target(
             let consuming = consuming_states_from(*co, states);
             continue_origins.extend(consuming);
         }
-        continue_origins.sort_unstable_by_key(|s| s.0);
+        continue_origins.sort_unstable();
         continue_origins.dedup();
 
         // Break match flags: walk from CInc break outputs through epsilon
@@ -2635,7 +2635,7 @@ fn break_closure(
         }
     }
 
-    deferred_asserts.sort_unstable_by_key(|s| s.0);
+    deferred_asserts.sort_unstable();
     deferred_asserts.dedup();
     BreakClosureResult {
         is_match,

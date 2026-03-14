@@ -382,8 +382,8 @@ impl DfaMemory {
             }
         }
 
-        self.closure_result.sort_unstable_by_key(|s| s.0);
-        self.closure_deferred.sort_unstable_by_key(|s| s.0);
+        self.closure_result.sort_unstable();
+        self.closure_deferred.sort_unstable();
 
         (is_match, is_match_at_end)
     }
