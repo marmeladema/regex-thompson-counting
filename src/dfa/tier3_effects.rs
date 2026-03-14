@@ -735,6 +735,49 @@ pub(crate) fn enqueue_target_deferred_match(
     }
 }
 
+/// Enqueue all guarded effects from a [`CompiledTargetEffects`] entry as
+/// [`PendingEffect`] entries in the given queue.
+///
+/// Each [`GuardedEffect`] becomes a separate `PendingEffect` with the
+/// captured `prev_was_word` boundary context.  The caller decides which
+/// queue (`pending_effects_current` or `pending_effects_next`) to target.
+#[inline]
+pub(crate) fn enqueue_guarded_effects(
+    queue: &mut Vec<PendingEffect>,
+    guarded: &[GuardedEffect],
+    prev_was_word: bool,
+) {
+    for ge in guarded.iter() {
+        queue.push(PendingEffect {
+            timing: ge.timing,
+            guard: ge.guard,
+            atom: ge.atom.clone(),
+            prev_was_word,
+        });
+    }
+}
+
+/// Apply immediate-mode atoms (from [`CompiledTargetEffects::immediate`]).
+///
+/// Immediate atoms are unconditional, counter-free effects that fire as
+/// soon as the target is reached.  Only `Match` and `MatchAtEnd` are
+/// expected; other atom kinds are silently ignored (they should not
+/// appear in `immediate`).
+#[inline]
+pub(crate) fn apply_immediate_atoms(
+    atoms: &[EffectAtom],
+    ever_matched: &mut bool,
+    match_at_end: &mut bool,
+) {
+    for atom in atoms.iter() {
+        match atom {
+            EffectAtom::Match => *ever_matched = true,
+            EffectAtom::MatchAtEnd => *match_at_end = true,
+            _ => {}
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Effect resolution results
 // ---------------------------------------------------------------------------

@@ -3005,17 +3005,11 @@ macro_rules! step_slow_impl {
                                 );
                                 // Bug 37 + Bug 47: apply byte-specific
                                 // immediate effects from the compiled Advance.
-                                for atom in effects.immediate.iter() {
-                                    match atom {
-                                        tier3_effects::EffectAtom::MatchAtEnd => {
-                                            self.match_at_end = true;
-                                        }
-                                        tier3_effects::EffectAtom::Match => {
-                                            self.ever_matched = true;
-                                        }
-                                        _ => {}
-                                    }
-                                }
+                                tier3_effects::apply_immediate_atoms(
+                                    &effects.immediate,
+                                    &mut self.ever_matched,
+                                    &mut self.match_at_end,
+                                );
                             }
                             tier3_effects::TargetStep::Increment {
                                 counter,
@@ -3065,16 +3059,11 @@ macro_rules! step_slow_impl {
                                             }
                                         }
                                     }
-                                     // Deposit guarded effects as PendingEffects.
-                                    let pw = crate::is_word_byte(byte);
-                                    for ge in effects.guarded.iter() {
-                                        self.pending_effects_current.push(tier3_effects::PendingEffect {
-                                            timing: ge.timing,
-                                            guard: ge.guard,
-                                            atom: ge.atom.clone(),
-                                            prev_was_word: pw,
-                                        });
-                                    }
+                                    tier3_effects::enqueue_guarded_effects(
+                                        &mut self.pending_effects_current,
+                                        &effects.guarded,
+                                        crate::is_word_byte(byte),
+                                    );
                                 }
                             }
                         }
@@ -3189,16 +3178,11 @@ macro_rules! step_slow_impl {
                                             }
                                         }
                                     }
-                                     // Deposit guarded effects as PendingEffects.
-                                    let pw = crate::is_word_byte(byte);
-                                    for ge in effects.guarded.iter() {
-                                        self.pending_effects_current.push(tier3_effects::PendingEffect {
-                                            timing: ge.timing,
-                                            guard: ge.guard,
-                                            atom: ge.atom.clone(),
-                                            prev_was_word: pw,
-                                        });
-                                    }
+                                    tier3_effects::enqueue_guarded_effects(
+                                        &mut self.pending_effects_current,
+                                        &effects.guarded,
+                                        crate::is_word_byte(byte),
+                                    );
                                 }
                             }
                         },
@@ -3599,17 +3583,11 @@ impl<'a> Tier3DfaMatcher<'a> {
                                         }
                                     }
                                     // Apply immediate atoms from compiled Advance.
-                                    for atom in effects.immediate.iter() {
-                                        match atom {
-                                            tier3_effects::EffectAtom::MatchAtEnd => {
-                                                resolved_mae = true;
-                                            }
-                                            tier3_effects::EffectAtom::Match => {
-                                                self.ever_matched = true;
-                                            }
-                                            _ => {}
-                                        }
-                                    }
+                                    tier3_effects::apply_immediate_atoms(
+                                        &effects.immediate,
+                                        &mut self.ever_matched,
+                                        &mut resolved_mae,
+                                    );
                                     // Second-order: target deferred asserts
                                     // go to pending_effects_next.
                                     tier3_effects::enqueue_target_deferred_match(
@@ -3674,15 +3652,11 @@ impl<'a> Tier3DfaMatcher<'a> {
                                         }
                                         // Deposit guarded effects as PendingEffects.
                                         // Second-order: goes to pending_effects_next.
-                                        let pw = crate::is_word_byte(b);
-                                        for ge in effects.guarded.iter() {
-                                            self.pending_effects_next.push(tier3_effects::PendingEffect {
-                                                timing: ge.timing,
-                                                guard: ge.guard,
-                                                atom: ge.atom.clone(),
-                                                prev_was_word: pw,
-                                            });
-                                        }
+                                        tier3_effects::enqueue_guarded_effects(
+                                            &mut self.pending_effects_next,
+                                            &effects.guarded,
+                                            crate::is_word_byte(b),
+                                        );
                                     }
                                 }
                             },
