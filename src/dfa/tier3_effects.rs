@@ -98,19 +98,24 @@ pub(crate) type BreakMask = u64;
 // ---------------------------------------------------------------------------
 
 /// When an effect becomes actionable relative to the current byte boundary.
+///
+/// Currently only `NextByte` exists.  An `EndOnly` variant was planned
+/// (for effects resolved only at end-of-input) but was removed because
+/// the runtime never populated the `pending_effects_end_only` queue.
+/// If compiled effects become the runtime authority, `EndOnly` can be
+/// reintroduced alongside a dedicated end-of-input resolution path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum EffectTiming {
     /// Defer until the next byte boundary (when the next byte is known).
+    /// Also used for end-of-input resolution (with `at_end=true` and
+    /// `next=None`).
     NextByte,
-    /// Defer until end-of-input processing.
-    EndOnly,
 }
 
 impl fmt::Display for EffectTiming {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NextByte => write!(f, "next_byte"),
-            Self::EndOnly => write!(f, "end_only"),
         }
     }
 }
@@ -424,8 +429,8 @@ impl fmt::Display for TargetStep {
 ///   direct `Match` or counter-free `MatchAtEnd`).
 /// - **`on_break`**: `Now` effects valid only when an incrementing instance
 ///   actually breaks (e.g. break-path `Match`, `MatchAtEnd`, tails, seeds).
-/// - **`guarded`**: effects with assertion-chain guards and/or deferred
-///   timing (`NextByte`, `EndOnly`) that cannot be resolved immediately.
+/// - **`guarded`**: effects with assertion-chain guards and deferred
+///   `NextByte` timing that cannot be resolved immediately.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CompiledTargetEffects {
     /// Local counter motion for this target.
@@ -605,9 +610,9 @@ pub(crate) fn eval_assert_chain(
             AssertEval::Fail => return false,
             AssertEval::Defer => {
                 // The assertion needs the next byte — can't resolve yet.
-                // This shouldn't happen for NextByte effects (we have the
-                // next byte), but for EndOnly it means we treat it as
-                // failure (conservative).
+                // For mid-input NextByte effects this shouldn't happen
+                // (we have the next byte).  For EOI resolution (at_end=true,
+                // next=None), treat as failure (conservative).
                 return false;
             }
         }
@@ -888,14 +893,6 @@ pub(crate) fn compile_target_effects(
                         },
                         atoms: vec![EffectAtom::MatchAtEnd].into_boxed_slice(),
                     });
-                    // Also an EndOnly variant for finish().
-                    guarded.push(GuardedEffect {
-                        timing: EffectTiming::EndOnly,
-                        guard: EffectGuard {
-                            assert_chain: chain_id,
-                        },
-                        atoms: vec![EffectAtom::MatchAtEnd].into_boxed_slice(),
-                    });
                 }
             }
 
@@ -1073,7 +1070,6 @@ mod tests {
     #[test]
     fn test_effect_timing_display() {
         assert_eq!(format!("{}", EffectTiming::NextByte), "next_byte");
-        assert_eq!(format!("{}", EffectTiming::EndOnly), "end_only");
     }
 
     #[test]

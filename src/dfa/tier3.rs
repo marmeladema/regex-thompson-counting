@@ -2779,9 +2779,6 @@ pub struct Tier3DfaMatcher<'a> {
     /// for the next boundary.  See [`pending_effects_current`] for the
     /// full lifecycle.
     pending_effects_next: Vec<tier3_effects::PendingEffect>,
-    /// Pending effects with `EffectTiming::EndOnly` — evaluated in
-    /// `finish()` at end-of-input.
-    pending_effects_end_only: Vec<tier3_effects::PendingEffect>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3413,7 +3410,6 @@ impl<'a> Tier3DfaMatcher<'a> {
             prefilter: regex.prefilter,
             pending_effects_current: Vec::new(),
             pending_effects_next: Vec::new(),
-            pending_effects_end_only: Vec::new(),
         }
     }
 
@@ -3441,7 +3437,6 @@ impl<'a> Tier3DfaMatcher<'a> {
         self.post_break_tails.clear();
         self.pending_effects_current.clear();
         self.pending_effects_next.clear();
-        self.pending_effects_end_only.clear();
 
         let trans = self.cache.populate(
             self.memory,
@@ -4121,10 +4116,6 @@ impl fmt::Debug for Tier3DfaMatcher<'_> {
             .field(
                 "pending_effects_next_len",
                 &self.pending_effects_next.len(),
-            )
-            .field(
-                "pending_effects_end_only_len",
-                &self.pending_effects_end_only.len(),
             );
         s.finish()
     }
@@ -4251,16 +4242,6 @@ impl fmt::Display for Tier3DfaMatcher<'_> {
         if !self.pending_effects_next.is_empty() {
             write!(f, "\n  eff_next: [")?;
             for (i, pe) in self.pending_effects_next.iter().enumerate() {
-                if i > 0 {
-                    write!(f, ", ")?;
-                }
-                write!(f, "{pe}")?;
-            }
-            write!(f, "]")?;
-        }
-        if !self.pending_effects_end_only.is_empty() {
-            write!(f, "\n  eff_end_only: [")?;
-            for (i, pe) in self.pending_effects_end_only.iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
