@@ -1172,4 +1172,351 @@ mod tests {
         assert!(s.contains("adv=[1]"));
         assert!(s.contains("cont=[3]"));
     }
+
+    // -----------------------------------------------------------------------
+    // Semantic tests for resolve_pending() and eval_assert_chain()
+    // -----------------------------------------------------------------------
+
+    /// Build a compiled `Regex` from a pattern string (test helper).
+    fn build_regex(pattern: &str) -> crate::Regex {
+        use regex_syntax::ast::parse::ParserBuilder;
+        use regex_syntax::hir::translate::TranslatorBuilder;
+
+        let ast = ParserBuilder::new()
+            .build()
+            .parse(pattern)
+            .expect("regex-syntax AST parse should succeed");
+        let hir = TranslatorBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .dot_matches_new_line(true)
+            .build()
+            .translate(pattern, &ast)
+            .expect("regex-syntax HIR translation should succeed");
+        crate::RegexBuilder::default()
+            .build(&hir)
+            .expect("builder should accept the HIR")
+    }
+
+    /// Find the first NFA state index with `State::Assert { kind, .. }`
+    /// matching the given `AssertKind`.
+    fn find_assert_state(regex: &crate::Regex, target_kind: crate::AssertKind) -> StateIdx {
+        for (i, state) in regex.states.0.iter().enumerate() {
+            if let crate::State::Assert { kind, .. } = state {
+                if *kind == target_kind {
+                    return StateIdx(i as u32);
+                }
+            }
+        }
+        panic!("no Assert({target_kind:?}) state found in regex");
+    }
+
+    #[test]
+    fn test_resolve_pending_unconditional_match() {
+        let regex = build_regex("a");
+        let arena = AssertChainArena::new();
+        let effects = vec![PendingEffect {
+            timing: EffectTiming::NextByte,
+            guard: EffectGuard::ALWAYS,
+            atoms: Box::new([EffectAtom::Match]),
+            prev_was_word: false,
+        }];
+        // Should resolve regardless of boundary context.
+        let actions = resolve_pending(
+            &effects,
+            EffectTiming::NextByte,
+            &arena,
+            false,
+            Some(b'x'),
+            &regex,
+        );
+        assert!(actions.set_match, "unconditional Match should resolve");
+        assert!(!actions.set_match_at_end);
+        assert!(actions.seeds.is_empty());
+        assert!(actions.tails.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_pending_assert_chain_passes() {
+        // Pattern `a\b$`: after consuming `a`, the \b assert leads to
+        // `$ → Match`.  Use AddTail to test the assertion guard without
+        // the downstream match reachability check (which is skipped for
+        // non-match atoms).
+        let regex = build_regex(r"a\b");
+        let wb_state = find_assert_state(&regex, crate::AssertKind::WordAscii);
+        let mut arena = AssertChainArena::new();
+        let chain_id = arena.intern(&[wb_state]);
+        let effects = vec![PendingEffect {
+            timing: EffectTiming::NextByte,
+            guard: EffectGuard {
+                assert_chain: chain_id,
+            },
+            atoms: vec![EffectAtom::AddTail {
+                origin: StateIdx(0),
+            }]
+            .into_boxed_slice(),
+            // prev byte is word
+            prev_was_word: true,
+        }];
+        // next byte is non-word → boundary exists → \b passes
+        let actions = resolve_pending(
+            &effects,
+            EffectTiming::NextByte,
+            &arena,
+            false,
+            Some(b' '),
+            &regex,
+        );
+        assert!(
+            !actions.tails.is_empty(),
+            "\\b should pass at word→non-word boundary"
+        );
+    }
+
+    #[test]
+    fn test_resolve_pending_assert_chain_fails() {
+        // Same pattern `a\b`, but boundary condition NOT met: word→word.
+        let regex = build_regex(r"a\b");
+        let wb_state = find_assert_state(&regex, crate::AssertKind::WordAscii);
+        let mut arena = AssertChainArena::new();
+        let chain_id = arena.intern(&[wb_state]);
+        let effects = vec![PendingEffect {
+            timing: EffectTiming::NextByte,
+            guard: EffectGuard {
+                assert_chain: chain_id,
+            },
+            atoms: vec![EffectAtom::AddTail {
+                origin: StateIdx(0),
+            }]
+            .into_boxed_slice(),
+            // prev byte is word
+            prev_was_word: true,
+        }];
+        // next byte is also word → no boundary → \b fails
+        let actions = resolve_pending(
+            &effects,
+            EffectTiming::NextByte,
+            &arena,
+            false,
+            Some(b'a'),
+            &regex,
+        );
+        assert!(
+            actions.tails.is_empty(),
+            "\\b should fail at word→word (no boundary)"
+        );
+    }
+
+    #[test]
+    fn test_resolve_pending_contradictory_or_alternatives() {
+        // Two pending effects for the same action — one guarded by \b,
+        // one guarded by \B.  At ANY boundary, exactly one should resolve
+        // (OR semantics via multiple effects).
+        // Use AddTail atoms to avoid downstream reachability checks.
+        let regex = build_regex(r"a\b|a\B");
+        let wb = find_assert_state(&regex, crate::AssertKind::WordAscii);
+        let nwb = find_assert_state(&regex, crate::AssertKind::WordAsciiNegate);
+
+        let mut arena = AssertChainArena::new();
+        let wb_chain = arena.intern(&[wb]);
+        let nwb_chain = arena.intern(&[nwb]);
+
+        let make_effects = || {
+            vec![
+                PendingEffect {
+                    timing: EffectTiming::NextByte,
+                    guard: EffectGuard {
+                        assert_chain: wb_chain,
+                    },
+                    atoms: vec![EffectAtom::AddTail {
+                        origin: StateIdx(0),
+                    }]
+                    .into_boxed_slice(),
+                    prev_was_word: true,
+                },
+                PendingEffect {
+                    timing: EffectTiming::NextByte,
+                    guard: EffectGuard {
+                        assert_chain: nwb_chain,
+                    },
+                    atoms: vec![EffectAtom::AddTail {
+                        origin: StateIdx(1),
+                    }]
+                    .into_boxed_slice(),
+                    prev_was_word: true,
+                },
+            ]
+        };
+
+        // Word → non-word: \b passes, \B fails — one tail should resolve.
+        let effects1 = make_effects();
+        let actions = resolve_pending(
+            &effects1,
+            EffectTiming::NextByte,
+            &arena,
+            false,
+            Some(b' '),
+            &regex,
+        );
+        assert!(
+            !actions.tails.is_empty(),
+            "OR alternatives: \\b should pass at word→non-word"
+        );
+        assert!(
+            actions.tails.contains(&StateIdx(0)),
+            "\\b tail should be present"
+        );
+
+        // Word → word: \b fails, \B passes — other tail should resolve.
+        let effects2 = make_effects();
+        let actions2 = resolve_pending(
+            &effects2,
+            EffectTiming::NextByte,
+            &arena,
+            false,
+            Some(b'a'),
+            &regex,
+        );
+        assert!(
+            !actions2.tails.is_empty(),
+            "OR alternatives: \\B should pass at word→word"
+        );
+        assert!(
+            actions2.tails.contains(&StateIdx(1)),
+            "\\B tail should be present"
+        );
+    }
+
+    #[test]
+    fn test_resolve_pending_conjunctive_chain() {
+        // A single chain of [\b, \B] (AND semantics).
+        // \b and \B are contradictory — AND can never pass.
+        // Use AddTail to avoid downstream reachability checks.
+        let regex = build_regex(r"a\b|a\B");
+        let wb = find_assert_state(&regex, crate::AssertKind::WordAscii);
+        let nwb = find_assert_state(&regex, crate::AssertKind::WordAsciiNegate);
+
+        let mut arena = AssertChainArena::new();
+        // Intern as a single chain with both (AND semantics).
+        let and_chain = arena.intern(&[wb, nwb]);
+
+        let effects = vec![PendingEffect {
+            timing: EffectTiming::NextByte,
+            guard: EffectGuard {
+                assert_chain: and_chain,
+            },
+            atoms: vec![EffectAtom::AddTail {
+                origin: StateIdx(0),
+            }]
+            .into_boxed_slice(),
+            prev_was_word: true,
+        }];
+
+        // Word → non-word: \b passes but \B fails → AND fails.
+        let actions = resolve_pending(
+            &effects,
+            EffectTiming::NextByte,
+            &arena,
+            false,
+            Some(b' '),
+            &regex,
+        );
+        assert!(
+            actions.tails.is_empty(),
+            "AND chain of \\b+\\B should never pass"
+        );
+
+        // Word → word: \b fails → AND fails immediately.
+        let actions2 = resolve_pending(
+            &effects,
+            EffectTiming::NextByte,
+            &arena,
+            false,
+            Some(b'a'),
+            &regex,
+        );
+        assert!(
+            actions2.tails.is_empty(),
+            "AND chain of \\b+\\B should never pass (2)"
+        );
+    }
+
+    #[test]
+    fn test_resolve_pending_add_tail() {
+        let regex = build_regex("a");
+        let arena = AssertChainArena::new();
+        let effects = vec![PendingEffect {
+            timing: EffectTiming::NextByte,
+            guard: EffectGuard::ALWAYS,
+            atoms: vec![EffectAtom::AddTail {
+                origin: StateIdx(5),
+            }]
+            .into_boxed_slice(),
+            prev_was_word: false,
+        }];
+        let actions = resolve_pending(
+            &effects,
+            EffectTiming::NextByte,
+            &arena,
+            false,
+            Some(b'x'),
+            &regex,
+        );
+        assert_eq!(actions.tails, vec![StateIdx(5)]);
+        assert!(!actions.set_match);
+    }
+
+    #[test]
+    fn test_resolve_pending_add_seed() {
+        let regex = build_regex("a");
+        let arena = AssertChainArena::new();
+        let effects = vec![PendingEffect {
+            timing: EffectTiming::NextByte,
+            guard: EffectGuard::ALWAYS,
+            atoms: vec![EffectAtom::AddSeed {
+                counter: CounterIdx(0),
+                origin: StateIdx(3),
+                value: 1,
+            }]
+            .into_boxed_slice(),
+            prev_was_word: false,
+        }];
+        let actions = resolve_pending(
+            &effects,
+            EffectTiming::NextByte,
+            &arena,
+            false,
+            Some(b'x'),
+            &regex,
+        );
+        assert_eq!(actions.seeds.len(), 1);
+        assert_eq!(actions.seeds[0], (CounterIdx(0), StateIdx(3), 1));
+        assert!(!actions.set_match);
+    }
+
+    #[test]
+    fn test_resolve_pending_match_at_end_atom() {
+        // MatchAtEnd atom sets set_match_at_end, not set_match.
+        let regex = build_regex("a");
+        let arena = AssertChainArena::new();
+        let effects = vec![PendingEffect {
+            timing: EffectTiming::NextByte,
+            guard: EffectGuard::ALWAYS,
+            atoms: Box::new([EffectAtom::MatchAtEnd]),
+            prev_was_word: false,
+        }];
+        let actions = resolve_pending(
+            &effects,
+            EffectTiming::NextByte,
+            &arena,
+            false,
+            Some(b'x'),
+            &regex,
+        );
+        assert!(!actions.set_match, "MatchAtEnd should not set set_match");
+        assert!(
+            actions.set_match_at_end,
+            "MatchAtEnd should set set_match_at_end"
+        );
+    }
 }
