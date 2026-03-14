@@ -191,6 +191,15 @@ pub(crate) struct Tier3Analysis {
 
     /// Arena of interned assertion chains referenced by effect guards.
     pub(crate) assert_chain_arena: tier3_effects::AssertChainArena,
+
+    /// Pre-interned break-path effect data, indexed by
+    /// [`BreakEffectsId`](tier3_effects::BreakEffectsId).
+    ///
+    /// Each entry corresponds to one counter's CInc break path.  All
+    /// `Tier3OriginKind::Increment` entries for the same counter share
+    /// the same `BreakEffectsId`.  Built at the end of
+    /// [`compute_tier3_analysis`] after all break-* fields are populated.
+    pub(crate) break_effects: Box<[tier3_effects::BreakEffects]>,
 }
 
 /// What happens structurally when a byte is consumed at a given target.
@@ -278,6 +287,13 @@ pub(crate) enum Tier3OriginKind {
         /// a match).  Populated during [`compute_tier3_analysis`] after
         /// the assertion chain arena is built.
         break_deferred_chain_ids: Box<[tier3_effects::AssertChainId]>,
+        /// Index into [`Tier3Analysis::break_effects`] for the pre-interned
+        /// break-path data.  All `Increment` entries for the same counter
+        /// share the same ID.  Initialized to
+        /// [`BreakEffectsId::NONE`](tier3_effects::BreakEffectsId::NONE) in
+        /// `analyze_target()` and populated at the end of
+        /// [`compute_tier3_analysis`].
+        break_effects_id: tier3_effects::BreakEffectsId,
     },
 }
 
@@ -871,6 +887,7 @@ pub(crate) fn compute_tier3_analysis(
         target_effects: Box::new([]),
         target_assert_chain_ids: Box::new([]),
         assert_chain_arena: tier3_effects::AssertChainArena::new(),
+        break_effects: Box::new([]),
     };
 
     // -- Step 9: compile typed target effects ----------------------------------
@@ -910,6 +927,47 @@ pub(crate) fn compute_tier3_analysis(
         }
     }
     analysis.assert_chain_arena = assert_chain_arena;
+
+    // -- Step 10: build pre-interned break effects table -----------------------
+    // Extract break-path data from each Increment target into a shared
+    // BreakEffects table, indexed by BreakEffectsId.  All Increment entries
+    // for the same counter share the same CInc break path, so we intern
+    // one entry per counter.
+    {
+        let mut counter_to_id: Vec<tier3_effects::BreakEffectsId> =
+            vec![tier3_effects::BreakEffectsId::NONE; 64];
+        let mut break_effects_vec: Vec<tier3_effects::BreakEffects> = Vec::new();
+
+        for target in analysis.targets.iter_mut().flatten() {
+            if let Tier3OriginKind::Increment {
+                counter,
+                break_deferred_asserts,
+                break_consuming_states,
+                break_consuming_pure,
+                break_consuming_deferred,
+                break_deferred_chain_ids,
+                break_effects_id,
+                ..
+            } = target
+            {
+                let c = counter.idx();
+                if counter_to_id[c] == tier3_effects::BreakEffectsId::NONE {
+                    let id = tier3_effects::BreakEffectsId(break_effects_vec.len() as u16);
+                    break_effects_vec.push(tier3_effects::BreakEffects {
+                        has_deferred: !break_deferred_asserts.is_empty(),
+                        break_deferred_chain_ids: break_deferred_chain_ids.clone(),
+                        break_consuming_pure: break_consuming_pure.clone(),
+                        break_consuming_deferred: break_consuming_deferred.clone(),
+                        break_consuming_states: break_consuming_states.clone(),
+                    });
+                    counter_to_id[c] = id;
+                }
+                *break_effects_id = counter_to_id[c];
+            }
+        }
+
+        analysis.break_effects = break_effects_vec.into_boxed_slice();
+    }
 
     analysis
 }
@@ -2417,6 +2475,8 @@ fn analyze_target(
             break_consuming_deferred: Box::new([]),
             // Populated after the assertion chain arena is built.
             break_deferred_chain_ids: Box::new([]),
+            // Populated at the end of compute_tier3_analysis.
+            break_effects_id: tier3_effects::BreakEffectsId::NONE,
         })
     } else if advance_origins.is_empty() {
         if advance_is_match_at_end || advance_is_match {
@@ -2915,18 +2975,15 @@ macro_rules! step_slow_impl {
                     }
                     Some(Some(Tier3OriginKind::Increment {
                         counter,
-                        advance_origins: _,
                         min,
                         max,
                         continue_origins,
                         break_is_match,
                         break_is_match_at_end,
-                        break_deferred_asserts,
-                        break_consuming_states,
-                        break_consuming_pure,
-                        break_consuming_deferred,
-                        break_deferred_chain_ids,
+                        break_effects_id,
+                        ..
                     })) => {
+                        let be = &self.analysis.break_effects[break_effects_id.idx()];
                         // Tail hit a CInc — hand off to the counter
                         // instance machinery.  The post-break tail
                         // consumed this byte, entering the CInc for the
@@ -2966,15 +3023,15 @@ macro_rules! step_slow_impl {
                             if *break_is_match_at_end {
                                 self.match_at_end = true;
                             }
-                            if !break_deferred_asserts.is_empty() {
+                            if be.has_deferred {
                                 // Bug 51: OR semantics — one PendingEffect per chain.
                                 tier3_effects::enqueue_break_deferred_match(
                                     &mut self.pending_effects_current,
-                                    break_deferred_chain_ids,
+                                    &be.break_deferred_chain_ids,
                                     crate::is_word_byte(byte),
                                 );
                                 // Bug 45: pure tails go immediately.
-                                for &new_o in break_consuming_pure.iter() {
+                                for &new_o in be.break_consuming_pure.iter() {
                                     if !self.next_post_break_tails.contains(&new_o) {
                                         self.next_post_break_tails.push(new_o);
                                     }
@@ -2982,12 +3039,12 @@ macro_rules! step_slow_impl {
                                 // Bug 46: deferred tails with per-tail assertions.
                                 tier3_effects::enqueue_deferred_tail(
                                     &mut self.pending_effects_current,
-                                    break_consuming_deferred,
+                                    &be.break_consuming_deferred,
                                     crate::is_word_byte(byte),
                                     true, // dedup
                                 );
                             } else {
-                                for &new_o in break_consuming_states.iter() {
+                                for &new_o in be.break_consuming_states.iter() {
                                     if !self.next_post_break_tails.contains(&new_o) {
                                         self.next_post_break_tails.push(new_o);
                                     }
@@ -3071,19 +3128,16 @@ macro_rules! step_slow_impl {
                         }
                         None => {}
                         Some(Tier3OriginKind::Increment {
-                            counter: _,
                             advance_origins,
                             min,
                             max,
                             continue_origins,
                             break_is_match,
                             break_is_match_at_end,
-                            break_deferred_asserts,
-                            break_consuming_states,
-                            break_consuming_pure,
-                            break_consuming_deferred,
-                            break_deferred_chain_ids,
+                            break_effects_id,
+                            ..
                         }) => {
+                            let be = &self.analysis.break_effects[break_effects_id.idx()];
                             // Advance-or-increment: entry survives at
                             // advance_origins with the same values.
                             for &new_o in advance_origins.iter() {
@@ -3108,15 +3162,15 @@ macro_rules! step_slow_impl {
                                 if *break_is_match_at_end {
                                     self.match_at_end = true;
                                 }
-                                if !break_deferred_asserts.is_empty() {
+                                if be.has_deferred {
                                     // Bug 51: OR semantics — one PendingEffect per chain.
                                     tier3_effects::enqueue_break_deferred_match(
                                         &mut self.pending_effects_current,
-                                        break_deferred_chain_ids,
+                                        &be.break_deferred_chain_ids,
                                         crate::is_word_byte(byte),
                                     );
                                     // Bug 45: pure tails go immediately.
-                                    for &new_o in break_consuming_pure.iter() {
+                                    for &new_o in be.break_consuming_pure.iter() {
                                         if !self.next_post_break_tails.contains(&new_o) {
                                             self.next_post_break_tails.push(new_o);
                                         }
@@ -3124,12 +3178,12 @@ macro_rules! step_slow_impl {
                                     // Bug 46: deferred tails with per-tail assertions.
                                     tier3_effects::enqueue_deferred_tail(
                                         &mut self.pending_effects_current,
-                                        break_consuming_deferred,
+                                        &be.break_consuming_deferred,
                                         crate::is_word_byte(byte),
                                         true, // dedup
                                     );
                                 } else {
-                                    for &new_o in break_consuming_states.iter() {
+                                    for &new_o in be.break_consuming_states.iter() {
                                         if !self.next_post_break_tails.contains(&new_o) {
                                             self.next_post_break_tails.push(new_o);
                                         }
@@ -3592,13 +3646,10 @@ impl<'a> Tier3DfaMatcher<'a> {
                                 ref continue_origins,
                                 break_is_match,
                                 break_is_match_at_end,
-                                ref break_deferred_asserts,
-                                ref break_consuming_states,
-                                ref break_consuming_pure,
-                                ref break_consuming_deferred,
-                                ref break_deferred_chain_ids,
+                                break_effects_id,
                                 ..
                             }) => {
+                                let be = &self.analysis.break_effects[break_effects_id.idx()];
                                 // Tail hit CInc — hand off to counter.
                                 // Value starts at 0, increment to 1.
                                 let pbt_value: u32 = 0;
@@ -3629,16 +3680,16 @@ impl<'a> Tier3DfaMatcher<'a> {
                                     if break_is_match_at_end {
                                         resolved_mae = true;
                                     }
-                                    if !break_deferred_asserts.is_empty() {
+                                    if be.has_deferred {
                                         // Bug 42/51: OR semantics — one PendingEffect per chain.
                                         // Second-order: goes to pending_effects_next.
                                         tier3_effects::enqueue_break_deferred_match(
                                             &mut self.pending_effects_next,
-                                            break_deferred_chain_ids,
+                                            &be.break_deferred_chain_ids,
                                             crate::is_word_byte(b),
                                         );
                                         // Bug 45: pure tails go immediately.
-                                        for &new_o in break_consuming_pure.iter() {
+                                        for &new_o in be.break_consuming_pure.iter() {
                                             if !resolved_tails.contains(&new_o) {
                                                 resolved_tails.push(new_o);
                                             }
@@ -3647,12 +3698,12 @@ impl<'a> Tier3DfaMatcher<'a> {
                                         // Second-order: goes to pending_effects_next.
                                         tier3_effects::enqueue_deferred_tail(
                                             &mut self.pending_effects_next,
-                                            break_consuming_deferred,
+                                            &be.break_consuming_deferred,
                                             crate::is_word_byte(b),
                                             false, // no dedup — freshly-cleared next queue
                                         );
                                     } else {
-                                        for &new_o in break_consuming_states.iter() {
+                                        for &new_o in be.break_consuming_states.iter() {
                                             if !resolved_tails.contains(&new_o) {
                                                 resolved_tails.push(new_o);
                                             }

@@ -575,8 +575,9 @@ impl DumpRegex<'_> {
                             break_consuming_pure,
                             break_consuming_deferred,
                             break_deferred_chain_ids,
+                            break_effects_id,
                         } => {
-                            writeln!(f, "    state {i}: Increment(c{counter}, {{{min},{max}}})",)?;
+                            writeln!(f, "    state {i}: Increment(c{counter}, {{{min},{max}}}, {break_effects_id})",)?;
                             writeln!(
                                 f,
                                 "      advance_origins: [{}]",

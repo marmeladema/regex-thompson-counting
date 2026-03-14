@@ -208,6 +208,82 @@ impl AssertChainArena {
 }
 
 // ---------------------------------------------------------------------------
+// Break effects (interned per-counter break-path data)
+// ---------------------------------------------------------------------------
+
+/// Compact ID referencing a [`BreakEffects`] entry in
+/// [`Tier3Analysis::break_effects`](super::Tier3Analysis::break_effects).
+///
+/// All `Tier3OriginKind::Increment` entries for the same counter share
+/// the same break-path structure (because Tier 3 has exactly one CInc
+/// per counter), so break effects are interned per-counter and referenced
+/// by this ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BreakEffectsId(pub(crate) u16);
+
+impl BreakEffectsId {
+    /// Sentinel: not yet assigned (used during `analyze_target()`; must be
+    /// overwritten before the analysis is consumed at runtime).
+    pub(crate) const NONE: Self = Self(u16::MAX);
+
+    /// Return the raw index as `usize`.
+    pub(crate) fn idx(self) -> usize {
+        debug_assert!(self != Self::NONE, "BreakEffectsId::NONE used as index");
+        self.0 as usize
+    }
+}
+
+impl fmt::Display for BreakEffectsId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if *self == Self::NONE {
+            write!(f, "NONE")
+        } else {
+            write!(f, "be{}", self.0)
+        }
+    }
+}
+
+/// Pre-interned break-path effect data for a counter's CInc break.
+///
+/// Extracted from `Tier3OriginKind::Increment`'s break-* fields and
+/// stored once on [`Tier3Analysis`](super::Tier3Analysis).  At runtime,
+/// the matcher looks up break effects by [`BreakEffectsId`] instead of
+/// reading the (now removed) fields from the cloned transition cache,
+/// eliminating per-transition heap allocations from boxed-slice clones.
+///
+/// # Field semantics
+///
+/// - `has_deferred`: whether any assertions gate the break path.  When
+///   `true`, the matcher uses `break_deferred_chain_ids` and the deferred
+///   helpers; when `false`, it uses `break_consuming_states` directly.
+/// - `break_deferred_chain_ids`: **OR semantics** — each chain is an
+///   independent assertion; any one passing suffices for a match.
+/// - `break_consuming_pure`: tails with no assertion gates (deposited
+///   immediately).
+/// - `break_consuming_deferred`: tails with per-tail assertion gates
+///   (**AND per tail**, OR across tuples).
+/// - `break_consuming_states`: all consuming states (used only when
+///   `has_deferred` is `false`).
+#[derive(Clone, Debug)]
+pub(crate) struct BreakEffects {
+    /// Whether the break path has deferred assertions (`\b`, `\B`, etc.).
+    pub(crate) has_deferred: bool,
+    /// Per-entry assertion chain IDs for break-deferred asserts (OR
+    /// semantics, parallel to the original `break_deferred_asserts`).
+    pub(crate) break_deferred_chain_ids: Box<[AssertChainId]>,
+    /// Consuming states reachable from the break path WITHOUT passing
+    /// through any deferred assertion.  Deposited immediately at runtime.
+    pub(crate) break_consuming_pure: Box<[StateIdx]>,
+    /// Per-tail deferred assertions: `(origin, assert_states, chain_id)`.
+    /// Each tail is gated on its own assertion chain (AND per tail).
+    #[allow(clippy::type_complexity)]
+    pub(crate) break_consuming_deferred: Box<[(StateIdx, Box<[StateIdx]>, AssertChainId)]>,
+    /// All consuming states on the break path (used when `has_deferred`
+    /// is `false` — no assertion splitting needed).
+    pub(crate) break_consuming_states: Box<[StateIdx]>,
+}
+
+// ---------------------------------------------------------------------------
 // Effect guard
 // ---------------------------------------------------------------------------
 
@@ -983,6 +1059,7 @@ pub(crate) fn compile_target_effects(
             break_consuming_pure,
             break_consuming_deferred,
             break_deferred_chain_ids: _,
+            break_effects_id: _,
         } => {
             let step = TargetStep::Increment {
                 counter: *counter,
