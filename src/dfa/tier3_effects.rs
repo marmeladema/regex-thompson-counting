@@ -594,62 +594,54 @@ impl fmt::Display for CompiledTargetEffects {
 
 /// Per-consuming-state compiled origin effects.
 ///
-/// Captures match flags and deferred assertion chain IDs that depend on the
-/// epsilon path from a consuming state's byte-consumption edge.  Indexed by
-/// the **origin** consuming state, NOT the post-consumption target — this is
-/// distinct from [`CompiledTargetEffects`] which is keyed by target.
+/// Uses the same `immediate` / `guarded` vocabulary as
+/// [`CompiledTargetEffects`], but keyed by the **origin** consuming state
+/// rather than the post-consumption target.
 ///
 /// Used at runtime for:
 /// - Dead-target fallback: when `target_effects[target.idx()]` is `None`,
-///   the origin's match flags determine whether `$ → Match` or direct
-///   `Match` is reachable from the consumption point.
-/// - Deferred assertion deposition: when a tail advances through a live
-///   target, its per-origin deferred assertions are deposited as
-///   [`PendingEffect`] entries with `Match` atoms.
+///   the origin's `immediate` atoms determine whether `$ → Match` or
+///   direct `Match` is reachable from the consumption point (applied via
+///   [`apply_immediate_atoms()`]).
+/// - Deferred assertion deposition: when a tail advances through a target,
+///   its per-origin `guarded` effects are deposited as [`PendingEffect`]
+///   entries (via [`enqueue_guarded_effects()`]).
 #[derive(Clone, Debug)]
 pub(crate) struct CompiledOriginEffects {
-    /// True if consuming a byte at this origin's state leads to
-    /// `$ → Match` through epsilon transitions.
-    pub(crate) is_match_at_end: bool,
-    /// True if consuming a byte at this origin's state leads directly
-    /// to `Match` through epsilon transitions (not through CInc).
-    pub(crate) is_match: bool,
-    /// Interned assertion chain IDs for deferred assertions on the
-    /// epsilon path from this origin's target to downstream consuming
-    /// states or `Match`.
+    /// Unconditional immediate effects: `Match` and/or `MatchAtEnd`.
+    pub(crate) immediate: Box<[EffectAtom]>,
+    /// Deferred assertion-gated effects (each with `EffectAtom::Match`).
     ///
-    /// **Semantics: AlternativeChains (OR).**  Each chain ID is an
-    /// independent 1-element assertion chain.  At runtime, each is
-    /// emitted as its own `PendingEffect` with `EffectAtom::Match`;
-    /// any one chain passing suffices for the match to fire.
-    pub(crate) deferred_chain_ids: Box<[AssertChainId]>,
+    /// **Semantics: OR across entries.**  Each entry is an independent
+    /// assertion-gated `Match`; any one passing suffices.
+    pub(crate) guarded: Box<[GuardedEffect]>,
 }
 
 impl fmt::Display for CompiledOriginEffects {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut flags = Vec::new();
-        if self.is_match {
-            flags.push("match");
-        }
-        if self.is_match_at_end {
-            flags.push("mae");
-        }
-        if flags.is_empty() && self.deferred_chain_ids.is_empty() {
+        if self.immediate.is_empty() && self.guarded.is_empty() {
             return write!(f, "(none)");
         }
-        if !flags.is_empty() {
-            write!(f, "{}", flags.join("+"))?;
-        }
-        if !self.deferred_chain_ids.is_empty() {
-            if !flags.is_empty() {
-                write!(f, " ")?;
-            }
-            write!(f, "deferred=[")?;
-            for (i, &cid) in self.deferred_chain_ids.iter().enumerate() {
+        if !self.immediate.is_empty() {
+            write!(f, "immediate=[")?;
+            for (i, a) in self.immediate.iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
-                write!(f, "{cid}")?;
+                write!(f, "{a}")?;
+            }
+            write!(f, "]")?;
+        }
+        if !self.guarded.is_empty() {
+            if !self.immediate.is_empty() {
+                write!(f, " ")?;
+            }
+            write!(f, "guarded=[")?;
+            for (i, g) in self.guarded.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{g}")?;
             }
             write!(f, "]")?;
         }
@@ -708,34 +700,8 @@ impl fmt::Display for PendingEffect {
 // adjusting OR/AND guard semantics) require a single-site fix instead of
 // a multi-site audit.
 
-/// Deposit target-deferred match effects.
-///
-/// For each assertion chain in `chain_ids`, pushes a `PendingEffect` with
-/// a single [`EffectAtom::Match`] atom.  These represent non-End assertion
-/// states on the epsilon path from a target, which would otherwise only
-/// fire via the contaminated no_break_current DFA state.
-///
-/// **Used for:** Bug 30 / Bug 34 target deferred asserts in both the
-/// `Advance` and `Some(None)` arms of post-break tail processing and
-/// effect resolution.
-pub(crate) fn enqueue_target_deferred_match(
-    queue: &mut Vec<PendingEffect>,
-    chain_ids: &[AssertChainId],
-    prev_was_word: bool,
-) {
-    for &chain_id in chain_ids {
-        queue.push(PendingEffect {
-            timing: EffectTiming::NextByte,
-            guard: EffectGuard {
-                assert_chain: chain_id,
-            },
-            atom: EffectAtom::Match,
-            prev_was_word,
-        });
-    }
-}
-
-/// Enqueue all guarded effects from a [`CompiledTargetEffects`] entry as
+/// Enqueue all guarded effects from a [`CompiledTargetEffects`] or
+/// [`CompiledOriginEffects`] entry as
 /// [`PendingEffect`] entries in the given queue.
 ///
 /// Each [`GuardedEffect`] becomes a separate `PendingEffect` with the
@@ -1274,25 +1240,44 @@ pub(crate) fn compile_all_target_effects(
     // PendingEffect entries.
     let origin_effects: Vec<CompiledOriginEffects> = (0..states.len())
         .map(|i| {
-            let chain_ids: Box<[AssertChainId]> = analysis
+            // Build immediate atoms from match flags.
+            let mut immediate = Vec::new();
+            if analysis.target_is_match.get(i).copied().unwrap_or(false) {
+                immediate.push(EffectAtom::Match);
+            }
+            if analysis
+                .target_is_match_at_end
+                .get(i)
+                .copied()
+                .unwrap_or(false)
+            {
+                immediate.push(EffectAtom::MatchAtEnd);
+            }
+            // Build guarded effects from deferred assertions.
+            // Each individual assert becomes a 1-element chain guarding
+            // an EffectAtom::Match.
+            let guarded: Vec<GuardedEffect> = analysis
                 .target_deferred_asserts
                 .get(i)
                 .map(|asserts| {
                     asserts
                         .iter()
-                        .map(|&assert_idx| arena.intern(&[assert_idx]))
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice()
+                        .map(|&assert_idx| {
+                            let chain_id = arena.intern(&[assert_idx]);
+                            GuardedEffect {
+                                timing: EffectTiming::NextByte,
+                                guard: EffectGuard {
+                                    assert_chain: chain_id,
+                                },
+                                atom: EffectAtom::Match,
+                            }
+                        })
+                        .collect()
                 })
                 .unwrap_or_default();
             CompiledOriginEffects {
-                is_match_at_end: analysis
-                    .target_is_match_at_end
-                    .get(i)
-                    .copied()
-                    .unwrap_or(false),
-                is_match: analysis.target_is_match.get(i).copied().unwrap_or(false),
-                deferred_chain_ids: chain_ids,
+                immediate: immediate.into_boxed_slice(),
+                guarded: guarded.into_boxed_slice(),
             }
         })
         .collect();

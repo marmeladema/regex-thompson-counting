@@ -2964,21 +2964,10 @@ macro_rules! step_slow_impl {
             // break.  If it consumed this byte and its target reaches
             // `$ → Match`, set match_at_end.
             //
-            // Shared match-flag check for dead-target (None) branches.
-            // (Bug 29: ensures consistent checking.)
-            // Uses origin_effects to consolidate what were previously
-            // separate target_is_match / target_is_match_at_end arrays.
-            macro_rules! check_origin_match_flags {
-                ($self:ident, $origin:expr) => {
-                    let oe = &$self.analysis.origin_effects[$origin.idx()];
-                    if oe.is_match_at_end {
-                        $self.match_at_end = true;
-                    }
-                    if oe.is_match {
-                        $self.ever_matched = true;
-                    }
-                };
-            }
+            // Dead-target and per-origin effects now use the same
+            // immediate/guarded vocabulary as target effects.  Match flags
+            // are applied via apply_immediate_atoms(), deferred assertions
+            // via enqueue_guarded_effects().
             let mut any_can_break = false;
             // counter_broke bitmask removed in 8F — was only used by the
             // transition-level break_seeds loop.  any_can_break is still
@@ -2996,11 +2985,10 @@ macro_rules! step_slow_impl {
                                         self.next_post_break_tails.push(new_o);
                                     }
                                 }
-                                // Bug 30: deposit target deferred asserts as
-                                // PendingEffect entries with Match atoms.
-                                tier3_effects::enqueue_target_deferred_match(
+                                // Bug 30: deposit per-origin deferred asserts.
+                                tier3_effects::enqueue_guarded_effects(
                                     &mut self.pending_effects_current,
-                                    &self.analysis.origin_effects[pbo.idx()].deferred_chain_ids,
+                                    &self.analysis.origin_effects[pbo.idx()].guarded,
                                     crate::is_word_byte(byte),
                                 );
                                 // Bug 37 + Bug 47: apply byte-specific
@@ -3069,13 +3057,18 @@ macro_rules! step_slow_impl {
                         }
                     }
                     Some(None) => {
-                        // `None` target — deposit deferred asserts (Bug 34).
-                        tier3_effects::enqueue_target_deferred_match(
+                        // `None` target — apply origin effects (Bug 34).
+                        let oe = &self.analysis.origin_effects[pbo.idx()];
+                        tier3_effects::apply_immediate_atoms(
+                            &oe.immediate,
+                            &mut self.ever_matched,
+                            &mut self.match_at_end,
+                        );
+                        tier3_effects::enqueue_guarded_effects(
                             &mut self.pending_effects_current,
-                            &self.analysis.origin_effects[pbo.idx()].deferred_chain_ids,
+                            &oe.guarded,
                             crate::is_word_byte(byte),
                         );
-                        check_origin_match_flags!(self, pbo);
                     }
                     None => {
                         // Origin not in transition — byte not accepted.
@@ -3588,11 +3581,11 @@ impl<'a> Tier3DfaMatcher<'a> {
                                         &mut self.ever_matched,
                                         &mut resolved_mae,
                                     );
-                                    // Second-order: target deferred asserts
+                                    // Second-order: origin deferred asserts
                                     // go to pending_effects_next.
-                                    tier3_effects::enqueue_target_deferred_match(
+                                    tier3_effects::enqueue_guarded_effects(
                                         &mut self.pending_effects_next,
-                                        &self.analysis.origin_effects[tail.idx()].deferred_chain_ids,
+                                        &self.analysis.origin_effects[tail.idx()].guarded,
                                         crate::is_word_byte(b),
                                     );
                                 }
@@ -3662,17 +3655,16 @@ impl<'a> Tier3DfaMatcher<'a> {
                             },
                             None => {
                                 let oe = &self.analysis.origin_effects[tail.idx()];
-                                if oe.is_match_at_end {
-                                    resolved_mae = true;
-                                }
-                                if oe.is_match {
-                                    self.ever_matched = true;
-                                }
-                                // Second-order: target deferred asserts
+                                tier3_effects::apply_immediate_atoms(
+                                    &oe.immediate,
+                                    &mut self.ever_matched,
+                                    &mut resolved_mae,
+                                );
+                                // Second-order: origin deferred asserts
                                 // go to pending_effects_next.
-                                tier3_effects::enqueue_target_deferred_match(
+                                tier3_effects::enqueue_guarded_effects(
                                     &mut self.pending_effects_next,
-                                    &oe.deferred_chain_ids,
+                                    &oe.guarded,
                                     crate::is_word_byte(b),
                                 );
                             }
