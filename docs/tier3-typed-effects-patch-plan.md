@@ -37,6 +37,39 @@ The patches below follow this order.  Within each priority tier, patches are
 ordered to minimize risk: smallest scope first, each patch independently
 testable.
 
+### Exact handoff point
+
+This document uses "authoritative at runtime" in a specific, narrow sense:
+
+- `CompiledTargetEffects` becomes the single runtime source of truth for
+  **nonlocal Tier 3 semantics**
+- local counter stepping still stays in the local step data
+  (`TargetStep` / the surviving local fields on `Tier3OriginKind`)
+
+In concrete terms, the handoff happens in **Patch 8A**, not earlier.
+
+- **Patches 1-6** fix contracts, normalize semantics, and strengthen tests.
+  They do **not** make compiled effects authoritative.
+- **Patch 7** creates a single runtime funnel by replacing the many open-coded
+  enqueue sites with helper functions.  After Patch 7, there is one execution
+  path, but that path may still read legacy `Tier3OriginKind` fields.  Patch 7
+  is therefore **not** the authority flip.
+- **Patch 8A** is the authority flip.  At that point, transitions carry
+  effect-template IDs, and the helpers from Patch 7 must obtain deferred
+  matches, break seeds, deferred tails, and other guarded nonlocal behavior
+  from `CompiledTargetEffects` / template tables rather than reconstructing it
+  from legacy Tier 3 side fields.
+- **Patch 8B** and **Patch 9** make the handoff exclusive by deleting the old
+  nonlocal truth and the remaining end-of-input fallback logic.
+- **Patch 8C** and **Patch 10** optimize the new model after the semantic
+  handoff is already complete.
+
+If a future reader wants one sentence to remember, it is this:
+
+- `CompiledTargetEffects` becomes authoritative when **Patch 8A lands**
+  and all nonlocal runtime deposition reads compiled templates instead of
+  legacy analysis fields.
+
 ---
 
 ## Priority 1: Fix Broken Contracts
@@ -484,6 +517,12 @@ fn enqueue_deferred_tail(
 
 Replace every hand-coded deposit site with a call to one of these helpers.
 
+This patch is intentionally only a funneling patch.  It creates one runtime
+deposition path, but it does **not** yet make `CompiledTargetEffects`
+authoritative.  The helpers introduced here may still read legacy
+`Tier3OriginKind` fields.  That is acceptable for Patch 7 as long as there is
+now exactly one place to swap over in Patch 8A.
+
 **Sites to replace:**
 
 | Line(s) | Current logic | Helper to use |
@@ -514,6 +553,9 @@ Replace every hand-coded deposit site with a call to one of these helpers.
 **Done criteria:**
 
 - No `PendingEffect` is constructed inline outside the helpers
+- All nonlocal runtime deposition flows through a single helper layer
+- The helper layer may still read legacy fields; compiled effects are not yet
+  authoritative at this stage
 - All tests pass
 - A future OR/AND bug requires fixing in one place, not four
 
@@ -535,13 +577,32 @@ correctness risk (reconstruction logic can diverge from the compiled model).
 
 This is the most invasive patch and should be approached carefully.
 
-Phase A — add template IDs:
+Phase A — add template IDs and flip runtime authority:
 
 1. Extend `CompiledTargetEffects` with interned IDs for each effect family
 2. Store effect template IDs alongside `Tier3OriginKind` in the transition
    cache
 3. The helpers from Patch 7 should consume template IDs rather than raw
    `Tier3OriginKind` fields
+
+**This is the exact runtime handoff point.**
+
+After Phase A lands:
+
+- deferred matches
+- break seeds
+- deferred tails
+- other guarded nonlocal effects
+
+must all be deposited from compiled template data, not reconstructed from the
+legacy Tier 3 side fields.  Local counter stepping still stays in the local
+step representation; only the nonlocal semantics flip to compiled effects.
+
+Put differently:
+
+- before Patch 8A, `CompiledTargetEffects` is shadow or advisory data
+- after Patch 8A, `CompiledTargetEffects` is authoritative for nonlocal
+  runtime behavior
 
 Phase B — shrink `Tier3OriginKind`:
 
@@ -553,8 +614,12 @@ Phase B — shrink `Tier3OriginKind`:
    - `break_consuming_deferred`
    - `break_deferred_chain_ids`
 2. Keep only the fields needed for local counter stepping:
-   - `counter`, `advance_origins`, `min`, `max`, `continue_origins`
-   - `break_is_match`, `break_is_match_at_end`
+    - `counter`, `advance_origins`, `min`, `max`, `continue_origins`
+    - `break_is_match`, `break_is_match_at_end`
+
+Phase B is where the old nonlocal truth is deleted.  Patch 8A flips runtime
+authority; Patch 8B removes the obsolete representation that would otherwise
+allow semantic drift to return.
 
 Phase C — intern atom bundles:
 
@@ -580,6 +645,14 @@ Phase C — intern atom bundles:
 - `Tier3OriginKind::Increment` has no break-deferred fields
 - Hot-path `PendingEffect` construction does not heap-allocate
 - All tests pass
+
+**Authority checkpoints:**
+
+- **Done for Patch 8A:** the runtime helpers read compiled template IDs for all
+  nonlocal effects, so `CompiledTargetEffects` is authoritative at runtime
+- **Done for Patch 8B:** the legacy nonlocal fields are removed, so there is no
+  second semantic source left in `Tier3OriginKind`
+- **Done for Patch 8C:** the authoritative model is also the efficient one
 
 ---
 
@@ -761,11 +834,17 @@ Patch 2 (split pending queues) ─── independent of Patches 1,3,4
 
 Patch 7 (extract helpers) ─── depends on Patches 1-4 being stable
   │
-  └── Patch 8 (template IDs) ─── depends on Patch 7
+  └── Patch 8A (template IDs + authority flip) ─── depends on Patch 7
         │
-        ├── Patch 9 (EOI seeds) ─── depends on Patch 8 for Option B
+        ├── Patch 8B (remove legacy nonlocal fields)
+        │     │
+        │     └── Patch 9 (EOI seeds) ─── depends on Patch 8A for Option B,
+        │                                 and ideally lands after 8B
         │
-        └── Patch 10 (remove allocs) ─── depends on Patch 8 Phase C
+        └── Patch 8C (intern atom bundles)
+              │
+              └── Patch 10 (remove allocs) ─── depends on Patch 8C unless
+                                               solved as part of 8C
 
 Patch 11 (homogeneous bundles) ─── independent, can be done anytime
 ```
@@ -778,9 +857,12 @@ Patch 11 (homogeneous bundles) ─── independent, can be done anytime
 3. Patch 5 — audit pass, no behavior change
 4. Patch 6 — adds tests, benefits from Patches 1-4 being landed
 5. Patch 11 — small, independent, can slot in anywhere
-6. Patch 7 — the key structural improvement
-7. Patch 8 — the big normalization patch
-8. Patches 9, 10 — final cleanup and optimization
+6. Patch 7 — create the single runtime deposition funnel
+7. Patch 8A — make `CompiledTargetEffects` authoritative for all nonlocal
+   runtime behavior
+8. Patch 8B — delete the old nonlocal truth from `Tier3OriginKind`
+9. Patch 9 — route the remaining EOI seed logic through the same model
+10. Patch 8C and Patch 10 — optimize the now-authoritative model
 
 ## Estimated Effort
 
