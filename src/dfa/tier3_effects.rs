@@ -609,8 +609,12 @@ pub(crate) struct PendingEffect {
     pub(crate) timing: EffectTiming,
     /// Condition for this effect to be valid.
     pub(crate) guard: EffectGuard,
-    /// The atoms to apply when the guard passes.
-    pub(crate) atoms: Box<[EffectAtom]>,
+    /// The atom to apply when the guard passes.
+    ///
+    /// Each `PendingEffect` carries exactly one atom.  The deposition
+    /// helpers create one `PendingEffect` per atom, so multi-atom
+    /// effects are represented as multiple entries in the queue.
+    pub(crate) atom: EffectAtom,
     /// Word-boundary context at the time the effect was scheduled.
     pub(crate) prev_was_word: bool,
 }
@@ -619,18 +623,9 @@ impl fmt::Display for PendingEffect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "[{}|{}|pw={}]",
-            self.timing, self.guard, self.prev_was_word
-        )?;
-        for (i, atom) in self.atoms.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
-            } else {
-                write!(f, " ")?;
-            }
-            write!(f, "{atom}")?;
-        }
-        Ok(())
+            "[{}|{}|pw={}] {}",
+            self.timing, self.guard, self.prev_was_word, self.atom
+        )
     }
 }
 
@@ -670,7 +665,7 @@ pub(crate) fn enqueue_target_deferred_match(
             guard: EffectGuard {
                 assert_chain: chain_id,
             },
-            atoms: Box::new([EffectAtom::Match]),
+            atom: EffectAtom::Match,
             prev_was_word,
         });
     }
@@ -698,7 +693,7 @@ pub(crate) fn enqueue_break_deferred_match(
                 guard: EffectGuard {
                     assert_chain: chain_id,
                 },
-                atoms: Box::new([EffectAtom::Match]),
+                atom: EffectAtom::Match,
                 prev_was_word,
             });
         }
@@ -732,11 +727,9 @@ pub(crate) fn enqueue_deferred_tail(
             continue;
         }
         if dedup
-            && queue.iter().any(|pe| {
-                pe.atoms
-                    .iter()
-                    .any(|a| matches!(a, EffectAtom::AddTail { origin: o } if *o == origin))
-            })
+            && queue
+                .iter()
+                .any(|pe| matches!(pe.atom, EffectAtom::AddTail { origin: o } if o == origin))
         {
             continue;
         }
@@ -745,7 +738,7 @@ pub(crate) fn enqueue_deferred_tail(
             guard: EffectGuard {
                 assert_chain: chain_id,
             },
-            atoms: vec![EffectAtom::AddTail { origin }].into_boxed_slice(),
+            atom: EffectAtom::AddTail { origin },
             prev_was_word,
         });
     }
@@ -774,12 +767,11 @@ pub(crate) fn enqueue_deferred_seed(
         guard: EffectGuard {
             assert_chain: chain_id,
         },
-        atoms: vec![EffectAtom::AddSeed {
+        atom: EffectAtom::AddSeed {
             counter,
             origin,
             value,
-        }]
-        .into_boxed_slice(),
+        },
         prev_was_word,
     });
 }
@@ -923,13 +915,10 @@ pub(crate) fn resolve_pending(
             Some(b' ')
         };
 
-        // Check downstream reachability only when the effect contains
-        // Match or MatchAtEnd atoms — for AddSeed/AddTail the assertion
+        // Check downstream reachability only when the effect carries a
+        // Match or MatchAtEnd atom — for AddSeed/AddTail the assertion
         // is just a gate on a non-match action.
-        let has_match_atoms = pe
-            .atoms
-            .iter()
-            .any(|a| matches!(a, EffectAtom::Match | EffectAtom::MatchAtEnd));
+        let has_match_atom = matches!(pe.atom, EffectAtom::Match | EffectAtom::MatchAtEnd);
         if !eval_assert_chain(
             pe.guard.assert_chain,
             arena,
@@ -937,32 +926,30 @@ pub(crate) fn resolve_pending(
             prev,
             next,
             regex,
-            has_match_atoms,
+            has_match_atom,
         ) {
             continue;
         }
 
-        // Guard passed — apply atoms.
-        for atom in pe.atoms.iter() {
-            match atom {
-                EffectAtom::AddSeed {
-                    counter,
-                    origin,
-                    value,
-                } => {
-                    actions.seeds.push((*counter, *origin, *value));
+        // Guard passed — apply atom.
+        match pe.atom {
+            EffectAtom::AddSeed {
+                counter,
+                origin,
+                value,
+            } => {
+                actions.seeds.push((counter, origin, value));
+            }
+            EffectAtom::AddTail { origin } => {
+                if !actions.tails.contains(&origin) {
+                    actions.tails.push(origin);
                 }
-                EffectAtom::AddTail { origin } => {
-                    if !actions.tails.contains(origin) {
-                        actions.tails.push(*origin);
-                    }
-                }
-                EffectAtom::Match => {
-                    actions.set_match = true;
-                }
-                EffectAtom::MatchAtEnd => {
-                    actions.set_match_at_end = true;
-                }
+            }
+            EffectAtom::Match => {
+                actions.set_match = true;
+            }
+            EffectAtom::MatchAtEnd => {
+                actions.set_match_at_end = true;
             }
         }
     }
@@ -1394,10 +1381,9 @@ mod tests {
         let pe = PendingEffect {
             timing: EffectTiming::NextByte,
             guard: EffectGuard::ALWAYS,
-            atoms: vec![EffectAtom::AddTail {
+            atom: EffectAtom::AddTail {
                 origin: StateIdx(3),
-            }]
-            .into_boxed_slice(),
+            },
             prev_was_word: true,
         };
         let s = format!("{pe}");
@@ -1472,7 +1458,7 @@ mod tests {
         let effects = vec![PendingEffect {
             timing: EffectTiming::NextByte,
             guard: EffectGuard::ALWAYS,
-            atoms: Box::new([EffectAtom::Match]),
+            atom: EffectAtom::Match,
             prev_was_word: false,
         }];
         // Should resolve regardless of boundary context.
@@ -1505,10 +1491,9 @@ mod tests {
             guard: EffectGuard {
                 assert_chain: chain_id,
             },
-            atoms: vec![EffectAtom::AddTail {
+            atom: EffectAtom::AddTail {
                 origin: StateIdx(0),
-            }]
-            .into_boxed_slice(),
+            },
             // prev byte is word
             prev_was_word: true,
         }];
@@ -1539,10 +1524,9 @@ mod tests {
             guard: EffectGuard {
                 assert_chain: chain_id,
             },
-            atoms: vec![EffectAtom::AddTail {
+            atom: EffectAtom::AddTail {
                 origin: StateIdx(0),
-            }]
-            .into_boxed_slice(),
+            },
             // prev byte is word
             prev_was_word: true,
         }];
@@ -1582,10 +1566,9 @@ mod tests {
                     guard: EffectGuard {
                         assert_chain: wb_chain,
                     },
-                    atoms: vec![EffectAtom::AddTail {
+                    atom: EffectAtom::AddTail {
                         origin: StateIdx(0),
-                    }]
-                    .into_boxed_slice(),
+                    },
                     prev_was_word: true,
                 },
                 PendingEffect {
@@ -1593,10 +1576,9 @@ mod tests {
                     guard: EffectGuard {
                         assert_chain: nwb_chain,
                     },
-                    atoms: vec![EffectAtom::AddTail {
+                    atom: EffectAtom::AddTail {
                         origin: StateIdx(1),
-                    }]
-                    .into_boxed_slice(),
+                    },
                     prev_was_word: true,
                 },
             ]
@@ -1659,10 +1641,9 @@ mod tests {
             guard: EffectGuard {
                 assert_chain: and_chain,
             },
-            atoms: vec![EffectAtom::AddTail {
+            atom: EffectAtom::AddTail {
                 origin: StateIdx(0),
-            }]
-            .into_boxed_slice(),
+            },
             prev_was_word: true,
         }];
 
@@ -1702,10 +1683,9 @@ mod tests {
         let effects = vec![PendingEffect {
             timing: EffectTiming::NextByte,
             guard: EffectGuard::ALWAYS,
-            atoms: vec![EffectAtom::AddTail {
+            atom: EffectAtom::AddTail {
                 origin: StateIdx(5),
-            }]
-            .into_boxed_slice(),
+            },
             prev_was_word: false,
         }];
         let actions = resolve_pending(
@@ -1727,12 +1707,11 @@ mod tests {
         let effects = vec![PendingEffect {
             timing: EffectTiming::NextByte,
             guard: EffectGuard::ALWAYS,
-            atoms: vec![EffectAtom::AddSeed {
+            atom: EffectAtom::AddSeed {
                 counter: CounterIdx(0),
                 origin: StateIdx(3),
                 value: 1,
-            }]
-            .into_boxed_slice(),
+            },
             prev_was_word: false,
         }];
         let actions = resolve_pending(
@@ -1756,7 +1735,7 @@ mod tests {
         let effects = vec![PendingEffect {
             timing: EffectTiming::NextByte,
             guard: EffectGuard::ALWAYS,
-            atoms: Box::new([EffectAtom::MatchAtEnd]),
+            atom: EffectAtom::MatchAtEnd,
             prev_was_word: false,
         }];
         let actions = resolve_pending(
