@@ -423,22 +423,17 @@ pub(crate) struct GuardedEffect {
     pub(crate) timing: EffectTiming,
     /// Under what condition the effect is valid.
     pub(crate) guard: EffectGuard,
-    /// The atoms to apply when the guard passes at the given timing.
-    pub(crate) atoms: Box<[EffectAtom]>,
+    /// The atom to apply when the guard passes at the given timing.
+    ///
+    /// Each `GuardedEffect` carries exactly one atom.  Multi-atom effects
+    /// are represented as multiple `GuardedEffect` entries in the parent
+    /// [`CompiledTargetEffects::guarded`] slice.
+    pub(crate) atom: EffectAtom,
 }
 
 impl fmt::Display for GuardedEffect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}|{}]", self.timing, self.guard)?;
-        for (i, atom) in self.atoms.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
-            } else {
-                write!(f, " ")?;
-            }
-            write!(f, "{atom}")?;
-        }
-        Ok(())
+        write!(f, "[{}|{}] {}", self.timing, self.guard, self.atom)
     }
 }
 
@@ -870,9 +865,7 @@ pub(crate) fn debug_assert_origins_consuming(
     }
     // Check guarded atoms.
     for ge in effects.guarded.iter() {
-        for atom in ge.atoms.iter() {
-            assert_atom_origins_consuming(atom, &is_consuming);
-        }
+        assert_atom_origins_consuming(&ge.atom, &is_consuming);
     }
 }
 
@@ -1048,7 +1041,7 @@ pub(crate) fn compile_target_effects(
                     guard: EffectGuard {
                         assert_chain: chain_id,
                     },
-                    atoms: vec![EffectAtom::Match].into_boxed_slice(),
+                    atom: EffectAtom::Match,
                 });
             }
 
@@ -1064,7 +1057,7 @@ pub(crate) fn compile_target_effects(
                     guard: EffectGuard {
                         assert_chain: dt.chain_id,
                     },
-                    atoms: vec![EffectAtom::AddTail { origin: dt.origin }].into_boxed_slice(),
+                    atom: EffectAtom::AddTail { origin: dt.origin },
                 });
             }
 
@@ -1077,12 +1070,11 @@ pub(crate) fn compile_target_effects(
                         guard: EffectGuard {
                             assert_chain: chain_id,
                         },
-                        atoms: vec![EffectAtom::AddSeed {
+                        atom: EffectAtom::AddSeed {
                             counter: bs.counter,
                             origin: bs.origin,
                             value: 0,
-                        }]
-                        .into_boxed_slice(),
+                        },
                     });
                 }
             }
@@ -1257,7 +1249,7 @@ mod tests {
             guard: EffectGuard {
                 assert_chain: AssertChainId(0),
             },
-            atoms: vec![EffectAtom::Match].into_boxed_slice(),
+            atom: EffectAtom::Match,
         };
         assert_eq!(format!("{ge}"), "[next_byte|asserts=chain#0] Match");
     }

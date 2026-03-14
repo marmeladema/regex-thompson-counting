@@ -3017,14 +3017,13 @@ macro_rules! step_slow_impl {
                                             }
                                         }
                                     }
-                                    // Deposit guarded effects as PendingEffects.
+                                     // Deposit guarded effects as PendingEffects.
                                     let pw = crate::is_word_byte(byte);
                                     for ge in effects.guarded.iter() {
-                                        debug_assert_eq!(ge.atoms.len(), 1);
                                         self.pending_effects_current.push(tier3_effects::PendingEffect {
                                             timing: ge.timing,
                                             guard: ge.guard,
-                                            atom: ge.atoms[0].clone(),
+                                            atom: ge.atom.clone(),
                                             prev_was_word: pw,
                                         });
                                     }
@@ -3142,14 +3141,13 @@ macro_rules! step_slow_impl {
                                             }
                                         }
                                     }
-                                    // Deposit guarded effects as PendingEffects.
+                                     // Deposit guarded effects as PendingEffects.
                                     let pw = crate::is_word_byte(byte);
                                     for ge in effects.guarded.iter() {
-                                        debug_assert_eq!(ge.atoms.len(), 1);
                                         self.pending_effects_current.push(tier3_effects::PendingEffect {
                                             timing: ge.timing,
                                             guard: ge.guard,
-                                            atom: ge.atoms[0].clone(),
+                                            atom: ge.atom.clone(),
                                             prev_was_word: pw,
                                         });
                                     }
@@ -3628,11 +3626,10 @@ impl<'a> Tier3DfaMatcher<'a> {
                                         // Second-order: goes to pending_effects_next.
                                         let pw = crate::is_word_byte(b);
                                         for ge in effects.guarded.iter() {
-                                            debug_assert_eq!(ge.atoms.len(), 1);
                                             self.pending_effects_next.push(tier3_effects::PendingEffect {
                                                 timing: ge.timing,
                                                 guard: ge.guard,
-                                                atom: ge.atoms[0].clone(),
+                                                atom: ge.atom.clone(),
                                                 prev_was_word: pw,
                                             });
                                         }
