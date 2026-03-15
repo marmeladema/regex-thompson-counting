@@ -14,6 +14,7 @@
 //! differential counter logic is simply dormant.
 
 pub(crate) mod eligibility;
+pub(crate) mod overlap;
 
 use std::fmt;
 

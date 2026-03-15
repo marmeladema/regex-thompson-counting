@@ -49,15 +49,30 @@ pub(crate) struct Tier2Eligibility {
 }
 
 impl Tier2Eligibility {
-    /// Returns true when the pattern is eligible for Tier 2 under the
-    /// current (strict disjointness) rule.
-    pub(crate) fn is_eligible(&self) -> bool {
+    /// Returns true when the pattern passes all Tier 2 requirements
+    /// except the byte-overlap check.
+    pub(crate) fn base_eligible(&self) -> bool {
         self.all_fixed_length
             && !self.has_deferred_in_long_body
             && !self.has_deferred_in_multi_counter_body
             && !self.counter_info.is_empty()
             && self.counter_info.len() <= super::MAX_TIER2_COUNTERS
-            && self.disjoint_bytes
+    }
+
+    /// Returns true under the strict (disjoint bytes) rule.
+    pub(crate) fn is_eligible(&self) -> bool {
+        self.base_eligible() && self.disjoint_bytes
+    }
+
+    /// Returns true under the relaxed rule: either disjoint bytes
+    /// (fast path) or a proven binary-exact overlap proof.
+    pub(crate) fn is_eligible_with_proof(&self, proof: super::overlap::Tier2OverlapProof) -> bool {
+        self.base_eligible()
+            && matches!(
+                proof,
+                super::overlap::Tier2OverlapProof::DisjointFastPath
+                    | super::overlap::Tier2OverlapProof::ProvenBinaryExact
+            )
     }
 }
 
