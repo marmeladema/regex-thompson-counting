@@ -3782,23 +3782,41 @@ impl<'a> NfaMatcher<'a> {
         }
 
         while let Some((idx, ctx)) = clist.pop() {
-            let target = match self.states[idx] {
-                State::Byte { byte: b2, out, .. } if b == b2 => out,
-                State::ByteCI { byte: b2, out, .. } if byte_match_ci(b, b2) => out,
-                State::ByteClass { class, out, .. } if self.classes[class][b] => out,
+            let (target, exit) = match self.states[idx] {
+                State::Byte {
+                    byte: b2,
+                    out,
+                    out_exit,
+                } if b == b2 => (out, out_exit),
+                State::ByteCI {
+                    byte: b2,
+                    out,
+                    out_exit,
+                } if byte_match_ci(b, b2) => (out, out_exit),
+                State::ByteClass {
+                    class,
+                    out,
+                    out_exit,
+                } if self.classes[class][b] => (out, out_exit),
                 State::ByteTable { table } => {
                     let t = self.byte_tables[table][b];
                     if t == StateIdx::NONE {
                         self.counter_pool.free(ctx.range);
                         continue;
                     }
-                    t
+                    (t, StateIdx::NONE)
                 }
                 _ => {
                     self.counter_pool.free(ctx.range);
                     continue;
                 }
             };
+            // Fused consume-and-branch: if out_exit is set, activate
+            // both successors (equivalent to Consume → Split).
+            if exit != StateIdx::NONE {
+                let ctx2 = ctx.clone(self.counter_pool);
+                self.addstack.push(AddStateOp::Visit(exit, ctx2));
+            }
             self.addstack.push(AddStateOp::Visit(target, ctx));
             any_consumed = true;
         }
