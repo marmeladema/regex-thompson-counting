@@ -891,6 +891,20 @@ impl Tier2DfaCache {
             0
         };
 
+        // Debug assertion for non-overlap-proven patterns: the disjoint-bytes
+        // guarantee means counting_mask should have at most 1 bit set.
+        // For overlap-proven patterns, multi-CInc is expected and was
+        // validated by the binary-exactness proof at compile time.
+        debug_assert!(
+            regex.tier2_overlap_proven || counting_mask.count_ones() <= 1,
+            "Tier 2 disjoint-body pattern has counting_mask with {} bits set \
+             on DFA state {:?} byte {}: this violates the disjoint-bytes \
+             invariant (the overlap proof was not used for this pattern)",
+            counting_mask.count_ones(),
+            from,
+            byte,
+        );
+
         // Build the post-seed list from probe seeds.
         let mut seed_list: Vec<(CounterIdx, u32)> = probe
             .seed_instances

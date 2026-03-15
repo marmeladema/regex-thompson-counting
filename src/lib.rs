@@ -799,6 +799,10 @@ pub struct Regex {
     /// `true` when this pattern has non-nested counters with fixed-length
     /// bodies and can use the Tier 2 differential-counter DFA.
     tier2_eligible: bool,
+    /// True when Tier 2 eligibility was granted through the overlap
+    /// proof path (not the disjoint fast path).  Used for debug
+    /// assertions in `populate()`.
+    tier2_overlap_proven: bool,
     /// Precomputed NFA analysis for Tier 2 (body interior data for
     /// differential counters).  `None` when the pattern is not tier 2
     /// eligible.
@@ -2360,6 +2364,7 @@ impl RegexBuilder {
 
         let mut tier2_eligible = non_nested_eligible
             && tier2_elig.as_ref().is_some_and(|e| e.is_eligible());
+        let mut tier2_overlap_proven = false;
 
         // Compute byte equivalence classes before moving data out.
         let classes_slice: Vec<ByteClass> = self.classes.iter().copied().collect();
@@ -2441,7 +2446,11 @@ impl RegexBuilder {
                 analysis,
                 self.counters.len(),
             );
-            tier2_eligible = elig.is_eligible_with_proof(proof.proof);
+            let admitted = elig.is_eligible_with_proof(proof.proof);
+            if admitted {
+                tier2_eligible = true;
+                tier2_overlap_proven = true;
+            }
         }
 
         // Precompute Tier 3 analysis if eligible.
@@ -2477,6 +2486,7 @@ impl RegexBuilder {
             start_closure_matches,
             dfa_eligible,
             tier2_eligible,
+            tier2_overlap_proven,
             tier2_analysis,
             tier3_eligible,
             tier3_analysis,
