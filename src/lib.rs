@@ -1634,6 +1634,12 @@ impl RegexBuilder {
                     // (CI + body + CInc) or be unrolled.  Estimate the
                     // counter path cost: inner + 2 (CI + CInc) + 1 (Split
                     // for the loop).  If min==0, add 1 for the outer `?`.
+                    //
+                    // Note: for single-atom bodies that will use dense
+                    // encoding, the actual unrolled cost is `max` (lower
+                    // than the counter estimate).  We deliberately keep
+                    // the counter estimate here to avoid penalising outer
+                    // unroll decisions that depend on this body's cost.
                     let counter_cost = inner + 3 + if min == 0 { 1 } else { 0 };
                     Some(counter_cost)
                 }
