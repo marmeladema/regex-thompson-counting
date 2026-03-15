@@ -1232,12 +1232,12 @@ impl<'a> Tier4DfaMatcher<'a> {
                 .as_ref()
                 .unwrap();
             for &seed_origin in origins.iter() {
-                // Look up the program for this seed origin.
-                let prog_idx = origin_table
-                    .iter()
-                    .find(|(o, _)| *o == seed_origin)
-                    .map(|(_, idx)| *idx);
-                if let Some(prog_idx) = prog_idx {
+                // Look up ALL programs for this seed origin (may be >1
+                // with dense out_exit encoding).
+                for &(o, prog_idx) in origin_table.iter() {
+                    if o != seed_origin {
+                        continue;
+                    }
                     let prog = &self.cache.programs[prog_idx.0 as usize];
                     // Seed contexts are empty — execute the program
                     // with a fresh context.
@@ -1272,6 +1272,8 @@ impl<'a> Tier4DfaMatcher<'a> {
         } else {
             for (ctx_origin, mut ctx) in self.contexts.drain(..) {
                 // Find the program for this context's origin NFA state.
+                // With dense out_exit encoding, an origin may have
+                // multiple programs; execute all of them.
                 let prog_idx = if origin_table.len() == 1 {
                     let (origin, idx) = origin_table[0];
                     if origin == ctx_origin {
@@ -1285,6 +1287,36 @@ impl<'a> Tier4DfaMatcher<'a> {
                         .find(|(origin, _)| *origin == ctx_origin)
                         .map(|(_, idx)| *idx)
                 };
+                // Execute additional programs for this origin (second+
+                // targets from out_exit), cloning the context for each.
+                if prog_idx.is_some() {
+                    for &(o, extra_prog_idx) in origin_table.iter() {
+                        if o != ctx_origin {
+                            continue;
+                        }
+                        if Some(extra_prog_idx) == prog_idx {
+                            continue; // skip the primary — handled below
+                        }
+                        let cloned_ctx = ctx.clone(self.pool);
+                        let prog = &self.cache.programs[extra_prog_idx.0 as usize];
+                        self.results.clear();
+                        execute_program(prog, &cloned_ctx, self.pool, &mut self.results);
+                        for r in self.results.drain(..) {
+                            match r {
+                                ProgramResult::Continue(new_origin, new_ctx) => {
+                                    self.next_contexts.push((new_origin, new_ctx));
+                                }
+                                ProgramResult::Match => {
+                                    self.ever_matched = true;
+                                }
+                                ProgramResult::MatchAtEnd => {
+                                    self.match_at_end = true;
+                                }
+                            }
+                        }
+                        self.pool.free(cloned_ctx.into_range());
+                    }
+                }
                 if let Some(prog_idx) = prog_idx {
                     let prog = &self.cache.programs[prog_idx.0 as usize];
                     // Fast path: single Increment with one active branch.

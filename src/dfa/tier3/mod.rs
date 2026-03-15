@@ -1851,20 +1851,33 @@ impl Tier3DfaCache {
         // Build per-origin target indices from the precomputed analysis.
         //
         // The analysis is indexed by *target* state (the NFA state
-        // reached after byte consumption), not by origin.  Each origin
-        // produces exactly one target, so `targets[0]` is the lookup key.
-        // We store the target index instead of cloning the full
-        // `Option<Tier3OriginKind>` — the structural action is looked up
-        // from `analysis.target_effects` at runtime.  The NFA state index
-        // serves as a de facto effect template ID (no separate newtype;
-        // deduplication is moot since each state has at most one CTE).
+        // reached after byte consumption), not by origin.  With dense
+        // single-atom encoding, one origin may produce two targets
+        // (out + out_exit), so origin_keys may contain duplicates.
         let mut origin_keys = Vec::new();
         let mut origin_targets_vec = Vec::new();
         for &(origin, ref targets) in &targets_per_origin {
-            debug_assert_eq!(targets.len(), 1);
-            let target = targets[0];
-            origin_keys.push(origin);
-            origin_targets_vec.push(target);
+            for &target in targets {
+                origin_keys.push(origin);
+                origin_targets_vec.push(target);
+            }
+        }
+
+        /// Check if ANY target for `origin` in the flattened origin/target
+        /// arrays has an Increment target effect.
+        fn origin_has_increment(
+            origin: StateIdx,
+            origin_keys: &[StateIdx],
+            origin_targets_vec: &[StateIdx],
+            targets: &[Option<Tier3OriginKind>],
+        ) -> bool {
+            origin_keys
+                .iter()
+                .zip(origin_targets_vec.iter())
+                .any(|(&k, &t)| {
+                    k == origin
+                        && matches!(targets[t.idx()], Some(Tier3OriginKind::Increment { .. }))
+                })
         }
 
         // Compute seed initial values for non-counting transitions.
@@ -1874,11 +1887,7 @@ impl Tier3DfaCache {
         // no increment to provide the +1.
         if !is_counting {
             for rs in &mut resolved_seeds {
-                if let Some(pos) = origin_keys.iter().position(|&k| k == rs.1)
-                    && matches!(
-                        analysis.targets[origin_targets_vec[pos].idx()],
-                        Some(Tier3OriginKind::Increment { .. })
-                    )
+                if origin_has_increment(rs.1, &origin_keys, &origin_targets_vec, &analysis.targets)
                 {
                     rs.2 = 1;
                 }
@@ -1930,17 +1939,17 @@ impl Tier3DfaCache {
             let pre_seeds: Vec<(CounterIdx, StateIdx, u32)> = resolved_seeds
                 .iter()
                 .filter(|rs| {
-                    origin_keys
-                        .iter()
-                        .position(|&k| k == rs.1)
-                        .is_some_and(|pos| {
-                            matches!(analysis.targets[origin_targets_vec[pos].idx()], Some(Tier3OriginKind::Increment { .. }))
-                        })
-                        // Bug 40: exclude break-gated seeds — origins NOT
-                        // reachable_without_break are counter-break-
-                        // dependent and should not be treated as
-                        // unconditional pre_seeds.
-                        && analysis.reachable_without_break[rs.1.idx()]
+                    origin_has_increment(
+                        rs.1,
+                        &origin_keys,
+                        &origin_targets_vec,
+                        &analysis.targets,
+                    )
+                    // Bug 40: exclude break-gated seeds — origins NOT
+                    // reachable_without_break are counter-break-
+                    // dependent and should not be treated as
+                    // unconditional pre_seeds.
+                    && analysis.reachable_without_break[rs.1.idx()]
                 })
                 .cloned()
                 .collect();
@@ -3063,111 +3072,124 @@ macro_rules! step_slow_impl {
             self.next_post_break_tails.clear();
             self.tail_epoch = self.tail_epoch.wrapping_add(1);
             for &pbo in &self.post_break_tails {
-                let pos = t.origin_keys.iter().position(|&k| k == pbo);
-                match pos.map(|i| &self.analysis.target_effects[t.origin_targets[i].idx()]) {
-                    Some(Some(effects)) => {
-                        match &effects.step {
-                            tier3_effects::TargetStep::Advance { new_origins } => {
-                                for &new_o in new_origins {
-                                    if self.tail_seen[new_o.idx()] != self.tail_epoch {
-                                        self.tail_seen[new_o.idx()] = self.tail_epoch;
-                                        self.next_post_break_tails.push(new_o);
-                                    }
-                                }
-                                // Bug 30: deposit per-origin deferred asserts.
-                                tier3_effects::enqueue_guarded_effects(
-                                    &mut self.pending_effects_current,
-                                    &self.analysis.origin_effects[pbo.idx()].guarded,
-                                    byte_is_word,
-                                );
-                                // Bug 37 + Bug 47: apply byte-specific
-                                // immediate effects from the compiled Advance.
-                                tier3_effects::apply_immediate_atoms(
-                                    &effects.immediate,
-                                    &mut self.ever_matched,
-                                    &mut self.match_at_end,
-                                );
-                            }
-                            tier3_effects::TargetStep::Increment {
-                                counter,
-                                min,
-                                max,
-                                continue_origins,
-                                ..
-                            } => {
-                                // Tail hit a CInc — hand off to the counter
-                                // instance machinery.  The post-break tail
-                                // consumed this byte, entering the CInc for the
-                                // first time (value 0 → incremented to 1).
-                                //
-                                // Insert the continued instance directly into
-                                // `$next` to avoid double-counting: the counter
-                                // loop (below) processes `$current`, and we
-                                // don't want this byte to be counted twice.
-                                let pbt_value: u32 = 0;
-                                // Check continue (value after increment < max).
-                                if pbt_value + 1 < *max {
-                                    for &new_o in continue_origins {
-                                        self.$next.seed(counter.idx(), new_o, pbt_value + 1);
-                                    }
-                                }
-                                // Check break (value after increment >= min).
-                                // Bug 36: the tail→CInc handoff IS a counter
-                                // break — set any_can_break so the DFA
-                                // selects with_break.
-                                if pbt_value + 1 >= *min {
-                                    any_can_break = true;
-                                    // Apply on_break atoms from CompiledTargetEffects.
-                                    for atom in &effects.on_break {
-                                        match atom {
-                                            tier3_effects::EffectAtom::Match => {
-                                                self.ever_matched = true;
-                                            }
-                                            tier3_effects::EffectAtom::MatchAtEnd => {
-                                                self.match_at_end = true;
-                                            }
-                                            tier3_effects::EffectAtom::AddTail { origin } => {
-                                                if self.tail_seen[origin.idx()] != self.tail_epoch {
-                                                    self.tail_seen[origin.idx()] = self.tail_epoch;
-                                                    self.next_post_break_tails.push(*origin);
-                                                }
-                                            }
-                                            tier3_effects::EffectAtom::AddSeed {
-                                                counter: sc,
-                                                origin: so,
-                                                value: sv,
-                                            } => {
-                                                self.$next.seed(sc.idx(), *so, *sv);
-                                            }
+                // Collect ALL target indices for this origin (may be >1
+                // with dense out_exit encoding).
+                let target_indices: Vec<usize> = t
+                    .origin_keys
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &k)| if k == pbo { Some(i) } else { None })
+                    .collect();
+                if target_indices.is_empty() {
+                    // Origin not found — skip.
+                    continue;
+                }
+                for &pos in &target_indices {
+                    match &self.analysis.target_effects[t.origin_targets[pos].idx()] {
+                        Some(effects) => {
+                            match &effects.step {
+                                tier3_effects::TargetStep::Advance { new_origins } => {
+                                    for &new_o in new_origins {
+                                        if self.tail_seen[new_o.idx()] != self.tail_epoch {
+                                            self.tail_seen[new_o.idx()] = self.tail_epoch;
+                                            self.next_post_break_tails.push(new_o);
                                         }
                                     }
+                                    // Bug 30: deposit per-origin deferred asserts.
                                     tier3_effects::enqueue_guarded_effects(
                                         &mut self.pending_effects_current,
-                                        &effects.guarded,
+                                        &self.analysis.origin_effects[pbo.idx()].guarded,
                                         byte_is_word,
                                     );
+                                    // Bug 37 + Bug 47: apply byte-specific
+                                    // immediate effects from the compiled Advance.
+                                    tier3_effects::apply_immediate_atoms(
+                                        &effects.immediate,
+                                        &mut self.ever_matched,
+                                        &mut self.match_at_end,
+                                    );
+                                }
+                                tier3_effects::TargetStep::Increment {
+                                    counter,
+                                    min,
+                                    max,
+                                    continue_origins,
+                                    ..
+                                } => {
+                                    // Tail hit a CInc — hand off to the counter
+                                    // instance machinery.  The post-break tail
+                                    // consumed this byte, entering the CInc for the
+                                    // first time (value 0 → incremented to 1).
+                                    //
+                                    // Insert the continued instance directly into
+                                    // `$next` to avoid double-counting: the counter
+                                    // loop (below) processes `$current`, and we
+                                    // don't want this byte to be counted twice.
+                                    let pbt_value: u32 = 0;
+                                    // Check continue (value after increment < max).
+                                    if pbt_value + 1 < *max {
+                                        for &new_o in continue_origins {
+                                            self.$next.seed(counter.idx(), new_o, pbt_value + 1);
+                                        }
+                                    }
+                                    // Check break (value after increment >= min).
+                                    // Bug 36: the tail→CInc handoff IS a counter
+                                    // break — set any_can_break so the DFA
+                                    // selects with_break.
+                                    if pbt_value + 1 >= *min {
+                                        any_can_break = true;
+                                        // Apply on_break atoms from CompiledTargetEffects.
+                                        for atom in &effects.on_break {
+                                            match atom {
+                                                tier3_effects::EffectAtom::Match => {
+                                                    self.ever_matched = true;
+                                                }
+                                                tier3_effects::EffectAtom::MatchAtEnd => {
+                                                    self.match_at_end = true;
+                                                }
+                                                tier3_effects::EffectAtom::AddTail { origin } => {
+                                                    if self.tail_seen[origin.idx()]
+                                                        != self.tail_epoch
+                                                    {
+                                                        self.tail_seen[origin.idx()] =
+                                                            self.tail_epoch;
+                                                        self.next_post_break_tails.push(*origin);
+                                                    }
+                                                }
+                                                tier3_effects::EffectAtom::AddSeed {
+                                                    counter: sc,
+                                                    origin: so,
+                                                    value: sv,
+                                                } => {
+                                                    self.$next.seed(sc.idx(), *so, *sv);
+                                                }
+                                            }
+                                        }
+                                        tier3_effects::enqueue_guarded_effects(
+                                            &mut self.pending_effects_current,
+                                            &effects.guarded,
+                                            byte_is_word,
+                                        );
+                                    }
                                 }
                             }
                         }
+                        None => {
+                            // `None` target — apply origin effects (Bug 34).
+                            let oe = &self.analysis.origin_effects[pbo.idx()];
+                            tier3_effects::apply_immediate_atoms(
+                                &oe.immediate,
+                                &mut self.ever_matched,
+                                &mut self.match_at_end,
+                            );
+                            tier3_effects::enqueue_guarded_effects(
+                                &mut self.pending_effects_current,
+                                &oe.guarded,
+                                byte_is_word,
+                            );
+                        }
                     }
-                    Some(None) => {
-                        // `None` target — apply origin effects (Bug 34).
-                        let oe = &self.analysis.origin_effects[pbo.idx()];
-                        tier3_effects::apply_immediate_atoms(
-                            &oe.immediate,
-                            &mut self.ever_matched,
-                            &mut self.match_at_end,
-                        );
-                        tier3_effects::enqueue_guarded_effects(
-                            &mut self.pending_effects_current,
-                            &oe.guarded,
-                            byte_is_word,
-                        );
-                    }
-                    None => {
-                        // Origin not in transition — byte not accepted.
-                    }
-                }
+                } // for &pos in &target_indices
             }
 
             // Apply pre_seeds BEFORE counter increment.
@@ -3210,78 +3232,87 @@ macro_rules! step_slow_impl {
             for c_idx in 0..num_counters {
                 for entry in self.$current.entries(c_idx) {
                     let origin = entry.origin;
-                    let effects = t
+                    // Collect ALL target effects for this origin (may
+                    // be >1 with dense out_exit encoding).
+                    let effect_indices: Vec<usize> = t
                         .origin_keys
                         .iter()
-                        .position(|&k| k == origin)
-                        .and_then(|i| {
-                            self.analysis.target_effects[t.origin_targets[i].idx()].as_ref()
-                        });
+                        .enumerate()
+                        .filter_map(|(i, &k)| if k == origin { Some(i) } else { None })
+                        .collect();
 
-                    match effects {
-                        Some(effects) => match &effects.step {
-                            tier3_effects::TargetStep::Advance { new_origins } => {
-                                for &new_o in new_origins {
-                                    self.$next.advance(c_idx, entry, new_o);
-                                }
-                            }
-                            tier3_effects::TargetStep::Increment {
-                                advance_origins,
-                                min,
-                                max,
-                                continue_origins,
-                                ..
-                            } => {
-                                // Advance-or-increment: entry survives at
-                                // advance_origins with the same values.
-                                for &new_o in advance_origins {
-                                    self.$next.advance(c_idx, entry, new_o);
-                                }
+                    for &ei in &effect_indices {
+                        let effects =
+                            self.analysis.target_effects[t.origin_targets[ei].idx()].as_ref();
 
-                                // Continue: incremented entry stays in the loop.
-                                if self.$current.can_continue(entry, *max) {
-                                    for &new_o in continue_origins {
-                                        self.$next.insert_continued(c_idx, entry, new_o, *max);
+                        match effects {
+                            Some(effects) => match &effects.step {
+                                tier3_effects::TargetStep::Advance { new_origins } => {
+                                    for &new_o in new_origins {
+                                        self.$next.advance(c_idx, entry, new_o);
                                     }
                                 }
+                                tier3_effects::TargetStep::Increment {
+                                    advance_origins,
+                                    min,
+                                    max,
+                                    continue_origins,
+                                    ..
+                                } => {
+                                    // Advance-or-increment: entry survives at
+                                    // advance_origins with the same values.
+                                    for &new_o in advance_origins {
+                                        self.$next.advance(c_idx, entry, new_o);
+                                    }
 
-                                // Break: entry has reached the minimum threshold.
-                                if self.$current.can_break(entry, *min) {
-                                    any_can_break = true;
-                                    // Apply on_break atoms from CompiledTargetEffects.
-                                    for atom in &effects.on_break {
-                                        match atom {
-                                            tier3_effects::EffectAtom::Match => {
-                                                self.ever_matched = true;
-                                            }
-                                            tier3_effects::EffectAtom::MatchAtEnd => {
-                                                self.match_at_end = true;
-                                            }
-                                            tier3_effects::EffectAtom::AddTail { origin } => {
-                                                if self.tail_seen[origin.idx()] != self.tail_epoch {
-                                                    self.tail_seen[origin.idx()] = self.tail_epoch;
-                                                    self.next_post_break_tails.push(*origin);
-                                                }
-                                            }
-                                            tier3_effects::EffectAtom::AddSeed {
-                                                counter: sc,
-                                                origin: so,
-                                                value: sv,
-                                            } => {
-                                                self.$next.seed(sc.idx(), *so, *sv);
-                                            }
+                                    // Continue: incremented entry stays in the loop.
+                                    if self.$current.can_continue(entry, *max) {
+                                        for &new_o in continue_origins {
+                                            self.$next.insert_continued(c_idx, entry, new_o, *max);
                                         }
                                     }
-                                    tier3_effects::enqueue_guarded_effects(
-                                        &mut self.pending_effects_current,
-                                        &effects.guarded,
-                                        byte_is_word,
-                                    );
+
+                                    // Break: entry has reached the minimum threshold.
+                                    if self.$current.can_break(entry, *min) {
+                                        any_can_break = true;
+                                        // Apply on_break atoms from CompiledTargetEffects.
+                                        for atom in &effects.on_break {
+                                            match atom {
+                                                tier3_effects::EffectAtom::Match => {
+                                                    self.ever_matched = true;
+                                                }
+                                                tier3_effects::EffectAtom::MatchAtEnd => {
+                                                    self.match_at_end = true;
+                                                }
+                                                tier3_effects::EffectAtom::AddTail { origin } => {
+                                                    if self.tail_seen[origin.idx()]
+                                                        != self.tail_epoch
+                                                    {
+                                                        self.tail_seen[origin.idx()] =
+                                                            self.tail_epoch;
+                                                        self.next_post_break_tails.push(*origin);
+                                                    }
+                                                }
+                                                tier3_effects::EffectAtom::AddSeed {
+                                                    counter: sc,
+                                                    origin: so,
+                                                    value: sv,
+                                                } => {
+                                                    self.$next.seed(sc.idx(), *so, *sv);
+                                                }
+                                            }
+                                        }
+                                        tier3_effects::enqueue_guarded_effects(
+                                            &mut self.pending_effects_current,
+                                            &effects.guarded,
+                                            byte_is_word,
+                                        );
+                                    }
                                 }
-                            }
-                        },
-                        None => {}
-                    }
+                            },
+                            None => {}
+                        }
+                    } // for &ei in &effect_indices
                 }
             }
 
