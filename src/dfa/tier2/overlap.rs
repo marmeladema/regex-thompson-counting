@@ -37,6 +37,7 @@ const MAX_SUBSET_WIDTH: u8 = 8;
 
 /// Outcome of the Tier 2 binary-exactness proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum Tier2OverlapProof {
     /// Body byte sets are pairwise disjoint — no proof needed.
     DisjointFastPath,
@@ -50,6 +51,7 @@ pub(crate) enum Tier2OverlapProof {
 
 /// Statistics from the overlap probe.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct Tier2OverlapStats {
     pub(crate) proof: Tier2OverlapProof,
     pub(crate) max_reachable_counting_width: u8,
@@ -445,11 +447,7 @@ fn consume_byte_at(
         State::ByteClass { class, out } if classes[class.idx()][byte] => Some(out),
         State::ByteTable { table } => {
             let t = byte_tables[table][byte];
-            if t != StateIdx::NONE {
-                Some(t)
-            } else {
-                None
-            }
+            if t != StateIdx::NONE { Some(t) } else { None }
         }
         _ => None,
     }
@@ -786,10 +784,8 @@ mod tests {
             let mut mem = crate::MatcherMemory::default();
 
             // Generate some boundary inputs.
-            let inputs = crate::fuzz_gen::generate_inputs(
-                &mut FuzzRng::new(&seed_bytes[..]),
-                &_ast,
-            );
+            let inputs =
+                crate::fuzz_gen::generate_inputs(&mut FuzzRng::new(&seed_bytes[..]), &_ast);
             // Also get AST for the admitted pattern.
             let (_, ast2) = generate_pattern(&mut FuzzRng::new(&seed_bytes));
             let inputs2 = crate::fuzz_gen::generate_inputs(
@@ -806,7 +802,8 @@ mod tests {
                     m2.chunk(input);
                     let t2 = m2.finish();
                     assert_eq!(
-                        nfa, t2,
+                        nfa,
+                        t2,
                         "Tier 2 != NFA for fuzz pattern {} on input {:?}",
                         pattern_str,
                         String::from_utf8_lossy(input),
@@ -879,21 +876,13 @@ mod tests {
 
                         // Enumerate all inputs up to max_input_len.
                         let mut input = Vec::new();
-                        check_inputs(
-                            &regex,
-                            &alphabet,
-                            max_input_len,
-                            &mut input,
-                            &pattern,
-                        );
+                        check_inputs(&regex, &alphabet, max_input_len, &mut input, &pattern);
                     }
                 }
             }
         }
 
-        eprintln!(
-            "exhaustive overlap mini-model: tested {tested} patterns, {admitted} admitted"
-        );
+        eprintln!("exhaustive overlap mini-model: tested {tested} patterns, {admitted} admitted");
         assert!(tested > 0, "should test some patterns");
     }
 
@@ -935,7 +924,8 @@ mod tests {
             m2.chunk(input);
             let t2 = m2.finish();
             assert_eq!(
-                nfa, t2,
+                nfa,
+                t2,
                 "Tier 2 != NFA for pattern {pattern} on input {:?} (len={})",
                 String::from_utf8_lossy(input),
                 input.len(),

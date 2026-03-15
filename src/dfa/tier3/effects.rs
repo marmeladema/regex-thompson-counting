@@ -813,7 +813,7 @@ pub(crate) fn eval_assert_chain(
     next: Option<u8>,
     regex: &Regex,
     check_reachability: bool,
-    scratch: &mut super::ReachScratch,
+    scratch: &mut super::super::ReachScratch,
 ) -> bool {
     if chain_id == AssertChainId::NONE {
         return true;
@@ -835,7 +835,9 @@ pub(crate) fn eval_assert_chain(
                     // `out` can still reach a match.  This handles chained
                     // assertions (e.g. `\b → \B → $ → Match`).
                     if at_end {
-                        if !super::DfaState::can_reach_match_at_end(out, prev, regex, scratch) {
+                        if !super::super::DfaState::can_reach_match_at_end(
+                            out, prev, regex, scratch,
+                        ) {
                             return false;
                         }
                     } else {
@@ -890,7 +892,7 @@ pub(crate) fn resolve_pending(
     at_end: bool,
     next: Option<u8>,
     regex: &Regex,
-    scratch: &mut super::ReachScratch,
+    scratch: &mut super::super::ReachScratch,
     actions: &mut ResolvedActions,
 ) {
     actions.clear();
@@ -1431,6 +1433,7 @@ pub(crate) fn compile_all_target_effects(
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::ReachScratch;
     use super::*;
 
     #[test]
@@ -1572,11 +1575,6 @@ mod tests {
     // Semantic tests for resolve_pending() and eval_assert_chain()
     // -----------------------------------------------------------------------
 
-    /// Create a fresh [`ReachScratch`] (test helper).
-    fn scratch() -> super::super::ReachScratch {
-        super::super::ReachScratch::new()
-    }
-
     /// Build a compiled `Regex` from a pattern string (test helper).
     fn build_regex(pattern: &str) -> crate::Regex {
         use regex_syntax::ast::parse::ParserBuilder;
@@ -1652,7 +1650,7 @@ mod tests {
             false,
             Some(b'x'),
             &regex,
-            &mut scratch(),
+            &mut ReachScratch::new(),
             &mut actions,
         );
         assert!(actions.set_match, "unconditional Match should resolve");
@@ -1691,7 +1689,7 @@ mod tests {
             false,
             Some(b' '),
             &regex,
-            &mut scratch(),
+            &mut ReachScratch::new(),
             &mut actions,
         );
         assert!(
@@ -1727,7 +1725,7 @@ mod tests {
             false,
             Some(b'a'),
             &regex,
-            &mut scratch(),
+            &mut ReachScratch::new(),
             &mut actions,
         );
         assert!(
@@ -1785,7 +1783,7 @@ mod tests {
             false,
             Some(b' '),
             &regex,
-            &mut scratch(),
+            &mut ReachScratch::new(),
             &mut actions,
         );
         assert!(
@@ -1807,7 +1805,7 @@ mod tests {
             false,
             Some(b'a'),
             &regex,
-            &mut scratch(),
+            &mut ReachScratch::new(),
             &mut actions2,
         );
         assert!(
@@ -1853,7 +1851,7 @@ mod tests {
             false,
             Some(b' '),
             &regex,
-            &mut scratch(),
+            &mut ReachScratch::new(),
             &mut actions,
         );
         assert!(
@@ -1870,7 +1868,7 @@ mod tests {
             false,
             Some(b'a'),
             &regex,
-            &mut scratch(),
+            &mut ReachScratch::new(),
             &mut actions2,
         );
         assert!(
@@ -1899,7 +1897,7 @@ mod tests {
             false,
             Some(b'x'),
             &regex,
-            &mut scratch(),
+            &mut ReachScratch::new(),
             &mut actions,
         );
         assert_eq!(actions.tails, vec![StateIdx(5)]);
@@ -1928,7 +1926,7 @@ mod tests {
             false,
             Some(b'x'),
             &regex,
-            &mut scratch(),
+            &mut ReachScratch::new(),
             &mut actions,
         );
         assert_eq!(actions.seeds.len(), 1);
@@ -1955,7 +1953,7 @@ mod tests {
             false,
             Some(b'x'),
             &regex,
-            &mut scratch(),
+            &mut ReachScratch::new(),
             &mut actions,
         );
         assert!(!actions.set_match, "MatchAtEnd should not set set_match");
@@ -2009,7 +2007,7 @@ mod tests {
             true, // at_end
             None, // no next byte
             &regex,
-            &mut scratch(),
+            &mut ReachScratch::new(),
             &mut actions,
         );
         assert!(actions.set_match, "EndLF should pass at EOI");
@@ -2052,7 +2050,7 @@ mod tests {
             false,       // not at_end
             Some(b'\n'), // next byte is newline
             &regex,
-            &mut scratch(),
+            &mut ReachScratch::new(),
             &mut actions,
         );
         assert!(actions.set_match, "EndLF should pass when next is newline");
@@ -2095,7 +2093,7 @@ mod tests {
             false,      // not at_end
             Some(b'x'), // next byte is not newline
             &regex,
-            &mut scratch(),
+            &mut ReachScratch::new(),
             &mut actions,
         );
         assert!(
@@ -2149,7 +2147,7 @@ mod tests {
             false,
             Some(b'x'),
             &regex,
-            &mut scratch(),
+            &mut ReachScratch::new(),
             &mut actions,
         );
         // All three atom kinds should be collected.
@@ -2216,7 +2214,7 @@ mod tests {
             false,
             Some(b'a'), // word char → word→word, \b fails
             &regex,
-            &mut scratch(),
+            &mut ReachScratch::new(),
             &mut actions,
         );
         assert!(actions.seeds.is_empty(), "seed should be dropped");
@@ -2238,7 +2236,15 @@ mod tests {
         let assert_idx = regex
             .states
             .iter()
-            .position(|s| matches!(s, crate::State::Assert { kind: crate::AssertKind::WordAscii, .. }))
+            .position(|s| {
+                matches!(
+                    s,
+                    crate::State::Assert {
+                        kind: crate::AssertKind::WordAscii,
+                        ..
+                    }
+                )
+            })
             .expect("should have \\b");
         let out = match regex.states.0[assert_idx] {
             crate::State::Assert { out, .. } => out,
@@ -2258,7 +2264,15 @@ mod tests {
         let end_idx = regex
             .states
             .iter()
-            .position(|s| matches!(s, crate::State::Assert { kind: crate::AssertKind::End, .. }))
+            .position(|s| {
+                matches!(
+                    s,
+                    crate::State::Assert {
+                        kind: crate::AssertKind::End,
+                        ..
+                    }
+                )
+            })
             .expect("should have $");
         let out = match regex.states.0[end_idx] {
             crate::State::Assert { out, .. } => out,
@@ -2278,7 +2292,15 @@ mod tests {
         let assert_idx = regex
             .states
             .iter()
-            .position(|s| matches!(s, crate::State::Assert { kind: crate::AssertKind::WordAscii, .. }))
+            .position(|s| {
+                matches!(
+                    s,
+                    crate::State::Assert {
+                        kind: crate::AssertKind::WordAscii,
+                        ..
+                    }
+                )
+            })
             .expect("should have \\b");
         let out = match regex.states.0[assert_idx] {
             crate::State::Assert { out, .. } => out,
@@ -2297,7 +2319,15 @@ mod tests {
         let assert_idx = regex
             .states
             .iter()
-            .position(|s| matches!(s, crate::State::Assert { kind: crate::AssertKind::WordAsciiNegate, .. }))
+            .position(|s| {
+                matches!(
+                    s,
+                    crate::State::Assert {
+                        kind: crate::AssertKind::WordAsciiNegate,
+                        ..
+                    }
+                )
+            })
             .expect("should have \\B");
         let out = match regex.states.0[assert_idx] {
             crate::State::Assert { out, .. } => out,
@@ -2314,7 +2344,9 @@ mod tests {
         // The break path from c0 goes through \B to a mixed topology
         // (consuming a{0,2} + $ → Match).
         let regex = build_regex_unroll(r"^.{7,8}\B(\b)?a{0,2}$", 0);
-        let analysis = regex.tier3_analysis.as_ref()
+        let analysis = regex
+            .tier3_analysis
+            .as_ref()
             .expect("tier3_analysis should be computed even if rejected");
         let sound = check_break_deferred_soundness(analysis, &regex.states.0);
         assert!(!sound, "Bug 53 pattern should be rejected");
@@ -2325,7 +2357,9 @@ mod tests {
         // Pattern: ^.{3,5}\b$ — \b directly before $ → Match.
         // The break path has \b → $ → Match: pure end-match topology.
         let regex = build_regex_unroll(r"^.{3,5}\b$", 0);
-        let analysis = regex.tier3_analysis.as_ref()
+        let analysis = regex
+            .tier3_analysis
+            .as_ref()
             .expect("tier3_analysis should be computed");
         let sound = check_break_deferred_soundness(analysis, &regex.states.0);
         assert!(sound, "pure \\b$ pattern should be accepted");

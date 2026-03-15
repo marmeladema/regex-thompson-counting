@@ -8,7 +8,7 @@
 use std::fmt;
 
 use crate::dfa::Tier3OriginKind;
-use crate::dfa::tier3_effects::{AssertChainArena, CompiledOriginEffects, CompiledTargetEffects};
+use crate::dfa::tier3::effects::{AssertChainArena, CompiledOriginEffects, CompiledTargetEffects};
 use crate::{AssertKind, ByteClass, ByteMap, Regex, State, StateIdx};
 
 // ---------------------------------------------------------------------------
@@ -179,7 +179,7 @@ fn fmt_target_effects(
     if arena.len() > 0 {
         writeln!(f, "  assert_chains:")?;
         for i in 0..arena.len() {
-            let chain = arena.get(crate::dfa::tier3_effects::AssertChainId(i as u32));
+            let chain = arena.get(crate::dfa::tier3::effects::AssertChainId(i as u32));
             let labels: Vec<String> = chain
                 .iter()
                 .map(|&s| {

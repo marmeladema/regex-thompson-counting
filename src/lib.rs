@@ -1601,12 +1601,7 @@ impl RegexBuilder {
     /// Used by the consecutive-repetition merger in the Concat handler.
     /// The `max_repetition` check is skipped because the individual
     /// repetitions were already validated by `regex-syntax`.
-    fn emit_bounded_repetition(
-        &mut self,
-        sub: &Hir,
-        min: usize,
-        max: usize,
-    ) -> Result<(), Error> {
+    fn emit_bounded_repetition(&mut self, sub: &Hir, min: usize, max: usize) -> Result<(), Error> {
         debug_assert!(min <= max);
         if max == 0 {
             return Ok(());
@@ -1768,10 +1763,8 @@ impl RegexBuilder {
                                     && rep2.min < rep2_max
                                     && rep2.sub == rep.sub
                                 {
-                                    merged_min =
-                                        merged_min.saturating_add(rep2.min as usize);
-                                    merged_max =
-                                        merged_max.saturating_add(rep2_max as usize);
+                                    merged_min = merged_min.saturating_add(rep2.min as usize);
+                                    merged_max = merged_max.saturating_add(rep2_max as usize);
                                     j += 1;
                                     continue;
                                 }
@@ -1782,11 +1775,7 @@ impl RegexBuilder {
                                 // Bypass max_repetition: individual reps were
                                 // already validated by regex-syntax.
                                 let before = self.postfix.len();
-                                self.emit_bounded_repetition(
-                                    &rep.sub,
-                                    merged_min,
-                                    merged_max,
-                                )?;
+                                self.emit_bounded_repetition(&rep.sub, merged_min, merged_max)?;
                                 if self.postfix.len() > before {
                                     count += 1;
                                     if count > 1 {
@@ -2357,13 +2346,10 @@ impl RegexBuilder {
         };
         let counter_info: Box<[(usize, usize, usize)]> = tier2_elig
             .as_ref()
-            .map_or_else(
-                || Vec::new().into_boxed_slice(),
-                |e| e.counter_info.clone(),
-            );
+            .map_or_else(|| Vec::new().into_boxed_slice(), |e| e.counter_info.clone());
 
-        let mut tier2_eligible = non_nested_eligible
-            && tier2_elig.as_ref().is_some_and(|e| e.is_eligible());
+        let mut tier2_eligible =
+            non_nested_eligible && tier2_elig.as_ref().is_some_and(|e| e.is_eligible());
         let mut tier2_overlap_proven = false;
 
         // Compute byte equivalence classes before moving data out.
@@ -2466,7 +2452,7 @@ impl RegexBuilder {
             // from the assertion mixes consuming states with $ → Match (or
             // direct Match), the current effect model cannot represent it
             // soundly.  Fall back to Tier 4 / NFA.
-            let sound = dfa::tier3_effects::check_break_deferred_soundness(
+            let sound = dfa::tier3::effects::check_break_deferred_soundness(
                 &analysis,
                 self.states.as_slice(),
             );

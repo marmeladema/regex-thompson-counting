@@ -48,7 +48,10 @@ use crate::{
     is_word_byte,
 };
 
-use super::{DfaCache, DfaMemory, DfaStateId, tier3_effects};
+pub(crate) mod effects;
+
+use super::{DfaCache, DfaMemory, DfaStateId};
+use effects as tier3_effects;
 
 // ---------------------------------------------------------------------------
 // Precomputed NFA analysis (built once at regex compile time)

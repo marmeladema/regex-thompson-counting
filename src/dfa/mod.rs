@@ -25,8 +25,7 @@
 
 mod tier1;
 pub(crate) mod tier2;
-mod tier3;
-pub(crate) mod tier3_effects;
+pub(crate) mod tier3;
 mod tier4;
 
 use indexmap::Equivalent;
@@ -35,7 +34,7 @@ use indexmap::IndexSet;
 pub(crate) use tier1::{DfaMatcher, Tier1DfaCache};
 pub(crate) use tier2::{Tier2Analysis, Tier2DfaCache, Tier2DfaMatcher, compute_tier2_analysis};
 pub(crate) use tier3::{
-    Tier3Analysis, Tier3BreakSeed, Tier3DfaCache, Tier3DfaMatcher, Tier3OriginKind,
+    Tier3Analysis, Tier3DfaCache, Tier3DfaMatcher, Tier3OriginKind,
     compute_tier3_analysis,
 };
 pub(crate) use tier4::{Tier4DfaCache, Tier4DfaMatcher};
