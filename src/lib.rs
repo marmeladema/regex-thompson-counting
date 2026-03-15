@@ -2717,8 +2717,15 @@ impl RegexBuilder {
     fn collect_byte_leaves(&self, idx: StateIdx, out: &mut Vec<(u8, StateIdx)>) -> bool {
         match self.states.as_slice()[idx] {
             State::Byte {
-                byte, out: target, ..
+                byte,
+                out: target,
+                out_exit,
             } => {
+                // Reject Byte states with out_exit (fused branch) —
+                // ByteTable is a single-target dispatch mechanism.
+                if out_exit != StateIdx::NONE {
+                    return false;
+                }
                 // Check for duplicate byte values.
                 if out.iter().any(|&(b, _)| b == byte) {
                     return false;
@@ -11417,7 +11424,7 @@ mod tests {
         // even with no consuming states downstream.
         test_tier3_dead_target_byte_table_mae {
             pattern: r"^(.{6,36}a{0,4}e*c)?$",
-            memory: 2489,
+            memory: 1465,
             min_tier: 2,
             inputs: [
                 ("xxxcbd ccac", true),          // Bug 39 crash case
