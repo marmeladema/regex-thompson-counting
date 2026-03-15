@@ -599,31 +599,67 @@ pub(crate) enum State {
     Match,
 }
 
-impl State {
-    /// Return the "dangling out" pointer used by [`RegexBuilder::patch`]
-    /// and [`RegexBuilder::append`] to thread fragment lists.
-    fn next(&self) -> StateIdx {
-        match self {
-            State::Byte { out, .. }
-            | State::ByteCI { out, .. }
-            | State::ByteClass { out, .. }
-            | State::CounterInstance { out, .. }
-            | State::Assert { out, .. } => *out,
-            State::Split { out1, .. } | State::CounterIncrement { out1, .. } => *out1,
-            _ => unreachable!(),
-        }
-    }
+// ---------------------------------------------------------------------------
+// Compile-time patch infrastructure
+// ---------------------------------------------------------------------------
 
-    /// Overwrite the "dangling out" pointer.
-    fn append(&mut self, next: StateIdx) {
-        match self {
+/// Identifies which field of an NFA [`State`] should be patched during
+/// fragment construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PatchSlot {
+    /// The primary `out` field (Byte, ByteCI, ByteClass, CounterInstance,
+    /// Assert, Split.out).
+    Out,
+    /// The secondary `out1` field (Split.out1, CounterIncrement.out1).
+    Out1,
+    /// The exit edge on consuming states (Byte.out_exit, ByteCI.out_exit,
+    /// ByteClass.out_exit).  Wired up when `out_exit` fields are added.
+    #[allow(dead_code)]
+    OutExit,
+}
+
+/// A compile-time reference to a single patchable slot in the NFA state
+/// array.  Collected in [`Fragment::outs`] and resolved by
+/// [`RegexBuilder::patch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PatchRef {
+    state: StateIdx,
+    slot: PatchSlot,
+}
+
+/// Return a mutable reference to the [`StateIdx`] field identified by
+/// `slot` inside `state`.
+///
+/// # Panics
+///
+/// Panics if `slot` does not exist on the given state variant (e.g.
+/// `Out1` on a `Byte` state, or `OutExit` before `out_exit` fields
+/// are added).
+fn patch_slot_mut(state: &mut State, slot: PatchSlot) -> &mut StateIdx {
+    match slot {
+        PatchSlot::Out => match state {
             State::Byte { out, .. }
             | State::ByteCI { out, .. }
             | State::ByteClass { out, .. }
             | State::CounterInstance { out, .. }
-            | State::Assert { out, .. } => *out = next,
-            State::Split { out1, .. } | State::CounterIncrement { out1, .. } => *out1 = next,
-            _ => unreachable!(),
+            | State::Assert { out, .. }
+            | State::Split { out, .. }
+            | State::CounterIncrement { out, .. } => out,
+            _ => panic!(
+                "patch_slot_mut: PatchSlot::Out not available on {:?}",
+                state
+            ),
+        },
+        PatchSlot::Out1 => match state {
+            State::Split { out1, .. } | State::CounterIncrement { out1, .. } => out1,
+            _ => panic!(
+                "patch_slot_mut: PatchSlot::Out1 not available on {:?}",
+                state
+            ),
+        },
+        PatchSlot::OutExit => {
+            // Will be wired up in Patch 2 when `out_exit` fields are added.
+            panic!("patch_slot_mut: PatchSlot::OutExit not yet available");
         }
     }
 }
@@ -650,6 +686,7 @@ impl StateIdx {
     /// Return the raw index as `usize` **without** asserting against `NONE`.
     /// Use only where `NONE` is a valid/expected value (e.g. bounds checks).
     #[inline]
+    #[allow(dead_code)]
     fn raw(self) -> usize {
         self.0 as usize
     }
@@ -678,34 +715,34 @@ impl IndexMut<StateIdx> for [State] {
     }
 }
 
-/// Bounds-checked mutable access by [`StateIdx`].
-trait StateSliceExt {
-    /// Returns `None` for [`StateIdx::NONE`] or any out-of-range index.
-    fn get_mut_state(&mut self, idx: StateIdx) -> Option<&mut State>;
-}
-
-impl StateSliceExt for [State] {
-    #[inline]
-    fn get_mut_state(&mut self, idx: StateIdx) -> Option<&mut State> {
-        self.get_mut(idx.raw())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // NFA fragment (used during construction)
 // ---------------------------------------------------------------------------
 
-/// A partially-built NFA fragment with a `start` state and a dangling
-/// `out` pointer that will be patched to the next fragment's start.
+/// A partially-built NFA fragment with a `start` state and a set of
+/// dangling patch references that will be patched to the next fragment's
+/// start during concatenation.
 #[derive(Debug)]
 struct Fragment {
     start: StateIdx,
-    out: StateIdx,
+    outs: Vec<PatchRef>,
 }
 
 impl Fragment {
-    fn new(start: StateIdx, out: StateIdx) -> Self {
-        Self { start, out }
+    /// Create a fragment with a single dangling `Out` slot on `state`.
+    fn new(start: StateIdx, state: StateIdx) -> Self {
+        Self {
+            start,
+            outs: vec![PatchRef {
+                state,
+                slot: PatchSlot::Out,
+            }],
+        }
+    }
+
+    /// Create a fragment with an explicit set of patch references.
+    fn with_outs(start: StateIdx, outs: Vec<PatchRef>) -> Self {
+        Self { start, outs }
     }
 }
 
@@ -1922,42 +1959,11 @@ impl RegexBuilder {
         idx
     }
 
-    /// Walk the linked list of dangling `out` pointers starting at `list`
-    /// and patch each one to point to `idx`.
-    fn patch(&mut self, mut list: StateIdx, idx: StateIdx) {
-        while let Some(state) = self.states.get_mut_state(list) {
-            list = match state {
-                State::Byte { out, .. }
-                | State::ByteCI { out, .. }
-                | State::ByteClass { out, .. }
-                | State::CounterInstance { out, .. }
-                | State::Assert { out, .. } => {
-                    let next = *out;
-                    *out = idx;
-                    next
-                }
-                State::Split { out1, .. } | State::CounterIncrement { out1, .. } => {
-                    let next = *out1;
-                    *out1 = idx;
-                    next
-                }
-                _ => panic!("patch: unexpected state {:?}", state),
-            };
+    /// Resolve every dangling [`PatchRef`] in `outs` to point to `target`.
+    fn patch(&mut self, outs: &[PatchRef], target: StateIdx) {
+        for pr in outs {
+            *patch_slot_mut(&mut self.states.as_mut_slice()[pr.state], pr.slot) = target;
         }
-    }
-
-    /// Append `list2` to the end of the dangling-pointer chain starting at
-    /// `list1`.
-    fn append(&mut self, list1: StateIdx, list2: StateIdx) -> StateIdx {
-        let len = self.states.len();
-        let mut s = &mut self.states.as_mut_slice()[list1];
-        let mut next = s.next();
-        while next.raw() < len {
-            s = &mut self.states.as_mut_slice()[next];
-            next = s.next();
-        }
-        s.append(list2);
-        list1
     }
 
     /// Consume one postfix HIR node and return the corresponding NFA
@@ -1968,8 +1974,8 @@ impl RegexBuilder {
             RegexHirNode::Catenate => {
                 let e2 = self.frags.pop().unwrap();
                 let e1 = self.frags.pop().unwrap();
-                self.patch(e1.out, e2.start);
-                Fragment::new(e1.start, e2.out)
+                self.patch(&e1.outs, e2.start);
+                Fragment::with_outs(e1.start, e2.outs)
             }
             RegexHirNode::Alternate => {
                 let e2 = self.frags.pop().unwrap();
@@ -1978,7 +1984,9 @@ impl RegexBuilder {
                     out: e1.start,
                     out1: e2.start,
                 });
-                Fragment::new(s, self.append(e1.out, e2.out))
+                let mut outs = e1.outs;
+                outs.extend(e2.outs);
+                Fragment::with_outs(s, outs)
             }
             RegexHirNode::RepeatZeroOne => {
                 let e = self.frags.pop().unwrap();
@@ -1986,7 +1994,12 @@ impl RegexBuilder {
                     out: e.start,
                     out1: StateIdx::NONE,
                 });
-                Fragment::new(s, self.append(e.out, s))
+                let mut outs = e.outs;
+                outs.push(PatchRef {
+                    state: s,
+                    slot: PatchSlot::Out1,
+                });
+                Fragment::with_outs(s, outs)
             }
             RegexHirNode::RepeatZeroPlus => {
                 let e = self.frags.pop().unwrap();
@@ -1994,8 +2007,14 @@ impl RegexBuilder {
                     out: e.start,
                     out1: StateIdx::NONE,
                 });
-                self.patch(e.out, s);
-                Fragment::new(s, s)
+                self.patch(&e.outs, s);
+                Fragment::with_outs(
+                    s,
+                    vec![PatchRef {
+                        state: s,
+                        slot: PatchSlot::Out1,
+                    }],
+                )
             }
             RegexHirNode::RepeatOnePlus => {
                 let e = self.frags.pop().unwrap();
@@ -2003,8 +2022,14 @@ impl RegexBuilder {
                     out: e.start,
                     out1: StateIdx::NONE,
                 });
-                self.patch(e.out, s);
-                Fragment::new(e.start, s)
+                self.patch(&e.outs, s);
+                Fragment::with_outs(
+                    e.start,
+                    vec![PatchRef {
+                        state: s,
+                        slot: PatchSlot::Out1,
+                    }],
+                )
             }
             RegexHirNode::CounterLoop { counter, min, max } => {
                 // Single-copy NFA:
@@ -2021,12 +2046,19 @@ impl RegexBuilder {
                     max,
                     counter,
                 });
-                self.patch(body.out, cinc); // body end → CInc
+                self.patch(&body.outs, cinc); // body end → CInc
                 let ci = self.state(State::CounterInstance {
                     counter,
                     out: body.start, // CI → body start
                 });
-                Fragment::new(ci, cinc) // entry=CI, exit=CInc.out1
+                // exit = CInc.out1 (break path)
+                Fragment::with_outs(
+                    ci,
+                    vec![PatchRef {
+                        state: cinc,
+                        slot: PatchSlot::Out1,
+                    }],
+                )
             }
             RegexHirNode::ByteClass(class) => {
                 let idx = self.state(State::ByteClass {
@@ -2088,7 +2120,7 @@ impl RegexBuilder {
         let start = if let Some(e) = self.frags.pop() {
             assert!(self.frags.is_empty());
             let s = self.state(State::Match);
-            self.patch(e.out, s);
+            self.patch(&e.outs, s);
             e.start
         } else {
             self.state(State::Match)
