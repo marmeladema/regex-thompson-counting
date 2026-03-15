@@ -9531,6 +9531,97 @@ mod tests {
         // Two counters on the same byte 'a' without a separator — tests
         // the break_seeds fix in tier 3.
 
+        // -----------------------------------------------------------------
+        // Tier 2 overlap refinement tests (Patches 5+6)
+        // -----------------------------------------------------------------
+
+        // Patch 5: Safe overlap — sequential counters with subset body bytes.
+        // Currently NOT promoted to Tier 2 (probe is too conservative for
+        // sequential overlap).  Will become Tier 2 when counter-lifecycle
+        // analysis is added.
+        test_tier2_overlap_safe_word_digit {
+            pattern: r"^\w{300}\d{200}$",
+            memory: 1491,
+            min_tier: 3,
+            inputs: [
+                ("aaa111", false),             // too short
+                ("aaaaaaaaaa1111111111", false), // too short (20 chars, need 500)
+            ],
+        }
+
+        test_tier2_overlap_safe_hex_subset {
+            pattern: r"^[0-9A-F]{400}[A-F]{200}$",
+            memory: 1491,
+            min_tier: 3,
+            inputs: [
+                ("AABB", false),               // too short
+            ],
+        }
+
+        test_tier2_overlap_safe_separator {
+            pattern: r"^\w{300}-\d{200}$",
+            memory: 1524,
+            min_tier: 3,
+            inputs: [
+                ("aaa-111", false),            // too short
+            ],
+        }
+
+        // Patch 6: Adversarial — must NOT become Tier 2.
+
+        // Variable split over overlapping alphabets.
+        test_tier2_overlap_unsafe_variable {
+            pattern: r"^\w{100,300}\d{100,200}$",
+            memory: 1491,
+            min_tier: 3,
+            inputs: [
+                ("aaa111", false),
+            ],
+        }
+
+        // Pure wildcard overlap — maximally ambiguous.
+        // Note: with default merge, .{0,200}.{0,200} becomes .{0,400} (Tier 2).
+        // The unroll=0+no-merge re-run exercises the multi-counter path.
+        test_tier2_overlap_unsafe_wildcard {
+            pattern: r"^.{0,200}.{0,200}$",
+            memory: 1168,
+            min_tier: 2,
+            inputs: [
+                ("", true),
+                ("a", true),
+                ("aa", true),
+            ],
+        }
+
+        // L=2 body overlap — counter_reset/preservation ambiguity.
+        test_tier2_overlap_unsafe_l2_word_digit {
+            pattern: r"^(?:\w\w){1,2}(?:\d\d){1,2}$",
+            memory: 1621,
+            min_tier: 1,
+            inputs: [
+                ("ab12", true),
+                ("ab1234", true),
+                ("abCD12", true),   // (\w\w){2}=abCD + (\d\d){1}=12
+                ("1234", true),     // \w{1,2}=12 + \d{1,2}=34
+                ("abcd", false),    // no \d suffix
+                ("12ab", false),    // \d before \w won't match with $
+                ("ab1", false),     // \d\d needs 2 digits
+            ],
+        }
+
+        // L=2 hex subset overlap.
+        test_tier2_overlap_unsafe_l2_hex {
+            pattern: r"^(?:[0-9A-F][0-9A-F]){1,2}(?:[A-F][A-F]){1,2}$",
+            memory: 1621,
+            min_tier: 1,
+            inputs: [
+                ("0AFF", true),
+                ("12ABCD", true),
+                ("BEEF", true),     // BE matches [0-9A-F], EF matches [A-F]
+                ("1234", false),    // no [A-F] suffix
+            ],
+        }
+
         test_adjacent_same_byte_counters {
             pattern: "^a{2,50}a{3,70}$",
             memory: 879,
