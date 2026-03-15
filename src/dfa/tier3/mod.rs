@@ -2307,9 +2307,9 @@ struct ClosureResult {
 /// Try to consume `byte` at NFA state `idx`.
 fn consume_byte(idx: StateIdx, byte: u8, regex: &Regex) -> Option<StateIdx> {
     match regex.states[idx] {
-        State::Byte { byte: b, out } if byte == b => Some(out),
-        State::ByteCI { byte: b, out } if byte_match_ci(byte, b) => Some(out),
-        State::ByteClass { class, out } if regex.classes[class][byte] => Some(out),
+        State::Byte { byte: b, out, .. } if byte == b => Some(out),
+        State::ByteCI { byte: b, out, .. } if byte_match_ci(byte, b) => Some(out),
+        State::ByteClass { class, out, .. } if regex.classes[class][byte] => Some(out),
         State::ByteTable { table } => {
             let t = regex.byte_tables[table][byte];
             if t != StateIdx::NONE { Some(t) } else { None }

@@ -240,16 +240,16 @@ fn collect_counter_byte_sets(
                     State::Assert { out, .. } | State::CounterInstance { out, .. } => {
                         stack.push(out);
                     }
-                    State::Byte { byte, out } => {
+                    State::Byte { byte, out, .. } => {
                         bytes[byte as usize] = true;
                         stack.push(out);
                     }
-                    State::ByteCI { byte, out } => {
+                    State::ByteCI { byte, out, .. } => {
                         bytes[byte as usize] = true;
                         bytes[(byte ^ 0x20) as usize] = true;
                         stack.push(out);
                     }
-                    State::ByteClass { class, out } => {
+                    State::ByteClass { class, out, .. } => {
                         let table = &classes[class.idx()];
                         for b in 0..=255u8 {
                             if table[b] {

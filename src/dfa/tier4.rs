@@ -921,9 +921,9 @@ impl Tier4DfaCache {
             let nfa_states = self.states[from.idx()].nfa_states.clone();
             for &idx in nfa_states.iter() {
                 let target = match regex.states[idx] {
-                    State::Byte { byte: b2, out } if byte == b2 => Some(out),
-                    State::ByteCI { byte: b2, out } if byte_match_ci(byte, b2) => Some(out),
-                    State::ByteClass { class, out } if regex.classes[class][byte] => Some(out),
+                    State::Byte { byte: b2, out, .. } if byte == b2 => Some(out),
+                    State::ByteCI { byte: b2, out, .. } if byte_match_ci(byte, b2) => Some(out),
+                    State::ByteClass { class, out, .. } if regex.classes[class][byte] => Some(out),
                     State::ByteTable { table } => {
                         let t = regex.byte_tables[table][byte];
                         if t != StateIdx::NONE { Some(t) } else { None }

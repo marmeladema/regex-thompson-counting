@@ -557,7 +557,16 @@ pub(crate) enum State {
     },
 
     /// Match a literal byte, then follow `out`.
-    Byte { byte: u8, out: StateIdx },
+    ///
+    /// When `out_exit != StateIdx::NONE`, the state behaves as a fused
+    /// `Consume(byte) → Split(out, out_exit)`: after consuming the byte,
+    /// both `out` (continue) and `out_exit` (exit) successors are
+    /// activated.  Used by the dense single-atom unroll encoding.
+    Byte {
+        byte: u8,
+        out: StateIdx,
+        out_exit: StateIdx,
+    },
 
     /// Case-insensitive ASCII byte match, then follow `out`.
     ///
@@ -568,7 +577,14 @@ pub(crate) enum State {
     /// Emitted instead of [`ByteClass`] when the class contains exactly
     /// one ASCII letter pair (e.g. `[cC]` under `(?i)`).  Avoids the
     /// 256-byte class table lookup — match is a single `OR` + `CMP`.
-    ByteCI { byte: u8, out: StateIdx },
+    ///
+    /// When `out_exit != StateIdx::NONE`, behaves as a fused
+    /// `ConsumeCI(byte) → Split(out, out_exit)`.
+    ByteCI {
+        byte: u8,
+        out: StateIdx,
+        out_exit: StateIdx,
+    },
 
     /// Match any byte in the class (lookup table), then follow `out`.
     ///
@@ -576,7 +592,14 @@ pub(crate) enum State {
     /// [`ByteClass`] lookup tables — one per possible byte value.
     /// A full-range table ([`ByteClass::ALL`]) is equivalent to the old
     /// `Wildcard` state.
-    ByteClass { class: ClassIdx, out: StateIdx },
+    ///
+    /// When `out_exit != StateIdx::NONE`, behaves as a fused
+    /// `ConsumeClass(class) → Split(out, out_exit)`.
+    ByteClass {
+        class: ClassIdx,
+        out: StateIdx,
+        out_exit: StateIdx,
+    },
 
     /// Byte dispatch table: for input byte `b`, follow
     /// `byte_tables[table][b]` if the target is not [`StateIdx::NONE`].
@@ -657,10 +680,15 @@ fn patch_slot_mut(state: &mut State, slot: PatchSlot) -> &mut StateIdx {
                 state
             ),
         },
-        PatchSlot::OutExit => {
-            // Will be wired up in Patch 2 when `out_exit` fields are added.
-            panic!("patch_slot_mut: PatchSlot::OutExit not yet available");
-        }
+        PatchSlot::OutExit => match state {
+            State::Byte { out_exit, .. }
+            | State::ByteCI { out_exit, .. }
+            | State::ByteClass { out_exit, .. } => out_exit,
+            _ => panic!(
+                "patch_slot_mut: PatchSlot::OutExit not available on {:?}",
+                state
+            ),
+        },
     }
 }
 
@@ -1146,11 +1174,22 @@ impl Regex {
                 )
                 .unwrap();
             }
-            State::Byte { byte: b, out } => {
+            State::Byte {
+                byte: b,
+                out,
+                out_exit,
+            } => {
                 stack.push(out);
                 writeln!(buffer, "\t{} -> {} [label=\"{}\"];", idx, out, b as char).unwrap();
+                if out_exit != StateIdx::NONE {
+                    writeln!(buffer, "\t{} -> {} [style=dashed];", idx, out_exit).unwrap();
+                }
             }
-            State::ByteCI { byte: b, out } => {
+            State::ByteCI {
+                byte: b,
+                out,
+                out_exit,
+            } => {
                 stack.push(out);
                 writeln!(
                     buffer,
@@ -1158,8 +1197,15 @@ impl Regex {
                     idx, out, b as char
                 )
                 .unwrap();
+                if out_exit != StateIdx::NONE {
+                    writeln!(buffer, "\t{} -> {} [style=dashed];", idx, out_exit).unwrap();
+                }
             }
-            State::ByteClass { class, out } => {
+            State::ByteClass {
+                class,
+                out,
+                out_exit,
+            } => {
                 stack.push(out);
                 // Summarise the class for the label.
                 let table = &self.classes[class];
@@ -1168,6 +1214,9 @@ impl Regex {
                     writeln!(buffer, "\t{} -> {} [label=\".\"];", idx, out).unwrap();
                 } else {
                     writeln!(buffer, "\t{} -> {} [label=\"[{}B]\"];", idx, out, count).unwrap();
+                }
+                if out_exit != StateIdx::NONE {
+                    writeln!(buffer, "\t{} -> {} [style=dashed];", idx, out_exit).unwrap();
                 }
             }
             State::Assert { kind, out } => {
@@ -1423,26 +1472,49 @@ impl RegexBuilder {
 
             for &si in &consuming {
                 let action = match states[si] {
-                    State::Byte { byte, out } => {
+                    State::Byte {
+                        byte,
+                        out,
+                        out_exit,
+                    } => {
                         if b == byte {
-                            1 + out.0
+                            // Push (out, out_exit) pair to differentiate
+                            // states with different exit targets.
+                            sig.push(1 + out.0);
+                            sig.push(out_exit.0);
                         } else {
-                            0
+                            sig.push(0);
+                            sig.push(0);
                         }
+                        continue;
                     }
-                    State::ByteCI { byte, out } => {
+                    State::ByteCI {
+                        byte,
+                        out,
+                        out_exit,
+                    } => {
                         if byte_match_ci(b, byte) {
-                            1 + out.0
+                            sig.push(1 + out.0);
+                            sig.push(out_exit.0);
                         } else {
-                            0
+                            sig.push(0);
+                            sig.push(0);
                         }
+                        continue;
                     }
-                    State::ByteClass { class, out } => {
+                    State::ByteClass {
+                        class,
+                        out,
+                        out_exit,
+                    } => {
                         if classes[class][b] {
-                            1 + out.0
+                            sig.push(1 + out.0);
+                            sig.push(out_exit.0);
                         } else {
-                            0
+                            sig.push(0);
+                            sig.push(0);
                         }
+                        continue;
                     }
                     State::ByteTable { table } => {
                         let t = byte_tables[table][b];
@@ -2064,6 +2136,7 @@ impl RegexBuilder {
                 let idx = self.state(State::ByteClass {
                     class,
                     out: StateIdx::NONE,
+                    out_exit: StateIdx::NONE,
                 });
                 Fragment::new(idx, idx)
             }
@@ -2071,6 +2144,7 @@ impl RegexBuilder {
                 let idx = self.state(State::ByteCI {
                     byte,
                     out: StateIdx::NONE,
+                    out_exit: StateIdx::NONE,
                 });
                 Fragment::new(idx, idx)
             }
@@ -2078,6 +2152,7 @@ impl RegexBuilder {
                 let idx = self.state(State::Byte {
                     byte,
                     out: StateIdx::NONE,
+                    out_exit: StateIdx::NONE,
                 });
                 Fragment::new(idx, idx)
             }
@@ -2528,7 +2603,9 @@ impl RegexBuilder {
     /// share the same byte value.
     fn collect_byte_leaves(&self, idx: StateIdx, out: &mut Vec<(u8, StateIdx)>) -> bool {
         match self.states.as_slice()[idx] {
-            State::Byte { byte, out: target } => {
+            State::Byte {
+                byte, out: target, ..
+            } => {
                 // Check for duplicate byte values.
                 if out.iter().any(|&(b, _)| b == byte) {
                     return false;
@@ -3703,9 +3780,9 @@ impl<'a> NfaMatcher<'a> {
 
         while let Some((idx, ctx)) = clist.pop() {
             let target = match self.states[idx] {
-                State::Byte { byte: b2, out } if b == b2 => out,
-                State::ByteCI { byte: b2, out } if byte_match_ci(b, b2) => out,
-                State::ByteClass { class, out } if self.classes[class][b] => out,
+                State::Byte { byte: b2, out, .. } if b == b2 => out,
+                State::ByteCI { byte: b2, out, .. } if byte_match_ci(b, b2) => out,
+                State::ByteClass { class, out, .. } if self.classes[class][b] => out,
                 State::ByteTable { table } => {
                     let t = self.byte_tables[table][b];
                     if t == StateIdx::NONE {
@@ -4969,7 +5046,9 @@ mod tests {
             }
 
             // Consuming states reset the epsilon budget.
-            State::Byte { byte, out: next } => {
+            State::Byte {
+                byte, out: next, ..
+            } => {
                 if out.len() >= GEN_MAX_INPUT_LEN {
                     return false;
                 }
@@ -4990,7 +5069,9 @@ mod tests {
                 }
             }
 
-            State::ByteCI { byte, out: next } => {
+            State::ByteCI {
+                byte, out: next, ..
+            } => {
                 if out.len() >= GEN_MAX_INPUT_LEN {
                     return false;
                 }
@@ -5011,7 +5092,9 @@ mod tests {
                 }
             }
 
-            State::ByteClass { class, out: next } => {
+            State::ByteClass {
+                class, out: next, ..
+            } => {
                 if out.len() >= GEN_MAX_INPUT_LEN {
                     return false;
                 }

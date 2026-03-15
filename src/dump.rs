@@ -106,18 +106,42 @@ impl fmt::Display for DumpState<'_> {
                     "CInc(c{counter}, {{{min},{max}}}) → cont:{out} | break:{out1}",
                 )
             }
-            State::Byte { byte, out } => {
+            State::Byte {
+                byte,
+                out,
+                out_exit,
+            } => {
                 write!(f, "Byte(")?;
                 format_byte(byte, f)?;
-                write!(f, ") → {out}")
+                write!(f, ") → {out}")?;
+                if out_exit != StateIdx::NONE {
+                    write!(f, " | exit:{out_exit}")?;
+                }
+                Ok(())
             }
-            State::ByteCI { byte, out } => {
+            State::ByteCI {
+                byte,
+                out,
+                out_exit,
+            } => {
                 write!(f, "ByteCI(")?;
                 format_byte(byte, f)?;
-                write!(f, ") → {out}")
+                write!(f, ") → {out}")?;
+                if out_exit != StateIdx::NONE {
+                    write!(f, " | exit:{out_exit}")?;
+                }
+                Ok(())
             }
-            State::ByteClass { class, out } => {
-                write!(f, "ByteClass(cls:{}) → {out}", class.idx())
+            State::ByteClass {
+                class,
+                out,
+                out_exit,
+            } => {
+                write!(f, "ByteClass(cls:{}) → {out}", class.idx())?;
+                if out_exit != StateIdx::NONE {
+                    write!(f, " | exit:{out_exit}")?;
+                }
+                Ok(())
             }
             State::ByteTable { table } => {
                 let map = &self.byte_tables[table.idx()];

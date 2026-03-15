@@ -442,9 +442,9 @@ fn consume_byte_at(
     byte_tables: &[ByteMap],
 ) -> Option<StateIdx> {
     match states[idx.idx()] {
-        State::Byte { byte: b, out } if byte == b => Some(out),
-        State::ByteCI { byte: b, out } if crate::byte_match_ci(byte, b) => Some(out),
-        State::ByteClass { class, out } if classes[class.idx()][byte] => Some(out),
+        State::Byte { byte: b, out, .. } if byte == b => Some(out),
+        State::ByteCI { byte: b, out, .. } if crate::byte_match_ci(byte, b) => Some(out),
+        State::ByteClass { class, out, .. } if classes[class.idx()][byte] => Some(out),
         State::ByteTable { table } => {
             let t = byte_tables[table][byte];
             if t != StateIdx::NONE { Some(t) } else { None }
