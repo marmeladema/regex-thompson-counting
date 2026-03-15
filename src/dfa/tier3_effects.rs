@@ -821,7 +821,11 @@ pub(crate) fn eval_assert_chain(
     let chain = arena.get(chain_id);
     for &assert_idx in chain {
         let State::Assert { kind, out } = regex.states.0[assert_idx] else {
-            // Not an Assert state — should not happen, but be defensive.
+            debug_assert!(
+                false,
+                "assert chain entry {} is not an Assert state: {:?}",
+                assert_idx, regex.states.0[assert_idx]
+            );
             return false;
         };
         match kind.eval(false, at_end, prev, next) {
@@ -848,9 +852,14 @@ pub(crate) fn eval_assert_chain(
             AssertEval::Fail => return false,
             AssertEval::Defer => {
                 // The assertion needs the next byte — can't resolve yet.
-                // For mid-input NextByte effects this shouldn't happen
-                // (we have the next byte).  For EOI resolution (at_end=true,
-                // next=None), treat as failure (conservative).
+                // At EOI (at_end=true, next=None) this is expected for
+                // some assertion kinds.  Mid-input with next=Some(b),
+                // all assertions should resolve to Pass or Fail.
+                debug_assert!(
+                    at_end,
+                    "Defer result mid-input for assert state {}: kind={kind:?}",
+                    assert_idx,
+                );
                 return false;
             }
         }

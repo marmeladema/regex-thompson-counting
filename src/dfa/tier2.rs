@@ -1802,8 +1802,9 @@ impl<'a> Tier2DfaMatcher<'a> {
                             stack.push(out);
                         }
                         State::Assert { kind, out } => {
-                            // Nested assertion (unlikely but handle it):
-                            // evaluate at end-of-input.
+                            // Chained assertion (e.g. `\b\B$` — multiple
+                            // assertions on the epsilon path): evaluate
+                            // at end-of-input.
                             if kind.eval(false, true, prev, None) == AssertEval::Pass {
                                 stack.push(out);
                             }

@@ -2470,7 +2470,8 @@ impl RegexBuilder {
                 for i in 0..counter_bytes.len() {
                     for j in (i + 1)..counter_bytes.len() {
                         if counter_bytes[i].0 == counter_bytes[j].0 {
-                            continue; // same counter (shouldn't happen)
+                            debug_assert!(false, "duplicate counter pair in byte overlap check");
+                            continue; // same counter — skip self-pair
                         }
                         for b in 0..256 {
                             if counter_bytes[i].1[b] && counter_bytes[j].1[b] {
@@ -2578,9 +2579,16 @@ impl RegexBuilder {
                                 }
                             }
                         }
-                        // Match or other terminal: shouldn't happen in a
-                        // well-formed counter body, but treat as dead end.
-                        _ => {}
+                        // Match or other terminal: dead end for body walk.
+                        // A well-formed counter body shouldn't reach Match
+                        // directly (it should go through CInc first).
+                        _ => {
+                            debug_assert!(
+                                !matches!(states[idx], State::Match),
+                                "Match state reachable in counter body walk from state {}",
+                                idx.idx()
+                            );
+                        }
                     }
                 }
                 result
