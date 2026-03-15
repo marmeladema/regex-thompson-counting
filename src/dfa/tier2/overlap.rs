@@ -578,3 +578,168 @@ fn byte_class_representatives(byte_classes: &[u8; 256], num_byte_classes: usize)
     }
     reps
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build(pattern: &str) -> crate::Regex {
+        use regex_syntax::ast::parse::ParserBuilder;
+        use regex_syntax::hir::translate::TranslatorBuilder;
+        let ast = ParserBuilder::new().build().parse(pattern).unwrap();
+        let hir = TranslatorBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .dot_matches_new_line(true)
+            .build()
+            .translate(pattern, &ast)
+            .unwrap();
+        crate::RegexBuilder::default()
+            .max_unroll_states(0)
+            .merge_repetitions(false)
+            .build(&hir)
+            .unwrap()
+    }
+
+    fn probe_result(regex: &crate::Regex) -> Tier2OverlapStats {
+        let analysis = crate::dfa::tier2::compute_tier2_analysis(
+            &regex.states.0,
+            &regex.byte_tables,
+            regex.counter_info.len(),
+        );
+        tier2_overlap_probe(
+            &regex.states.0,
+            &regex.classes,
+            &regex.byte_tables,
+            &regex.byte_classes,
+            regex.num_byte_classes,
+            regex.start,
+            &analysis,
+            regex.counter_info.len(),
+        )
+    }
+
+    fn eligibility(regex: &crate::Regex) -> crate::dfa::tier2::eligibility::Tier2Eligibility {
+        let classes_set: indexmap::IndexSet<crate::ByteClass> =
+            regex.classes.iter().copied().collect();
+        crate::dfa::tier2::eligibility::compute_tier2_eligibility(
+            &regex.states.0,
+            &classes_set,
+            &regex.byte_tables,
+            regex.counter_info.len(),
+            false, // has_deferred_in_counter_body
+        )
+    }
+
+    // -- Disjoint fast path --
+
+    #[test]
+    fn test_proof_disjoint_fast_path() {
+        let regex = build(r"^a{3,5}b{2,4}$");
+        let elig = eligibility(&regex);
+        assert!(elig.disjoint_bytes);
+        // Probe is not needed for disjoint — but running it should still pass.
+        let stats = probe_result(&regex);
+        assert_eq!(stats.max_reachable_counting_width, 1);
+    }
+
+    // -- Proven binary-exact (alternation body) --
+
+    #[test]
+    fn test_proof_alternation_binary_exact() {
+        // Alternation branches with overlapping bytes: [ab]{5,26} and
+        // [bc]{5,26} share byte 'b'.  But only one branch is ever active
+        // → the probe should prove binary-exact.
+        let regex = build(r"^([ab]{5,26}|[bc]{5,26})$");
+        let elig = eligibility(&regex);
+        assert!(!elig.disjoint_bytes);
+        assert!(!elig.has_identical_body_bytes);
+        let stats = probe_result(&regex);
+        assert_eq!(
+            stats.proof,
+            Tier2OverlapProof::ProvenBinaryExact,
+            "alternation with overlapping bytes should be proven binary-exact"
+        );
+        assert!(elig.is_eligible_with_proof(stats.proof));
+    }
+
+    // -- Rejected: sequential overlap --
+
+    #[test]
+    fn test_proof_sequential_overlap_rejected() {
+        let regex = build(r"^\w{3}\d{2}$");
+        let elig = eligibility(&regex);
+        assert!(!elig.disjoint_bytes);
+        let stats = probe_result(&regex);
+        assert_eq!(
+            stats.proof,
+            Tier2OverlapProof::RejectedNonBinaryExact,
+            "sequential overlap should be rejected (no lifecycle analysis)"
+        );
+        assert_eq!(stats.max_reachable_counting_width, 2);
+    }
+
+    #[test]
+    fn test_proof_hex_subset_rejected() {
+        let regex = build(r"^[0-9A-F]{4}[A-F]{2}$");
+        let elig = eligibility(&regex);
+        assert!(!elig.disjoint_bytes);
+        let stats = probe_result(&regex);
+        assert_eq!(stats.proof, Tier2OverlapProof::RejectedNonBinaryExact);
+    }
+
+    // -- Rejected: variable counts --
+
+    #[test]
+    fn test_proof_variable_overlap_rejected() {
+        let regex = build(r"^\w{1,3}\d{1,3}$");
+        let elig = eligibility(&regex);
+        assert!(!elig.disjoint_bytes);
+        let stats = probe_result(&regex);
+        assert_eq!(stats.proof, Tier2OverlapProof::RejectedNonBinaryExact);
+    }
+
+    // -- Rejected: wildcard overlap --
+
+    #[test]
+    fn test_proof_wildcard_overlap() {
+        let regex = build(r"^.{0,2}.{0,2}$");
+        let elig = eligibility(&regex);
+        assert!(!elig.disjoint_bytes);
+        // Binary-exact (symmetric) but blocked by identical body bytes.
+        let stats = probe_result(&regex);
+        assert_eq!(stats.proof, Tier2OverlapProof::ProvenBinaryExact);
+        assert!(elig.has_identical_body_bytes);
+        // is_eligible_with_proof should reject due to identical bytes.
+        assert!(!elig.is_eligible_with_proof(stats.proof));
+    }
+
+    // -- Alternation with identical bytes --
+
+    #[test]
+    fn test_proof_alternation_identical_bytes_rejected() {
+        // Two f{5,26} in alternation: identical body bytes.
+        let regex = build(r"^(f{5,26}|f{5,26})$");
+        let elig = eligibility(&regex);
+        assert!(elig.has_identical_body_bytes);
+        let stats = probe_result(&regex);
+        // Even if probe says binary-exact, is_eligible_with_proof rejects.
+        assert!(!elig.is_eligible_with_proof(stats.proof));
+    }
+
+    // -- Alternation with different bytes accepted --
+
+    #[test]
+    fn test_proof_disjoint_alternation_accepted() {
+        // Disjoint bytes (a vs b): fast-path eligible regardless of probe.
+        let regex = build(r"^(a{5,26}|b{5,26})$");
+        let elig = eligibility(&regex);
+        assert!(elig.disjoint_bytes);
+        assert!(!elig.has_identical_body_bytes);
+        assert!(elig.is_eligible());
+    }
+}
