@@ -2185,62 +2185,8 @@ impl RegexBuilder {
         // the next byte via Phase 1 resolution + cinc_mask), but NOT
         // for L>1 bodies (counter_reset can prematurely clear instances
         // when the NFA is between the last consuming state and CInc).
-        fn body_has_deferred(
-            start: StateIdx,
-            own_counter: CounterIdx,
-            states: &[State],
-            byte_tables: &[ByteMap],
-        ) -> bool {
-            let mut stack = vec![start];
-            let mut visited = vec![false; states.len()];
-            while let Some(idx) = stack.pop() {
-                let i = idx.idx();
-                if visited[i] {
-                    continue;
-                }
-                visited[i] = true;
-                match states[idx] {
-                    State::CounterIncrement { counter, .. } if counter == own_counter => {
-                        continue;
-                    }
-                    State::Assert { kind, out } => {
-                        if matches!(
-                            kind,
-                            AssertKind::EndLF
-                                | AssertKind::EndCRLF
-                                | AssertKind::StartCRLF
-                                | AssertKind::WordAscii
-                                | AssertKind::WordAsciiNegate
-                                | AssertKind::WordStartAscii
-                                | AssertKind::WordEndAscii
-                        ) {
-                            return true;
-                        }
-                        stack.push(out);
-                    }
-                    State::Split { out, out1 } => {
-                        stack.push(out1);
-                        stack.push(out);
-                    }
-                    State::CounterInstance { out, .. } => stack.push(out),
-                    // Follow through consuming states -- deferred
-                    // assertions may appear after a byte match within
-                    // the counter body (e.g. `(?m:a$){2,3}`).
-                    State::Byte { out, .. }
-                    | State::ByteCI { out, .. }
-                    | State::ByteClass { out, .. } => stack.push(out),
-                    State::ByteTable { table } => {
-                        for &succ in byte_tables[table.idx()].0.iter() {
-                            if succ != StateIdx::NONE {
-                                stack.push(succ);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            false
-        }
+        // body_has_deferred is now in dfa::tier2::eligibility.
+        use dfa::tier2::eligibility::body_has_deferred;
 
         let has_deferred_in_counter_body = has_counters && {
             let states = &self.states;
@@ -2392,287 +2338,28 @@ impl RegexBuilder {
             && !has_deferred_in_counter_body
             && self.counters.len() <= MAX_TIER2_COUNTERS;
 
-        // Compute per-counter info: (min, max, body_byte_length).
-        // body_byte_length is the fixed number of bytes consumed per iteration,
-        // or 0 if the body has variable length.
-        #[allow(clippy::type_complexity)]
-        let (counter_info, disjoint_bytes): (Box<[(usize, usize, usize)]>, bool) = if has_counters {
-            let states = &self.states;
-            let byte_tables = &self.byte_tables;
-
-            /// Check that the byte sets matched by different counter bodies
-            /// are pairwise disjoint.  When this holds, at most one counter
-            /// fires CInc on any DFA transition, so the binary
-            /// with_break/no_break split is correct for multiple counters.
-            fn counter_bodies_have_disjoint_bytes(
-                states: &[State],
-                classes: &indexmap::set::IndexSet<ByteClass>,
-                byte_tables: &[ByteMap],
-            ) -> bool {
-                // Collect per-counter byte sets (as [bool; 256]).
-                let mut counter_bytes: Vec<(CounterIdx, [bool; 256])> = Vec::new();
-                for s in states.iter() {
-                    if let State::CounterInstance { counter, out } = s {
-                        let mut bytes = [false; 256];
-                        // Walk the body from CI.out to find all consuming
-                        // states, stopping at CInc for the same counter.
-                        let mut stack = vec![*out];
-                        let mut visited = vec![false; states.len()];
-                        while let Some(idx) = stack.pop() {
-                            let i = idx.idx();
-                            if visited[i] {
-                                continue;
-                            }
-                            visited[i] = true;
-                            match states[idx] {
-                                State::CounterIncrement { counter: c, .. } if c == *counter => {}
-                                State::Split { out, out1 } => {
-                                    stack.push(out1);
-                                    stack.push(out);
-                                }
-                                State::Assert { out, .. } | State::CounterInstance { out, .. } => {
-                                    stack.push(out);
-                                }
-                                State::Byte { byte, out } => {
-                                    bytes[byte as usize] = true;
-                                    stack.push(out);
-                                }
-                                State::ByteCI { byte, out } => {
-                                    bytes[byte as usize] = true;
-                                    bytes[(byte ^ 0x20) as usize] = true;
-                                    stack.push(out);
-                                }
-                                State::ByteClass { class, out } => {
-                                    let table = &classes[class.idx()];
-                                    for b in 0..=255u8 {
-                                        if table[b] {
-                                            bytes[b as usize] = true;
-                                        }
-                                    }
-                                    stack.push(out);
-                                }
-                                State::ByteTable { table } => {
-                                    let map = &byte_tables[table.idx()];
-                                    for b in 0..=255u8 {
-                                        if map[b] != StateIdx::NONE {
-                                            bytes[b as usize] = true;
-                                            stack.push(map[b]);
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        counter_bytes.push((*counter, bytes));
-                    }
-                }
-                // Pairwise disjointness check.
-                for i in 0..counter_bytes.len() {
-                    for j in (i + 1)..counter_bytes.len() {
-                        if counter_bytes[i].0 == counter_bytes[j].0 {
-                            debug_assert!(false, "duplicate counter pair in byte overlap check");
-                            continue; // same counter — skip self-pair
-                        }
-                        for b in 0..256 {
-                            if counter_bytes[i].1[b] && counter_bytes[j].1[b] {
-                                return false;
-                            }
-                        }
-                    }
-                }
-                true
-            }
-
-            /// Compute the fixed byte-length of a counter body.
-            /// Returns `Some(len)` if all paths through the body consume
-            /// exactly `len` bytes, `None` if variable-length.
-            fn counter_body_length(
-                ci_out: StateIdx,
-                own_counter: CounterIdx,
-                states: &[State],
-                byte_tables: &[ByteMap],
-            ) -> Option<usize> {
-                // DFS from ci_out (the body entry).  Each path counts
-                // consuming states until it reaches CInc(own_counter).
-                // All paths must agree on the count.
-                let mut result: Option<usize> = None;
-                let mut stack: Vec<(StateIdx, usize)> = vec![(ci_out, 0)];
-                let mut visited: Vec<Option<usize>> = vec![None; states.len()];
-                // Use a separate "in_stack" to avoid infinite loops on
-                // cycles that don't pass through CInc.
-                let mut in_stack = vec![false; states.len()];
-                while let Some((idx, depth)) = stack.pop() {
-                    let i = idx.idx();
-                    in_stack[i] = false;
-                    match states[idx] {
-                        State::CounterIncrement { counter, .. } if counter == own_counter => {
-                            // Reached our CInc: this path consumed `depth` bytes.
-                            match result {
-                                None => result = Some(depth),
-                                Some(prev) if prev != depth => return None,
-                                _ => {}
-                            }
-                        }
-                        State::Split { out, out1 } => {
-                            for succ in [out, out1] {
-                                let si = succ.idx();
-                                if !in_stack[si] {
-                                    match visited[si] {
-                                        Some(d) if d == depth => {} // already explored at same depth
-                                        Some(_) => return None,     // different depth = variable
-                                        None => {
-                                            visited[si] = Some(depth);
-                                            in_stack[si] = true;
-                                            stack.push((succ, depth));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        State::Assert { out, .. } | State::CounterInstance { out, .. } => {
-                            let si = out.idx();
-                            if !in_stack[si] {
-                                match visited[si] {
-                                    Some(d) if d == depth => {}
-                                    Some(_) => return None,
-                                    None => {
-                                        visited[si] = Some(depth);
-                                        in_stack[si] = true;
-                                        stack.push((out, depth));
-                                    }
-                                }
-                            }
-                        }
-                        State::Byte { out, .. }
-                        | State::ByteCI { out, .. }
-                        | State::ByteClass { out, .. } => {
-                            let si = out.idx();
-                            let nd = depth + 1;
-                            if !in_stack[si] {
-                                match visited[si] {
-                                    Some(d) if d == nd => {}
-                                    Some(_) => return None,
-                                    None => {
-                                        visited[si] = Some(nd);
-                                        in_stack[si] = true;
-                                        stack.push((out, nd));
-                                    }
-                                }
-                            }
-                        }
-                        State::ByteTable { table } => {
-                            let nd = depth + 1;
-                            for &succ in byte_tables[table.idx()].0.iter() {
-                                if succ != StateIdx::NONE {
-                                    let si = succ.idx();
-                                    if !in_stack[si] {
-                                        match visited[si] {
-                                            Some(d) if d == nd => {}
-                                            Some(_) => return None,
-                                            None => {
-                                                visited[si] = Some(nd);
-                                                in_stack[si] = true;
-                                                stack.push((succ, nd));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // Match or other terminal: dead end for body walk.
-                        // A well-formed counter body shouldn't reach Match
-                        // directly (it should go through CInc first).
-                        _ => {
-                            debug_assert!(
-                                !matches!(states[idx], State::Match),
-                                "Match state reachable in counter body walk from state {}",
-                                idx.idx()
-                            );
-                        }
-                    }
-                }
-                result
-            }
-
-            let num_counters = self.counters.len();
-            let mut info = vec![(0usize, 0usize, 0usize); num_counters];
-            // First, collect min/max from CInc states.
-            for s in states.iter() {
-                if let State::CounterIncrement {
-                    counter, min, max, ..
-                } = s
-                {
-                    info[counter.idx()] = (*min, *max, 0);
-                }
-            }
-            // Then, compute body lengths from CI states.
-            for s in states.iter() {
-                if let State::CounterInstance { counter, out } = s {
-                    let ci = counter.idx();
-                    let body_len =
-                        counter_body_length(*out, *counter, states, byte_tables).unwrap_or(0);
-                    info[ci].2 = body_len;
-                }
-            }
-            let disjoint_bytes =
-                counter_bodies_have_disjoint_bytes(states, &self.classes, byte_tables);
-
-            (info.into_boxed_slice(), disjoint_bytes)
+        // Compute Tier 2 eligibility via the extracted helper.
+        // See dfa::tier2::eligibility for the full analysis.
+        let tier2_elig = if has_counters {
+            Some(dfa::tier2::eligibility::compute_tier2_eligibility(
+                &self.states,
+                &self.classes,
+                &self.byte_tables,
+                self.counters.len(),
+                has_deferred_in_counter_body,
+            ))
         } else {
-            (Box::new([]), true)
+            None
         };
-
-        // Tier 2 eligibility: non-nested counters with fixed-length bodies
-        // and pairwise-disjoint byte sets.
-        //
-        // Uses non_nested_eligible (not tier3_eligible) because tier 2
-        // supports deferred assertions inside L=1 counter bodies via its
-        // Phase 1 deferred resolution + cinc_mask mechanism.  For L>1
-        // bodies, deferred assertions break the phase-clock model (the
-        // counter_reset logic can prematurely clear instances when the
-        // NFA is between the last consuming state and CInc due to a
-        // deferred assertion), so they remain ineligible.
-        //
-        // Additional requirements beyond non-nested:
-        //  - every counter body must have a fixed byte-length (> 0),
-        //  - the byte sets of different counter bodies must not overlap,
-        //  - at most MAX_TIER2_COUNTERS counters (u64 bitmask limit), and
-        //  - if a body contains a deferred assertion, body_len must be 1.
-        //
-        // The disjoint-bytes condition guarantees that at most one counter
-        // fires CInc per DFA transition, so the binary with_break/no_break
-        // DFA split remains correct with multiple counters.
-        let has_deferred_in_long_body = has_deferred_in_counter_body && {
-            // Check if any counter with a deferred assertion in its body
-            // has body_length > 1.  L=1 bodies are safe because the single
-            // phase handles the 1-byte deferral correctly.
-            let states = &self.states;
-            let byte_tables = &self.byte_tables;
-            states.iter().any(|s| {
-                if let State::CounterInstance { counter, out } = s {
-                    let ci = counter.idx();
-                    let body_len = counter_info.get(ci).map_or(0, |info| info.2);
-                    body_len > 1 && body_has_deferred(*out, *counter, states, byte_tables)
-                } else {
-                    false
-                }
-            })
-        };
-        // Multi-counter + deferred-in-body: the probe closure cannot
-        // see past deferred assertions to follow CInc break paths, so
-        // the with_break DFA successor misses the next counter's entry
-        // states.  Single-counter is fine (break leads to Match, handled
-        // by resolved_break_match).
-        let has_deferred_in_multi_counter_body =
-            has_deferred_in_counter_body && counter_info.len() > 1;
+        let counter_info: Box<[(usize, usize, usize)]> = tier2_elig
+            .as_ref()
+            .map_or_else(
+                || Vec::new().into_boxed_slice(),
+                |e| e.counter_info.clone(),
+            );
 
         let tier2_eligible = non_nested_eligible
-            && !has_deferred_in_long_body
-            && !has_deferred_in_multi_counter_body
-            && !counter_info.is_empty()
-            && counter_info.len() <= MAX_TIER2_COUNTERS
-            && counter_info.iter().all(|&(_, _, body_len)| body_len > 0)
-            && disjoint_bytes;
+            && tier2_elig.as_ref().is_some_and(|e| e.is_eligible());
 
         // Compute byte equivalence classes before moving data out.
         let classes_slice: Vec<ByteClass> = self.classes.iter().copied().collect();
@@ -3061,9 +2748,7 @@ impl fmt::Display for CounterIdx {
 /// Maximum number of counters supported (limited by `CounterIdx(u8)`).
 const MAX_COUNTERS: usize = 256;
 
-/// Maximum counters for tier 2: the `counting_mask` and `counter_reset`
-/// fields in `Transition` are `u64` bitmasks.
-const MAX_TIER2_COUNTERS: usize = 64;
+use dfa::tier2::MAX_TIER2_COUNTERS;
 
 /// Default maximum NFA states produced by unrolling a repetition.
 /// Used by [`RegexBuilder::default()`].

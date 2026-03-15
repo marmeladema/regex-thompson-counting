@@ -24,7 +24,7 @@
 //! hit the program is replayed against each active counter context.
 
 mod tier1;
-mod tier2;
+pub(crate) mod tier2;
 mod tier3;
 pub(crate) mod tier3_effects;
 mod tier4;
