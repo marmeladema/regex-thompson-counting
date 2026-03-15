@@ -993,6 +993,124 @@ fn assert_atom_origins_consuming(atom: &EffectAtom, is_consuming: &impl Fn(State
 }
 
 // ---------------------------------------------------------------------------
+// Post-assert topology classification (Bug 53)
+// ---------------------------------------------------------------------------
+
+/// What is epsilon-reachable from an assertion's output, ignoring
+/// consuming states.
+///
+/// Used to determine whether a break-deferred guarded effect can
+/// soundly carry a `Match` or `MatchAtEnd` atom, or whether the
+/// topology is too complex for Tier 3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PostAssertTopology {
+    /// Match reachable through epsilon without End/EndLF assertions.
+    DirectMatch,
+    /// Match reachable only through End/EndLF → Match.
+    PureEndMatch,
+    /// Only consuming states downstream — no epsilon Match.
+    ConsumingOnly,
+    /// Both direct/end Match AND consuming states.  Too complex
+    /// for the current effect model.
+    MixedMatchAndConsuming,
+    /// Both `$ → Match` AND consuming states.
+    MixedEndAndConsuming,
+}
+
+impl PostAssertTopology {
+    /// True when this topology is safe for Tier 3's effect model.
+    pub(crate) fn is_tier3_sound(self) -> bool {
+        matches!(
+            self,
+            Self::DirectMatch | Self::PureEndMatch | Self::ConsumingOnly
+        )
+    }
+}
+
+/// Classify the post-assert topology from `start` by walking epsilon
+/// transitions.
+fn classify_post_assert(start: StateIdx, states: &[crate::State]) -> PostAssertTopology {
+    let n = states.len();
+    let mut visited = vec![false; n];
+    let mut stack = vec![(start, false)]; // (state, passed_through_end)
+    let mut has_direct_match = false;
+    let mut has_end_match = false;
+    let mut has_consuming = false;
+    while let Some((idx, through_end)) = stack.pop() {
+        let i = idx.idx();
+        if i >= n || visited[i] {
+            continue;
+        }
+        visited[i] = true;
+        match states[i] {
+            crate::State::Match => {
+                if through_end {
+                    has_end_match = true;
+                } else {
+                    has_direct_match = true;
+                }
+            }
+            crate::State::Split { out, out1 } => {
+                stack.push((out, through_end));
+                stack.push((out1, through_end));
+            }
+            crate::State::Assert { kind, out } => {
+                let is_end = matches!(kind, crate::AssertKind::End | crate::AssertKind::EndLF);
+                stack.push((out, through_end || is_end));
+            }
+            crate::State::CounterInstance { out, .. } => {
+                stack.push((out, through_end));
+            }
+            // Consuming states and CInc break paths: stop.
+            crate::State::Byte { .. }
+            | crate::State::ByteCI { .. }
+            | crate::State::ByteClass { .. }
+            | crate::State::ByteTable { .. }
+            | crate::State::CounterIncrement { .. } => {
+                has_consuming = true;
+            }
+        }
+    }
+    match (has_direct_match, has_end_match, has_consuming) {
+        (true, _, true) => PostAssertTopology::MixedMatchAndConsuming,
+        (_, true, true) => PostAssertTopology::MixedEndAndConsuming,
+        (true, _, _) => PostAssertTopology::DirectMatch,
+        (_, true, _) => PostAssertTopology::PureEndMatch,
+        (_, _, true) => PostAssertTopology::ConsumingOnly,
+        // No match, no consuming — dead path.  Treat as consuming-only
+        // (the effect will simply never fire).
+        _ => PostAssertTopology::ConsumingOnly,
+    }
+}
+
+/// Check that all break-deferred assertion chains in a Tier 3 analysis
+/// have a post-assert topology that the current effect model can
+/// represent soundly.
+///
+/// Returns `true` if all chains are sound (Tier 3 is safe).
+/// Returns `false` if any chain has a mixed/unsupported topology
+/// (pattern should fall back to Tier 4 / NFA).
+pub(crate) fn check_break_deferred_soundness(
+    analysis: &super::Tier3Analysis,
+    states: &[crate::State],
+) -> bool {
+    for be in &*analysis.break_effects {
+        for &chain_id in &be.break_deferred_chain_ids {
+            let chain = analysis.assert_chain_arena.get(chain_id);
+            if let Some(&assert_idx) = chain.last()
+                && let crate::State::Assert { out, .. } = states[assert_idx.idx()]
+            {
+                let topo = classify_post_assert(out, states);
+                if !topo.is_tier3_sound() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
 // Effect compilation: Tier3OriginKind → CompiledTargetEffects
 // ---------------------------------------------------------------------------
 
@@ -1467,6 +1585,28 @@ mod tests {
             .translate(pattern, &ast)
             .expect("regex-syntax HIR translation should succeed");
         crate::RegexBuilder::default()
+            .build(&hir)
+            .expect("builder should accept the HIR")
+    }
+
+    /// Build a compiled `Regex` with custom unroll limit (test helper).
+    fn build_regex_unroll(pattern: &str, unroll: usize) -> crate::Regex {
+        use regex_syntax::ast::parse::ParserBuilder;
+        use regex_syntax::hir::translate::TranslatorBuilder;
+
+        let ast = ParserBuilder::new()
+            .build()
+            .parse(pattern)
+            .expect("regex-syntax AST parse should succeed");
+        let hir = TranslatorBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .dot_matches_new_line(true)
+            .build()
+            .translate(pattern, &ast)
+            .expect("regex-syntax HIR translation should succeed");
+        crate::RegexBuilder::default()
+            .max_unroll_states(unroll)
             .build(&hir)
             .expect("builder should accept the HIR")
     }
@@ -2073,5 +2213,112 @@ mod tests {
         assert!(actions.seeds.is_empty(), "seed should be dropped");
         assert!(actions.tails.is_empty(), "tail should be dropped");
         assert!(!actions.set_match);
+    }
+
+    // -----------------------------------------------------------------------
+    // Post-assert topology classification (Bug 53)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_post_assert_direct_match() {
+        // Pattern: `\ba` — \b directly before Match-reachable path.
+        // The \b output goes to consuming 'a', but let's test a
+        // simpler shape: assert → Match.
+        let regex = build_regex(r"\b");
+        // \b → Match: the assert output goes to Match.
+        let assert_idx = regex
+            .states
+            .iter()
+            .position(|s| matches!(s, crate::State::Assert { kind: crate::AssertKind::WordAscii, .. }))
+            .expect("should have \\b");
+        let out = match regex.states.0[assert_idx] {
+            crate::State::Assert { out, .. } => out,
+            _ => unreachable!(),
+        };
+        let topo = classify_post_assert(out, &regex.states.0);
+        // \b's output leads to Match directly.
+        assert_eq!(topo, PostAssertTopology::DirectMatch);
+        assert!(topo.is_tier3_sound());
+    }
+
+    #[test]
+    fn test_post_assert_pure_end_match() {
+        // Pattern: `a$` — $ → Match. From $'s output, Match is
+        // reachable only through End assertion.
+        let regex = build_regex(r"a$");
+        let end_idx = regex
+            .states
+            .iter()
+            .position(|s| matches!(s, crate::State::Assert { kind: crate::AssertKind::End, .. }))
+            .expect("should have $");
+        let out = match regex.states.0[end_idx] {
+            crate::State::Assert { out, .. } => out,
+            _ => unreachable!(),
+        };
+        // From $'s output: directly Match (through_end was already set
+        // by the caller, so from this point it's DirectMatch).
+        let topo = classify_post_assert(out, &regex.states.0);
+        assert_eq!(topo, PostAssertTopology::DirectMatch);
+    }
+
+    #[test]
+    fn test_post_assert_consuming_only() {
+        // Pattern with assert → consuming state, no Match.
+        // `\ba` — \b output → Byte('a') (consuming).
+        let regex = build_regex(r"\ba");
+        let assert_idx = regex
+            .states
+            .iter()
+            .position(|s| matches!(s, crate::State::Assert { kind: crate::AssertKind::WordAscii, .. }))
+            .expect("should have \\b");
+        let out = match regex.states.0[assert_idx] {
+            crate::State::Assert { out, .. } => out,
+            _ => unreachable!(),
+        };
+        let topo = classify_post_assert(out, &regex.states.0);
+        assert_eq!(topo, PostAssertTopology::ConsumingOnly);
+        assert!(topo.is_tier3_sound());
+    }
+
+    #[test]
+    fn test_post_assert_mixed_end_and_consuming() {
+        // Pattern: `\B(a|$)` — \B output → Split → (Byte('a') | $ → Match)
+        // This is a mixed topology: consuming + end-match.
+        let regex = build_regex(r"\B(a|$)");
+        let assert_idx = regex
+            .states
+            .iter()
+            .position(|s| matches!(s, crate::State::Assert { kind: crate::AssertKind::WordAsciiNegate, .. }))
+            .expect("should have \\B");
+        let out = match regex.states.0[assert_idx] {
+            crate::State::Assert { out, .. } => out,
+            _ => unreachable!(),
+        };
+        let topo = classify_post_assert(out, &regex.states.0);
+        assert_eq!(topo, PostAssertTopology::MixedEndAndConsuming);
+        assert!(!topo.is_tier3_sound());
+    }
+
+    #[test]
+    fn test_check_break_deferred_soundness_rejects_mixed() {
+        // Pattern from Bug 53: ^.{7,8}\B(\b)?a{0,2}$
+        // The break path from c0 goes through \B to a mixed topology
+        // (consuming a{0,2} + $ → Match).
+        let regex = build_regex_unroll(r"^.{7,8}\B(\b)?a{0,2}$", 0);
+        let analysis = regex.tier3_analysis.as_ref()
+            .expect("tier3_analysis should be computed even if rejected");
+        let sound = check_break_deferred_soundness(analysis, &regex.states.0);
+        assert!(!sound, "Bug 53 pattern should be rejected");
+    }
+
+    #[test]
+    fn test_check_break_deferred_soundness_accepts_pure() {
+        // Pattern: ^.{3,5}\b$ — \b directly before $ → Match.
+        // The break path has \b → $ → Match: pure end-match topology.
+        let regex = build_regex_unroll(r"^.{3,5}\b$", 0);
+        let analysis = regex.tier3_analysis.as_ref()
+            .expect("tier3_analysis should be computed");
+        let sound = check_break_deferred_soundness(analysis, &regex.states.0);
+        assert!(sound, "pure \\b$ pattern should be accepted");
     }
 }

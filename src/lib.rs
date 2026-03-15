@@ -2604,15 +2604,25 @@ impl RegexBuilder {
         };
 
         // Precompute Tier 3 analysis if eligible.
-        let tier3_analysis = if tier3_eligible {
-            Some(compute_tier3_analysis(
+        let (tier3_eligible, tier3_analysis) = if tier3_eligible {
+            let analysis = compute_tier3_analysis(
                 self.states.as_slice(),
                 &byte_tables_slice,
                 &state_can_reach_match,
                 start,
-            ))
+            );
+            // Bug 53: check that all break-deferred assertion chains have
+            // a supported post-assert topology.  If any chain's downstream
+            // from the assertion mixes consuming states with $ → Match (or
+            // direct Match), the current effect model cannot represent it
+            // soundly.  Fall back to Tier 4 / NFA.
+            let sound = dfa::tier3_effects::check_break_deferred_soundness(
+                &analysis,
+                self.states.as_slice(),
+            );
+            (sound, Some(analysis))
         } else {
-            None
+            (false, None)
         };
 
         Ok(Regex {
@@ -10815,6 +10825,102 @@ mod tests {
                 ("fffabcde", false),            // no \b (f/a both word chars)
                 ("fff", false),                 // too short for c1
                 ("ffff bcde", true),            // 4 f's, \b between 'f' and ' '
+            ],
+        }
+
+        // Bug 53: break-deferred assertion whose downstream path mixes
+        // consuming states (a{0,2} counter) with $ → Match.  The
+        // post-assert topology is MixedEndAndConsuming, which is
+        // unsupported by Tier 3's effect model.  The pattern falls back
+        // to NFA/Tier 4.  With default unrolling, a{0,2} is unrolled
+        // and the topology is pure, so Tier 1 handles it.
+        test_bug53_mixed_post_assert_topology {
+            pattern: r"^.{7,8}\B(\b)?a{0,2}$",
+            memory: 1563,
+            min_tier: 1,
+            inputs: [
+                ("aaaaaaaa", true),         // .{7} + \B(word→word) + skip \b + a{1} + $
+                ("aaaaaaaaa", true),        // .{7} + \B + skip \b + a{2} + $
+                ("aaaaaaa", false),         // .{7} + \B at word→EOI fails
+                ("aaaaaa", false),          // too short: .{7} needs 7 bytes
+                ("aaaaaaaaaa", true),       // .{8} + \B + a{0,2}
+                ("aaaaaaaaaaaaa", false),   // 13 bytes: .{8} + \B + a{2} = 10, 3 extra
+                ("aaaaaaa ", true),         // .{7} ends at 'a', \B(a→' ') fails...
+                                            // but .{7} can end at ' ', \B(' '→eoi)=pass
+            ],
+        }
+
+        // Bug 53 variant: MixedEndAndConsuming with \b.
+        // Counter break → \b → Split → (CI(b{2,3}) | $ → Match).
+        // The optional (b{2,3})? after \b creates a mixed topology.
+        // With default unrolling, b{2,3} is unrolled → Tier 1.
+        // With unroll=0, the soundness check rejects from Tier 3.
+        test_bug53_mixed_end_consuming_word_boundary {
+            pattern: r"^a{3,5}\b(b{2,3})?$",
+            memory: 1208,
+            min_tier: 1,
+            inputs: [
+                ("aaa", true),              // a{3} + \b(word→eoi) + skip (b{2,3})? + $
+                ("aaaa", true),             // a{4} + \b(word→eoi) + skip + $
+                ("aaaaa", true),            // a{5} + \b(word→eoi) + skip + $
+                ("aaabb", false),           // \b(a→b) fails: both word chars
+                ("aaabbb", false),          // same: \b between word chars fails
+                ("aaa ", false),            // trailing space: a{3}+\b+skip but $ needs pos 3, ' ' left over
+                ("", false),               // too short
+            ],
+        }
+
+        // Bug 53 variant: MixedEndAndConsuming with two wildcard counters.
+        // c0=.{3,5}, c1=.{3,5}, break from c1 → \b → (CI(a{2,3}) | $→Match).
+        // Three counters when unroll=0.
+        test_bug53_mixed_end_consuming_multi_counter {
+            pattern: r"^.{3,5}.{3,5}\b(a{2,3})?$",
+            memory: 1695,
+            min_tier: 1,
+            inputs: [
+                ("aaaaaa", true),           // .{3}.{3} + \b(word→eoi) + skip + $
+                ("aaaaaa ", false),         // 7 chars, .{3}.{3}=6 then ' ', $ at 7 — no \b before $
+                ("aaaaaaaaaa", true),       // .{5}.{5} + \b(word→eoi) + skip + $
+                ("aaaaaaaaaa ", false),     // 11 chars, trailing space fails $
+                ("aaa aaa", true),          // .{3}="aaa" .{3}=" aa" \b(a→a)=fails...
+                                            // .{4}="aaa " .{3}="aaa" \b(a→eoi) at pos 7 ✓
+                ("aaaaaaaaa", true),        // .{4}.{5}=9, \b(word→eoi) ✓
+                ("aaaaa", false),           // too short: .{3}.{3} needs ≥ 6
+            ],
+        }
+
+        // Bug 53 variant: MixedMatchAndConsuming (unanchored).
+        // No $ anchor: Match is directly reachable from the ? skip
+        // path after \b, AND consuming a{2,3} is also reachable.
+        test_bug53_mixed_match_consuming_unanchored {
+            pattern: r".{3,5}\b(a{2,3})?",
+            memory: 1398,
+            min_tier: 1,
+            inputs: [
+                ("abc", true),              // .{3} + \b(c→eoi) + skip
+                ("abcaa", true),            // .{3} + \b(c→a)=boundary + a{2}
+                ("abcde", true),            // .{5} + \b(e→eoi) + skip
+                ("ab", false),              // too short for .{3}
+                ("   ", false),             // .{3}="   " + \b(' '→eoi) fails (non-word→eoi = no boundary)
+                ("123 a", true),            // .{3}="123" \b(3→' ')=yes + skip
+            ],
+        }
+
+        // Bug 53 variant: MixedEndAndConsuming with \B.
+        // Counter break → \B → Split → (CI(a{2,3}) | $ → Match).
+        test_bug53_mixed_end_consuming_non_word_boundary {
+            pattern: r"^.{3,5}\B(a{2,3})?$",
+            memory: 1464,
+            min_tier: 1,
+            inputs: [
+                ("aaaaa", true),            // .{3} + \B(a→a)=yes + a{2} + $
+                ("aaaaaa", true),           // .{3} + \B(a→a)=yes + a{3} + $
+                ("aaaaaaa", true),          // .{4} + \B(a→a)=yes + a{3} + $
+                ("aaa", false),             // .{3} + \B(a→eoi)=no (word→eoi is boundary)
+                ("aaaa", false),            // .{3}+\B(a→a)+a{2,3}? only 1 'a' left: min=2 fails
+                                            // .{4}+\B(a→eoi)=no
+                ("aa", false),              // too short
+                ("   aa", false),           // \B(' '→'a')=no (non-word→word is boundary)
             ],
         }
 
