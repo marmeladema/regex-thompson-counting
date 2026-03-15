@@ -320,9 +320,14 @@ pub(crate) fn compute_tier3_analysis(
         // as a tombstone, but their out fields are irrelevant).
         let _ = i;
         match *state {
-            State::Byte { out, .. } | State::ByteCI { out, .. } | State::ByteClass { out, .. } => {
+            State::Byte { out, out_exit, .. }
+            | State::ByteCI { out, out_exit, .. }
+            | State::ByteClass { out, out_exit, .. } => {
                 if out != StateIdx::NONE {
                     is_target[out.idx()] = true;
+                }
+                if out_exit != StateIdx::NONE {
+                    is_target[out_exit.idx()] = true;
                 }
             }
             State::ByteTable { table } => {
@@ -618,11 +623,14 @@ pub(crate) fn compute_tier3_analysis(
                     State::Assert { out, .. } | State::CounterInstance { out, .. } => {
                         stack.push(out);
                     }
-                    State::Byte { out, .. }
-                    | State::ByteCI { out, .. }
-                    | State::ByteClass { out, .. } => {
+                    State::Byte { out, out_exit, .. }
+                    | State::ByteCI { out, out_exit, .. }
+                    | State::ByteClass { out, out_exit, .. } => {
                         count += 1;
                         stack.push(out);
+                        if out_exit != StateIdx::NONE {
+                            stack.push(out_exit);
+                        }
                     }
                     State::ByteTable { table } => {
                         count += 1;
@@ -653,20 +661,24 @@ pub(crate) fn compute_tier3_analysis(
     // state is `$ → Match`.
     let mut target_mae = vec![false; n];
     for (i, state) in states.iter().enumerate() {
-        let target = match *state {
-            State::Byte { out, .. } | State::ByteCI { out, .. } | State::ByteClass { out, .. } => {
+        let mut targets_buf: [Option<StateIdx>; 2] = [None, None];
+        match *state {
+            State::Byte { out, out_exit, .. }
+            | State::ByteCI { out, out_exit, .. }
+            | State::ByteClass { out, out_exit, .. } => {
                 if out != StateIdx::NONE {
-                    Some(out)
-                } else {
-                    None
+                    targets_buf[0] = Some(out);
+                }
+                if out_exit != StateIdx::NONE {
+                    targets_buf[1] = Some(out_exit);
                 }
             }
             // ByteTable targets vary per byte; skip (overapproximation would
             // be unsound, and the tail tracker won't encounter ByteTable
             // origins in practice for tier 3 patterns).
-            _ => None,
-        };
-        if let Some(t) = target {
+            _ => {}
+        }
+        for t in targets_buf.into_iter().flatten() {
             // Walk epsilon transitions from the target to find `$ → Match`.
             let mut estack = vec![t];
             let mut evisited = vec![false; n];
@@ -700,17 +712,21 @@ pub(crate) fn compute_tier3_analysis(
     // intervening `Assert(End)` (Bug 25).
     let mut target_match = vec![false; n];
     for (i, state) in states.iter().enumerate() {
-        let target = match *state {
-            State::Byte { out, .. } | State::ByteCI { out, .. } | State::ByteClass { out, .. } => {
+        let mut targets_buf: [Option<StateIdx>; 2] = [None, None];
+        match *state {
+            State::Byte { out, out_exit, .. }
+            | State::ByteCI { out, out_exit, .. }
+            | State::ByteClass { out, out_exit, .. } => {
                 if out != StateIdx::NONE {
-                    Some(out)
-                } else {
-                    None
+                    targets_buf[0] = Some(out);
+                }
+                if out_exit != StateIdx::NONE {
+                    targets_buf[1] = Some(out_exit);
                 }
             }
-            _ => None,
-        };
-        if let Some(t) = target {
+            _ => {}
+        }
+        for t in targets_buf.into_iter().flatten() {
             let mut estack = vec![t];
             let mut evisited = vec![false; n];
             while let Some(eidx) = estack.pop() {
@@ -760,18 +776,22 @@ pub(crate) fn compute_tier3_analysis(
     // `target_assert_chain_ids` during `compile_all_target_effects`.
     let mut target_da: Vec<Box<[StateIdx]>> = Vec::with_capacity(n);
     for state in states {
-        let target = match *state {
-            State::Byte { out, .. } | State::ByteCI { out, .. } | State::ByteClass { out, .. } => {
+        let mut targets_buf: [Option<StateIdx>; 2] = [None, None];
+        match *state {
+            State::Byte { out, out_exit, .. }
+            | State::ByteCI { out, out_exit, .. }
+            | State::ByteClass { out, out_exit, .. } => {
                 if out != StateIdx::NONE {
-                    Some(out)
-                } else {
-                    None
+                    targets_buf[0] = Some(out);
+                }
+                if out_exit != StateIdx::NONE {
+                    targets_buf[1] = Some(out_exit);
                 }
             }
-            _ => None,
-        };
+            _ => {}
+        }
         let mut asserts = Vec::new();
-        if let Some(t) = target {
+        for t in targets_buf.into_iter().flatten() {
             let mut estack = vec![t];
             let mut evisited = vec![false; n];
             while let Some(eidx) = estack.pop() {
@@ -854,13 +874,16 @@ pub(crate) fn compute_tier3_analysis(
                     // path (out1).  States behind out1 are counter-dependent.
                     stack.push(out);
                 }
-                State::Byte { out, .. }
-                | State::ByteCI { out, .. }
-                | State::ByteClass { out, .. } => {
+                State::Byte { out, out_exit, .. }
+                | State::ByteCI { out, out_exit, .. }
+                | State::ByteClass { out, out_exit, .. } => {
                     rwb[i] = true;
                     // Follow .out to reach consuming states deeper in the
                     // NFA graph (e.g. unrolled repetition chains).
                     stack.push(out);
+                    if out_exit != StateIdx::NONE {
+                        stack.push(out_exit);
+                    }
                 }
                 State::ByteTable { table } => {
                     rwb[i] = true;
@@ -2752,10 +2775,20 @@ fn break_consuming_tails(
                 stack.push((out, deferred));
             }
             State::CounterInstance { out, .. } => stack.push((out, deferred)),
-            State::Byte { out, .. } | State::ByteCI { out, .. } | State::ByteClass { out, .. } => {
-                // Only include if the target's analysis is NOT Increment.
-                // Increment targets are handled by counter seeding.
-                if !matches!(targets[out.idx()], Some(Tier3OriginKind::Increment { .. })) {
+            State::Byte { out, out_exit, .. }
+            | State::ByteCI { out, out_exit, .. }
+            | State::ByteClass { out, out_exit, .. } => {
+                // Only include if at least one target's analysis is NOT
+                // Increment.  Increment targets are handled by counter
+                // seeding.
+                let all_targets_inc =
+                    matches!(targets[out.idx()], Some(Tier3OriginKind::Increment { .. }))
+                        && (out_exit == StateIdx::NONE
+                            || matches!(
+                                targets[out_exit.idx()],
+                                Some(Tier3OriginKind::Increment { .. })
+                            ));
+                if !all_targets_inc {
                     if is_pure && !pure_result.contains(&idx) {
                         pure_result.push(idx);
                     }

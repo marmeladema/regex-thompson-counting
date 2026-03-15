@@ -2363,10 +2363,13 @@ impl RegexBuilder {
                             }
                             // Follow consuming states to detect nesting
                             // behind byte-consuming instructions.
-                            State::Byte { out, .. }
-                            | State::ByteCI { out, .. }
-                            | State::ByteClass { out, .. } => {
+                            State::Byte { out, out_exit, .. }
+                            | State::ByteCI { out, out_exit, .. }
+                            | State::ByteClass { out, out_exit, .. } => {
                                 stack.push(out);
+                                if out_exit != StateIdx::NONE {
+                                    stack.push(out_exit);
+                                }
                             }
                             State::ByteTable { table } => {
                                 for &succ in &byte_tables[table.idx()].0 {

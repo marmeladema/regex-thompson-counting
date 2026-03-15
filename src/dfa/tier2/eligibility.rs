@@ -240,16 +240,37 @@ fn collect_counter_byte_sets(
                     State::Assert { out, .. } | State::CounterInstance { out, .. } => {
                         stack.push(out);
                     }
-                    State::Byte { byte, out, .. } => {
+                    State::Byte {
+                        byte,
+                        out,
+                        out_exit,
+                        ..
+                    } => {
                         bytes[byte as usize] = true;
                         stack.push(out);
+                        if out_exit != StateIdx::NONE {
+                            stack.push(out_exit);
+                        }
                     }
-                    State::ByteCI { byte, out, .. } => {
+                    State::ByteCI {
+                        byte,
+                        out,
+                        out_exit,
+                        ..
+                    } => {
                         bytes[byte as usize] = true;
                         bytes[(byte ^ 0x20) as usize] = true;
                         stack.push(out);
+                        if out_exit != StateIdx::NONE {
+                            stack.push(out_exit);
+                        }
                     }
-                    State::ByteClass { class, out, .. } => {
+                    State::ByteClass {
+                        class,
+                        out,
+                        out_exit,
+                        ..
+                    } => {
                         let table = &classes[class.idx()];
                         for b in 0..=255u8 {
                             if table[b] {
@@ -257,6 +278,9 @@ fn collect_counter_byte_sets(
                             }
                         }
                         stack.push(out);
+                        if out_exit != StateIdx::NONE {
+                            stack.push(out_exit);
+                        }
                     }
                     State::ByteTable { table } => {
                         let map = &byte_tables[table.idx()];
@@ -333,9 +357,11 @@ pub(crate) fn counter_body_length(
                     }
                 }
             }
-            State::Byte { out, .. } | State::ByteCI { out, .. } | State::ByteClass { out, .. } => {
-                let si = out.idx();
+            State::Byte { out, out_exit, .. }
+            | State::ByteCI { out, out_exit, .. }
+            | State::ByteClass { out, out_exit, .. } => {
                 let nd = depth + 1;
+                let si = out.idx();
                 if !in_stack[si] {
                     match visited[si] {
                         Some(d) if d == nd => {}
@@ -344,6 +370,22 @@ pub(crate) fn counter_body_length(
                             visited[si] = Some(nd);
                             in_stack[si] = true;
                             stack.push((out, nd));
+                        }
+                    }
+                }
+                // The exit branch re-enters at the same depth as the
+                // consuming step (it branches post-consumption).
+                if out_exit != StateIdx::NONE {
+                    let esi = out_exit.idx();
+                    if !in_stack[esi] {
+                        match visited[esi] {
+                            Some(d) if d == nd => {}
+                            Some(_) => return None,
+                            None => {
+                                visited[esi] = Some(nd);
+                                in_stack[esi] = true;
+                                stack.push((out_exit, nd));
+                            }
                         }
                     }
                 }
@@ -423,8 +465,13 @@ pub(crate) fn body_has_deferred(
                 stack.push(out);
             }
             State::CounterInstance { out, .. } => stack.push(out),
-            State::Byte { out, .. } | State::ByteCI { out, .. } | State::ByteClass { out, .. } => {
-                stack.push(out)
+            State::Byte { out, out_exit, .. }
+            | State::ByteCI { out, out_exit, .. }
+            | State::ByteClass { out, out_exit, .. } => {
+                stack.push(out);
+                if out_exit != StateIdx::NONE {
+                    stack.push(out_exit);
+                }
             }
             State::ByteTable { table } => {
                 for &succ in &byte_tables[table.idx()].0 {

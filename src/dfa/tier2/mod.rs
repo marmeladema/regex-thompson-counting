@@ -412,12 +412,15 @@ pub(crate) fn compute_tier2_analysis(
                     State::Assert { out, .. } | State::CounterInstance { out, .. } => {
                         stack.push(out);
                     }
-                    State::Byte { out, .. }
-                    | State::ByteCI { out, .. }
-                    | State::ByteClass { out, .. } => {
+                    State::Byte { out, out_exit, .. }
+                    | State::ByteCI { out, out_exit, .. }
+                    | State::ByteClass { out, out_exit, .. } => {
                         all_body_consuming.push(idx.0);
                         // Follow through the successor to find more body states.
                         stack.push(out);
+                        if out_exit != StateIdx::NONE {
+                            stack.push(out_exit);
+                        }
                     }
                     State::ByteTable { table } => {
                         all_body_consuming.push(idx.0);
