@@ -4,10 +4,13 @@
 //!
 //! Three sequential bounded repetitions with a wildcard body — this creates
 //! massive NFA state space (~3000 active states) that punishes engines
-//! without efficient counting.  rethoc compiles this to Tier 3 by default
-//! (conditional DFA with 3 counters, 14 NFA states).
+//! without efficient counting.  With default compilation, rethoc merges
+//! the three repetitions into `.{0,3000}a` (single counter, Tier 2).
+//! The tier3/tier4/nfa benchmarks disable merging to preserve the
+//! 3-counter structure and exercise those tiers directly.
 //!
-//! Benchmarked engines: rethoc/tier3, rethoc/tier4, rethoc/nfa, regex.
+//! Benchmarked engines: rethoc/default, rethoc/tier3, rethoc/tier4,
+//! rethoc/nfa, regex.
 //!
 //! # Nested pattern (`(.{0,1000}a){0,1000}b`)
 //!
@@ -23,7 +26,7 @@
 use std::hint::black_box;
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use regex_thompson_counting::{MatcherMemory, RegexBuilder};
 
@@ -89,7 +92,15 @@ const SLOW_MAX_SIZE: usize = 4 * 1024;
 
 fn bench_no_match(c: &mut Criterion) {
     let hir = parse_hir(PATTERN);
-    let rethoc_re = RegexBuilder::default().build(&hir).unwrap();
+    // Default compilation: merges .{0,1000}.{0,1000}.{0,1000} → .{0,3000}
+    // (single counter, Tier 2).
+    let rethoc_merged = RegexBuilder::default().build(&hir).unwrap();
+    // No-merge compilation: preserves 3 separate counters for tier3/tier4/nfa
+    // benchmarks that need the multi-counter structure.
+    let rethoc_re = RegexBuilder::default()
+        .merge_repetitions(false)
+        .build(&hir)
+        .unwrap();
     let regex_re = regex::bytes::RegexBuilder::new(PATTERN)
         .unicode(false)
         .dot_matches_new_line(true)
@@ -104,7 +115,20 @@ fn bench_no_match(c: &mut Criterion) {
         let hay = vec![b'x'; size];
         group.throughput(Throughput::Bytes(size as u64));
 
-        // rethoc tier 3 (default — conditional DFA, range-compressed)
+        // rethoc default (merged repetitions → single counter, Tier 2)
+        group.bench_with_input(BenchmarkId::new("rethoc/default", size), &hay, |b, hay| {
+            let mut mem = MatcherMemory::default();
+            let mut m = mem.matcher(&rethoc_merged);
+            m.chunk(hay);
+            m.finish();
+            b.iter(|| {
+                let mut m = mem.matcher(&rethoc_merged);
+                m.chunk(black_box(hay));
+                black_box(m.finish())
+            })
+        });
+
+        // rethoc tier 3 (no-merge — conditional DFA, range-compressed, 3 counters)
         group.bench_with_input(BenchmarkId::new("rethoc/tier3", size), &hay, |b, hay| {
             let mut mem = MatcherMemory::default();
             // Warm up the DFA cache.
@@ -160,7 +184,11 @@ fn bench_no_match(c: &mut Criterion) {
 
 fn bench_match_at_end(c: &mut Criterion) {
     let hir = parse_hir(PATTERN);
-    let rethoc_re = RegexBuilder::default().build(&hir).unwrap();
+    let rethoc_merged = RegexBuilder::default().build(&hir).unwrap();
+    let rethoc_re = RegexBuilder::default()
+        .merge_repetitions(false)
+        .build(&hir)
+        .unwrap();
     let regex_re = regex::bytes::RegexBuilder::new(PATTERN)
         .unicode(false)
         .dot_matches_new_line(true)
@@ -176,7 +204,20 @@ fn bench_match_at_end(c: &mut Criterion) {
         hay[size - 1] = b'a';
         group.throughput(Throughput::Bytes(size as u64));
 
-        // rethoc tier 3 (default — conditional DFA, range-compressed)
+        // rethoc default (merged repetitions → single counter, Tier 2)
+        group.bench_with_input(BenchmarkId::new("rethoc/default", size), &hay, |b, hay| {
+            let mut mem = MatcherMemory::default();
+            let mut m = mem.matcher(&rethoc_merged);
+            m.chunk(hay);
+            m.finish();
+            b.iter(|| {
+                let mut m = mem.matcher(&rethoc_merged);
+                m.chunk(black_box(hay));
+                black_box(m.finish())
+            })
+        });
+
+        // rethoc tier 3 (no-merge — conditional DFA, range-compressed, 3 counters)
         group.bench_with_input(BenchmarkId::new("rethoc/tier3", size), &hay, |b, hay| {
             let mut mem = MatcherMemory::default();
             let mut m = mem.matcher_for_tier(&rethoc_re, 3).unwrap();

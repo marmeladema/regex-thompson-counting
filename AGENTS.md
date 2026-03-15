@@ -198,19 +198,22 @@ Data-driven tests use the `match_tests!` macro in `src/lib.rs` (line ~4616). Eac
 
 The macro generates one `#[test]` per entry that compiles the pattern, asserts tier and memory,
 compares against the `regex` crate as oracle, and exercises ALL eligible tiers (NFA through Tier 4).
-It also re-runs with unrolling disabled to force counter-based execution paths.
+It also re-runs with unrolling AND repetition merging disabled to force counter-based
+execution paths while preserving multi-counter structure.
 
 **Key implication for debugging:** A test entry with `min_tier: 1` and a simple pattern like
 `\b\w{3,5}\b` will be tested on Tier 1 with default unrolling, BUT ALSO on Tier 2/3 when the
-macro re-runs with `unroll_limit=0` (which forces counter-based execution, promoting the pattern
-to higher tiers). So a Tier 3 bug can cause failures in tests whose `min_tier` is 1. When you
-see "Tier3 chunk mismatch" in a test failure, it's the `unroll_limit=0` re-run that failed.
+macro re-runs with `unroll_limit=0` + `merge_repetitions=false` (which forces counter-based
+execution, promoting the pattern to higher tiers). So a Tier 3 bug can cause failures in tests
+whose `min_tier` is 1. When you see "Tier3 chunk mismatch" in a test failure, it's the
+`unroll_limit=0` re-run that failed.
 
 **NEVER set `unroll_limit: 0` in test entries.** The macro ALREADY re-runs every
 test with `unroll_limit=0` automatically. Setting it explicitly just skips the
 default-unrolling run and redundantly tests `unroll_limit=0` twice. Use the
 default (omit `unroll_limit` entirely) so both code paths are exercised. The
-`memory` and `min_tier` values should reflect default unrolling.
+`memory` and `min_tier` values should reflect default unrolling (with merging
+enabled).
 
 ### Code Organization
 
@@ -229,6 +232,8 @@ cargo run --release -- dot '<pattern>'                  # Graphviz DOT output
 cargo run --release -- match --tier 2 '<pattern>' 'input' # force a specific tier
 cargo run --release -- info --unroll-limit 0 '<pattern>'  # disable unrolling (force counters)
 cargo run --release -- match --unroll-limit 0 '<pattern>' 'input' # match with counters only
+cargo run --release -- info --no-merge '<pattern>'       # disable same-body repetition merging
+cargo run --release -- match --no-merge --unroll-limit 0 '<pattern>' 'input' # no merge + no unroll
 cargo run --release -- dump '<pattern>'                 # NFA states, counters, byte classes, aux arrays
 cargo run --release -- dump --dfa '<pattern>'           # + tier-specific DFA analysis (Tier 2/3)
 cargo run --release -- dump --format debug '<pattern>'  # Rust {:#?} of the Regex struct
@@ -316,13 +321,15 @@ When fuzzing discovers bugs, follow this discipline:
    ```bash
    # Default tier (may unroll counters away):
    cargo run --release -- match --debug --chunk-size 1 '<pattern>' '<input>'
-   # Force counter-based execution (no unrolling) — essential when the
-   # bug is in a counter tier:
-   cargo run --release -- match --debug --chunk-size 1 --unroll-limit 0 '<pattern>' '<input>'
-   # Force a specific tier (0=NFA, 1-4=DFA tiers):
-   cargo run --release -- match --debug --chunk-size 1 --tier 3 '<pattern>' '<input>'
-   # Combine: force tier 3 without unrolling:
-   cargo run --release -- match --debug --chunk-size 1 --tier 3 --unroll-limit 0 '<pattern>' '<input>'
+    # Force counter-based execution (no unrolling) — essential when the
+    # bug is in a counter tier:
+    cargo run --release -- match --debug --chunk-size 1 --unroll-limit 0 '<pattern>' '<input>'
+    # Force a specific tier (0=NFA, 1-4=DFA tiers):
+    cargo run --release -- match --debug --chunk-size 1 --tier 3 '<pattern>' '<input>'
+    # Combine: force tier 3 without unrolling:
+    cargo run --release -- match --debug --chunk-size 1 --tier 3 --unroll-limit 0 '<pattern>' '<input>'
+    # Disable repetition merging (prevents .{0,N}.{0,M} → .{0,N+M}):
+    cargo run --release -- match --debug --chunk-size 1 --no-merge --unroll-limit 0 '<pattern>' '<input>'
    ```
    The `[init]` line prints full `Debug` (struct fields, NFA states, cache
    details).  Each subsequent `[after chunk ...]` line prints compact

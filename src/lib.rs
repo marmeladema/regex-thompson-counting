@@ -1202,6 +1202,13 @@ pub struct RegexBuilder {
     /// (fixed or non-fixed) of a simple body into concatenated copies.
     /// Set to 0 to disable unrolling entirely.  Default: 32.
     max_unroll_states: usize,
+    /// Whether to merge consecutive bounded repetitions with identical
+    /// bodies (e.g. `.{0,1000}.{0,1000}` → `.{0,2000}`).  Default: true.
+    ///
+    /// Disabled alongside `max_unroll_states=0` in the `match_tests!`
+    /// macro to preserve the multi-counter Tier 3 structures that tests
+    /// are designed to exercise.
+    merge_repetitions: bool,
 }
 
 impl Default for RegexBuilder {
@@ -1215,6 +1222,7 @@ impl Default for RegexBuilder {
             byte_tables: Vec::new(),
             max_repetition: 1000,
             max_unroll_states: DEFAULT_MAX_UNROLL_STATES,
+            merge_repetitions: true,
         }
     }
 }
@@ -1232,6 +1240,13 @@ impl RegexBuilder {
     /// to disable unrolling entirely.  Default: 32.
     pub fn max_unroll_states(&mut self, limit: usize) -> &mut Self {
         self.max_unroll_states = limit;
+        self
+    }
+
+    /// Enable or disable merging of consecutive bounded repetitions
+    /// with identical bodies.  Default: true.
+    pub fn merge_repetitions(&mut self, enable: bool) -> &mut Self {
+        self.merge_repetitions = enable;
         self
     }
 
@@ -1577,6 +1592,56 @@ impl RegexBuilder {
         Ok(())
     }
 
+    /// Emit postfix for a bounded repetition with the given min/max/sub.
+    ///
+    /// Used by the consecutive-repetition merger in the Concat handler.
+    /// The `max_repetition` check is skipped because the individual
+    /// repetitions were already validated by `regex-syntax`.
+    fn emit_bounded_repetition(
+        &mut self,
+        sub: &Hir,
+        min: usize,
+        max: usize,
+    ) -> Result<(), Error> {
+        debug_assert!(min <= max);
+        if max == 0 {
+            return Ok(());
+        }
+        // Try to unroll.
+        let body_nfa = Self::estimate_nfa_states(sub).unwrap_or(0);
+        let limit = self.max_unroll_states;
+        if min > 0 && self.try_unroll(min, max, body_nfa, limit, sub)? {
+            // Unrolled — no counter needed.
+        } else if min == 0
+            && max != usize::MAX
+            && self.try_unroll(1, max, body_nfa, limit.saturating_sub(1), sub)?
+        {
+            self.postfix.push(RegexHirNode::RepeatZeroOne);
+        } else if min > 0 {
+            let counter = self.next_counter()?;
+            let before = self.postfix.len();
+            self.hir2postfix(sub)?;
+            if self.postfix.len() > before {
+                self.postfix
+                    .push(RegexHirNode::CounterLoop { counter, min, max });
+            }
+        } else {
+            // {0,max}: lower to (body{1,max})?
+            let counter = self.next_counter()?;
+            let before = self.postfix.len();
+            self.hir2postfix(sub)?;
+            if self.postfix.len() > before {
+                self.postfix.push(RegexHirNode::CounterLoop {
+                    counter,
+                    min: 1,
+                    max,
+                });
+                self.postfix.push(RegexHirNode::RepeatZeroOne);
+            }
+        }
+        Ok(())
+    }
+
     fn hir2postfix(&mut self, hir: &Hir) -> Result<(), Error> {
         match hir.kind() {
             HirKind::Empty => {
@@ -1675,9 +1740,62 @@ impl RegexBuilder {
             HirKind::Capture(cap) => self.hir2postfix(&cap.sub),
             HirKind::Concat(children) => {
                 let mut count = 0;
-                for child in children {
+                let mut i = 0;
+                while i < children.len() {
+                    // Merge consecutive bounded repetitions with identical
+                    // bodies.  E.g. `.{0,1000}.{0,1000}.{0,1000}` → `.{0,3000}`.
+                    //
+                    // Only merge genuine bounded counters (max > 1, finite)
+                    // — not `?` (0,1), `*` (0,∞), or `+` (1,∞).
+                    if self.merge_repetitions
+                        && let HirKind::Repetition(rep) = children[i].kind()
+                        && let Some(rep_max) = rep.max
+                        && rep_max > 1
+                        && rep.min < rep_max
+                    {
+                        {
+                            let mut merged_min = rep.min as usize;
+                            let mut merged_max = rep_max as usize;
+                            let mut j = i + 1;
+                            while j < children.len() {
+                                if let HirKind::Repetition(rep2) = children[j].kind()
+                                    && let Some(rep2_max) = rep2.max
+                                    && rep2_max > 1
+                                    && rep2.min < rep2_max
+                                    && rep2.sub == rep.sub
+                                {
+                                    merged_min =
+                                        merged_min.saturating_add(rep2.min as usize);
+                                    merged_max =
+                                        merged_max.saturating_add(rep2_max as usize);
+                                    j += 1;
+                                    continue;
+                                }
+                                break;
+                            }
+                            if j > i + 1 {
+                                // Merged run of j - i repetitions into one.
+                                // Bypass max_repetition: individual reps were
+                                // already validated by regex-syntax.
+                                let before = self.postfix.len();
+                                self.emit_bounded_repetition(
+                                    &rep.sub,
+                                    merged_min,
+                                    merged_max,
+                                )?;
+                                if self.postfix.len() > before {
+                                    count += 1;
+                                    if count > 1 {
+                                        self.postfix.push(RegexHirNode::Catenate);
+                                    }
+                                }
+                                i = j;
+                                continue;
+                            }
+                        }
+                    }
                     let before = self.postfix.len();
-                    self.hir2postfix(child)?;
+                    self.hir2postfix(&children[i])?;
                     // Only emit Catenate if the child actually produced
                     // output (Empty produces nothing).
                     if self.postfix.len() > before {
@@ -1686,6 +1804,7 @@ impl RegexBuilder {
                             self.postfix.push(RegexHirNode::Catenate);
                         }
                     }
+                    i += 1;
                 }
                 Ok(())
             }
@@ -7211,8 +7330,8 @@ mod tests {
         // 13 chars: MATCH (\b passes at word→end).
         test_tier3_multi_counter_deferred_break {
             pattern: r#"^.{6,39}.{7,31}\b$"#,
-            memory: 1268,
-            min_tier: 3,
+            memory: 1168,
+            min_tier: 2,
             inputs: [
                 ("aaaaaaaaaaaa", false),
                 ("aaaaaaaaaaaaa", true),
@@ -7222,8 +7341,8 @@ mod tests {
         // Same pattern with \B instead: \B fails at word→end.
         test_tier3_multi_counter_deferred_break_neg {
             pattern: r#"^.{6,39}.{7,31}\B$"#,
-            memory: 1268,
-            min_tier: 3,
+            memory: 1168,
+            min_tier: 2,
             inputs: [
                 ("aaaaaaaaaaaaa", false),
                 ("aaaaaaaaaaaaaaa", false),
@@ -9661,8 +9780,8 @@ mod tests {
 
         test_adjacent_same_byte_counters {
             pattern: "^a{2,50}a{3,70}$",
-            memory: 979,
-            min_tier: 3,
+            memory: 879,
+            min_tier: 2,
             inputs: [
                 ("aaaaa", true),
                 ("aaaaaa", true),
@@ -10529,8 +10648,8 @@ mod tests {
         // an origin is genuinely reachable without counter breaks.
         test_tier3_contaminated_no_break_chain_false_positive {
             pattern: r"^(.{7,25}.{7,25})?((a?a?)?(a?a?)?)?$",
-            memory: 1631,
-            min_tier: 3,
+            memory: 1531,
+            min_tier: 2,
             inputs: [
                 ("", true),              // optional group skips, suffix skips, $ matches
                 ("a", true),             // optional group skips, suffix matches "a"
@@ -10566,8 +10685,8 @@ mod tests {
         // step_from_dead, matching the fast-path logic.
         test_tier3_non_counting_mae_false_positive {
             pattern: r"c{2,12}c{2,12}f$",
-            memory: 2231,
-            min_tier: 1,
+            memory: 879,
+            min_tier: 2,
             inputs: [
                 ("ccf", false),               // only 2 c's, need ≥4 (2+2)
                 ("cccf", false),              // only 3 c's, need ≥4 (2+2)
@@ -11768,8 +11887,8 @@ mod tests {
         // should return true.
         test_tier3_cov_contaminated_clean_nb_deferred_pass {
             pattern: r"^(.{3,10}.{3,10}|x+)\b$",
-            memory: 2289,
-            min_tier: 1,
+            memory: 1267,
+            min_tier: 2,
             inputs: [
                 ("xxx", true),           // x+ path, \b at EOI, counter-free
                 ("aaaaaa", true),         // counter path 3+3=6, contaminated, clean_nb \b passes
@@ -12256,6 +12375,7 @@ mod tests {
         pattern.push('$');
         let mut builder = RegexBuilder::default();
         builder.max_unroll_states(0);
+        builder.merge_repetitions(false);
         let result = builder.build(&regex_syntax::parse(&pattern).unwrap());
         assert!(
             matches!(result, Err(Error::TooManyCounters)),
@@ -12274,6 +12394,7 @@ mod tests {
         pattern.push('$');
         let mut builder = RegexBuilder::default();
         builder.max_unroll_states(0);
+        builder.merge_repetitions(false);
         let result = builder.build(&regex_syntax::parse(&pattern).unwrap());
         assert!(
             result.is_ok(),
@@ -12421,8 +12542,10 @@ mod tests {
         }
 
         // Second pass: recompile with unrolling disabled to exercise
-        // counter-based code paths.
+        // counter-based code paths.  Also disable merging so that
+        // multi-counter patterns retain their counter structure.
         builder.max_unroll_states(0);
+        builder.merge_repetitions(false);
         if let Ok(re_no_unroll) = builder.build(&hir) {
             for input in inputs {
                 let expected = oracle.is_match(input);

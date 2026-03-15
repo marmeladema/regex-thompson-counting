@@ -1,13 +1,14 @@
 use gungraun::{
-    Callgrind, FlamegraphConfig, LibraryBenchmarkConfig, library_benchmark,
-    library_benchmark_group, main,
+    library_benchmark, library_benchmark_group, main, Callgrind, FlamegraphConfig,
+    LibraryBenchmarkConfig,
 };
 use regex_thompson_counting::{MatcherMemory, Regex, RegexBuilder};
 use std::hint::black_box;
 
 /// Pathological bounded-repetition pattern: three sequential `.{0,1000}`
-/// followed by a literal `a`.  Compiles to Tier 3 (conditional DFA with
-/// 3 counters).  This is the profiling target for Tier 3 simulation cost.
+/// followed by a literal `a`.  Compiled with merging disabled to preserve
+/// the 3-counter Tier 3 structure for profiling.  With default merging,
+/// these would become `.{0,3000}a` (Tier 2, single counter).
 const PATTERN: &str = r".{0,1000}.{0,1000}.{0,1000}a";
 
 /// Haystack size for callgrind profiling.  With compilation factored out
@@ -34,14 +35,20 @@ fn parse_hir(pattern: &str) -> regex_syntax::hir::Hir {
 /// Callgrind only measures the benchmark function, not setup.
 fn setup_no_match() -> (Regex, Vec<u8>) {
     let hir = parse_hir(PATTERN);
-    let re = RegexBuilder::default().build(&hir).unwrap();
+    let re = RegexBuilder::default()
+        .merge_repetitions(false)
+        .build(&hir)
+        .unwrap();
     let haystack = vec![b'x'; HAYSTACK_SIZE];
     (re, haystack)
 }
 
 fn setup_match_at_end() -> (Regex, Vec<u8>) {
     let hir = parse_hir(PATTERN);
-    let re = RegexBuilder::default().build(&hir).unwrap();
+    let re = RegexBuilder::default()
+        .merge_repetitions(false)
+        .build(&hir)
+        .unwrap();
     let mut haystack = vec![b'x'; HAYSTACK_SIZE];
     *haystack.last_mut().unwrap() = b'a';
     (re, haystack)

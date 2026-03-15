@@ -6,7 +6,7 @@ use regex_thompson_counting::{MatcherMemory, Regex, RegexBuilder};
 use std::io::{self, Write};
 use std::process;
 
-fn parse_pattern(pattern: &str, unroll_limit: Option<usize>) -> Regex {
+fn parse_pattern(pattern: &str, unroll_limit: Option<usize>, merge: bool) -> Regex {
     let ast = ParserBuilder::new()
         .build()
         .parse(pattern)
@@ -28,6 +28,7 @@ fn parse_pattern(pattern: &str, unroll_limit: Option<usize>) -> Regex {
     if let Some(limit) = unroll_limit {
         builder.max_unroll_states(limit);
     }
+    builder.merge_repetitions(merge);
     builder.build(&hir).unwrap_or_else(|e| {
         eprintln!("error: failed to compile pattern: {e}");
         process::exit(1);
@@ -59,6 +60,7 @@ Options:
   --chunk-size <N>     Feed input in chunks of N bytes (default: entire input at once)
   --tier <0|1|2|3|4>   Force a specific execution tier (0=NFA, 1-4=DFA tiers)
   --unroll-limit <N>   Max NFA states for repetition unrolling (0=disable, default: 32)
+  --no-merge           Disable merging of consecutive same-body repetitions
   --dfa                Include tier-specific DFA analysis in dump output
   --debug              Print matcher state after each step
   -h, --help           Print this help message"
@@ -70,10 +72,12 @@ enum Command {
         pattern: String,
         unroll_limit: Option<usize>,
         format: Format,
+        merge: bool,
     },
     Dot {
         pattern: String,
         unroll_limit: Option<usize>,
+        merge: bool,
     },
     Match {
         pattern: String,
@@ -82,12 +86,14 @@ enum Command {
         tier: Option<u8>,
         unroll_limit: Option<usize>,
         debug: bool,
+        merge: bool,
     },
     Dump {
         pattern: String,
         unroll_limit: Option<usize>,
         format: Format,
         dfa: bool,
+        merge: bool,
     },
 }
 
@@ -104,6 +110,7 @@ fn parse_args() -> Command {
     let mut format = Format::Text;
     let mut debug = false;
     let mut dfa = false;
+    let mut merge = true;
     let mut positional = Vec::new();
 
     let mut i = 0;
@@ -154,6 +161,9 @@ fn parse_args() -> Command {
                     eprintln!("error: --unroll-limit must be a non-negative integer");
                     process::exit(1);
                 }));
+            }
+            "--no-merge" => {
+                merge = false;
             }
             "--format" => {
                 i += 1;
@@ -206,6 +216,7 @@ fn parse_args() -> Command {
                 pattern: positional[1].clone(),
                 unroll_limit,
                 format,
+                merge,
             }
         }
         "dot" => {
@@ -216,6 +227,7 @@ fn parse_args() -> Command {
             Command::Dot {
                 pattern: positional[1].clone(),
                 unroll_limit,
+                merge,
             }
         }
         "match" => {
@@ -230,6 +242,7 @@ fn parse_args() -> Command {
                 tier,
                 unroll_limit,
                 debug,
+                merge,
             }
         }
         "dump" => {
@@ -242,6 +255,7 @@ fn parse_args() -> Command {
                 unroll_limit,
                 format,
                 dfa,
+                merge,
             }
         }
         other => {
@@ -252,8 +266,8 @@ fn parse_args() -> Command {
     }
 }
 
-fn run_info(pattern: &str, unroll_limit: Option<usize>, format: Format) {
-    let regex = parse_pattern(pattern, unroll_limit);
+fn run_info(pattern: &str, unroll_limit: Option<usize>, format: Format, merge: bool) {
+    let regex = parse_pattern(pattern, unroll_limit, merge);
     let info = regex.info();
     match format {
         Format::Text => {
@@ -273,16 +287,16 @@ fn run_info(pattern: &str, unroll_limit: Option<usize>, format: Format) {
     }
 }
 
-fn run_dot(pattern: &str, unroll_limit: Option<usize>) {
-    let regex = parse_pattern(pattern, unroll_limit);
+fn run_dot(pattern: &str, unroll_limit: Option<usize>, merge: bool) {
+    let regex = parse_pattern(pattern, unroll_limit, merge);
     let stdout = io::stdout();
     let mut out = stdout.lock();
     regex.to_dot(&mut out);
     out.flush().unwrap();
 }
 
-fn run_dump(pattern: &str, unroll_limit: Option<usize>, format: Format, dfa: bool) {
-    let regex = parse_pattern(pattern, unroll_limit);
+fn run_dump(pattern: &str, unroll_limit: Option<usize>, format: Format, dfa: bool, merge: bool) {
+    let regex = parse_pattern(pattern, unroll_limit, merge);
     match format {
         Format::Text => {
             print!("{}", regex.dump(dfa));
@@ -304,8 +318,9 @@ fn run_match(
     tier: Option<u8>,
     unroll_limit: Option<usize>,
     debug: bool,
+    merge: bool,
 ) {
-    let regex = parse_pattern(pattern, unroll_limit);
+    let regex = parse_pattern(pattern, unroll_limit, merge);
     let mut memory = MatcherMemory::default();
 
     eprintln!("pattern: {pattern}");
@@ -382,11 +397,13 @@ fn main() {
             pattern,
             unroll_limit,
             format,
-        } => run_info(&pattern, unroll_limit, format),
+            merge,
+        } => run_info(&pattern, unroll_limit, format, merge),
         Command::Dot {
             pattern,
             unroll_limit,
-        } => run_dot(&pattern, unroll_limit),
+            merge,
+        } => run_dot(&pattern, unroll_limit, merge),
         Command::Match {
             pattern,
             inputs,
@@ -394,12 +411,22 @@ fn main() {
             tier,
             unroll_limit,
             debug,
-        } => run_match(&pattern, &inputs, chunk_size, tier, unroll_limit, debug),
+            merge,
+        } => run_match(
+            &pattern,
+            &inputs,
+            chunk_size,
+            tier,
+            unroll_limit,
+            debug,
+            merge,
+        ),
         Command::Dump {
             pattern,
             unroll_limit,
             format,
             dfa,
-        } => run_dump(&pattern, unroll_limit, format, dfa),
+            merge,
+        } => run_dump(&pattern, unroll_limit, format, dfa, merge),
     }
 }
