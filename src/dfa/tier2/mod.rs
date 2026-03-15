@@ -849,15 +849,21 @@ impl Tier2DfaCache {
                         // These are only reachable when the counter
                         // breaks AND the deferred assertion passed.
                         for &bc in analysis.break_consuming(ci) {
-                            if let Some(t) = consume_byte(bc, byte, regex) {
+                            if let Some((t, te)) = consume_byte(bc, byte, regex) {
                                 resolved_break_targets.push(t);
+                                if te != StateIdx::NONE {
+                                    resolved_break_targets.push(te);
+                                }
                             }
                         }
                     }
                 }
                 for &idx in cr.nfa_states.iter() {
-                    if let Some(t) = consume_byte(idx, byte, regex) {
+                    if let Some((t, te)) = consume_byte(idx, byte, regex) {
                         targets.push(t);
+                        if te != StateIdx::NONE {
+                            targets.push(te);
+                        }
                         resolved_body_consumed = true;
                     }
                 }
@@ -866,8 +872,11 @@ impl Tier2DfaCache {
             // Phase 2: consuming states consume `byte`.
             let nfa_states = self.inner.states[from.idx()].nfa_states.clone();
             for &idx in nfa_states.iter() {
-                if let Some(t) = consume_byte(idx, byte, regex) {
+                if let Some((t, te)) = consume_byte(idx, byte, regex) {
                     targets.push(t);
+                    if te != StateIdx::NONE {
+                        targets.push(te);
+                    }
                 }
             }
         }
@@ -1225,14 +1234,32 @@ struct ClosureResult {
 // Free functions
 // ---------------------------------------------------------------------------
 
-fn consume_byte(idx: StateIdx, byte: u8, regex: &Regex) -> Option<StateIdx> {
+/// Consume `byte` at NFA state `idx`.  Returns `(out, out_exit)` where
+/// `out_exit` is `StateIdx::NONE` when there is no exit branch.
+fn consume_byte(idx: StateIdx, byte: u8, regex: &Regex) -> Option<(StateIdx, StateIdx)> {
     match regex.states[idx] {
-        State::Byte { byte: b, out, .. } if byte == b => Some(out),
-        State::ByteCI { byte: b, out, .. } if byte_match_ci(byte, b) => Some(out),
-        State::ByteClass { class, out, .. } if regex.classes[class][byte] => Some(out),
+        State::Byte {
+            byte: b,
+            out,
+            out_exit,
+        } if byte == b => Some((out, out_exit)),
+        State::ByteCI {
+            byte: b,
+            out,
+            out_exit,
+        } if byte_match_ci(byte, b) => Some((out, out_exit)),
+        State::ByteClass {
+            class,
+            out,
+            out_exit,
+        } if regex.classes[class][byte] => Some((out, out_exit)),
         State::ByteTable { table } => {
             let t = regex.byte_tables[table][byte];
-            if t != StateIdx::NONE { Some(t) } else { None }
+            if t != StateIdx::NONE {
+                Some((t, StateIdx::NONE))
+            } else {
+                None
+            }
         }
         _ => None,
     }

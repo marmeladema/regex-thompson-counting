@@ -1799,9 +1799,16 @@ impl Tier3DfaCache {
                 // against `byte`.  Build a map from seed origin → target
                 // for later remapping of resolved seeds (Bug 16).
                 for &idx in &cr.nfa_states {
-                    if let Some(t) = consume_byte(idx, byte, regex) {
-                        targets_per_origin.push((idx, vec![t]));
+                    if let Some((t, te)) = consume_byte(idx, byte, regex) {
+                        let mut ts = vec![t];
+                        if te != StateIdx::NONE {
+                            ts.push(te);
+                        }
                         resolved_body_targets.push((idx, t));
+                        if te != StateIdx::NONE {
+                            resolved_body_targets.push((idx, te));
+                        }
+                        targets_per_origin.push((idx, ts));
                     }
                 }
             }
@@ -1809,8 +1816,12 @@ impl Tier3DfaCache {
             // Phase 2: consuming states in `from` consume `byte`.
             let nfa_states = &self.inner.states[from.idx()].nfa_states;
             for &idx in nfa_states {
-                if let Some(t) = consume_byte(idx, byte, regex) {
-                    targets_per_origin.push((idx, vec![t]));
+                if let Some((t, te)) = consume_byte(idx, byte, regex) {
+                    let mut ts = vec![t];
+                    if te != StateIdx::NONE {
+                        ts.push(te);
+                    }
+                    targets_per_origin.push((idx, ts));
                 }
             }
         }
@@ -2327,15 +2338,32 @@ struct ClosureResult {
 // Free functions
 // ---------------------------------------------------------------------------
 
-/// Try to consume `byte` at NFA state `idx`.
-fn consume_byte(idx: StateIdx, byte: u8, regex: &Regex) -> Option<StateIdx> {
+/// Try to consume `byte` at NFA state `idx`.  Returns `(out, out_exit)`
+/// where `out_exit` is `StateIdx::NONE` when there is no exit branch.
+fn consume_byte(idx: StateIdx, byte: u8, regex: &Regex) -> Option<(StateIdx, StateIdx)> {
     match regex.states[idx] {
-        State::Byte { byte: b, out, .. } if byte == b => Some(out),
-        State::ByteCI { byte: b, out, .. } if byte_match_ci(byte, b) => Some(out),
-        State::ByteClass { class, out, .. } if regex.classes[class][byte] => Some(out),
+        State::Byte {
+            byte: b,
+            out,
+            out_exit,
+        } if byte == b => Some((out, out_exit)),
+        State::ByteCI {
+            byte: b,
+            out,
+            out_exit,
+        } if byte_match_ci(byte, b) => Some((out, out_exit)),
+        State::ByteClass {
+            class,
+            out,
+            out_exit,
+        } if regex.classes[class][byte] => Some((out, out_exit)),
         State::ByteTable { table } => {
             let t = regex.byte_tables[table][byte];
-            if t != StateIdx::NONE { Some(t) } else { None }
+            if t != StateIdx::NONE {
+                Some((t, StateIdx::NONE))
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -3856,19 +3884,112 @@ impl<'a> Tier3DfaMatcher<'a> {
         // Process resolved tails: consume byte `b` through each
         // tail using static analysis targets.
         for &tail in &actions.tails {
-            if let Some(target) = consume_byte(tail, b, self.regex) {
-                match &self.analysis.target_effects[target.idx()] {
-                    Some(effects) => match &effects.step {
-                        tier3_effects::TargetStep::Advance { new_origins } => {
-                            for &new_o in new_origins {
-                                if self.tail_seen[new_o.idx()] != self.tail_epoch {
-                                    self.tail_seen[new_o.idx()] = self.tail_epoch;
-                                    self.resolved_tails.push(new_o);
+            if let Some((target, exit_target)) = consume_byte(tail, b, self.regex) {
+                // Process both the primary target and the exit target
+                // (when present).
+                let targets_to_process: [StateIdx; 2] = [target, exit_target];
+                for &tgt in targets_to_process.iter().filter(|t| **t != StateIdx::NONE) {
+                    match &self.analysis.target_effects[tgt.idx()] {
+                        Some(effects) => match &effects.step {
+                            tier3_effects::TargetStep::Advance { new_origins } => {
+                                for &new_o in new_origins {
+                                    if self.tail_seen[new_o.idx()] != self.tail_epoch {
+                                        self.tail_seen[new_o.idx()] = self.tail_epoch;
+                                        self.resolved_tails.push(new_o);
+                                    }
+                                }
+                                // Apply immediate atoms from compiled Advance.
+                                tier3_effects::apply_immediate_atoms(
+                                    &effects.immediate,
+                                    &mut self.ever_matched,
+                                    &mut resolved_mae,
+                                );
+                                // Second-order: origin deferred asserts
+                                // go to pending_effects_next.
+                                tier3_effects::enqueue_guarded_effects(
+                                    &mut self.pending_effects_next,
+                                    &self.analysis.origin_effects[tail.idx()].guarded,
+                                    b_is_word,
+                                );
+                            }
+                            tier3_effects::TargetStep::Increment {
+                                counter,
+                                min,
+                                max,
+                                continue_origins,
+                                ..
+                            } => {
+                                // Tail hit CInc — hand off to counter.
+                                // Value starts at 0, increment to 1.
+                                let pbt_value: u32 = 0;
+                                if pbt_value + 1 < *max {
+                                    for &new_o in continue_origins {
+                                        if self.use_ranges {
+                                            self.ranged_counters.insert(
+                                                counter.idx(),
+                                                new_o,
+                                                pbt_value + 1,
+                                                pbt_value + 1,
+                                            );
+                                        } else {
+                                            self.inst_counters.seed(
+                                                counter.idx(),
+                                                new_o,
+                                                pbt_value + 1,
+                                            );
+                                        }
+                                        self.has_live_instances = true;
+                                    }
+                                }
+                                if pbt_value + 1 >= *min {
+                                    // Apply on_break atoms from CompiledTargetEffects.
+                                    for atom in &effects.on_break {
+                                        match atom {
+                                            tier3_effects::EffectAtom::Match => {
+                                                self.ever_matched = true;
+                                            }
+                                            tier3_effects::EffectAtom::MatchAtEnd => {
+                                                self.match_at_end = true;
+                                            }
+                                            tier3_effects::EffectAtom::AddTail { origin } => {
+                                                if self.tail_seen[origin.idx()] != self.tail_epoch {
+                                                    self.tail_seen[origin.idx()] = self.tail_epoch;
+                                                    self.next_post_break_tails.push(*origin);
+                                                }
+                                            }
+                                            tier3_effects::EffectAtom::AddSeed {
+                                                counter: sc,
+                                                origin: so,
+                                                value: sv,
+                                            } => {
+                                                if self.use_ranges {
+                                                    self.ranged_counters.insert(
+                                                        sc.idx(),
+                                                        *so,
+                                                        *sv,
+                                                        *sv,
+                                                    );
+                                                } else {
+                                                    self.inst_counters.seed(sc.idx(), *so, *sv);
+                                                }
+                                                self.has_live_instances = true;
+                                            }
+                                        }
+                                    }
+                                    // Deposit guarded effects as PendingEffects.
+                                    // Second-order: goes to pending_effects_next.
+                                    tier3_effects::enqueue_guarded_effects(
+                                        &mut self.pending_effects_next,
+                                        &effects.guarded,
+                                        b_is_word,
+                                    );
                                 }
                             }
-                            // Apply immediate atoms from compiled Advance.
+                        },
+                        None => {
+                            let oe = &self.analysis.origin_effects[tail.idx()];
                             tier3_effects::apply_immediate_atoms(
-                                &effects.immediate,
+                                &oe.immediate,
                                 &mut self.ever_matched,
                                 &mut resolved_mae,
                             );
@@ -3876,100 +3997,12 @@ impl<'a> Tier3DfaMatcher<'a> {
                             // go to pending_effects_next.
                             tier3_effects::enqueue_guarded_effects(
                                 &mut self.pending_effects_next,
-                                &self.analysis.origin_effects[tail.idx()].guarded,
+                                &oe.guarded,
                                 b_is_word,
                             );
                         }
-                        tier3_effects::TargetStep::Increment {
-                            counter,
-                            min,
-                            max,
-                            continue_origins,
-                            ..
-                        } => {
-                            // Tail hit CInc — hand off to counter.
-                            // Value starts at 0, increment to 1.
-                            let pbt_value: u32 = 0;
-                            if pbt_value + 1 < *max {
-                                for &new_o in continue_origins {
-                                    if self.use_ranges {
-                                        self.ranged_counters.insert(
-                                            counter.idx(),
-                                            new_o,
-                                            pbt_value + 1,
-                                            pbt_value + 1,
-                                        );
-                                    } else {
-                                        self.inst_counters.seed(
-                                            counter.idx(),
-                                            new_o,
-                                            pbt_value + 1,
-                                        );
-                                    }
-                                    self.has_live_instances = true;
-                                }
-                            }
-                            if pbt_value + 1 >= *min {
-                                // Apply on_break atoms from CompiledTargetEffects.
-                                for atom in &effects.on_break {
-                                    match atom {
-                                        tier3_effects::EffectAtom::Match => {
-                                            self.ever_matched = true;
-                                        }
-                                        tier3_effects::EffectAtom::MatchAtEnd => {
-                                            self.match_at_end = true;
-                                        }
-                                        tier3_effects::EffectAtom::AddTail { origin } => {
-                                            if self.tail_seen[origin.idx()] != self.tail_epoch {
-                                                self.tail_seen[origin.idx()] = self.tail_epoch;
-                                                self.next_post_break_tails.push(*origin);
-                                            }
-                                        }
-                                        tier3_effects::EffectAtom::AddSeed {
-                                            counter: sc,
-                                            origin: so,
-                                            value: sv,
-                                        } => {
-                                            if self.use_ranges {
-                                                self.ranged_counters.insert(
-                                                    sc.idx(),
-                                                    *so,
-                                                    *sv,
-                                                    *sv,
-                                                );
-                                            } else {
-                                                self.inst_counters.seed(sc.idx(), *so, *sv);
-                                            }
-                                            self.has_live_instances = true;
-                                        }
-                                    }
-                                }
-                                // Deposit guarded effects as PendingEffects.
-                                // Second-order: goes to pending_effects_next.
-                                tier3_effects::enqueue_guarded_effects(
-                                    &mut self.pending_effects_next,
-                                    &effects.guarded,
-                                    b_is_word,
-                                );
-                            }
-                        }
-                    },
-                    None => {
-                        let oe = &self.analysis.origin_effects[tail.idx()];
-                        tier3_effects::apply_immediate_atoms(
-                            &oe.immediate,
-                            &mut self.ever_matched,
-                            &mut resolved_mae,
-                        );
-                        // Second-order: origin deferred asserts
-                        // go to pending_effects_next.
-                        tier3_effects::enqueue_guarded_effects(
-                            &mut self.pending_effects_next,
-                            &oe.guarded,
-                            b_is_word,
-                        );
                     }
-                }
+                } // end for tgt in targets_to_process
             }
             // Tail can't consume this byte — keep as post_break_tail.
             else if self.tail_seen[tail.idx()] != self.tail_epoch {

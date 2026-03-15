@@ -920,18 +920,44 @@ impl Tier4DfaCache {
         if from != DfaStateId::DEAD {
             let nfa_states = self.states[from.idx()].nfa_states.clone();
             for &idx in nfa_states.iter() {
-                let target = match regex.states[idx] {
-                    State::Byte { byte: b2, out, .. } if byte == b2 => Some(out),
-                    State::ByteCI { byte: b2, out, .. } if byte_match_ci(byte, b2) => Some(out),
-                    State::ByteClass { class, out, .. } if regex.classes[class][byte] => Some(out),
+                match regex.states[idx] {
+                    State::Byte {
+                        byte: b2,
+                        out,
+                        out_exit,
+                    } if byte == b2 => {
+                        origin_targets.push((idx, out));
+                        if out_exit != StateIdx::NONE {
+                            origin_targets.push((idx, out_exit));
+                        }
+                    }
+                    State::ByteCI {
+                        byte: b2,
+                        out,
+                        out_exit,
+                    } if byte_match_ci(byte, b2) => {
+                        origin_targets.push((idx, out));
+                        if out_exit != StateIdx::NONE {
+                            origin_targets.push((idx, out_exit));
+                        }
+                    }
+                    State::ByteClass {
+                        class,
+                        out,
+                        out_exit,
+                    } if regex.classes[class][byte] => {
+                        origin_targets.push((idx, out));
+                        if out_exit != StateIdx::NONE {
+                            origin_targets.push((idx, out_exit));
+                        }
+                    }
                     State::ByteTable { table } => {
                         let t = regex.byte_tables[table][byte];
-                        if t != StateIdx::NONE { Some(t) } else { None }
+                        if t != StateIdx::NONE {
+                            origin_targets.push((idx, t));
+                        }
                     }
-                    _ => None,
-                };
-                if let Some(t) = target {
-                    origin_targets.push((idx, t));
+                    _ => {}
                 }
             }
         }
