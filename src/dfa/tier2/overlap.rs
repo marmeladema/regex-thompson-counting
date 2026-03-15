@@ -743,6 +743,83 @@ mod tests {
         assert!(elig.is_eligible());
     }
 
+    // -- Overlap-focused property test (Patch 9) --
+
+    /// Generate random overlapping two-counter patterns and verify
+    /// that any admitted by the proof match correctly against Tier 0.
+    #[test]
+    #[ignore] // slow: uses random patterns
+    fn test_fuzz_tier2_overlap() {
+        use crate::fuzz_gen::{FuzzRng, generate_pattern};
+
+        let mut admitted = 0;
+        let mut tested = 0;
+
+        // Use a deterministic seed sequence.
+        for seed in 0u64..500 {
+            let seed_bytes = seed.to_le_bytes();
+            let mut rng = FuzzRng::new(&seed_bytes);
+            let (pattern_str, _ast) = generate_pattern(&mut rng);
+
+            let regex = match build_checked(&pattern_str) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            if regex.counter_info.len() < 2 {
+                continue; // only test multi-counter patterns
+            }
+            tested += 1;
+
+            let elig = eligibility(&regex);
+            if !elig.base_eligible() || elig.disjoint_bytes {
+                continue;
+            }
+
+            let stats = probe_result(&regex);
+            if !elig.is_eligible_with_proof(stats.proof) {
+                continue;
+            }
+
+            // Admitted — test on boundary inputs.
+            admitted += 1;
+            let mut mem = crate::MatcherMemory::default();
+
+            // Generate some boundary inputs.
+            let inputs = crate::fuzz_gen::generate_inputs(
+                &mut FuzzRng::new(&seed_bytes[..]),
+                &_ast,
+            );
+            // Also get AST for the admitted pattern.
+            let (_, ast2) = generate_pattern(&mut FuzzRng::new(&seed_bytes));
+            let inputs2 = crate::fuzz_gen::generate_inputs(
+                &mut FuzzRng::new(&(seed + 1000).to_le_bytes()),
+                &ast2,
+            );
+
+            for input in inputs.iter().chain(inputs2.iter()) {
+                let mut m0 = mem.matcher_for_tier(&regex, 0).unwrap();
+                m0.chunk(input);
+                let nfa = m0.finish();
+
+                if let Ok(mut m2) = mem.matcher_for_tier(&regex, 2) {
+                    m2.chunk(input);
+                    let t2 = m2.finish();
+                    assert_eq!(
+                        nfa, t2,
+                        "Tier 2 != NFA for fuzz pattern {} on input {:?}",
+                        pattern_str,
+                        String::from_utf8_lossy(input),
+                    );
+                }
+            }
+        }
+
+        eprintln!(
+            "fuzz tier2 overlap: {tested} multi-counter patterns tested, {admitted} admitted"
+        );
+    }
+
     // -- Exhaustive adversarial mini-model tests (Patch 8) --
 
     /// Enumerate two-counter overlap patterns over a tiny alphabet,
