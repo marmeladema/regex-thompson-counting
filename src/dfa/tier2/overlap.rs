@@ -742,4 +742,136 @@ mod tests {
         assert!(!elig.has_identical_body_bytes);
         assert!(elig.is_eligible());
     }
+
+    // -- Exhaustive adversarial mini-model tests (Patch 8) --
+
+    /// Enumerate two-counter overlap patterns over a tiny alphabet,
+    /// verify that any pattern admitted by the proof matches correctly
+    /// against Tier 0 (NFA).
+    #[test]
+    #[ignore] // slow: ~30 seconds
+    fn test_exhaustive_overlap_mini_model() {
+        use crate::MatcherMemory;
+
+        // Alphabet subsets to combine.
+        let sets: &[(&str, &str)] = &[
+            ("[ab]", "ab"),
+            ("[bc]", "bc"),
+            ("[abc]", "abc"),
+            ("[a0]", "a0"),
+            ("[01]", "01"),
+        ];
+        let bounds: &[(usize, usize)] = &[(1, 2), (2, 3), (1, 3)];
+        let max_input_len = 12;
+
+        let mut tested = 0;
+        let mut admitted = 0;
+
+        for &(s1, alpha1) in sets {
+            for &(s2, alpha2) in sets {
+                for &(m1, n1) in bounds {
+                    for &(m2, n2) in bounds {
+                        let pattern = format!("^{s1}{{{m1},{n1}}}{s2}{{{m2},{n2}}}$");
+                        let regex = match build_checked(&pattern) {
+                            Some(r) => r,
+                            None => continue,
+                        };
+                        tested += 1;
+
+                        let elig = eligibility(&regex);
+                        if !elig.base_eligible() || elig.disjoint_bytes {
+                            continue;
+                        }
+
+                        let stats = probe_result(&regex);
+                        if !elig.is_eligible_with_proof(stats.proof) {
+                            continue;
+                        }
+
+                        // Pattern admitted — verify Tier 2 vs Tier 0.
+                        admitted += 1;
+
+                        // Build input alphabet.
+                        let mut alphabet: Vec<u8> = Vec::new();
+                        for c in alpha1.bytes().chain(alpha2.bytes()) {
+                            if !alphabet.contains(&c) {
+                                alphabet.push(c);
+                            }
+                        }
+                        alphabet.push(b'x'); // non-matching char
+
+                        // Enumerate all inputs up to max_input_len.
+                        let mut input = Vec::new();
+                        check_inputs(
+                            &regex,
+                            &alphabet,
+                            max_input_len,
+                            &mut input,
+                            &pattern,
+                        );
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "exhaustive overlap mini-model: tested {tested} patterns, {admitted} admitted"
+        );
+        assert!(tested > 0, "should test some patterns");
+    }
+
+    fn build_checked(pattern: &str) -> Option<crate::Regex> {
+        use regex_syntax::ast::parse::ParserBuilder;
+        use regex_syntax::hir::translate::TranslatorBuilder;
+        let ast = ParserBuilder::new().build().parse(pattern).ok()?;
+        let hir = TranslatorBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .dot_matches_new_line(true)
+            .build()
+            .translate(pattern, &ast)
+            .ok()?;
+        crate::RegexBuilder::default()
+            .max_unroll_states(0)
+            .merge_repetitions(false)
+            .build(&hir)
+            .ok()
+    }
+
+    fn check_inputs(
+        regex: &crate::Regex,
+        alphabet: &[u8],
+        max_len: usize,
+        input: &mut Vec<u8>,
+        pattern: &str,
+    ) {
+        // Check current input.
+        let mut mem = crate::MatcherMemory::default();
+
+        // Tier 0 (NFA oracle).
+        let mut m0 = mem.matcher_for_tier(regex, 0).unwrap();
+        m0.chunk(input);
+        let nfa = m0.finish();
+
+        // Tier 2 (forced).
+        if let Ok(mut m2) = mem.matcher_for_tier(regex, 2) {
+            m2.chunk(input);
+            let t2 = m2.finish();
+            assert_eq!(
+                nfa, t2,
+                "Tier 2 != NFA for pattern {pattern} on input {:?} (len={})",
+                String::from_utf8_lossy(input),
+                input.len(),
+            );
+        }
+
+        // Recurse.
+        if input.len() < max_len {
+            for &b in alphabet {
+                input.push(b);
+                check_inputs(regex, alphabet, max_len, input, pattern);
+                input.pop();
+            }
+        }
+    }
 }
