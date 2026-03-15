@@ -7,6 +7,52 @@ use std::fmt;
 
 use crate::{Prefilter, Regex, State, StateIdx, byte_match_ci, is_word_byte};
 
+/// Push consumption targets for NFA state `idx` when it consumes `byte`.
+///
+/// For consuming states with `out_exit != NONE`, both `out` and `out_exit`
+/// are pushed (fused consume-and-branch semantics).
+fn push_consume_targets(state: &State, byte: u8, regex: &Regex, targets: &mut Vec<StateIdx>) {
+    match *state {
+        State::Byte {
+            byte: b2,
+            out,
+            out_exit,
+        } if byte == b2 => {
+            targets.push(out);
+            if out_exit != StateIdx::NONE {
+                targets.push(out_exit);
+            }
+        }
+        State::ByteCI {
+            byte: b2,
+            out,
+            out_exit,
+        } if byte_match_ci(byte, b2) => {
+            targets.push(out);
+            if out_exit != StateIdx::NONE {
+                targets.push(out_exit);
+            }
+        }
+        State::ByteClass {
+            class,
+            out,
+            out_exit,
+        } if regex.classes[class][byte] => {
+            targets.push(out);
+            if out_exit != StateIdx::NONE {
+                targets.push(out_exit);
+            }
+        }
+        State::ByteTable { table } => {
+            let t = regex.byte_tables[table][byte];
+            if t != StateIdx::NONE {
+                targets.push(t);
+            }
+        }
+        _ => {}
+    }
+}
+
 use super::{DfaCache, DfaMemory, DfaStateId};
 
 // ---------------------------------------------------------------------------
@@ -219,21 +265,7 @@ impl Tier1DfaCache {
                 // previous borrow of from_state may have been invalidated).
                 let from_state = &self.inner.states[from.idx()];
                 for &idx in resolved_consumers.iter() {
-                    let target = match regex.states[idx] {
-                        State::Byte { byte: b2, out, .. } if byte == b2 => Some(out),
-                        State::ByteCI { byte: b2, out, .. } if byte_match_ci(byte, b2) => Some(out),
-                        State::ByteClass { class, out, .. } if regex.classes[class][byte] => {
-                            Some(out)
-                        }
-                        State::ByteTable { table } => {
-                            let t = regex.byte_tables[table][byte];
-                            if t != StateIdx::NONE { Some(t) } else { None }
-                        }
-                        _ => None,
-                    };
-                    if let Some(t) = target {
-                        targets.push(t);
-                    }
+                    push_consume_targets(&regex.states[idx], byte, regex, &mut targets);
                 }
                 // If the resolved closure itself found a match or
                 // match_at_end, we need to handle it.  But `resolved_match`
@@ -254,21 +286,7 @@ impl Tier1DfaCache {
                 // Phase 2: original consuming states consume `byte`.
                 let nfa_states = from_state.nfa_states.clone();
                 for &idx in nfa_states.iter() {
-                    let target = match regex.states[idx] {
-                        State::Byte { byte: b2, out, .. } if byte == b2 => Some(out),
-                        State::ByteCI { byte: b2, out, .. } if byte_match_ci(byte, b2) => Some(out),
-                        State::ByteClass { class, out, .. } if regex.classes[class][byte] => {
-                            Some(out)
-                        }
-                        State::ByteTable { table } => {
-                            let t = regex.byte_tables[table][byte];
-                            if t != StateIdx::NONE { Some(t) } else { None }
-                        }
-                        _ => None,
-                    };
-                    if let Some(t) = target {
-                        targets.push(t);
-                    }
+                    push_consume_targets(&regex.states[idx], byte, regex, &mut targets);
                 }
 
                 // Phase 3: epsilon closure of all targets + re-seed.
@@ -338,19 +356,7 @@ impl Tier1DfaCache {
             // No deferred assertions to resolve — fast path (Phase 2 only).
             let nfa_states = from_state.nfa_states.clone();
             for &idx in nfa_states.iter() {
-                let target = match regex.states[idx] {
-                    State::Byte { byte: b2, out, .. } if byte == b2 => Some(out),
-                    State::ByteCI { byte: b2, out, .. } if byte_match_ci(byte, b2) => Some(out),
-                    State::ByteClass { class, out, .. } if regex.classes[class][byte] => Some(out),
-                    State::ByteTable { table } => {
-                        let t = regex.byte_tables[table][byte];
-                        if t != StateIdx::NONE { Some(t) } else { None }
-                    }
-                    _ => None,
-                };
-                if let Some(t) = target {
-                    targets.push(t);
-                }
+                push_consume_targets(&regex.states[idx], byte, regex, &mut targets);
             }
         }
 
