@@ -2261,13 +2261,13 @@ impl RegexBuilder {
         let non_nested_eligible =
             has_counters && !has_crlf_assert && !has_zero_width_counter_body && {
                 let states = &self.states;
-                fn has_nesting(states: &[State]) -> bool {
+                fn has_nesting(states: &[State], byte_tables: &[ByteMap]) -> bool {
                     for s in states.iter() {
                         if let State::CounterInstance { counter, out } = s {
                             // Walk from CI.out to CInc(counter) through epsilon
                             // states.  If we encounter another counter's CI or
                             // CInc on the way, it's nested.
-                            if body_crosses_other_counter(*out, *counter, states) {
+                            if body_crosses_other_counter(*out, *counter, states, byte_tables) {
                                 return true;
                             }
                         }
@@ -2278,6 +2278,7 @@ impl RegexBuilder {
                     start: StateIdx,
                     own_counter: CounterIdx,
                     states: &[State],
+                    byte_tables: &[ByteMap],
                 ) -> bool {
                     let mut stack = vec![start];
                     let mut visited = vec![false; states.len()];
@@ -2321,10 +2322,14 @@ impl RegexBuilder {
                             | State::ByteClass { out, .. } => {
                                 stack.push(out);
                             }
-                            // ByteTable dispatches via a table — skip it.
-                            // Nested counters behind ByteTable are extremely
-                            // unlikely in practice.
-                            State::ByteTable { .. } | State::Match => {}
+                            State::ByteTable { table } => {
+                                for &succ in &byte_tables[table.idx()].0 {
+                                    if succ != StateIdx::NONE {
+                                        stack.push(succ);
+                                    }
+                                }
+                            }
+                            State::Match => {}
                         }
                     }
                     false
@@ -2369,7 +2374,7 @@ impl RegexBuilder {
                     }
                     false
                 }
-                !has_nesting(states) && !has_self_loop(states)
+                !has_nesting(states, &self.byte_tables) && !has_self_loop(states)
             };
 
         // Tier 3 eligibility: non-nested counters WITHOUT deferred assertions
@@ -5495,6 +5500,29 @@ mod tests {
                 ("bcbca", true),
             ],
         }
+        // Bug 54: nested counters behind ByteTable not detected.
+        // The outer {1,100} wraps alternation branches each containing
+        // b{1,100} — inner counters nested inside the outer counter.
+        // The ByteTable at the outer CI's output dispatches to the inner
+        // CIs.  body_crosses_other_counter must follow ByteTable successors
+        // to detect the nesting.
+        test_nested_counters_behind_byte_table {
+            pattern: "((ab{1,100}|cb{1,100}|db{1,100})){1,100}",
+            memory: 2269,
+            min_tier: 4,
+            inputs: [
+                ("ab", true),
+                ("abbbcbbb", true),
+                ("abcbdbbb", true),
+                ("abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", true),
+                ("a", false),
+                ("b", false),
+                ("", false),
+                ("x", false),
+                ("axb", false),
+            ],
+        }
+
         test_aaaaa {
             pattern: "^(a|a?){2,3}$",
             memory: 1208,
