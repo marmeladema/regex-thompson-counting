@@ -97,7 +97,7 @@ struct SubsetClosure {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn tier2_overlap_probe(
     states: &[State],
-    classes: &indexmap::set::IndexSet<crate::ByteClass>,
+    classes: &[crate::ByteClass],
     byte_tables: &[ByteMap],
     byte_classes: &[u8; 256],
     num_byte_classes: usize,
@@ -402,7 +402,7 @@ fn consume_all(
     nfa_set: &[StateIdx],
     byte: u8,
     states: &[State],
-    classes: &indexmap::set::IndexSet<crate::ByteClass>,
+    classes: &[crate::ByteClass],
     byte_tables: &[ByteMap],
 ) -> Vec<StateIdx> {
     let mut targets = Vec::new();
@@ -419,7 +419,7 @@ fn add_start_targets(
     start: StateIdx,
     byte: u8,
     states: &[State],
-    classes: &indexmap::set::IndexSet<crate::ByteClass>,
+    classes: &[crate::ByteClass],
     byte_tables: &[ByteMap],
 ) {
     let start_consuming = epsilon_consuming_closure(&[start], states, false);
@@ -436,7 +436,7 @@ fn consume_byte_at(
     idx: StateIdx,
     byte: u8,
     states: &[State],
-    classes: &indexmap::set::IndexSet<crate::ByteClass>,
+    classes: &[crate::ByteClass],
     byte_tables: &[ByteMap],
 ) -> Option<StateIdx> {
     match states[idx.idx()] {

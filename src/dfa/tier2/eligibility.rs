@@ -46,6 +46,10 @@ pub(crate) struct Tier2Eligibility {
     /// True when deferred assertions exist in any counter body AND
     /// there is more than one counter.
     pub(crate) has_deferred_in_multi_counter_body: bool,
+    /// True when any two counters have identical body byte sets.
+    /// This causes Tier 2's runtime to overcount (both counters advance
+    /// simultaneously and `counter_reset` never fires).
+    pub(crate) has_identical_body_bytes: bool,
 }
 
 impl Tier2Eligibility {
@@ -68,6 +72,7 @@ impl Tier2Eligibility {
     /// (fast path) or a proven binary-exact overlap proof.
     pub(crate) fn is_eligible_with_proof(&self, proof: super::overlap::Tier2OverlapProof) -> bool {
         self.base_eligible()
+            && !self.has_identical_body_bytes
             && matches!(
                 proof,
                 super::overlap::Tier2OverlapProof::DisjointFastPath
@@ -110,12 +115,16 @@ pub(crate) fn compute_tier2_eligibility(
 
     let has_deferred_in_multi_counter_body = has_deferred_in_counter_body && counter_info.len() > 1;
 
+    let has_identical_body_bytes =
+        counter_bodies_have_identical_bytes(states, classes, byte_tables);
+
     Tier2Eligibility {
         counter_info,
         disjoint_bytes,
         all_fixed_length,
         has_deferred_in_long_body,
         has_deferred_in_multi_counter_body,
+        has_identical_body_bytes,
     }
 }
 
@@ -163,6 +172,53 @@ pub(crate) fn counter_bodies_have_disjoint_bytes(
     classes: &indexmap::set::IndexSet<ByteClass>,
     byte_tables: &[ByteMap],
 ) -> bool {
+    let counter_bytes = collect_counter_byte_sets(states, classes, byte_tables);
+    for i in 0..counter_bytes.len() {
+        for j in (i + 1)..counter_bytes.len() {
+            if counter_bytes[i].0 == counter_bytes[j].0 {
+                debug_assert!(false, "duplicate counter pair in byte overlap check");
+                continue;
+            }
+            for b in 0..256 {
+                if counter_bytes[i].1[b] && counter_bytes[j].1[b] {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Check if any two counters have identical body byte sets.
+///
+/// When two counters have identical body bytes, both advance on every byte,
+/// and `counter_reset` never fires for either (both have body-interior
+/// progress).  This causes Tier 2's differential counter model to overcount.
+pub(crate) fn counter_bodies_have_identical_bytes(
+    states: &[State],
+    classes: &indexmap::set::IndexSet<ByteClass>,
+    byte_tables: &[ByteMap],
+) -> bool {
+    let counter_bytes = collect_counter_byte_sets(states, classes, byte_tables);
+    for i in 0..counter_bytes.len() {
+        for j in (i + 1)..counter_bytes.len() {
+            if counter_bytes[i].0 == counter_bytes[j].0 {
+                continue;
+            }
+            if counter_bytes[i].1 == counter_bytes[j].1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Collect per-counter byte sets (shared by disjoint and identical checks).
+fn collect_counter_byte_sets(
+    states: &[State],
+    classes: &indexmap::set::IndexSet<ByteClass>,
+    byte_tables: &[ByteMap],
+) -> Vec<(CounterIdx, [bool; 256])> {
     let mut counter_bytes: Vec<(CounterIdx, [bool; 256])> = Vec::new();
     for s in states {
         if let State::CounterInstance { counter, out } = s {
@@ -217,21 +273,7 @@ pub(crate) fn counter_bodies_have_disjoint_bytes(
             counter_bytes.push((*counter, bytes));
         }
     }
-    // Pairwise disjointness check.
-    for i in 0..counter_bytes.len() {
-        for j in (i + 1)..counter_bytes.len() {
-            if counter_bytes[i].0 == counter_bytes[j].0 {
-                debug_assert!(false, "duplicate counter pair in byte overlap check");
-                continue;
-            }
-            for b in 0..256 {
-                if counter_bytes[i].1[b] && counter_bytes[j].1[b] {
-                    return false;
-                }
-            }
-        }
-    }
-    true
+    counter_bytes
 }
 
 // ---------------------------------------------------------------------------

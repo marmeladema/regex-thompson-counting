@@ -2358,7 +2358,7 @@ impl RegexBuilder {
                 |e| e.counter_info.clone(),
             );
 
-        let tier2_eligible = non_nested_eligible
+        let mut tier2_eligible = non_nested_eligible
             && tier2_elig.as_ref().is_some_and(|e| e.is_eligible());
 
         // Compute byte equivalence classes before moving data out.
@@ -2421,6 +2421,28 @@ impl RegexBuilder {
         } else {
             None
         };
+
+        // Run the binary-exactness overlap probe for patterns that pass
+        // all Tier 2 requirements except byte-disjointness.
+        if !tier2_eligible
+            && non_nested_eligible
+            && let Some(elig) = &tier2_elig
+            && let Some(analysis) = &tier2_analysis
+            && elig.base_eligible()
+            && !elig.disjoint_bytes
+        {
+            let proof = dfa::tier2::overlap::tier2_overlap_probe(
+                &self.states,
+                &classes_slice,
+                &self.byte_tables,
+                &byte_classes,
+                num_byte_classes,
+                start,
+                analysis,
+                self.counters.len(),
+            );
+            tier2_eligible = elig.is_eligible_with_proof(proof.proof);
+        }
 
         // Precompute Tier 3 analysis if eligible.
         let (tier3_eligible, tier3_analysis) = if tier3_eligible {
