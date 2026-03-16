@@ -34,13 +34,15 @@
 //! `Hir::repetition`) provide additional normalization for free
 //! (flattening, adjacent-literal merging, `{0,0}` → empty, etc.).
 
+use std::mem;
+
 use regex_syntax::hir::{Hir, HirKind, Repetition};
 
 /// Optimize an HIR tree by stripping captures, collapsing nested
 /// quantifiers, and deduplicating alternation branches.
 pub(crate) fn optimize(hir: Hir) -> Hir {
     match hir.into_kind() {
-        // Leaf nodes — reconstruct through smart constructors.
+        // Leaf nodes — pass through unchanged.
         HirKind::Empty => Hir::empty(),
         HirKind::Literal(lit) => Hir::literal(lit.0),
         HirKind::Class(cls) => Hir::class(cls),
@@ -49,17 +51,18 @@ pub(crate) fn optimize(hir: Hir) -> Hir {
         // Strip captures — our engine ignores capture groups.
         HirKind::Capture(cap) => optimize(*cap.sub),
 
-        // Concatenation — optimize children, let smart constructor
-        // flatten/merge.
-        HirKind::Concat(subs) => {
-            let subs: Vec<Hir> = subs.into_iter().map(optimize).collect();
+        // Concatenation — optimize children in place, let smart
+        // constructor flatten/merge.
+        HirKind::Concat(mut subs) => {
+            optimize_children(&mut subs);
             Hir::concat(subs)
         }
 
-        // Alternation — optimize children, deduplicate, reconstruct.
-        HirKind::Alternation(subs) => {
-            let subs: Vec<Hir> = subs.into_iter().map(optimize).collect();
-            let subs = dedup_branches(subs);
+        // Alternation — optimize children in place, deduplicate,
+        // reconstruct.
+        HirKind::Alternation(mut subs) => {
+            optimize_children(&mut subs);
+            dedup_branches(&mut subs);
             Hir::alternation(subs)
         }
 
@@ -69,6 +72,14 @@ pub(crate) fn optimize(hir: Hir) -> Hir {
             let sub = optimize(*rep.sub);
             collapse_repetition(rep.min, rep.max, rep.greedy, sub)
         }
+    }
+}
+
+/// Optimize each child in `subs` in place, reusing the Vec allocation.
+fn optimize_children(subs: &mut [Hir]) {
+    for sub in subs.iter_mut() {
+        let owned = mem::replace(sub, Hir::empty());
+        *sub = optimize(owned);
     }
 }
 
@@ -135,18 +146,19 @@ fn is_simple_quantifier(min: u32, max: Option<u32>) -> bool {
     matches!((min, max), (0, Some(1)) | (1, None) | (0, None))
 }
 
-/// Remove duplicate branches from an alternation.
+/// Remove duplicate branches from an alternation in place.
 ///
-/// Uses `Hir`'s `PartialEq` to detect equal sub-trees.  Also collapses
-/// multiple empty branches to a single one.
-fn dedup_branches(mut subs: Vec<Hir>) -> Vec<Hir> {
-    let mut seen: Vec<Hir> = Vec::with_capacity(subs.len());
-    for sub in subs.drain(..) {
-        if !seen.iter().any(|s| s == &sub) {
-            seen.push(sub);
+/// Uses `Hir`'s `PartialEq` to detect equal sub-trees.  Preserves
+/// the first occurrence of each unique branch and the relative order.
+fn dedup_branches(subs: &mut Vec<Hir>) {
+    let mut i = 0;
+    while i < subs.len() {
+        if subs[..i].iter().any(|s| s == &subs[i]) {
+            subs.remove(i);
+        } else {
+            i += 1;
         }
     }
-    seen
 }
 
 #[cfg(test)]
