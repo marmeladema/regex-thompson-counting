@@ -13,8 +13,8 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use regex_thompson_counting::fuzz_gen::{generate_inputs, generate_pattern, FuzzRng};
-use regex_thompson_counting::{MatcherMemory, RegexBuilder};
+use rethoc_engine::fuzz_gen::{generate_inputs, generate_pattern, FuzzRng};
+use rethoc_engine::{MatcherMemory, RegexBuilder};
 
 use std::cell::RefCell;
 
@@ -195,7 +195,7 @@ fuzz_target!(|data: &[u8]| {
     }
 });
 
-fn parse_hir_bytes(pattern: &str) -> Option<regex_thompson_counting::Hir> {
+fn parse_hir_bytes(pattern: &str) -> Option<rethoc_engine::Hir> {
     use regex_syntax::ast::parse::ParserBuilder;
     use regex_syntax::hir::translate::TranslatorBuilder;
     let ast = ParserBuilder::new().build().parse(pattern).ok()?;

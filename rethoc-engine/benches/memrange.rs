@@ -9,7 +9,7 @@ use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use regex_thompson_counting::{memrange_scalar, memrange_simd};
+use rethoc_engine::{memrange_scalar, memrange_simd};
 
 /// Build a haystack of `size` bytes filled with `fill`, optionally placing
 /// a match byte at `match_pos`.

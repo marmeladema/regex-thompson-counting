@@ -1,4 +1,4 @@
-use regex_thompson_counting::{MatcherMemory, Regex, RegexConfig};
+use rethoc_engine::{MatcherMemory, Regex, RegexConfig};
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};

@@ -1,0 +1,37 @@
+[package]
+name = "rethoc-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ahash = "0.8"
+hashbrown = "0.16"
+indexmap = "2"
+memchr = "2.8.0"
+regex-syntax = "0.8.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+gungraun = "0.17.2"
+itertools = "0.10"
+proptest = "1"
+regex = "1"
+
+[[bench]]
+name = "flamegraph"
+harness = false
+
+[[bench]]
+name = "memrange"
+harness = false
+
+[[bench]]
+name = "pathological"
+harness = false
+
+[[bench]]
+name = "pathological_profile"
+harness = false

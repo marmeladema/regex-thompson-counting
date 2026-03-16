@@ -2,7 +2,7 @@ use gungraun::{
     Callgrind, FlamegraphConfig, LibraryBenchmarkConfig, library_benchmark,
     library_benchmark_group, main,
 };
-use regex_thompson_counting::{MatcherMemory, Regex, RegexBuilder};
+use rethoc_engine::{MatcherMemory, Regex, RegexBuilder};
 use std::hint::black_box;
 
 /// Pathological bounded-repetition pattern: three sequential `.{0,1000}`

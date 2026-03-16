@@ -2,7 +2,7 @@ use gungraun::{
     Callgrind, FlamegraphConfig, LibraryBenchmarkConfig, library_benchmark,
     library_benchmark_group, main,
 };
-use regex_thompson_counting::{MatcherMemory, RegexBuilder};
+use rethoc_engine::{MatcherMemory, RegexBuilder};
 use std::hint::black_box;
 
 // aws-keys "quick" pattern from rebar benchmark

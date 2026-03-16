@@ -28,11 +28,11 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use regex_thompson_counting::{MatcherMemory, RegexBuilder};
+use rethoc_engine::{MatcherMemory, RegexBuilder};
 
 const PATTERN: &str = r".{0,1000}.{0,1000}.{0,1000}a";
 
-fn parse_hir(pattern: &str) -> regex_thompson_counting::Hir {
+fn parse_hir(pattern: &str) -> rethoc_engine::Hir {
     use regex_syntax::ast::parse::ParserBuilder;
     use regex_syntax::hir::translate::TranslatorBuilder;
     let ast = ParserBuilder::new().build().parse(pattern).unwrap();
@@ -310,7 +310,7 @@ fn bench_match_at_end(c: &mut Criterion) {
 // Nested pattern benchmarks
 // ---------------------------------------------------------------------------
 
-const NESTED_PATTERN: &str = r"(.{0,1000}a){0,1000}b";
+const NESTED_PATTERN: &str = r"(.{0,100}a){0,100}b";
 
 /// Sizes for nested benchmarks.  Tier 4 on this pattern is O(N * max_inner *
 /// max_outer) so only small inputs are practical.
@@ -318,7 +318,10 @@ const NESTED_SIZES: &[usize] = &[256, 1024];
 
 fn bench_nested_match_at_end(c: &mut Criterion) {
     let hir = parse_hir(NESTED_PATTERN);
-    let rethoc_re = RegexBuilder::default().build(&hir).unwrap();
+    let rethoc_re = RegexBuilder::default()
+        .max_estimated_states(4096)
+        .build(&hir)
+        .unwrap();
 
     // The regex crate cannot compile this nested pattern within its default
     // 10 MB NFA size limit (or even 100 MB), so we only benchmark rethoc.

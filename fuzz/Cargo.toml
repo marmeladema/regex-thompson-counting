@@ -12,8 +12,8 @@ libfuzzer-sys = "0.4"
 regex = "1"
 regex-syntax = "0.8.9"
 
-[dependencies.regex-thompson-counting]
-path = ".."
+[dependencies.rethoc-engine]
+path = "../rethoc-engine"
 
 # Prevent this from interfering with workspaces.
 [workspace]

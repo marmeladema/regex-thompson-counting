@@ -4,7 +4,7 @@
 //! # Quick start
 //!
 //! ```
-//! use regex_thompson_counting::{Regex, MatcherMemory};
+//! use rethoc_engine::{Regex, MatcherMemory};
 //!
 //! let re = Regex::new(r"^[a-z]{3,8}$").unwrap();
 //! let mut mem = MatcherMemory::default();
@@ -31,7 +31,7 @@
 //! Use [`RegexConfig`] to tune compilation limits:
 //!
 //! ```
-//! use regex_thompson_counting::{Regex, RegexConfig};
+//! use rethoc_engine::{Regex, RegexConfig};
 //!
 //! let re = Regex::with_config(r"a{1,500}", RegexConfig {
 //!     max_repetition: 500,
@@ -987,7 +987,7 @@ impl Regex {
     /// Compile a regex from a pattern string with custom configuration.
     ///
     /// ```ignore
-    /// use regex_thompson_counting::{Regex, RegexConfig};
+    /// use rethoc_engine::{Regex, RegexConfig};
     /// let re = Regex::with_config("a{1,500}", RegexConfig {
     ///     max_unroll_states: 0,
     ///     ..Default::default()
@@ -1316,7 +1316,7 @@ use indexmap::IndexSet;
 /// [`Default::default()`] and override individual fields.
 ///
 /// ```
-/// use regex_thompson_counting::RegexConfig;
+/// use rethoc_engine::RegexConfig;
 /// let cfg = RegexConfig { max_unroll_states: 0, ..Default::default() };
 /// ```
 #[derive(Clone, Debug)]
@@ -1379,7 +1379,7 @@ impl Default for RegexConfig {
 /// # Example
 ///
 /// ```
-/// use regex_thompson_counting::{RegexBuilder, RegexConfig};
+/// use rethoc_engine::{RegexBuilder, RegexConfig};
 /// use regex_syntax::hir::Hir;
 ///
 /// let hir: Hir = regex_syntax::parse(r"hello|world").unwrap();

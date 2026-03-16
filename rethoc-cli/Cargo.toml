@@ -1,0 +1,13 @@
+[package]
+name = "rethoc-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rethoc"
+path = "src/main.rs"
+
+[dependencies]
+rethoc-engine = { path = "../rethoc-engine" }
+serde_json = "1"

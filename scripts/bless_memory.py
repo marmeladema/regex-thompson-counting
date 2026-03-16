@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-LIB_RS = REPO_ROOT / "src" / "lib.rs"
+LIB_RS = REPO_ROOT / "rethoc-engine" / "src" / "lib.rs"
 RETHOC = REPO_ROOT / "target" / "release" / "rethoc"
 
 # ---------------------------------------------------------------------------

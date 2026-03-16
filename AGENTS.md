@@ -54,30 +54,45 @@ Does NOT touch `min_tier:` values — those are left alone to catch tier regress
 
 ## Project Layout
 
+The repository is a Cargo workspace with two crates:
+
 ```
-src/lib.rs          # Core NFA compiler, matcher, counter pool, ALL tests (~9800 lines)
-src/main.rs         # CLI binary `rethoc` (info, match, dot, dump subcommands)
-src/dump.rs         # Human-readable dump (DumpRegex, DumpState Display wrappers)
-src/info.rs         # Diagnostic/serialization types (RegexInfo, MemoryInfo, etc.)
-src/memrange.rs     # SIMD byte-range prefilter (SSE2/AVX2/NEON + scalar fallback)
-src/fuzz_gen.rs     # Grammar-aware pattern + input generator for fuzzing
-src/dfa/mod.rs      # Shared DFA infrastructure (DfaMemory, DfaState, epsilon_closure)
-src/dfa/tier1.rs    # Tier 1: Lazy DFA, counter-free patterns
-src/dfa/tier2.rs    # Tier 2: Differential counters, fixed-length bodies (Becchi-style)
-src/dfa/tier3.rs    # Tier 3: Conditional transitions, non-nested variable-length bodies
-src/dfa/tier4.rs    # Tier 4: Counter programs, nested repetitions
-fuzz/Cargo.toml                    # cargo-fuzz workspace configuration
-fuzz/fuzz_targets/fuzz_match.rs    # Fuzz target: oracle differential (rethoc vs regex crate)
-fuzz/fuzz_targets/fuzz_differential.rs  # Fuzz target: cross-tier differential (NFA as oracle)
-fuzz/fuzz_targets/fuzz_compile.rs  # Fuzz target: compilation robustness
-benches/flamegraph.rs      # Callgrind benchmarks (gungraun harness)
-benches/pathological.rs    # Criterion benchmarks: pathological bounded repetitions
-benches/pathological_profile.rs  # Callgrind profile for pathological patterns
-scripts/bless_memory.py    # Update memory assertions in match_tests!
+Cargo.toml                          # Workspace root
+rethoc-engine/                      # Library crate (regex engine)
+  Cargo.toml
+  src/lib.rs                        # Core NFA compiler, matcher, counter pool, ALL tests
+  src/dump.rs                       # Human-readable dump (DumpRegex, DumpState Display wrappers)
+  src/info.rs                       # Diagnostic/serialization types (RegexInfo, MemoryInfo, etc.)
+  src/memrange.rs                   # SIMD byte-range prefilter (SSE2/AVX2/NEON + scalar fallback)
+  src/fuzz_gen.rs                   # Grammar-aware pattern + input generator for fuzzing
+  src/hir_optimize.rs               # HIR normalization pass (strip captures, collapse quantifiers)
+  src/dfa/mod.rs                    # Shared DFA infrastructure (DfaMemory, DfaState, epsilon_closure)
+  src/dfa/tier1.rs                  # Tier 1: Lazy DFA, counter-free patterns
+  src/dfa/tier2/mod.rs              # Tier 2: Differential counters, fixed-length bodies (Becchi-style)
+  src/dfa/tier2/eligibility.rs      # Tier 2 eligibility analysis
+  src/dfa/tier2/overlap.rs          # Tier 2 byte-overlap probing
+  src/dfa/tier3/mod.rs              # Tier 3: Conditional transitions, non-nested variable-length bodies
+  src/dfa/tier3/effects.rs          # Tier 3 target effect analysis
+  src/dfa/tier4.rs                  # Tier 4: Counter programs, nested repetitions
+  benches/flamegraph.rs             # Callgrind benchmarks (gungraun harness)
+  benches/pathological.rs           # Criterion benchmarks: pathological bounded repetitions
+  benches/pathological_profile.rs   # Callgrind profile for pathological patterns
+  tests/                            # (empty — all tests are inline in lib.rs)
+rethoc-cli/                         # Binary crate (CLI tool)
+  Cargo.toml
+  src/main.rs                       # CLI binary `rethoc` (info, match, grep, dot, dump)
+fuzz/                               # cargo-fuzz targets (separate workspace)
+  Cargo.toml
+  fuzz_targets/fuzz_match.rs        # Fuzz target: oracle differential (rethoc vs regex crate)
+  fuzz_targets/fuzz_differential.rs # Fuzz target: cross-tier differential (NFA as oracle)
+  fuzz_targets/fuzz_compile.rs      # Fuzz target: compilation robustness
+scripts/bless_memory.py             # Update memory assertions in match_tests!
+docs/                               # Design documents and patch plans
 ```
 
-All tests are inline in `src/lib.rs` (`#[cfg(test)] mod tests`) and `src/memrange.rs`.
-The `tests/` directory is empty — there are no integration tests.
+All tests are inline in `rethoc-engine/src/lib.rs` (`#[cfg(test)] mod tests`),
+`rethoc-engine/src/memrange.rs`, `rethoc-engine/src/dfa/tier2/mod.rs`, and
+`rethoc-engine/src/hir_optimize.rs`.
 
 ## Architecture
 
