@@ -1458,6 +1458,72 @@ pub struct Tier2DfaMatcher<'a> {
     prefilter: Prefilter,
 }
 
+/// Check if resolving deferred assertions at end-of-input reaches a
+/// CInc whose counter, after one more increment, allows a break to
+/// Match.  Free function to avoid borrow conflicts between the DFA
+/// state (`cache.inner`) and the counter/memory state.
+fn resolve_deferred_cinc_at_end(
+    deferred: &[StateIdx],
+    prev: Option<u8>,
+    regex: &crate::Regex,
+    counters: &CounterState,
+    memory: &mut DfaMemory,
+) -> bool {
+    if deferred.is_empty() {
+        return false;
+    }
+    let states = &regex.states;
+
+    for v in memory.closure_visited.iter_mut() {
+        *v = false;
+    }
+    memory.closure_stack.clear();
+    for &assert_idx in deferred {
+        if let State::Assert { kind, out } = states[assert_idx]
+            && kind.eval(false, true, prev, None) == AssertEval::Pass
+        {
+            memory.closure_stack.push(out);
+        }
+    }
+
+    while let Some(idx) = memory.closure_stack.pop() {
+        let i = idx.idx();
+        if memory.closure_visited[i] {
+            continue;
+        }
+        memory.closure_visited[i] = true;
+        match states[idx] {
+            State::CounterIncrement { counter, min, .. } => {
+                let ci = counter.idx();
+                if !regex.counter_break_can_match[ci] {
+                    continue;
+                }
+                if ci < counters.meta.len() {
+                    let m = &counters.meta[ci];
+                    for ph in 0..m.num_phases {
+                        let phase = &counters.phases[m.phase_start + ph];
+                        if !phase.is_empty() && phase.oldest + 1 >= min as u32 {
+                            return true;
+                        }
+                    }
+                }
+            }
+            State::Split { out, out1 } => {
+                memory.closure_stack.push(out1);
+                memory.closure_stack.push(out);
+            }
+            State::Assert { kind, out } => {
+                if kind.eval(false, true, prev, None) == AssertEval::Pass {
+                    memory.closure_stack.push(out);
+                }
+            }
+            State::CounterInstance { out, .. } => memory.closure_stack.push(out),
+            _ => {}
+        }
+    }
+    false
+}
+
 impl<'a> Tier2DfaMatcher<'a> {
     #[inline]
     pub(crate) fn new(
@@ -1756,7 +1822,7 @@ impl<'a> Tier2DfaMatcher<'a> {
     }
 
     #[inline]
-    pub fn finish(mut self) -> bool {
+    pub fn finish(self) -> bool {
         if self.ever_matched {
             return true;
         }
@@ -1778,71 +1844,14 @@ impl<'a> Tier2DfaMatcher<'a> {
             // bodies.  When a deferred assertion resolves at end-of-input
             // and reaches CInc, we need to check whether incrementing the
             // counter allows a break to Match.
-            // Extract what we need before borrowing self mutably.
-            let deferred = state.deferred_asserts.clone();
-            let prev = state.prev_byte_representative();
-            if self.resolve_deferred_cinc_at_end(&deferred, prev) {
+            if resolve_deferred_cinc_at_end(
+                &state.deferred_asserts,
+                state.prev_byte_representative(),
+                self.regex,
+                &self.cache.counters,
+                self.memory,
+            ) {
                 return true;
-            }
-        }
-        false
-    }
-
-    /// Check if resolving deferred assertions at end-of-input reaches a
-    /// CInc whose counter, after one more increment, allows a break to
-    /// Match.  This handles patterns like `(\w\b){1,3}` where the last
-    /// `\b` is only resolved at end-of-input.
-    fn resolve_deferred_cinc_at_end(&mut self, deferred: &[StateIdx], prev: Option<u8>) -> bool {
-        if deferred.is_empty() {
-            return false;
-        }
-        let states = &self.regex.states;
-
-        for v in self.memory.closure_visited.iter_mut() {
-            *v = false;
-        }
-        self.memory.closure_stack.clear();
-        for &assert_idx in deferred {
-            if let State::Assert { kind, out } = states[assert_idx]
-                && kind.eval(false, true, prev, None) == AssertEval::Pass
-            {
-                self.memory.closure_stack.push(out);
-            }
-        }
-
-        while let Some(idx) = self.memory.closure_stack.pop() {
-            let i = idx.idx();
-            if self.memory.closure_visited[i] {
-                continue;
-            }
-            self.memory.closure_visited[i] = true;
-            match states[idx] {
-                State::CounterIncrement { counter, min, .. } => {
-                    let ci = counter.idx();
-                    if !self.regex.counter_break_can_match[ci] {
-                        continue;
-                    }
-                    if ci < self.cache.counters.meta.len() {
-                        let m = &self.cache.counters.meta[ci];
-                        for ph in 0..m.num_phases {
-                            let phase = &self.cache.counters.phases[m.phase_start + ph];
-                            if !phase.is_empty() && phase.oldest + 1 >= min as u32 {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                State::Split { out, out1 } => {
-                    self.memory.closure_stack.push(out1);
-                    self.memory.closure_stack.push(out);
-                }
-                State::Assert { kind, out } => {
-                    if kind.eval(false, true, prev, None) == AssertEval::Pass {
-                        self.memory.closure_stack.push(out);
-                    }
-                }
-                State::CounterInstance { out, .. } => self.memory.closure_stack.push(out),
-                _ => {}
             }
         }
         false
