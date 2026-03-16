@@ -33,97 +33,22 @@ pub(crate) const MAX_TIER2_COUNTERS: usize = 64;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Sentinel value for "no node" in the [`DeltaPool`] linked list.
-const SENTINEL: u32 = u32::MAX;
-
 // ---------------------------------------------------------------------------
 // Delta pool (arena-backed linked list for counter deltas)
 // ---------------------------------------------------------------------------
 
-/// Arena-backed pool of linked-list nodes for counter deltas.
-///
-/// All counters share a single `DeltaPool`.  Each [`DiffCounter`] owns a
-/// linked list (head/tail indices) whose nodes live in this pool.  Freed
-/// nodes are threaded into an intrusive free list and recycled by
-/// subsequent allocations.
-///
-/// Between matches, [`reset`](Self::reset) clears the backing vecs
-/// (retaining heap capacity) so the pool's memory is reused across
-/// matcher invocations without per-counter loops.
-#[derive(Clone, Debug)]
-struct DeltaPool {
-    /// Node payload (delta value).
-    values: Vec<u32>,
-    /// `next[i]` = index of the successor node, or [`SENTINEL`].
-    next: Vec<u32>,
-    /// Head of the intrusive free list threaded through `next[]`,
-    /// or [`SENTINEL`] if the free list is empty.
-    free_head: u32,
-}
-
-impl DeltaPool {
-    fn new() -> Self {
-        Self {
-            values: Vec::new(),
-            next: Vec::new(),
-            free_head: SENTINEL,
-        }
-    }
-
-    /// Allocate a node with the given value.  Reuses a freed slot if
-    /// available, otherwise appends to the end of the arena.
-    #[inline]
-    fn alloc(&mut self, val: u32) -> u32 {
-        if self.free_head != SENTINEL {
-            let idx = self.free_head;
-            self.free_head = self.next[idx as usize];
-            self.values[idx as usize] = val;
-            self.next[idx as usize] = SENTINEL;
-            idx
-        } else {
-            let idx = self.values.len() as u32;
-            self.values.push(val);
-            self.next.push(SENTINEL);
-            idx
-        }
-    }
-
-    /// Return a single node to the free list for reuse.
-    #[inline]
-    fn free_node(&mut self, idx: u32) {
-        self.next[idx as usize] = self.free_head;
-        self.free_head = idx;
-    }
-
-    /// Return an entire linked-list chain `[head … tail]` to the free
-    /// list in O(1).  `tail.next` must be [`SENTINEL`].
-    #[inline]
-    fn free_chain(&mut self, head: u32, tail: u32) {
-        debug_assert_ne!(head, SENTINEL);
-        debug_assert_ne!(tail, SENTINEL);
-        self.next[tail as usize] = self.free_head;
-        self.free_head = head;
-    }
-
-    /// Clear all nodes (retaining heap capacity).
-    fn reset(&mut self) {
-        self.values.clear();
-        self.next.clear();
-        self.free_head = SENTINEL;
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Differential counter (per-phase, no heap)
+// Differential counter (per-phase, ring-buffer deltas)
 // ---------------------------------------------------------------------------
 
 /// Differential counter for one phase of one counter.
 ///
 /// All instances in the same phase increment in lockstep.  We store only
 /// the oldest instance's absolute value and the count of active instances.
-/// Deltas between consecutive instances are recorded as a linked list in
-/// the shared [`DeltaPool`] so that when the oldest is deallocated, the
-/// new oldest's value can be recovered in O(1).
+/// Deltas between consecutive instances are stored in a power-of-two
+/// ring buffer for cache-friendly FIFO access: dealloc pops from head,
+/// alloc pushes to tail, and both ends wrap around the same contiguous
+/// memory.
 #[derive(Clone, Debug)]
 struct DiffCounter {
     /// Absolute value of the oldest (highest-value) instance.
@@ -132,10 +57,13 @@ struct DiffCounter {
     count: u32,
     /// Sum of all deltas (oldest_value − youngest_value).
     total_delta: u32,
-    /// Head of the delta linked list in the pool, or [`SENTINEL`].
+    /// Ring buffer of delta values between consecutive instances.
+    /// Capacity is always a power of two.
+    ring: Vec<u32>,
+    /// Index of the oldest delta in `ring` (head of queue).
     head: u32,
-    /// Tail of the delta linked list in the pool, or [`SENTINEL`].
-    tail: u32,
+    /// Bitmask for fast modular indexing: `ring.len() - 1`.
+    mask: u32,
 }
 
 impl DiffCounter {
@@ -144,9 +72,41 @@ impl DiffCounter {
             oldest: 0,
             count: 0,
             total_delta: 0,
-            head: SENTINEL,
-            tail: SENTINEL,
+            ring: Vec::new(),
+            head: 0,
+            mask: 0,
         }
+    }
+
+    /// Pre-allocate the ring buffer.  `max_instances` is the counter's
+    /// `max` value — capped to avoid huge allocations for unbounded
+    /// repetitions.  The ring grows on demand if more capacity is needed.
+    fn reserve(&mut self, max_instances: usize) {
+        // Cap initial allocation: 4096 entries = 16 KB per phase.
+        // Unbounded counters (max = usize::MAX) start small and grow.
+        let cap = max_instances.clamp(1, 4096).next_power_of_two();
+        if self.ring.len() < cap {
+            self.ring.resize(cap, 0);
+        }
+        self.mask = (self.ring.len() as u32) - 1;
+    }
+
+    /// Double the ring buffer capacity, preserving existing contents
+    /// in their correct logical order.
+    fn grow(&mut self) {
+        let old_cap = self.ring.len();
+        let new_cap = (old_cap * 2).max(4);
+        let old_mask = self.mask;
+        let head = self.head;
+        let n = self.count.saturating_sub(1) as usize; // number of deltas
+
+        let mut new_ring = vec![0u32; new_cap];
+        for (i, dst) in new_ring[..n].iter_mut().enumerate() {
+            *dst = self.ring[((head.wrapping_add(i as u32)) & old_mask) as usize];
+        }
+        self.ring = new_ring;
+        self.mask = (new_cap as u32) - 1;
+        self.head = 0;
     }
 
     /// Youngest instance value.
@@ -165,49 +125,39 @@ impl DiffCounter {
 
     /// Deallocate the oldest instance.  Returns `true` if instances remain.
     #[inline]
-    fn dealloc_oldest(&mut self, pool: &mut DeltaPool) -> bool {
+    fn dealloc_oldest(&mut self) -> bool {
         debug_assert!(self.count > 0);
         self.count -= 1;
         if self.count > 0 {
-            let old_head = self.head;
-            debug_assert_ne!(old_head, SENTINEL);
-            let d = pool.values[old_head as usize];
-            self.head = pool.next[old_head as usize];
-            if self.head == SENTINEL {
-                self.tail = SENTINEL;
-            }
-            pool.free_node(old_head);
+            let d = self.ring[(self.head & self.mask) as usize];
+            self.head = self.head.wrapping_add(1);
             self.oldest -= d;
             self.total_delta -= d;
             true
         } else {
-            if self.head != SENTINEL {
-                pool.free_chain(self.head, self.tail);
-            }
             self.total_delta = 0;
-            self.head = SENTINEL;
-            self.tail = SENTINEL;
             false
         }
     }
 
     /// Allocate a new instance with a given initial value (youngest).
     #[inline]
-    fn alloc_new_with_value(&mut self, value: u32, pool: &mut DeltaPool) {
+    fn alloc_new_with_value(&mut self, value: u32) {
         if self.count == 0 {
             self.oldest = value;
             self.count = 1;
             self.total_delta = 0;
         } else {
+            // Number of deltas = count - 1 (before adding the new one).
+            // If the ring is full, grow it.
+            let num_deltas = (self.count - 1) as usize;
+            if num_deltas >= self.ring.len() {
+                self.grow();
+            }
             let youngest_val = self.youngest();
             let gap = youngest_val - value;
-            let node = pool.alloc(gap);
-            if self.tail != SENTINEL {
-                pool.next[self.tail as usize] = node;
-            } else {
-                self.head = node;
-            }
-            self.tail = node;
+            let tail = self.head.wrapping_add(self.count - 1);
+            self.ring[(tail & self.mask) as usize] = gap;
             self.total_delta += gap;
             self.count += 1;
         }
@@ -215,8 +165,8 @@ impl DiffCounter {
 
     /// Allocate a new instance with value 0 (youngest).
     #[inline]
-    fn alloc_new(&mut self, pool: &mut DeltaPool) {
-        self.alloc_new_with_value(0, pool);
+    fn alloc_new(&mut self) {
+        self.alloc_new_with_value(0);
     }
 
     #[inline]
@@ -224,17 +174,13 @@ impl DiffCounter {
         self.count == 0
     }
 
-    /// Return nodes to the pool and reset to empty state.
+    /// Reset to empty state (ring buffer capacity retained).
     #[inline]
-    fn clear(&mut self, pool: &mut DeltaPool) {
-        if self.head != SENTINEL {
-            pool.free_chain(self.head, self.tail);
-        }
+    fn clear(&mut self) {
         self.oldest = 0;
         self.count = 0;
         self.total_delta = 0;
-        self.head = SENTINEL;
-        self.tail = SENTINEL;
+        self.head = 0;
     }
 }
 
@@ -616,7 +562,7 @@ pub(crate) struct Tier2DfaCache {
     transitions: Vec<Transition>,
     start_seeds: Box<[(CounterIdx, u32)]>,
     /// Shared arena for delta linked-list nodes across all counters.
-    delta_pool: DeltaPool,
+
     /// Flat array of differential counters for all phases of all counters.
     /// Indexed via [`CounterMeta::phase_start`].
     phases: Vec<DiffCounter>,
@@ -642,7 +588,7 @@ impl Tier2DfaCache {
             stride: 256,
             transitions: Vec::new(),
             start_seeds: Box::new([]),
-            delta_pool: DeltaPool::new(),
+
             phases: Vec::new(),
             counter_meta: Vec::new(),
             total_phases: 0,
@@ -694,7 +640,7 @@ impl Tier2DfaCache {
         let can_break = phase.oldest >= min;
         if can_break {
             while !phase.is_empty() && phase.oldest >= max {
-                phase.dealloc_oldest(&mut self.delta_pool);
+                phase.dealloc_oldest();
             }
         }
         can_break
@@ -706,7 +652,7 @@ impl Tier2DfaCache {
         let start = self.counter_meta[c_idx].phase_start;
         let end = start + self.counter_meta[c_idx].num_phases;
         for p in &mut self.phases[start..end] {
-            p.clear(&mut self.delta_pool);
+            p.clear();
         }
     }
 
@@ -731,7 +677,7 @@ impl Tier2DfaCache {
         let target_phase = (m.active_phase + nph - 1) % nph;
         let phase_idx = m.phase_start + target_phase;
         // m borrow ends here.
-        self.phases[phase_idx].alloc_new_with_value(initial_value, &mut self.delta_pool);
+        self.phases[phase_idx].alloc_new_with_value(initial_value);
     }
 
     /// Check if any phase has live instances.
@@ -741,29 +687,30 @@ impl Tier2DfaCache {
     }
 
     /// Clear all counter instances and reset active phases.
+    /// Retains ring buffer allocations.
     fn clear_all_counters(&mut self) {
-        for ci in 0..self.counter_meta.len() {
-            let start = self.counter_meta[ci].phase_start;
-            let end = start + self.counter_meta[ci].num_phases;
-            for p in &mut self.phases[start..end] {
-                p.clear(&mut self.delta_pool);
-            }
-            self.counter_meta[ci].active_phase = 0;
+        for p in &mut self.phases {
+            p.clear();
+        }
+        for m in &mut self.counter_meta {
+            m.active_phase = 0;
         }
     }
 
-    /// Reset all phases and the delta pool for a new match.
-    /// O(1): just clears the pool and phases vec (capacity retained).
-    /// Phases are lazily repopulated by [`ensure_phases`] on the first
-    /// slow-path byte that actually needs counter operations.
+    /// Reset counter state between matches.  Clears logical state of
+    /// each phase but retains ring buffer allocations for reuse.
     fn reset_for_new_match(&mut self) {
-        self.delta_pool.reset();
-        self.phases.clear();
+        for p in &mut self.phases {
+            p.clear();
+        }
+        for m in &mut self.counter_meta {
+            m.active_phase = 0;
+        }
     }
 
-    /// Lazily populate the phases vec and reset active_phase for all counters.
-    /// Called once per match on the first slow-path byte; subsequent calls
-    /// short-circuit on the `is_empty` check.
+    /// Lazily allocate phases on first use; subsequent calls are a
+    /// no-op (ring buffers survive across matches via
+    /// `reset_for_new_match`).
     #[inline]
     fn ensure_phases(&mut self) {
         if !self.phases.is_empty() {
@@ -772,6 +719,10 @@ impl Tier2DfaCache {
         self.phases.resize(self.total_phases, DiffCounter::new());
         for m in &mut self.counter_meta {
             m.active_phase = 0;
+            let max = m.max as usize;
+            for p in &mut self.phases[m.phase_start..m.phase_start + m.num_phases] {
+                p.reserve(max);
+            }
         }
     }
 
@@ -1250,7 +1201,6 @@ impl Tier2DfaCache {
         memory.clear(num_nfa_states);
         self.transitions.clear();
         self.start_seeds = Box::new([]);
-        self.delta_pool.reset();
         self.phases.clear();
         self.counter_meta.clear();
         self.total_phases = 0;
@@ -1517,7 +1467,7 @@ impl<'a> Tier2DfaMatcher<'a> {
                 let nph = m.num_phases;
                 let target_phase = (nph - 1) % nph;
                 let phase_idx = m.phase_start + target_phase;
-                cache.phases[phase_idx].alloc_new(&mut cache.delta_pool);
+                cache.phases[phase_idx].alloc_new();
             }
             has_live = true;
         }
@@ -2007,5 +1957,168 @@ impl fmt::Display for Tier2DfaMatcher<'_> {
             write!(f, "]")?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MatcherMemory, Regex, RegexConfig};
+
+    /// Helper: build a tier-2-eligible regex.  Disables unrolling so that
+    /// even small bounded repeats use counters (tier 2), and raises the
+    /// estimated-states limit for large patterns.
+    fn build(pattern: &str) -> Regex {
+        Regex::with_config(
+            pattern,
+            RegexConfig {
+                max_unroll_states: 0,
+                max_estimated_states: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// Helper: run a single tier-2 match and return the result.
+    fn match_tier2(mem: &mut MatcherMemory, re: &Regex, input: &[u8]) -> bool {
+        let mut m = mem.matcher_for_tier(re, 2).unwrap();
+        m.chunk(input);
+        m.finish()
+    }
+
+    // ── Ring buffer reuse across matches ──
+
+    #[test]
+    fn test_prepare_ring_reuse_same_regex() {
+        let re = build(".{1,100}a");
+        let mut mem = MatcherMemory::default();
+
+        // First match — allocates phases and ring buffers.
+        assert!(match_tier2(&mut mem, &re, b"xxxxa"));
+
+        // Access the cache to check ring capacity was retained.
+        let cache = mem.tier2_cache.as_ref().unwrap();
+        assert!(
+            !cache.phases.is_empty(),
+            "phases should be retained after first match"
+        );
+        let cap_after_first = cache.phases[0].ring.len();
+        assert!(cap_after_first > 0, "ring should be allocated");
+
+        // Second match — reuses ring buffers, no reallocation.
+        assert!(match_tier2(&mut mem, &re, b"ya"));
+
+        let cache = mem.tier2_cache.as_ref().unwrap();
+        assert_eq!(
+            cache.phases[0].ring.len(),
+            cap_after_first,
+            "ring capacity should be unchanged across matches"
+        );
+    }
+
+    #[test]
+    fn test_prepare_ring_cleared_between_matches() {
+        let re = build(".{1,100}a");
+        let mut mem = MatcherMemory::default();
+
+        // Match with many instances seeded.
+        assert!(match_tier2(&mut mem, &re, b"xxxxxxxxxa"));
+
+        // Counter state should be clean for next match — a short input
+        // that only seeds 1 instance should still work.
+        assert!(match_tier2(&mut mem, &re, b"xa"));
+
+        // No match.
+        assert!(!match_tier2(&mut mem, &re, b"xxx"));
+    }
+
+    #[test]
+    fn test_prepare_different_regex_reallocates() {
+        let re1 = build(".{1,100}a");
+        let re2 = build("[a-z]{1,50}x");
+        let mut mem = MatcherMemory::default();
+
+        // Warm up with re1.
+        assert!(match_tier2(&mut mem, &re1, b"xxxxa"));
+        let phases_after_re1 = mem.tier2_cache.as_ref().unwrap().phases.len();
+        assert!(phases_after_re1 > 0);
+
+        // Switch to re2 — should clear and reallocate.
+        assert!(match_tier2(&mut mem, &re2, b"abcx"));
+
+        // Phases may have a different count depending on re2's counters.
+        let phases_after_re2 = mem.tier2_cache.as_ref().unwrap().phases.len();
+        assert!(phases_after_re2 > 0);
+
+        // Switch back to re1 — clear again.
+        assert!(match_tier2(&mut mem, &re1, b"za"));
+    }
+
+    // ── Ring buffer growth for unbounded counters ──
+
+    #[test]
+    fn test_prepare_ring_grows_for_large_input() {
+        let re = build(".{1,100}a");
+        let mut mem = MatcherMemory::default();
+
+        // Short input.
+        assert!(match_tier2(&mut mem, &re, b"xxxa"));
+
+        // Long input — ring grows to accommodate many live instances.
+        let mut long_input = vec![b'x'; 8000];
+        long_input.push(b'a');
+        assert!(match_tier2(&mut mem, &re, &long_input));
+    }
+
+    // ── Ring buffer growth for unbounded counters ──
+
+    #[test]
+    fn test_prepare_ring_grows_for_unbounded() {
+        // a{2,}b — unbounded counter, ring starts at the initial cap
+        // and must grow for long inputs.
+        let re = build("a{2,}b");
+        let mut mem = MatcherMemory::default();
+
+        assert!(match_tier2(&mut mem, &re, b"aab"));
+        assert!(!match_tier2(&mut mem, &re, b"ab"));
+
+        let mut long_input = vec![b'a'; 8000];
+        long_input.push(b'b');
+        assert!(match_tier2(&mut mem, &re, &long_input));
+    }
+
+    // ── Correctness across reused matches ──
+
+    #[test]
+    fn test_prepare_no_stale_state() {
+        let re = build(".{3,5}x");
+        let mut mem = MatcherMemory::default();
+
+        // Match: 4 dots then x.
+        assert!(match_tier2(&mut mem, &re, b"aaaax"));
+
+        // No match: only 2 dots (below min=3).
+        assert!(!match_tier2(&mut mem, &re, b"aax"));
+
+        // Match again: exactly 3.
+        assert!(match_tier2(&mut mem, &re, b"bbbx"));
+
+        // No match: x without enough prefix.
+        assert!(!match_tier2(&mut mem, &re, b"x"));
+    }
+
+    #[test]
+    fn test_prepare_no_stale_state_small_bound() {
+        // a{2,5}b with unroll disabled → tier 2 counter.
+        let re = build("a{2,5}b");
+        let mut mem = MatcherMemory::default();
+
+        assert!(match_tier2(&mut mem, &re, b"aab"));
+        assert!(match_tier2(&mut mem, &re, b"aaaaab"));
+        assert!(!match_tier2(&mut mem, &re, b"ab"));
+        assert!(!match_tier2(&mut mem, &re, b"aaa"));
+        // Reuse after no-match.
+        assert!(match_tier2(&mut mem, &re, b"aaab"));
     }
 }
