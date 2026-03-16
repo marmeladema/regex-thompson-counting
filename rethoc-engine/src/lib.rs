@@ -64,6 +64,7 @@ mod dump;
 pub mod fuzz_gen;
 mod hir_optimize;
 mod info;
+pub mod memclass;
 mod memrange;
 
 use dfa::{
