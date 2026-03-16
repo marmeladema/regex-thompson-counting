@@ -23,7 +23,7 @@ use crate::{
     is_word_byte,
 };
 
-use super::{DfaCache, DfaMemory, DfaState, DfaStateId};
+use super::{DfaCache, DfaMemory, DfaStateId};
 
 /// Maximum counters for tier 2: the `counting_mask` and `counter_reset`
 /// fields in `Transition` are `u64` bitmasks.
@@ -345,6 +345,21 @@ pub(crate) struct Tier2Analysis {
     break_consuming: Box<[StateIdx]>,
     /// Per-counter `(start, end)` range into [`break_consuming`](Self::break_consuming).
     break_consuming_ranges: Box<[(usize, usize)]>,
+    /// Per-counter flag: `true` if `Match` is directly reachable (without
+    /// passing through an end-of-input assertion) from the counter's break
+    /// path (`CInc.out1`).  Precomputed at build time.
+    break_direct_match: Box<[bool]>,
+    /// Per-NFA-state bitmask of counter indices whose `CounterIncrement`
+    /// is reachable via epsilon transitions.  Indexed by `StateIdx`.
+    /// Replaces the runtime `find_cinc_counters` and `deferred_cinc_mask`
+    /// graph walks.
+    cinc_reachable: Box<[u64]>,
+    /// Flat array of consuming NFA states reachable from each counter's
+    /// `CounterInstance.out` via epsilon transitions.  Used to build
+    /// seed instances at populate time without a graph walk.
+    ci_seed_consuming: Box<[StateIdx]>,
+    /// Per-counter `(start, end)` range into [`ci_seed_consuming`].
+    ci_seed_consuming_ranges: Box<[(usize, usize)]>,
 }
 
 impl Tier2Analysis {
@@ -353,6 +368,25 @@ impl Tier2Analysis {
     pub(crate) fn interior(&self, ci: usize) -> &[u32] {
         let (start, end) = self.body_ranges[ci];
         &self.body_interior[start..end]
+    }
+
+    /// Returns `true` if `Match` is directly reachable (without an
+    /// end-of-input assertion) from counter `ci`'s break path.
+    pub(crate) fn break_has_direct_match(&self, ci: usize) -> bool {
+        self.break_direct_match[ci]
+    }
+
+    /// Returns the bitmask of counter indices whose `CounterIncrement`
+    /// is reachable via epsilon transitions from NFA state `idx`.
+    pub(crate) fn cinc_reachable_from(&self, idx: StateIdx) -> u64 {
+        self.cinc_reachable[idx.idx()]
+    }
+
+    /// Returns the consuming NFA states reachable from counter `ci`'s
+    /// `CounterInstance.out` via epsilon transitions.
+    pub(crate) fn seed_consuming(&self, ci: usize) -> &[StateIdx] {
+        let (start, end) = self.ci_seed_consuming_ranges[ci];
+        &self.ci_seed_consuming[start..end]
     }
 
     /// Returns the slice of consuming NFA states reachable from counter
@@ -380,6 +414,7 @@ pub(crate) fn compute_tier2_analysis(
 ) -> Tier2Analysis {
     let mut per_counter: Vec<Vec<u32>> = vec![Vec::new(); num_counters];
     let mut break_per_counter: Vec<Vec<StateIdx>> = vec![Vec::new(); num_counters];
+    let mut break_direct: Vec<bool> = vec![false; num_counters];
 
     for s in states.iter() {
         if let State::CounterInstance { counter, out } = s {
@@ -444,11 +479,16 @@ pub(crate) fn compute_tier2_analysis(
             per_counter[ci] = interior;
         }
 
-        // Collect break-path consuming states for each CInc.
+        // Collect break-path consuming states and match reachability
+        // for each CInc.
         if let State::CounterIncrement { counter, out1, .. } = *s {
             let ci = counter.idx();
             if ci < num_counters {
                 break_per_counter[ci] = collect_break_consuming(out1, states);
+                let (direct, _at_end) = break_path_match_kind(out1, states);
+                if direct {
+                    break_direct[ci] = true;
+                }
             }
         }
     }
@@ -471,11 +511,65 @@ pub(crate) fn compute_tier2_analysis(
         break_ranges.push((start, break_flat.len()));
     }
 
+    // Precompute per-NFA-state CInc reachability bitmask.
+    // For each state, walk epsilon transitions and record which
+    // CounterIncrement counters are reachable.
+    let n = states.len();
+    let mut cinc_reachable = vec![0u64; n];
+    for (si, _) in states.iter().enumerate() {
+        let mut mask = 0u64;
+        let mut stack = vec![StateIdx(si as u32)];
+        let mut visited = vec![false; n];
+        while let Some(idx) = stack.pop() {
+            let i = idx.idx();
+            if visited[i] {
+                continue;
+            }
+            visited[i] = true;
+            match states[idx] {
+                State::CounterIncrement { counter, .. } => {
+                    mask |= 1u64 << counter.idx();
+                }
+                State::Split { out, out1 } => {
+                    stack.push(out1);
+                    stack.push(out);
+                }
+                State::Assert { out, .. } => stack.push(out),
+                State::CounterInstance { out, .. } => stack.push(out),
+                _ => {}
+            }
+        }
+        cinc_reachable[si] = mask;
+    }
+
+    // Precompute per-counter seed consuming states: consuming NFA states
+    // reachable from each CounterInstance.out via epsilon transitions.
+    let mut seed_per_counter: Vec<Vec<StateIdx>> = vec![Vec::new(); num_counters];
+    for s in states.iter() {
+        if let State::CounterInstance { counter, out } = *s {
+            let ci = counter.idx();
+            if ci < num_counters && seed_per_counter[ci].is_empty() {
+                seed_per_counter[ci] = consuming_states_from(out, states);
+            }
+        }
+    }
+    let mut seed_flat: Vec<StateIdx> = Vec::new();
+    let mut seed_ranges: Vec<(usize, usize)> = Vec::with_capacity(num_counters);
+    for v in seed_per_counter {
+        let start = seed_flat.len();
+        seed_flat.extend(v);
+        seed_ranges.push((start, seed_flat.len()));
+    }
+
     Tier2Analysis {
         body_interior: flat.into_boxed_slice(),
         body_ranges: ranges.into_boxed_slice(),
         break_consuming: break_flat.into_boxed_slice(),
         break_consuming_ranges: break_ranges.into_boxed_slice(),
+        break_direct_match: break_direct.into_boxed_slice(),
+        cinc_reachable: cinc_reachable.into_boxed_slice(),
+        ci_seed_consuming: seed_flat.into_boxed_slice(),
+        ci_seed_consuming_ranges: seed_ranges.into_boxed_slice(),
     }
 }
 
@@ -695,6 +789,7 @@ impl Tier2DfaCache {
         memory: &mut DfaMemory,
         seeds: impl Iterator<Item = StateIdx>,
         regex: &Regex,
+        analysis: &Tier2Analysis,
         at_start: bool,
         prev_byte: Option<u8>,
         next_byte: Option<u8>,
@@ -725,9 +820,8 @@ impl Tier2DfaCache {
         );
 
         let mut seed_instances: Vec<(CounterIdx, StateIdx)> = Vec::new();
-        for &(counter, ci_out) in &memory.closure_seeds {
-            let consuming = consuming_states_from(ci_out, &regex.states);
-            for c in consuming {
+        for &(counter, _ci_out) in &memory.closure_seeds {
+            for &c in analysis.seed_consuming(counter.idx()) {
                 seed_instances.push((counter, c));
             }
         }
@@ -797,6 +891,7 @@ impl Tier2DfaCache {
                     memory,
                     extra.into_iter(),
                     regex,
+                    analysis,
                     false,
                     resolved_prev,
                     Some(byte),
@@ -824,24 +919,10 @@ impl Tier2DfaCache {
                         mask &= mask - 1;
 
                         // Check direct (epsilon-only) match from break
-                        // target — gated on the precomputed flag.
-                        if regex.counter_break_can_match[ci] {
-                            for s in regex.states.iter() {
-                                if let State::CounterIncrement { counter, out1, .. } = *s
-                                    && counter.idx() == ci
-                                {
-                                    let (direct, _at_end) =
-                                        break_path_match_kind(out1, &regex.states);
-                                    if direct {
-                                        resolved_break_match = true;
-                                    }
-                                    // _at_end is intentionally ignored:
-                                    // $ cannot pass mid-stream (Phase 1
-                                    // always has a next byte).  EOI
-                                    // break-through-$ is handled by
-                                    // resolve_deferred_cinc_at_end().
-                                }
-                            }
+                        // target — precomputed at analysis time.
+                        if regex.counter_break_can_match[ci] && analysis.break_has_direct_match(ci)
+                        {
+                            resolved_break_match = true;
                         }
 
                         // Consume the current byte at precomputed
@@ -886,6 +967,7 @@ impl Tier2DfaCache {
             memory,
             targets.iter().copied().chain(std::iter::once(regex.start)),
             regex,
+            analysis,
             false,
             Some(byte),
             None,
@@ -898,7 +980,10 @@ impl Tier2DfaCache {
         // Include counters reached via resolved deferred assertions
         // (Phase 1) which are not reachable from targets alone.
         let counting_mask = if is_counting {
-            find_cinc_counters(&targets, &regex.states) | resolved_cinc_mask
+            targets
+                .iter()
+                .fold(0u64, |acc, &t| acc | analysis.cinc_reachable_from(t))
+                | resolved_cinc_mask
         } else {
             0
         };
@@ -935,6 +1020,7 @@ impl Tier2DfaCache {
                 memory,
                 targets.iter().copied().chain(std::iter::once(regex.start)),
                 regex,
+                analysis,
                 false,
                 Some(byte),
                 None,
@@ -957,6 +1043,7 @@ impl Tier2DfaCache {
                         .chain(resolved_break_targets.iter().copied())
                         .chain(std::iter::once(regex.start)),
                     regex,
+                    analysis,
                     false,
                     Some(byte),
                     None,
@@ -1043,7 +1130,13 @@ impl Tier2DfaCache {
 
             // Counters reachable from deferred assertions (for pre-reset
             // snapshot in step_inner).
-            let dcm = deferred_cinc_mask(&probe.deferred_asserts, &regex.states);
+            let dcm = probe.deferred_asserts.iter().fold(0u64, |acc, &assert_idx| {
+                if let State::Assert { out, .. } = regex.states[assert_idx] {
+                    acc | analysis.cinc_reachable_from(out)
+                } else {
+                    acc
+                }
+            });
 
             // For L=1 counter bodies with deferred assertions gating
             // CInc, the probe can't see through the deferred assertion
@@ -1161,7 +1254,12 @@ impl Tier2DfaCache {
     }
 
     #[inline]
-    pub(crate) fn prepare(&mut self, memory: &mut DfaMemory, regex: &Regex) {
+    pub(crate) fn prepare(
+        &mut self,
+        memory: &mut DfaMemory,
+        regex: &Regex,
+        analysis: &Tier2Analysis,
+    ) {
         let id = regex.id;
         if self.inner.regex_id == id && self.inner.start_id != DfaStateId::DEAD {
             return;
@@ -1173,6 +1271,7 @@ impl Tier2DfaCache {
             memory,
             std::iter::once(regex.start),
             regex,
+            analysis,
             true,
             None,
             None,
@@ -1265,10 +1364,29 @@ fn consume_byte(idx: StateIdx, byte: u8, regex: &Regex) -> Option<(StateIdx, Sta
     }
 }
 
+/// Walk epsilon transitions from `start` and collect all reachable
+/// consuming states.  Allocates its own scratch buffers.
 fn consuming_states_from(start: StateIdx, states: &[State]) -> Vec<StateIdx> {
     let mut result = Vec::new();
     let mut stack = vec![start];
     let mut visited = vec![false; states.len()];
+    consuming_states_walk(&mut stack, &mut visited, states, &mut result);
+    result
+}
+
+/// Walk epsilon transitions from `start` and append reachable
+/// consuming states to `result`, using `DfaMemory` scratch buffers
+/// for the visited array and work stack.
+///
+/// Does NOT touch `memory.closure_result` — the caller may still
+/// need it for the epsilon closure result built earlier.
+/// Shared walk logic for `consuming_states_from`.
+fn consuming_states_walk(
+    stack: &mut Vec<StateIdx>,
+    visited: &mut [bool],
+    states: &[State],
+    result: &mut Vec<StateIdx>,
+) {
     while let Some(idx) = stack.pop() {
         let i = idx.idx();
         if visited[i] {
@@ -1291,36 +1409,6 @@ fn consuming_states_from(start: StateIdx, states: &[State]) -> Vec<StateIdx> {
             _ => {}
         }
     }
-    result
-}
-
-/// Find ALL counters that fire CInc reachable from `targets`, as a bitmask.
-fn find_cinc_counters(targets: &[StateIdx], states: &[State]) -> u64 {
-    let mut mask: u64 = 0;
-    for &t in targets {
-        let mut stack = vec![t];
-        let mut visited = vec![false; states.len()];
-        while let Some(idx) = stack.pop() {
-            let i = idx.idx();
-            if visited[i] {
-                continue;
-            }
-            visited[i] = true;
-            match states[idx] {
-                State::CounterIncrement { counter, .. } => {
-                    mask |= 1u64 << counter.idx();
-                }
-                State::Split { out, out1 } => {
-                    stack.push(out1);
-                    stack.push(out);
-                }
-                State::Assert { out, .. } => stack.push(out),
-                State::CounterInstance { out, .. } => stack.push(out),
-                _ => {}
-            }
-        }
-    }
-    mask
 }
 
 /// Walk from `start` through epsilon states on the CInc break path
@@ -1333,10 +1421,16 @@ fn find_cinc_counters(targets: &[StateIdx], states: &[State]) -> u64 {
 ///   `(?Rm:$)` — this fires only at end-of-input.
 ///
 /// Both can be true if there are multiple paths.
+/// Walk from `start` through epsilon states on the CInc break path
+/// (CInc.out1) and determine how `Match` is reachable:
+///
+/// Returns `(direct, at_end)`:
+/// - `direct`: Match is reachable without passing through an end-like
+///   assertion (`$`, `\Z`, `\z`).
+/// - `at_end`: Match is reachable through an end-like assertion.
 fn break_path_match_kind(start: StateIdx, states: &[State]) -> (bool, bool) {
     let mut direct = false;
     let mut at_end = false;
-    // Stack entries: (state, through_end_assert)
     let mut stack: Vec<(StateIdx, bool)> = vec![(start, false)];
     let mut visited = vec![[false; 2]; states.len()];
     while let Some((idx, through_end)) = stack.pop() {
@@ -1368,49 +1462,10 @@ fn break_path_match_kind(start: StateIdx, states: &[State]) -> (bool, bool) {
             State::CounterInstance { out, .. } => {
                 stack.push((out, through_end));
             }
-            // Consuming states and CInc: stop walking.
             _ => {}
         }
     }
     (direct, at_end)
-}
-
-/// Compute a bitmask of counters reachable via CInc from deferred
-/// assertions in a closure result.  When a deferred assertion gates
-/// the path to CInc, the transition is classified as non-counting
-/// (CInc not in the epsilon closure).  But the counter should NOT be
-/// reset — the body just consumed a byte on this transition, and the
-/// CInc is merely deferred behind the assertion.
-fn deferred_cinc_mask(deferred: &[StateIdx], states: &[State]) -> u64 {
-    let mut mask: u64 = 0;
-    let mut visited = vec![false; states.len()];
-    for &assert_idx in deferred {
-        // Start from the assert's output (the assertion itself is
-        // already known to be deferred).
-        if let State::Assert { out, .. } = states[assert_idx] {
-            let mut stack = vec![out];
-            while let Some(idx) = stack.pop() {
-                let i = idx.idx();
-                if visited[i] {
-                    continue;
-                }
-                visited[i] = true;
-                match states[idx] {
-                    State::CounterIncrement { counter, .. } => {
-                        mask |= 1u64 << counter.idx();
-                    }
-                    State::Split { out, out1 } => {
-                        stack.push(out1);
-                        stack.push(out);
-                    }
-                    State::Assert { out, .. } => stack.push(out),
-                    State::CounterInstance { out, .. } => stack.push(out),
-                    _ => {}
-                }
-            }
-        }
-    }
-    mask
 }
 
 // ---------------------------------------------------------------------------
@@ -1777,7 +1832,7 @@ impl<'a> Tier2DfaMatcher<'a> {
     }
 
     #[inline]
-    pub fn finish(self) -> bool {
+    pub fn finish(mut self) -> bool {
         if self.ever_matched {
             return true;
         }
@@ -1799,7 +1854,10 @@ impl<'a> Tier2DfaMatcher<'a> {
             // bodies.  When a deferred assertion resolves at end-of-input
             // and reaches CInc, we need to check whether incrementing the
             // counter allows a break to Match.
-            if self.resolve_deferred_cinc_at_end(state) {
+            // Extract what we need before borrowing self mutably.
+            let deferred = state.deferred_asserts.clone();
+            let prev = state.prev_byte_representative();
+            if self.resolve_deferred_cinc_at_end(&deferred, prev) {
                 return true;
             }
         }
@@ -1810,60 +1868,57 @@ impl<'a> Tier2DfaMatcher<'a> {
     /// CInc whose counter, after one more increment, allows a break to
     /// Match.  This handles patterns like `(\w\b){1,3}` where the last
     /// `\b` is only resolved at end-of-input.
-    fn resolve_deferred_cinc_at_end(&self, state: &DfaState) -> bool {
-        if state.deferred_asserts.is_empty() {
+    fn resolve_deferred_cinc_at_end(&mut self, deferred: &[StateIdx], prev: Option<u8>) -> bool {
+        if deferred.is_empty() {
             return false;
         }
-        let prev = state.prev_byte_representative();
         let states = &self.regex.states;
-        for &assert_idx in state.deferred_asserts.iter() {
+
+        for v in self.memory.closure_visited.iter_mut() {
+            *v = false;
+        }
+        self.memory.closure_stack.clear();
+        for &assert_idx in deferred {
             if let State::Assert { kind, out } = states[assert_idx]
                 && kind.eval(false, true, prev, None) == AssertEval::Pass
             {
-                // The assertion passes at end-of-input.  Walk epsilon states
-                // from `out` looking for CInc.
-                let mut stack = vec![out];
-                let mut visited = vec![false; states.len()];
-                while let Some(idx) = stack.pop() {
-                    let i = idx.idx();
-                    if visited[i] {
+                self.memory.closure_stack.push(out);
+            }
+        }
+
+        while let Some(idx) = self.memory.closure_stack.pop() {
+            let i = idx.idx();
+            if self.memory.closure_visited[i] {
+                continue;
+            }
+            self.memory.closure_visited[i] = true;
+            match states[idx] {
+                State::CounterIncrement { counter, min, .. } => {
+                    let ci = counter.idx();
+                    if !self.regex.counter_break_can_match[ci] {
                         continue;
                     }
-                    visited[i] = true;
-                    match states[idx] {
-                        State::CounterIncrement { counter, min, .. } => {
-                            let ci = counter.idx();
-                            if !self.regex.counter_break_can_match[ci] {
-                                continue;
-                            }
-                            // Check if this counter has a live instance
-                            // that would reach >= min after one increment.
-                            if ci < self.cache.counter_meta.len() {
-                                let m = &self.cache.counter_meta[ci];
-                                for ph in 0..m.num_phases {
-                                    let phase = &self.cache.phases[m.phase_start + ph];
-                                    if !phase.is_empty() && phase.oldest + 1 >= min as u32 {
-                                        return true;
-                                    }
-                                }
+                    if ci < self.cache.counter_meta.len() {
+                        let m = &self.cache.counter_meta[ci];
+                        for ph in 0..m.num_phases {
+                            let phase = &self.cache.phases[m.phase_start + ph];
+                            if !phase.is_empty() && phase.oldest + 1 >= min as u32 {
+                                return true;
                             }
                         }
-                        State::Split { out, out1 } => {
-                            stack.push(out1);
-                            stack.push(out);
-                        }
-                        State::Assert { kind, out } => {
-                            // Chained assertion (e.g. `\b\B$` — multiple
-                            // assertions on the epsilon path): evaluate
-                            // at end-of-input.
-                            if kind.eval(false, true, prev, None) == AssertEval::Pass {
-                                stack.push(out);
-                            }
-                        }
-                        State::CounterInstance { out, .. } => stack.push(out),
-                        _ => {}
                     }
                 }
+                State::Split { out, out1 } => {
+                    self.memory.closure_stack.push(out1);
+                    self.memory.closure_stack.push(out);
+                }
+                State::Assert { kind, out } => {
+                    if kind.eval(false, true, prev, None) == AssertEval::Pass {
+                        self.memory.closure_stack.push(out);
+                    }
+                }
+                State::CounterInstance { out, .. } => self.memory.closure_stack.push(out),
+                _ => {}
             }
         }
         false
