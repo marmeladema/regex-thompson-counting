@@ -3643,6 +3643,14 @@ impl<'a> Tier3DfaMatcher<'a> {
                     return;
                 }
             }
+            Prefilter::Memclass(t) => {
+                if let Some(idx) = crate::memclass::memclass(&t, input) {
+                    self.prefilter = Prefilter::None;
+                    &input[idx..]
+                } else {
+                    return;
+                }
+            }
             Prefilter::Range(lo, hi) => {
                 if let Some(idx) = crate::memrange::memrange(lo, hi, input) {
                     self.prefilter = Prefilter::None;

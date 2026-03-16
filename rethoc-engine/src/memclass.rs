@@ -23,7 +23,7 @@
 /// all target bytes with that low nibble.  The high-nibble table does
 /// the same for `byte >> 4`.  A byte is a member iff
 /// `lo_table[b & 0xF] & hi_table[b >> 4] != 0`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct MemclassTable {
     /// Lookup table indexed by low nibble (byte & 0xF).
     pub(crate) lo: [u8; 16],
