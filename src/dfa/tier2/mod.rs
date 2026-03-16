@@ -216,7 +216,7 @@ struct Transition {
     with_break_is_match: bool,
     with_break_is_match_at_end: bool,
     /// True if this transition crosses at least one CInc node.
-    is_counting: bool,
+
     /// Bitmask: bit `i` set means counter `i` fires CInc at this transition.
     counting_mask: u64,
     /// Seeds to apply BEFORE counter_increment.
@@ -246,7 +246,6 @@ impl Transition {
             with_break: DfaStateId::UNPOPULATED,
             with_break_is_match: false,
             with_break_is_match_at_end: false,
-            is_counting: false,
             counting_mask: 0,
             pre_seeds: Box::new([]),
             seeds: Box::new([]),
@@ -968,6 +967,8 @@ impl Tier2DfaCache {
         // Find ALL counters that fire CInc at this transition.
         // Include counters reached via resolved deferred assertions
         // (Phase 1) which are not reachable from targets alone.
+        // Guarded by is_counting because the precomputed cinc_reachable
+        // is a static over-approximation that ignores assertion gating.
         let counting_mask = if is_counting {
             targets
                 .iter()
@@ -1004,7 +1005,7 @@ impl Tier2DfaCache {
         seed_list.dedup();
 
         // Compute DFA successors.
-        if is_counting {
+        if counting_mask != 0 {
             let cr_nb = self.epsilon_closure(
                 memory,
                 targets.iter().copied().chain(std::iter::once(regex.start)),
@@ -1089,7 +1090,6 @@ impl Tier2DfaCache {
                 with_break: wb_id,
                 with_break_is_match: wb_m || resolved_is_match || resolved_break_match,
                 with_break_is_match_at_end: wb_mae,
-                is_counting: true,
                 counting_mask,
                 pre_seeds: pre_seed_list.into_boxed_slice(),
                 seeds: seed_list.into_boxed_slice(),
@@ -1158,7 +1158,6 @@ impl Tier2DfaCache {
                 with_break: id,
                 with_break_is_match: m || resolved_is_match,
                 with_break_is_match_at_end: mae,
-                is_counting: false,
                 counting_mask: 0,
                 pre_seeds: pre_seed_list.into_boxed_slice(),
                 seeds: seed_list.into_boxed_slice(),
@@ -1614,7 +1613,10 @@ impl<'a> Tier2DfaMatcher<'a> {
         let t = &self.cache.transitions[slot];
 
         // Fast path: non-counting, no seeds, no live counters.
-        if !t.is_counting && t.pre_seeds.is_empty() && t.seeds.is_empty() && !self.has_live_counters
+        if t.counting_mask == 0
+            && t.pre_seeds.is_empty()
+            && t.seeds.is_empty()
+            && !self.has_live_counters
         {
             self.current = t.no_break;
             self.match_at_end = t.no_break_is_match_at_end;
@@ -1636,15 +1638,13 @@ impl<'a> Tier2DfaMatcher<'a> {
             }
         }
 
-        if t.is_counting {
-            // Process ALL counters that fire CInc on this transition.
-            let mut mask = t.counting_mask;
-            while mask != 0 {
-                let c_idx = mask.trailing_zeros() as usize;
-                mask &= mask - 1; // clear lowest set bit
-                if c_idx < self.cache.counters.meta.len() && self.cache.counters.increment(c_idx) {
-                    any_can_break = true;
-                }
+        // Process ALL counters that fire CInc on this transition.
+        let mut mask = t.counting_mask;
+        while mask != 0 {
+            let c_idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1; // clear lowest set bit
+            if c_idx < self.cache.counters.meta.len() && self.cache.counters.increment(c_idx) {
+                any_can_break = true;
             }
         }
 
@@ -1705,7 +1705,7 @@ impl<'a> Tier2DfaMatcher<'a> {
         );
         self.current = trans.no_break;
 
-        if !trans.is_counting {
+        if trans.counting_mask == 0 {
             if trans.no_break_is_match {
                 self.ever_matched = true;
             }
