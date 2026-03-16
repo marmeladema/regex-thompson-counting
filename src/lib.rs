@@ -1,64 +1,51 @@
-//! Thompson NFA with per-thread counting constraints.
+//! A regex engine based on Thompson NFA simulation with multi-tier DFA
+//! acceleration and native support for bounded repetitions (`{min,max}`).
 //!
-//! Based on Russ Cox's article <https://swtch.com/~rsc/regexp/regexp1.html>
-//! (Thompson NFA construction and simulation) with additional support for
-//! bounded repetitions (`{min,max}`) via per-thread counter contexts.
+//! # Quick start
 //!
-//! # Architecture
+//! ```
+//! use regex_thompson_counting::{Regex, MatcherMemory};
 //!
-//! The pipeline is:
-//!
-//! ```text
-//! regex_syntax::hir::Hir  ──hir2postfix──>  postfix HIR  ──next_fragment──>  NFA states
+//! let re = Regex::new(r"^[a-z]{3,8}$").unwrap();
+//! let mut mem = MatcherMemory::default();
+//! let mut m = mem.matcher(&re);
+//! m.chunk(b"hello");
+//! assert!(m.finish());
 //! ```
 //!
-//! ## Counting constraints
+//! # Features
 //!
-//! A repetition `body{min,max}` is lowered to a **single-copy** NFA:
+//! - **Streaming**: input is fed through [`chunk`](AnyMatcher::chunk)
+//!   calls — callers may split input across arbitrarily many chunks.
+//! - **No backtracking**: matching runs in time proportional to the
+//!   input length, with per-byte work bounded by the compiled pattern.
+//! - **Bounded repetitions**: `a{3,100}`, `.{0,1000}`, and nested
+//!   variants like `(ab{2,5}){1,10}` are supported natively.
+//! - **Multi-tier execution**: the compiler selects the fastest
+//!   execution strategy for each pattern — from a plain lazy DFA for
+//!   simple patterns to specialised counter-aware DFAs for complex
+//!   bounded repetitions.
 //!
-//! ```text
-//! CounterInstance(c) ── body ── CounterIncrement(c, min, max)
-//!                         ^                │
-//!                         └── continue ────┘
-//!                                  break ──> (next)
+//! # Configuration
+//!
+//! Use [`RegexConfig`] to tune compilation limits:
+//!
+//! ```
+//! use regex_thompson_counting::{Regex, RegexConfig};
+//!
+//! let re = Regex::with_config(r"a{1,500}", RegexConfig {
+//!     max_repetition: 500,
+//!     ..Default::default()
+//! }).unwrap();
 //! ```
 //!
-//! `CounterInstance` is an epsilon state that adds `(counter, 0)` to the
-//! thread's counter context.  The body runs, then `CounterIncrement`
-//! increments the counter in the context.  If `value < max`, the
-//! continue path loops back to the body.  If `value >= min`, the break
-//! path exits the repetition (removing the counter from context).
+//! # Safety guarantees
 //!
-//! ## Per-thread counter contexts
-//!
-//! Each thread carries a [`CounterCtx`] — a fixed-length vector indexed
-//! by counter, where each slot holds the counter's current value or
-//! `COUNTER_INACTIVE`.  This replaces the Becchi multi-instance
-//! differential counter representation, eliminating the need for:
-//!
-//! - Two-copy body duplication (body₁/body₂ with counter index remapping)
-//! - DeltaPool (arena-backed linked-list for counter deltas)
-//! - `body_counter_map` (compile-time BFS for stale-instance detection)
-//! - `single_byte_body` flags and `anchored_start` bypass
-//! - `CounterGeneration` stamps for epsilon-closure re-entry detection
-//!
-//! ## Deduplication
-//!
-//! Two-tier dedup prevents duplicate work in the epsilon closure:
-//!
-//! - **Empty context** (threads outside all repetitions): fast O(1)
-//!   dedup via `lastlist[state] == listid`.
-//! - **Non-empty context**: linear scan of a `Vec<(StateIdx, CounterCtx)>`
-//!   with value comparison through the [`CounterPool`], cleared per step.
-//!
-//! ## Complexity
-//!
-//! - **Anchored patterns** (`^...$`): only 1 counter instance per
-//!   repetition (no re-seeding).  O(|states|) per step — identical to
-//!   the delta approach.
-//! - **Unanchored patterns**: O(|states| × max) per step.  The
-//!   `max_repetition` compile-time cap (default 1000) bounds this for
-//!   untrusted patterns.
+//! - **Untrusted patterns**: compilation is bounded by configurable
+//!   limits ([`RegexConfig::max_repetition`]) and never panics or
+//!   hangs.
+//! - **Untrusted input**: matching time is linear in input length
+//!   with no exponential blowup.
 
 use std::fmt;
 use std::io::Write;
@@ -113,8 +100,7 @@ pub enum Error {
     /// A bounded repetition `{n,m}` where `m` exceeds the configured
     /// `max_repetition` limit.  Contains `(actual_max, limit)`.
     RepetitionTooLarge(usize, usize),
-    /// The pattern requires more than 256 counters (the maximum supported
-    /// by the `CounterIdx(u8)` representation).
+    /// The pattern requires more than 256 counters.
     TooManyCounters,
     /// The pattern string could not be parsed into an AST.
     Parse(String),
@@ -997,13 +983,8 @@ impl Regex {
     }
 
     /// Return the total memory footprint (in bytes) of this compiled
-    /// regex, including both inline and heap-allocated data.
-    ///
-    /// This accounts for:
-    /// - The `Regex` struct itself (inline fields).
-    /// - The `states` boxed slice (header + per-state inline size).
-    /// - The `classes` boxed slice (byte-class lookup tables).
-    /// - The `byte_tables` boxed slice.
+    /// regex, including the struct itself and all heap-allocated data
+    /// (state tables, character class tables, byte dispatch tables).
     pub fn memory_size(&self) -> usize {
         let inline = std::mem::size_of::<Self>();
         let states_alloc = self.states.len() * std::mem::size_of::<State>();
@@ -1020,9 +1001,8 @@ impl Regex {
     }
     /// Return per-counter info: `(min, max, body_byte_length)`.
     ///
-    /// `body_byte_length` is the fixed number of bytes consumed per counter
-    /// iteration (used by the Tier 2 differential-counter DFA).  It is 0
-    /// for variable-length bodies.
+    /// `body_byte_length` is the fixed number of bytes consumed per
+    /// counter iteration, or 0 for variable-length bodies.
     pub fn counter_info(&self, counter_idx: usize) -> (usize, usize, usize) {
         self.counter_info[counter_idx]
     }
@@ -1046,7 +1026,6 @@ impl Regex {
             0
         }
     }
-    /// Print diagnostic information about this compiled regex.
     /// Return a [`RegexInfo`] snapshot of compiled regex diagnostics.
     pub fn info(&self) -> RegexInfo {
         // -- NFA state breakdown --
@@ -1307,12 +1286,10 @@ impl Regex {
         }
     }
 
-    /// Return a human-readable dump of the compiled NFA states, counters,
-    /// and analysis data.
+    /// Return a human-readable dump of the compiled regex internals.
     ///
     /// When `dfa` is `true`, the dump also includes tier-specific DFA
-    /// analysis (Tier 2 body interior, Tier 3 origin actions, break seeds,
-    /// reachability flags, etc.).
+    /// analysis data used for debugging.
     ///
     /// The returned value implements [`Display`](fmt::Display), so it can
     /// be used directly with `print!` or `write!`.
@@ -1325,15 +1302,6 @@ impl Regex {
 // NFA builder (regex-syntax HIR -> postfix -> NFA)
 // ---------------------------------------------------------------------------
 
-/// Builds a compiled [`Regex`] from a [`regex_syntax::hir::Hir`].
-///
-/// The pipeline is:
-/// 1. [`hir2postfix`](Self::hir2postfix) — recursively lowers the
-///    `regex-syntax` HIR into a postfix sequence of [`RegexHirNode`]s.
-/// 2. [`next_fragment`](Self::next_fragment) — consumes postfix nodes one
-///    at a time, emitting NFA [`State`]s and wiring [`Fragment`]s together.
-/// 3. [`build`](Self::build) — drives the pipeline and patches the final
-///    fragment to the `Match` state.
 use indexmap::IndexSet;
 
 // ---------------------------------------------------------------------------
@@ -1355,16 +1323,20 @@ pub struct RegexConfig {
     /// `a{1,1000}`).  Patterns exceeding this limit are rejected at
     /// compile time.  Default: 1000.
     pub max_repetition: usize,
-    /// Maximum NFA states that may be produced by unrolling a repetition
-    /// (fixed or non-fixed) of a simple body into concatenated copies.
-    /// Set to 0 to disable unrolling entirely.  Default: 32.
-    pub max_unroll_states: usize,
-    /// Whether to merge consecutive bounded repetitions with identical
-    /// bodies (e.g. `.{0,1000}.{0,1000}` → `.{0,2000}`).  Default: true.
+    /// Maximum number of internal states the compiler may produce when
+    /// unrolling a bounded repetition into concatenated copies (e.g.
+    /// `a{1,20}` → 20 states).  Repetitions that exceed this budget
+    /// fall back to a compact counter-based representation.
     ///
-    /// Disabled alongside `max_unroll_states=0` in the `match_tests!`
-    /// macro to preserve the multi-counter Tier 3 structures that tests
-    /// are designed to exercise.
+    /// Set to 0 to disable unrolling entirely (all bounded repetitions
+    /// use counters).  Default: 32.
+    pub max_unroll_states: usize,
+    /// Whether to merge adjacent bounded repetitions with identical
+    /// bodies into a single repetition (e.g. `.{0,1000}.{0,1000}` is
+    /// rewritten to `.{0,2000}`).
+    ///
+    /// Merging reduces the number of counters and often enables a
+    /// faster execution tier.  Default: `true`.
     pub merge_repetitions: bool,
 }
 
@@ -1382,6 +1354,27 @@ impl Default for RegexConfig {
 // NFA compiler
 // ---------------------------------------------------------------------------
 
+/// Low-level compiler that transforms a [`regex_syntax::hir::Hir`] into
+/// a ready-to-match [`Regex`].
+///
+/// Most callers should use [`Regex::new`] or [`Regex::with_config`]
+/// instead — they handle parsing and compilation in a single call.
+/// `RegexBuilder` is useful when you need to:
+///
+/// - Compile multiple patterns with the same configuration (reuses
+///   internal allocations across [`build`](Self::build) calls).
+/// - Work with a pre-parsed [`Hir`] directly.
+///
+/// # Example
+///
+/// ```
+/// use regex_thompson_counting::{RegexBuilder, RegexConfig};
+/// use regex_syntax::hir::Hir;
+///
+/// let hir: Hir = regex_syntax::parse(r"hello|world").unwrap();
+/// let mut builder = RegexBuilder::with_config(RegexConfig::default());
+/// let re = builder.build(&hir).unwrap();
+/// ```
 #[derive(Debug)]
 pub struct RegexBuilder {
     postfix: Vec<RegexHirNode>,
@@ -1431,9 +1424,9 @@ impl RegexBuilder {
         self
     }
 
-    /// Set the maximum NFA states that may be produced by unrolling a
-    /// repetition of a simple body into concatenated copies.  Set to 0
-    /// to disable unrolling entirely.  Default: 32.
+    /// Set the maximum number of internal states the compiler may
+    /// produce when unrolling a bounded repetition.  Set to 0 to
+    /// disable unrolling entirely.  Default: 32.
     pub fn max_unroll_states(&mut self, limit: usize) -> &mut Self {
         self.config.max_unroll_states = limit;
         self
@@ -1448,8 +1441,8 @@ impl RegexBuilder {
 
     /// Parse a pattern string and compile it into a [`Regex`].
     ///
-    /// Convenience method equivalent to `parse_hir(pattern)` followed
-    /// by `self.build(&hir)`.
+    /// Equivalent to parsing the pattern and calling
+    /// [`build`](Self::build) on the result.
     pub fn compile(&mut self, pattern: &str) -> Result<Regex, Error> {
         let hir = parse_hir(pattern)?;
         self.build(&hir)
@@ -3393,7 +3386,7 @@ impl CtxDedupTable {
 // ---------------------------------------------------------------------------
 // Matcher (NFA simulation)
 
-/// Reusable memory for [`Matcher`].  Create once, call
+/// Reusable memory for matchers.  Create once, call
 /// [`matcher`](Self::matcher) for each regex to match.
 #[derive(Debug, Default)]
 pub struct MatcherMemory {
@@ -3600,13 +3593,13 @@ impl MatcherMemory {
 /// A matcher that dispatches to either the lazy DFA or the NFA simulator.
 #[allow(clippy::large_enum_variant)]
 pub enum AnyMatcher<'a> {
-    /// Lazy DFA path (Tier 1: counter-free, simple-assertion patterns).
+    /// Lazy DFA (counter-free patterns).
     Dfa(DfaMatcher<'a>),
-    /// Tier 2 DFA path (non-nested fixed-length-body counters, differential counters).
+    /// DFA with differential counters (non-nested, fixed-length bodies).
     Tier2Dfa(Tier2DfaMatcher<'a>),
-    /// Tier 3 DFA path (non-nested counters, conditional transitions).
+    /// DFA with conditional transitions (non-nested counters).
     Tier3Dfa(Tier3DfaMatcher<'a>),
-    /// Counting DFA path (Tier 4: DFA + explicit counter contexts).
+    /// DFA with counter programs (nested repetitions).
     Tier4Dfa(Tier4DfaMatcher<'a>),
     /// NFA simulator path (general case).
     Nfa(NfaMatcher<'a>),

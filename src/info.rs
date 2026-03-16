@@ -18,7 +18,6 @@ use serde::Serialize;
 /// Information about a single bounded-repetition counter.
 ///
 /// Each counter corresponds to a `{min,max}` repetition in the pattern.
-/// The index is the internal counter slot number used by the NFA/DFA.
 #[derive(Debug, Clone, Serialize)]
 pub struct CounterInfo {
     /// Internal counter slot index (0-based).
@@ -98,8 +97,9 @@ pub struct ExecutionInfo {
 
 /// Start-closure diagnostics.
 ///
-/// The start closure is the set of consuming (non-epsilon) NFA states
-/// reachable from the start state via epsilon transitions.
+/// The start closure is the set of byte-consuming states reachable
+/// from the start state without consuming any input.  A non-empty
+/// start closure enables fast-path re-seeding in the matcher.
 #[derive(Debug, Clone, Serialize)]
 pub struct StartClosureInfo {
     /// Number of consuming states in the start closure.
@@ -129,7 +129,7 @@ pub struct StartClosureInfo {
 /// | `deferred_assertions` | Assertions resolved at DFA transition time     |
 /// | `byte_classes`     | DFA alphabet stride (equivalence classes)         |
 /// | `execution`        | Which DFA tier was selected                       |
-/// | `start_closure`    | Epsilon-closure from start state                  |
+/// | `start_closure`    | Reachable start states                            |
 /// | `prefilter`        | Literal acceleration strategy                     |
 #[derive(Debug, Clone, Serialize)]
 pub struct RegexInfo {

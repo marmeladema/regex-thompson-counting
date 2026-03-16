@@ -167,6 +167,20 @@ pub(crate) struct DfaStateId(u32);           // DEAD = u32::MAX, UNPOPULATED = u
 - Module-level `//!` doc comments on all modules with architectural overviews.
 - `///` doc comments on all public and `pub(crate)` types, methods, fields, and enum variants.
 - Markdown formatting with backtick code, `[TypeName]` cross-references, and ASCII diagrams.
+- **Public API doc comments (`pub` items) must not reference internal
+  implementation details.**  Specifically, avoid mentioning:
+  - Internal type names not in the public API (`StateIdx`, `ByteClass`,
+    `CounterIdx`, `Fragment`, `RegexHirNode`, `CounterCtx`, etc.)
+  - Private or `pub(crate)` method names (`hir2postfix`, `next_fragment`,
+    `epsilon_closure`, `addstate`, etc.)
+  - Tier numbers as implementation details (say "faster execution
+    strategy" not "Tier 2 differential-counter DFA")
+  - Internal test infrastructure (`match_tests!` macro, `unroll_limit!`,
+    test helper function names)
+  - NFA/DFA internals (epsilon transitions, Split states, counter pools)
+
+  `pub(crate)` doc comments may reference internals freely since they
+  target contributors, not downstream users.
 - Section separators in long files:
   ```rust
   // ---------------------------------------------------------------------------
