@@ -41,6 +41,7 @@ Options:
   --no-merge           Disable merging of consecutive same-body repetitions
   --dfa                Include tier-specific DFA analysis in dump output
   --debug              Print matcher state after each step
+  -q, --quiet          Suppress output (grep: exit code only)
   -h, --help           Print this help message"
     );
 }
@@ -67,6 +68,7 @@ enum Command {
         pattern: String,
         file: Option<String>,
         config: RegexConfig,
+        quiet: bool,
     },
     Dump {
         pattern: String,
@@ -91,6 +93,7 @@ fn parse_args() -> Command {
     let mut debug = false;
     let mut dfa = false;
     let mut merge = true;
+    let mut quiet = false;
     let mut positional = Vec::new();
 
     let mut i = 0;
@@ -155,6 +158,9 @@ fn parse_args() -> Command {
             }
             "--no-merge" => {
                 merge = false;
+            }
+            "-q" | "--quiet" => {
+                quiet = true;
             }
             "--format" => {
                 i += 1;
@@ -252,6 +258,7 @@ fn parse_args() -> Command {
                 pattern: positional[1].clone(),
                 file: positional.get(2).cloned(),
                 config,
+                quiet,
             }
         }
         "dump" => {
@@ -398,7 +405,7 @@ fn run_match(
     }
 }
 
-fn run_grep(pattern: &str, file: Option<&str>, config: RegexConfig) {
+fn run_grep(pattern: &str, file: Option<&str>, config: RegexConfig, quiet: bool) {
     let regex = parse_pattern(pattern, config);
     let mut memory = MatcherMemory::default();
 
@@ -425,8 +432,13 @@ fn run_grep(pattern: &str, file: Option<&str>, config: RegexConfig) {
         let mut matcher = memory.matcher(&regex);
         matcher.chunk(line.as_bytes());
         if matcher.finish() {
-            writeln!(out, "{}", line).unwrap();
+            if !quiet {
+                writeln!(out, "{}", line).unwrap();
+            }
             any_matched = true;
+            if quiet {
+                break;
+            }
         }
     }
 
@@ -455,7 +467,8 @@ fn main() {
             pattern,
             file,
             config,
-        } => run_grep(&pattern, file.as_deref(), config),
+            quiet,
+        } => run_grep(&pattern, file.as_deref(), config, quiet),
         Command::Dump {
             pattern,
             config,
