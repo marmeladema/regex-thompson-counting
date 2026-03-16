@@ -552,6 +552,151 @@ fn collect_break_consuming(start: StateIdx, states: &[State]) -> Vec<StateIdx> {
 }
 
 // ---------------------------------------------------------------------------
+// Counter state (differential counter runtime)
+// ---------------------------------------------------------------------------
+
+/// Runtime state for all differential counters in a Tier 2 matcher.
+///
+/// Owns the per-phase [`DiffCounter`]s and per-counter [`CounterMeta`].
+/// Extracted from [`Tier2DfaCache`] so that counter operations can be
+/// called while other cache fields (e.g. `transitions`) are borrowed.
+pub(crate) struct CounterState {
+    /// Flat array of differential counters for all phases of all counters.
+    /// Indexed via [`CounterMeta::phase_start`].
+    phases: Vec<DiffCounter>,
+    /// Per-counter metadata (phase range, active_phase, min, max).
+    meta: Vec<CounterMeta>,
+    /// Total number of phase slots (sum of num_phases across counters).
+    /// Computed once in [`Tier2DfaCache::prepare`].
+    total_phases: usize,
+}
+
+impl CounterState {
+    fn new() -> Self {
+        Self {
+            phases: Vec::new(),
+            meta: Vec::new(),
+            total_phases: 0,
+        }
+    }
+
+    /// Populate counter metadata from the regex's counter info.
+    /// Called once per regex in [`Tier2DfaCache::prepare`].
+    fn populate(&mut self, regex: &crate::Regex) {
+        self.phases.clear();
+        self.meta.clear();
+        for ci in 0..regex.num_counters {
+            let (min, max, body_len) = regex.counter_info(ci);
+            let nph = body_len.max(1);
+            let phase_start = self.phases.len();
+            for _ in 0..nph {
+                self.phases.push(DiffCounter::new());
+            }
+            self.meta.push(CounterMeta {
+                phase_start,
+                num_phases: nph,
+                active_phase: 0,
+                min: min as u32,
+                max: max as u32,
+            });
+        }
+        self.total_phases = self.phases.len();
+    }
+
+    /// Ensure phases are allocated (first match) or already present
+    /// (subsequent matches — ring buffers survive via [`reset`]).
+    #[inline]
+    fn ensure_phases(&mut self) {
+        if !self.phases.is_empty() {
+            return;
+        }
+        self.phases.resize(self.total_phases, DiffCounter::new());
+        for m in &mut self.meta {
+            m.active_phase = 0;
+            let max = m.max as usize;
+            for p in &mut self.phases[m.phase_start..m.phase_start + m.num_phases] {
+                p.reserve(max);
+            }
+        }
+    }
+
+    /// Reset counter state between matches.  Clears logical state of
+    /// each phase but retains ring buffer allocations for reuse.
+    fn reset(&mut self) {
+        for p in &mut self.phases {
+            p.clear();
+        }
+        for m in &mut self.meta {
+            m.active_phase = 0;
+        }
+    }
+
+    /// Clear everything including metadata (used when switching regex).
+    fn clear(&mut self) {
+        self.phases.clear();
+        self.meta.clear();
+        self.total_phases = 0;
+    }
+
+    /// Increment the active phase of counter `c_idx`.
+    /// Returns `true` if any instance can break (oldest >= min).
+    #[inline]
+    fn increment(&mut self, c_idx: usize) -> bool {
+        let m = &self.meta[c_idx];
+        let phase_idx = m.phase_start + m.active_phase;
+        let min = m.min;
+        let max = m.max;
+
+        let phase = &mut self.phases[phase_idx];
+        if phase.is_empty() {
+            return false;
+        }
+        phase.increment_all();
+        let can_break = phase.oldest >= min;
+        if can_break {
+            while !phase.is_empty() && phase.oldest >= max {
+                phase.dealloc_oldest();
+            }
+        }
+        can_break
+    }
+
+    /// Clear all phases of counter `c_idx`.
+    #[inline]
+    fn reset_counter(&mut self, c_idx: usize) {
+        let start = self.meta[c_idx].phase_start;
+        let end = start + self.meta[c_idx].num_phases;
+        for p in &mut self.phases[start..end] {
+            p.clear();
+        }
+    }
+
+    /// Advance active_phase for every counter (called on every byte).
+    #[inline]
+    fn advance_all_phases(&mut self) {
+        for m in &mut self.meta {
+            m.active_phase = (m.active_phase + 1) % m.num_phases;
+        }
+    }
+
+    /// Seed a new counter instance into the appropriate phase.
+    #[inline]
+    fn seed(&mut self, c_idx: usize, initial_value: u32) {
+        let m = &self.meta[c_idx];
+        let nph = m.num_phases;
+        let target_phase = (m.active_phase + nph - 1) % nph;
+        let phase_idx = m.phase_start + target_phase;
+        self.phases[phase_idx].alloc_new_with_value(initial_value);
+    }
+
+    /// Check if any phase has live instances.
+    #[inline]
+    fn has_live(&self) -> bool {
+        self.phases.iter().any(|p| !p.is_empty())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tier 2 DFA cache
 // ---------------------------------------------------------------------------
 
@@ -561,16 +706,8 @@ pub(crate) struct Tier2DfaCache {
     stride: usize,
     transitions: Vec<Transition>,
     start_seeds: Box<[(CounterIdx, u32)]>,
-    /// Shared arena for delta linked-list nodes across all counters.
-
-    /// Flat array of differential counters for all phases of all counters.
-    /// Indexed via [`CounterMeta::phase_start`].
-    phases: Vec<DiffCounter>,
-    /// Per-counter metadata (phase range, active_phase, min, max).
-    counter_meta: Vec<CounterMeta>,
-    /// Total number of phase slots (sum of num_phases across counters).
-    /// Computed once in `prepare()`, used by `ensure_phases()` for lazy resize.
-    total_phases: usize,
+    /// Runtime state for all differential counters.
+    counters: CounterState,
 }
 
 impl fmt::Debug for Tier2DfaCache {
@@ -588,10 +725,7 @@ impl Tier2DfaCache {
             stride: 256,
             transitions: Vec::new(),
             start_seeds: Box::new([]),
-
-            phases: Vec::new(),
-            counter_meta: Vec::new(),
-            total_phases: 0,
+            counters: CounterState::new(),
         }
     }
 
@@ -615,115 +749,6 @@ impl Tier2DfaCache {
                     .extend(std::iter::repeat_with(Transition::empty).take(stride));
             },
         )
-    }
-
-    // -----------------------------------------------------------------------
-    // Counter helper methods (split-borrow safe: these operate on `self`
-    // directly, so the borrow checker can see field disjointness)
-    // -----------------------------------------------------------------------
-
-    /// Increment the active phase of counter `c_idx`.
-    /// Returns `true` if any instance can break (oldest >= min).
-    #[inline]
-    fn counter_increment(&mut self, c_idx: usize) -> bool {
-        let m = &self.counter_meta[c_idx];
-        let phase_idx = m.phase_start + m.active_phase;
-        let min = m.min;
-        let max = m.max;
-        // m borrow ends here (NLL: all fields copied to locals).
-
-        let phase = &mut self.phases[phase_idx];
-        if phase.is_empty() {
-            return false;
-        }
-        phase.increment_all();
-        let can_break = phase.oldest >= min;
-        if can_break {
-            while !phase.is_empty() && phase.oldest >= max {
-                phase.dealloc_oldest();
-            }
-        }
-        can_break
-    }
-
-    /// Clear all phases of counter `c_idx`, returning nodes to the pool.
-    #[inline]
-    fn counter_reset_idx(&mut self, c_idx: usize) {
-        let start = self.counter_meta[c_idx].phase_start;
-        let end = start + self.counter_meta[c_idx].num_phases;
-        for p in &mut self.phases[start..end] {
-            p.clear();
-        }
-    }
-
-    /// Advance active_phase for every counter (called on every byte).
-    #[inline]
-    fn advance_all_phases(&mut self) {
-        for m in &mut self.counter_meta {
-            m.active_phase = (m.active_phase + 1) % m.num_phases;
-        }
-    }
-
-    /// Seed a new counter instance into the appropriate phase.
-    ///
-    /// Targets the phase that will fire CInc when this instance completes
-    /// its first body iteration.  The body has L bytes, and the phase
-    /// clock has already been advanced for this byte, so:
-    ///   `target_phase = (active_phase + L - 1) % L`
-    #[inline]
-    fn seed_counter(&mut self, c_idx: usize, initial_value: u32) {
-        let m = &self.counter_meta[c_idx];
-        let nph = m.num_phases;
-        let target_phase = (m.active_phase + nph - 1) % nph;
-        let phase_idx = m.phase_start + target_phase;
-        // m borrow ends here.
-        self.phases[phase_idx].alloc_new_with_value(initial_value);
-    }
-
-    /// Check if any phase has live instances.
-    #[inline]
-    fn has_live_phases(&self) -> bool {
-        self.phases.iter().any(|p| !p.is_empty())
-    }
-
-    /// Clear all counter instances and reset active phases.
-    /// Retains ring buffer allocations.
-    fn clear_all_counters(&mut self) {
-        for p in &mut self.phases {
-            p.clear();
-        }
-        for m in &mut self.counter_meta {
-            m.active_phase = 0;
-        }
-    }
-
-    /// Reset counter state between matches.  Clears logical state of
-    /// each phase but retains ring buffer allocations for reuse.
-    fn reset_for_new_match(&mut self) {
-        for p in &mut self.phases {
-            p.clear();
-        }
-        for m in &mut self.counter_meta {
-            m.active_phase = 0;
-        }
-    }
-
-    /// Lazily allocate phases on first use; subsequent calls are a
-    /// no-op (ring buffers survive across matches via
-    /// `reset_for_new_match`).
-    #[inline]
-    fn ensure_phases(&mut self) {
-        if !self.phases.is_empty() {
-            return;
-        }
-        self.phases.resize(self.total_phases, DiffCounter::new());
-        for m in &mut self.counter_meta {
-            m.active_phase = 0;
-            let max = m.max as usize;
-            for p in &mut self.phases[m.phase_start..m.phase_start + m.num_phases] {
-                p.reserve(max);
-            }
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -1201,9 +1226,7 @@ impl Tier2DfaCache {
         memory.clear(num_nfa_states);
         self.transitions.clear();
         self.start_seeds = Box::new([]);
-        self.phases.clear();
-        self.counter_meta.clear();
-        self.total_phases = 0;
+        self.counters.clear();
     }
 
     #[inline]
@@ -1244,26 +1267,8 @@ impl Tier2DfaCache {
             self.inner.states[self.inner.start_id.idx()].is_match_at_end;
         self.start_seeds = cr.seed_instances.iter().map(|&(c, _s)| (c, 0u32)).collect();
 
-        // Initialize flat phases and counter metadata.
-        // Allocated once per regex, reused across matcher invocations.
-        self.phases.clear();
-        self.counter_meta.clear();
-        for ci in 0..regex.num_counters {
-            let (min, max, body_len) = regex.counter_info(ci);
-            let nph = body_len.max(1);
-            let phase_start = self.phases.len();
-            for _ in 0..nph {
-                self.phases.push(DiffCounter::new());
-            }
-            self.counter_meta.push(CounterMeta {
-                phase_start,
-                num_phases: nph,
-                active_phase: 0,
-                min: min as u32,
-                max: max as u32,
-            });
-        }
-        self.total_phases = self.phases.len();
+        // Initialize counter state (phases + metadata).
+        self.counters.populate(regex);
     }
 }
 
@@ -1446,9 +1451,8 @@ impl<'a> Tier2DfaMatcher<'a> {
         regex: &'a Regex,
         analysis: &'a Tier2Analysis,
     ) -> Self {
-        // O(1) reset: clears the delta pool and phases vec.
-        // Phases are lazily repopulated on the first slow-path byte.
-        cache.reset_for_new_match();
+        cache.counters.reset();
+        cache.counters.ensure_phases();
 
         // Seed initial counter instances (only for patterns where the
         // start state directly reaches a CounterInstance via epsilons).
@@ -1456,18 +1460,17 @@ impl<'a> Tier2DfaMatcher<'a> {
         // this block is skipped entirely — no counter work at all.
         let mut has_live = false;
         if !cache.start_seeds.is_empty() {
-            cache.ensure_phases();
             // Iterate start_seeds by index to avoid borrow conflict with
             // seed_counter (which borrows cache mutably).
             let num_start_seeds = cache.start_seeds.len();
             for si in 0..num_start_seeds {
                 let (counter, _initial_value) = cache.start_seeds[si];
                 let c_idx = counter.idx();
-                let m = &cache.counter_meta[c_idx];
+                let m = &cache.counters.meta[c_idx];
                 let nph = m.num_phases;
                 let target_phase = (nph - 1) % nph;
                 let phase_idx = m.phase_start + target_phase;
-                cache.phases[phase_idx].alloc_new();
+                cache.counters.phases[phase_idx].alloc_new();
             }
             has_live = true;
         }
@@ -1549,27 +1552,6 @@ impl<'a> Tier2DfaMatcher<'a> {
             return;
         }
 
-        // Slow path: snapshot scalar transition fields into locals so the
-        // borrow on self.cache.transitions is released before we call
-        // helper methods (including ensure_phases) that borrow self.cache
-        // mutably.
-        let is_counting = t.is_counting;
-        let counting_mask = t.counting_mask;
-        let no_break = t.no_break;
-        let no_break_is_match = t.no_break_is_match;
-        let no_break_is_match_at_end = t.no_break_is_match_at_end;
-        let with_break = t.with_break;
-        let with_break_is_match = t.with_break_is_match;
-        let with_break_is_match_at_end = t.with_break_is_match_at_end;
-        let counter_reset = t.counter_reset;
-        let num_pre_seeds = t.pre_seeds.len();
-        let num_seeds = t.seeds.len();
-        // `t` borrow ends here (NLL: last use was t.seeds.len()).
-
-        // Ensure counter phases are populated before any counter ops.
-        // First call per match does the work; subsequent calls short-circuit.
-        self.cache.ensure_phases();
-
         self.match_at_end = false;
         let mut any_can_break = false;
 
@@ -1578,85 +1560,77 @@ impl<'a> Tier2DfaMatcher<'a> {
         // deferred-assertion resolution on L=1 counter bodies.  The seed
         // must be visible to the increment so the counter can break on
         // this very transition.
-        for si in 0..num_pre_seeds {
-            let (counter, initial_value) = self.cache.transitions[slot].pre_seeds[si];
+        for (counter, initial_value) in &t.pre_seeds {
             let c_idx = counter.idx();
-            if c_idx < self.cache.counter_meta.len() {
-                self.cache.seed_counter(c_idx, initial_value);
+            if c_idx < self.cache.counters.meta.len() {
+                self.cache.counters.seed(c_idx, *initial_value);
             }
         }
 
-        if is_counting {
+        if t.is_counting {
             // Process ALL counters that fire CInc on this transition.
-            let mut mask = counting_mask;
+            let mut mask = t.counting_mask;
             while mask != 0 {
                 let c_idx = mask.trailing_zeros() as usize;
                 mask &= mask - 1; // clear lowest set bit
-                if c_idx < self.cache.counter_meta.len() && self.cache.counter_increment(c_idx) {
+                if c_idx < self.cache.counters.meta.len() && self.cache.counters.increment(c_idx) {
                     any_can_break = true;
-                }
-            }
-
-            // Record match from break path.
-            if any_can_break {
-                if with_break_is_match {
-                    self.ever_matched = true;
-                }
-                if with_break_is_match_at_end {
-                    self.match_at_end = true;
                 }
             }
         }
 
-        // Select DFA successor.
-        if is_counting && any_can_break {
-            self.current = with_break;
-        } else {
-            self.current = no_break;
-            if no_break_is_match {
+        // Select DFA successor and record match flags.
+        if any_can_break {
+            self.current = t.with_break;
+            if t.with_break_is_match {
                 self.ever_matched = true;
             }
-            if no_break_is_match_at_end {
+            if t.with_break_is_match_at_end {
+                self.match_at_end = true;
+            }
+        } else {
+            self.current = t.no_break;
+            if t.no_break_is_match {
+                self.ever_matched = true;
+            }
+            if t.no_break_is_match_at_end {
                 self.match_at_end = true;
             }
         }
 
         // Apply counter_reset: clear instances for counters whose body
         // was interrupted (no interior body NFA states in the successor).
-        if counter_reset != 0 {
-            let mut mask = counter_reset;
-            while mask != 0 {
-                let c_idx = mask.trailing_zeros() as usize;
-                mask &= mask - 1;
-                if c_idx < self.cache.counter_meta.len() {
-                    self.cache.counter_reset_idx(c_idx);
-                }
+        let mut mask = t.counter_reset;
+        while mask != 0 {
+            let c_idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if c_idx < self.cache.counters.meta.len() {
+                self.cache.counters.reset_counter(c_idx);
             }
         }
 
         // Advance active_phase for EVERY counter on EVERY byte.
         // This keeps the phase clock synchronized with byte position.
-        self.cache.advance_all_phases();
+        self.cache.counters.advance_all_phases();
 
         // Seed new counter instances.
         // Access seeds by index: each index yields a Copy tuple, so the
         // temporary borrow on self.cache.transitions ends before we
         // call seed_counter.
-        for si in 0..num_seeds {
-            let (counter, initial_value) = self.cache.transitions[slot].seeds[si];
+        for (counter, initial_value) in &t.seeds {
             let c_idx = counter.idx();
-            if c_idx < self.cache.counter_meta.len() {
-                self.cache.seed_counter(c_idx, initial_value);
+            if c_idx < self.cache.counters.meta.len() {
+                self.cache.counters.seed(c_idx, *initial_value);
             }
         }
 
         // Update has_live_counters flag.
-        self.has_live_counters = self.cache.has_live_phases();
+        self.has_live_counters = self.cache.counters.has_live();
     }
 
     fn step_from_dead(&mut self, byte: u8) {
         if self.has_live_counters {
-            self.cache.clear_all_counters();
+            self.cache.counters.reset();
             self.has_live_counters = false;
         }
         self.match_at_end = false;
@@ -1680,20 +1654,20 @@ impl<'a> Tier2DfaMatcher<'a> {
         }
 
         // Ensure counter phases are populated before counter ops.
-        self.cache.ensure_phases();
+        self.cache.counters.ensure_phases();
 
         // Advance active_phase for every counter (every byte ticks the clock).
-        self.cache.advance_all_phases();
+        self.cache.counters.advance_all_phases();
 
         // Seed with phase-aware placement.
         // `trans` is an owned local — no borrow conflict with cache.
         for &(counter, initial_value) in trans.seeds.iter() {
             let c_idx = counter.idx();
-            if c_idx < self.cache.counter_meta.len() {
-                self.cache.seed_counter(c_idx, initial_value);
+            if c_idx < self.cache.counters.meta.len() {
+                self.cache.counters.seed(c_idx, initial_value);
             }
         }
-        self.has_live_counters = self.cache.has_live_phases();
+        self.has_live_counters = self.cache.counters.has_live();
     }
 
     #[inline(always)]
@@ -1851,10 +1825,10 @@ impl<'a> Tier2DfaMatcher<'a> {
                     if !self.regex.counter_break_can_match[ci] {
                         continue;
                     }
-                    if ci < self.cache.counter_meta.len() {
-                        let m = &self.cache.counter_meta[ci];
+                    if ci < self.cache.counters.meta.len() {
+                        let m = &self.cache.counters.meta[ci];
                         for ph in 0..m.num_phases {
-                            let phase = &self.cache.phases[m.phase_start + ph];
+                            let phase = &self.cache.counters.phases[m.phase_start + ph];
                             if !phase.is_empty() && phase.oldest + 1 >= min as u32 {
                                 return true;
                             }
@@ -1929,16 +1903,16 @@ impl fmt::Display for Tier2DfaMatcher<'_> {
             write!(f, " mae")?;
         }
         // Counter summary: show per-counter active phase info.
-        if self.has_live_counters && !self.cache.counter_meta.is_empty() {
+        if self.has_live_counters && !self.cache.counters.meta.is_empty() {
             write!(f, " counters=[")?;
-            for (ci, meta) in self.cache.counter_meta.iter().enumerate() {
+            for (ci, meta) in self.cache.counters.meta.iter().enumerate() {
                 if ci > 0 {
                     write!(f, ", ")?;
                 }
                 // Find the active phase's DiffCounter.
                 let phase_idx = meta.phase_start + meta.active_phase;
-                if phase_idx < self.cache.phases.len() {
-                    let dc = &self.cache.phases[phase_idx];
+                if phase_idx < self.cache.counters.phases.len() {
+                    let dc = &self.cache.counters.phases[phase_idx];
                     if dc.count > 0 {
                         write!(
                             f,
@@ -2000,10 +1974,10 @@ mod tests {
         // Access the cache to check ring capacity was retained.
         let cache = mem.tier2_cache.as_ref().unwrap();
         assert!(
-            !cache.phases.is_empty(),
+            !cache.counters.phases.is_empty(),
             "phases should be retained after first match"
         );
-        let cap_after_first = cache.phases[0].ring.len();
+        let cap_after_first = cache.counters.phases[0].ring.len();
         assert!(cap_after_first > 0, "ring should be allocated");
 
         // Second match — reuses ring buffers, no reallocation.
@@ -2011,7 +1985,7 @@ mod tests {
 
         let cache = mem.tier2_cache.as_ref().unwrap();
         assert_eq!(
-            cache.phases[0].ring.len(),
+            cache.counters.phases[0].ring.len(),
             cap_after_first,
             "ring capacity should be unchanged across matches"
         );
@@ -2041,14 +2015,14 @@ mod tests {
 
         // Warm up with re1.
         assert!(match_tier2(&mut mem, &re1, b"xxxxa"));
-        let phases_after_re1 = mem.tier2_cache.as_ref().unwrap().phases.len();
+        let phases_after_re1 = mem.tier2_cache.as_ref().unwrap().counters.phases.len();
         assert!(phases_after_re1 > 0);
 
         // Switch to re2 — should clear and reallocate.
         assert!(match_tier2(&mut mem, &re2, b"abcx"));
 
         // Phases may have a different count depending on re2's counters.
-        let phases_after_re2 = mem.tier2_cache.as_ref().unwrap().phases.len();
+        let phases_after_re2 = mem.tier2_cache.as_ref().unwrap().counters.phases.len();
         assert!(phases_after_re2 > 0);
 
         // Switch back to re1 — clear again.
