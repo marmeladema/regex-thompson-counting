@@ -902,9 +902,9 @@ pub struct Regex {
     /// (Tier 4: no complex assertions).
     tier4_eligible: bool,
     /// Per-counter info: `(min, max, body_byte_length)`.
-    /// `body_byte_length` is 0 if the body has variable length.
-    /// Empty if the pattern has no counters.
-    counter_info: Box<[(usize, usize, usize)]>,
+    /// Per-counter compile-time info.  Empty if the pattern has no
+    /// counters.
+    counter_info: Box<[CounterInfo]>,
     /// Byte equivalence classes for DFA transition table compression.
     ///
     /// Maps each input byte (0..255) to a small equivalence class index.
@@ -1016,11 +1016,8 @@ impl Regex {
             + reach_match_alloc
             + break_match_alloc
     }
-    /// Return per-counter info: `(min, max, body_byte_length)`.
-    ///
-    /// `body_byte_length` is the fixed number of bytes consumed per
-    /// counter iteration, or 0 for variable-length bodies.
-    pub fn counter_info(&self, counter_idx: usize) -> (usize, usize, usize) {
+    /// Return per-counter compile-time information.
+    pub fn counter_info(&self, counter_idx: usize) -> CounterInfo {
         self.counter_info[counter_idx]
     }
     /// Return the minimum DFA tier that can handle this regex.
@@ -1069,20 +1066,8 @@ impl Regex {
             }
         }
 
-        // -- Counters --
-        let mut counters = Vec::new();
-        for s in self.states.iter() {
-            if let State::CounterIncrement {
-                counter, min, max, ..
-            } = s
-            {
-                counters.push(CounterInfo {
-                    index: counter.idx(),
-                    min: *min,
-                    max: *max,
-                });
-            }
-        }
+        // -- Counters (directly from compile-time counter_info) --
+        let counters: Vec<CounterInfo> = self.counter_info.to_vec();
 
         // -- Assertions --
         let mut assert_kinds = std::collections::BTreeSet::new();
@@ -2744,7 +2729,7 @@ impl RegexBuilder {
         } else {
             None
         };
-        let counter_info: Box<[(usize, usize, usize)]> = tier2_elig
+        let counter_info: Box<[CounterInfo]> = tier2_elig
             .as_ref()
             .map_or_else(|| Vec::new().into_boxed_slice(), |e| e.counter_info.clone());
 
@@ -5239,7 +5224,8 @@ mod tests {
         let boundary_values: Vec<Vec<usize>> = regex
             .counter_info
             .iter()
-            .map(|&(min, max, _)| {
+            .map(|c| {
+                let (min, max) = (c.min, c.max);
                 let mut vals = Vec::new();
                 if min > 0 {
                     vals.push(min - 1);

@@ -34,7 +34,7 @@ use crate::{AssertKind, ByteClass, ByteMap, CounterIdx, State, StateIdx};
 pub(crate) struct Tier2Eligibility {
     /// Per-counter `(min, max, body_byte_length)`.
     /// `body_byte_length` is 0 if the body has variable length.
-    pub(crate) counter_info: Box<[(usize, usize, usize)]>,
+    pub(crate) counter_info: Box<[crate::CounterInfo]>,
     /// True when the byte sets of different counter bodies are pairwise
     /// disjoint.
     pub(crate) disjoint_bytes: bool,
@@ -100,13 +100,13 @@ pub(crate) fn compute_tier2_eligibility(
     let disjoint_bytes = counter_bodies_have_disjoint_bytes(states, classes, byte_tables);
 
     let all_fixed_length =
-        !counter_info.is_empty() && counter_info.iter().all(|&(_, _, body_len)| body_len > 0);
+        !counter_info.is_empty() && counter_info.iter().all(|c| c.body_byte_length > 0);
 
     let has_deferred_in_long_body = has_deferred_in_counter_body
         && states.iter().any(|s| {
             if let State::CounterInstance { counter, out } = s {
                 let ci = counter.idx();
-                let body_len = counter_info.get(ci).map_or(0, |info| info.2);
+                let body_len = counter_info.get(ci).map_or(0, |c| c.body_byte_length);
                 body_len > 1 && body_has_deferred(*out, *counter, states, byte_tables)
             } else {
                 false
@@ -137,15 +137,24 @@ fn build_counter_info(
     states: &[State],
     byte_tables: &[ByteMap],
     counters_len: usize,
-) -> Box<[(usize, usize, usize)]> {
-    let mut info = vec![(0usize, 0usize, 0usize); counters_len];
+) -> Box<[crate::CounterInfo]> {
+    let mut info: Vec<crate::CounterInfo> = (0..counters_len)
+        .map(|i| crate::CounterInfo {
+            index: i,
+            min: 0,
+            max: 0,
+            body_byte_length: 0,
+        })
+        .collect();
     // Collect min/max from CInc states.
     for s in states {
         if let State::CounterIncrement {
             counter, min, max, ..
         } = s
         {
-            info[counter.idx()] = (*min, *max, 0);
+            let ci = counter.idx();
+            info[ci].min = *min;
+            info[ci].max = *max;
         }
     }
     // Compute body lengths from CI states.
@@ -153,7 +162,7 @@ fn build_counter_info(
         if let State::CounterInstance { counter, out } = s {
             let ci = counter.idx();
             let body_len = counter_body_length(*out, *counter, states, byte_tables).unwrap_or(0);
-            info[ci].2 = body_len;
+            info[ci].body_byte_length = body_len;
         }
     }
     info.into_boxed_slice()

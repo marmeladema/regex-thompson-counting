@@ -580,31 +580,35 @@ impl CounterState {
         }
     }
 
-    /// Populate counter metadata from the regex's counter info.
+    /// Populate counter metadata from a slice of `(min, max, body_len)`
+    /// tuples — one per counter.  Called once per regex in
+    /// Populate counter metadata and pre-allocate ring buffers.
     /// Called once per regex in [`Tier2DfaCache::prepare`].
-    fn populate(&mut self, regex: &crate::Regex) {
+    fn populate(&mut self, counters: &[crate::CounterInfo]) {
         self.phases.clear();
         self.meta.clear();
-        for ci in 0..regex.num_counters {
-            let (min, max, body_len) = regex.counter_info(ci);
-            let nph = body_len.max(1);
+        for spec in counters {
+            let nph = spec.body_byte_length.max(1);
             let phase_start = self.phases.len();
             for _ in 0..nph {
-                self.phases.push(DiffCounter::new());
+                let mut dc = DiffCounter::new();
+                dc.reserve(spec.max);
+                self.phases.push(dc);
             }
             self.meta.push(CounterMeta {
                 phase_start,
                 num_phases: nph,
                 active_phase: 0,
-                min: min as u32,
-                max: max as u32,
+                min: spec.min as u32,
+                max: spec.max as u32,
             });
         }
         self.total_phases = self.phases.len();
     }
 
-    /// Ensure phases are allocated (first match) or already present
-    /// (subsequent matches — ring buffers survive via [`reset`]).
+    /// Safety net: if phases were dropped (e.g. by [`clear`]), re-create
+    /// them.  Normally a no-op since [`populate`] creates phases and
+    /// [`reset`] preserves them.
     #[inline]
     fn ensure_phases(&mut self) {
         if !self.phases.is_empty() {
@@ -1268,7 +1272,7 @@ impl Tier2DfaCache {
         self.start_seeds = cr.seed_instances.iter().map(|&(c, _s)| (c, 0u32)).collect();
 
         // Initialize counter state (phases + metadata).
-        self.counters.populate(regex);
+        self.counters.populate(&regex.counter_info);
     }
 }
 
@@ -2094,5 +2098,278 @@ mod tests {
         assert!(!match_tier2(&mut mem, &re, b"aaa"));
         // Reuse after no-match.
         assert!(match_tier2(&mut mem, &re, b"aaab"));
+    }
+
+    // ── CounterState unit tests ──────────────────────────────────────
+
+    /// Helper: create a CounterState from `(min, max, body_byte_length)`
+    /// tuples for test convenience.
+    fn make_counter_state(specs: &[(usize, usize, usize)]) -> CounterState {
+        let info: Vec<crate::CounterInfo> = specs
+            .iter()
+            .enumerate()
+            .map(|(i, &(min, max, body_byte_length))| crate::CounterInfo {
+                index: i,
+                min,
+                max,
+                body_byte_length,
+            })
+            .collect();
+        let mut cs = CounterState::new();
+        cs.populate(&info);
+        cs
+    }
+
+    // ── populate / structure ──
+
+    #[test]
+    fn test_counter_state_populate_empty() {
+        let cs = make_counter_state(&[]);
+        assert_eq!(cs.meta.len(), 0);
+        assert_eq!(cs.phases.len(), 0);
+        assert!(!cs.has_live());
+    }
+
+    #[test]
+    fn test_counter_state_populate_single_counter() {
+        // (min=2, max=5, body_len=1) → 1 phase
+        let cs = make_counter_state(&[(2, 5, 1)]);
+        assert_eq!(cs.meta.len(), 1);
+        assert_eq!(cs.meta[0].min, 2);
+        assert_eq!(cs.meta[0].max, 5);
+        assert_eq!(cs.meta[0].num_phases, 1);
+        assert_eq!(cs.meta[0].phase_start, 0);
+        assert_eq!(cs.phases.len(), 1);
+    }
+
+    #[test]
+    fn test_counter_state_populate_multi_phase() {
+        // body_len=3 → 3 phases
+        let cs = make_counter_state(&[(1, 10, 3)]);
+        assert_eq!(cs.meta.len(), 1);
+        assert_eq!(cs.meta[0].num_phases, 3);
+        assert_eq!(cs.phases.len(), 3);
+    }
+
+    #[test]
+    fn test_counter_state_populate_multiple_counters() {
+        // Two counters with different body lengths.
+        let cs = make_counter_state(&[(1, 5, 1), (2, 10, 2)]);
+        assert_eq!(cs.meta.len(), 2);
+        assert_eq!(cs.phases.len(), 3); // 1 + 2
+        assert_eq!(cs.meta[0].phase_start, 0);
+        assert_eq!(cs.meta[0].num_phases, 1);
+        assert_eq!(cs.meta[1].phase_start, 1);
+        assert_eq!(cs.meta[1].num_phases, 2);
+    }
+
+    #[test]
+    fn test_counter_state_populate_zero_body_len() {
+        // body_len=0 → clamped to 1 phase.
+        let cs = make_counter_state(&[(1, 5, 0)]);
+        assert_eq!(cs.meta[0].num_phases, 1);
+        assert_eq!(cs.phases.len(), 1);
+    }
+
+    // ── seed / increment / break ──
+
+    #[test]
+    fn test_counter_state_seed_and_has_live() {
+        let mut cs = make_counter_state(&[(1, 5, 1)]);
+        assert!(!cs.has_live());
+        cs.seed(0, 0);
+        assert!(cs.has_live());
+    }
+
+    #[test]
+    fn test_counter_state_increment_below_min() {
+        // min=3, seed at 0, increment once → value=1 < min=3, no break.
+        let mut cs = make_counter_state(&[(3, 5, 1)]);
+        cs.seed(0, 0);
+        assert!(!cs.increment(0));
+    }
+
+    #[test]
+    fn test_counter_state_increment_reaches_min() {
+        // min=2, seed at 0, increment twice → value=2 >= min=2, can break.
+        let mut cs = make_counter_state(&[(2, 5, 1)]);
+        cs.seed(0, 0);
+        assert!(!cs.increment(0)); // value=1
+        assert!(cs.increment(0)); // value=2 >= min=2
+    }
+
+    #[test]
+    fn test_counter_state_increment_reaches_max() {
+        // min=1, max=3.  Seed, increment 3 times → oldest evicted at max.
+        let mut cs = make_counter_state(&[(1, 3, 1)]);
+        cs.seed(0, 0);
+        assert!(cs.increment(0)); // value=1 >= min=1
+        assert!(cs.increment(0)); // value=2
+        assert!(cs.increment(0)); // value=3 == max → oldest evicted
+        // After eviction the phase should be empty (only 1 instance).
+        assert!(!cs.has_live());
+    }
+
+    #[test]
+    fn test_counter_state_multiple_instances() {
+        // min=2, max=5. Seed two instances, increment both.
+        let mut cs = make_counter_state(&[(2, 5, 1)]);
+        cs.seed(0, 0); // instance A at value 0
+        cs.seed(0, 0); // instance B at value 0
+        assert!(!cs.increment(0)); // A=1, B=1 — both < min=2
+        assert!(cs.increment(0)); // A=2, B=2 — A >= min
+    }
+
+    #[test]
+    fn test_counter_state_seed_with_initial_value() {
+        // min=3, seed at value 2, one increment should break.
+        let mut cs = make_counter_state(&[(3, 10, 1)]);
+        cs.seed(0, 2);
+        assert!(cs.increment(0)); // value=3 >= min=3
+    }
+
+    // ── reset_counter ──
+
+    #[test]
+    fn test_counter_state_reset_counter() {
+        let mut cs = make_counter_state(&[(1, 10, 1)]);
+        cs.seed(0, 0);
+        assert!(cs.has_live());
+        cs.reset_counter(0);
+        assert!(!cs.has_live());
+    }
+
+    #[test]
+    fn test_counter_state_reset_one_counter_preserves_other() {
+        let mut cs = make_counter_state(&[(1, 10, 1), (1, 10, 1)]);
+        cs.seed(0, 0);
+        cs.seed(1, 0);
+        assert!(cs.has_live());
+        cs.reset_counter(0);
+        assert!(cs.has_live()); // counter 1 still live
+        cs.reset_counter(1);
+        assert!(!cs.has_live());
+    }
+
+    // ── advance_all_phases ──
+
+    #[test]
+    fn test_counter_state_advance_phases() {
+        // body_len=3, so 3 phases.  Advance rotates active_phase.
+        let mut cs = make_counter_state(&[(1, 10, 3)]);
+        assert_eq!(cs.meta[0].active_phase, 0);
+        cs.advance_all_phases();
+        assert_eq!(cs.meta[0].active_phase, 1);
+        cs.advance_all_phases();
+        assert_eq!(cs.meta[0].active_phase, 2);
+        cs.advance_all_phases();
+        assert_eq!(cs.meta[0].active_phase, 0); // wraps
+    }
+
+    // ── reset / clear ──
+
+    #[test]
+    fn test_counter_state_reset_clears_instances() {
+        let mut cs = make_counter_state(&[(1, 10, 1)]);
+        cs.seed(0, 0);
+        cs.increment(0);
+        assert!(cs.has_live());
+        cs.reset();
+        assert!(!cs.has_live());
+        assert_eq!(cs.meta[0].active_phase, 0);
+    }
+
+    #[test]
+    fn test_counter_state_reset_retains_ring_capacity() {
+        let mut cs = make_counter_state(&[(1, 100, 1)]);
+        cs.seed(0, 0);
+        let cap = cs.phases[0].ring.len();
+        assert!(cap > 0);
+        cs.reset();
+        assert_eq!(cs.phases[0].ring.len(), cap);
+    }
+
+    #[test]
+    fn test_counter_state_clear_drops_everything() {
+        let mut cs = make_counter_state(&[(1, 10, 1)]);
+        cs.seed(0, 0);
+        cs.clear();
+        assert_eq!(cs.meta.len(), 0);
+        assert_eq!(cs.phases.len(), 0);
+        assert_eq!(cs.total_phases, 0);
+    }
+
+    // ── repopulate after clear ──
+
+    #[test]
+    fn test_counter_state_repopulate_after_clear() {
+        let mut cs = make_counter_state(&[(1, 5, 1)]);
+        cs.seed(0, 0);
+        cs.clear();
+
+        // Repopulate with different counters.
+        cs.populate(&[
+            crate::CounterInfo {
+                index: 0,
+                min: 2,
+                max: 8,
+                body_byte_length: 2,
+            },
+            crate::CounterInfo {
+                index: 1,
+                min: 1,
+                max: 3,
+                body_byte_length: 1,
+            },
+        ]);
+        assert_eq!(cs.meta.len(), 2);
+        assert_eq!(cs.phases.len(), 3); // 2 + 1
+        assert!(!cs.has_live());
+
+        // Seed and increment the new counters.
+        cs.seed(0, 0);
+        cs.seed(1, 0);
+        assert!(cs.has_live());
+    }
+
+    // ── ring buffer growth ──
+
+    #[test]
+    fn test_counter_state_ring_grows() {
+        // max=10000, initial ring cap is capped at 4096.
+        // Seeding > 4096 instances forces a grow.
+        let mut cs = make_counter_state(&[(1, 10000, 1)]);
+        let initial_cap = cs.phases[0].ring.len();
+        assert!(initial_cap <= 4096);
+
+        for _ in 0..5000 {
+            cs.seed(0, 0);
+        }
+        assert!(cs.phases[0].ring.len() > initial_cap);
+        assert!(cs.has_live());
+
+        // Increment should still work correctly after growth.
+        assert!(cs.increment(0)); // oldest=1 >= min=1
+    }
+
+    // ── ensure_phases idempotent ──
+
+    #[test]
+    fn test_counter_state_ensure_phases_idempotent() {
+        let mut cs = make_counter_state(&[(1, 10, 1)]);
+        let ptr1 = cs.phases.as_ptr();
+        cs.ensure_phases(); // second call — no-op
+        let ptr2 = cs.phases.as_ptr();
+        assert_eq!(ptr1, ptr2);
+    }
+
+    // ── increment on empty phase ──
+
+    #[test]
+    fn test_counter_state_increment_empty_phase() {
+        // No seed — increment returns false.
+        let mut cs = make_counter_state(&[(1, 10, 1)]);
+        assert!(!cs.increment(0));
+        assert!(!cs.has_live());
     }
 }

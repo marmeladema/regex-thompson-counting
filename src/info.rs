@@ -18,14 +18,18 @@ use serde::Serialize;
 /// Information about a single bounded-repetition counter.
 ///
 /// Each counter corresponds to a `{min,max}` repetition in the pattern.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct CounterInfo {
-    /// Internal counter slot index (0-based).
+    /// Counter slot index (0-based).  May differ from the position in
+    /// the array for patterns with nested counters.
     pub index: usize,
     /// Minimum number of iterations required for this repetition.
     pub min: usize,
     /// Maximum number of iterations allowed for this repetition.
     pub max: usize,
+    /// Fixed number of bytes consumed per iteration of the counter
+    /// body, or 0 for variable-length bodies.
+    pub body_byte_length: usize,
 }
 
 /// Memory layout breakdown of a compiled [`Regex`](crate::Regex).
@@ -205,7 +209,19 @@ impl fmt::Display for RegexInfo {
             writeln!(f)?;
             writeln!(f, "Counters: {}", self.counters.len())?;
             for c in &self.counters {
-                writeln!(f, "  counter[{}]: {{{},{}}}", c.index, c.min, c.max)?;
+                if c.body_byte_length > 0 {
+                    writeln!(
+                        f,
+                        "  counter[{}]: {{{},{}}}, body_len={}",
+                        c.index, c.min, c.max, c.body_byte_length
+                    )?;
+                } else {
+                    writeln!(
+                        f,
+                        "  counter[{}]: {{{},{}}}, body_len=variable",
+                        c.index, c.min, c.max
+                    )?;
+                }
             }
         }
 

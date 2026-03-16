@@ -334,11 +334,16 @@ impl fmt::Display for DumpRegex<'_> {
         // -- Counters ---------------------------------------------------------
         if r.num_counters > 0 {
             writeln!(f, "Counters ({}):", r.num_counters)?;
-            for (i, &(min, max, body_len)) in r.counter_info.iter().enumerate() {
-                if body_len == 0 {
-                    writeln!(f, "  c{i}: {{{min},{max}}}, body_len=variable")?;
+            for c in r.counter_info.iter() {
+                let i = c.index;
+                if c.body_byte_length == 0 {
+                    writeln!(f, "  c{i}: {{{},{}}}, body_len=variable", c.min, c.max)?;
                 } else {
-                    writeln!(f, "  c{i}: {{{min},{max}}}, body_len={body_len}")?;
+                    writeln!(
+                        f,
+                        "  c{i}: {{{},{}}}, body_len={}",
+                        c.min, c.max, c.body_byte_length
+                    )?;
                 }
             }
             writeln!(f)?;
