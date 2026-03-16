@@ -714,8 +714,9 @@ mod tests {
 
     #[test]
     fn test_proof_alternation_identical_bytes_rejected() {
-        // Two f{5,26} in alternation: identical body bytes.
-        let regex = build(r"^(f{5,26}|f{5,26})$");
+        // f{5,26} and f{5,20} in alternation: same body byte ('f')
+        // but different bounds, so they survive alternation dedup.
+        let regex = build(r"^(f{5,26}|f{5,20})$");
         let elig = eligibility(&regex);
         assert!(elig.has_identical_body_bytes);
         let stats = probe_result(&regex);

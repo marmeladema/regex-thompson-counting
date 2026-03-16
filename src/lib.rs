@@ -62,6 +62,7 @@ static NEXT_REGEX_ID: AtomicU64 = AtomicU64::new(1);
 mod dfa;
 mod dump;
 pub mod fuzz_gen;
+mod hir_optimize;
 mod info;
 mod memrange;
 
@@ -962,13 +963,14 @@ pub(crate) fn parse_hir(pattern: &str) -> Result<Hir, Error> {
         .build()
         .parse(pattern)
         .map_err(|e| Error::Parse(e.to_string()))?;
-    TranslatorBuilder::new()
+    let hir = TranslatorBuilder::new()
         .unicode(false)
         .utf8(false)
         .dot_matches_new_line(true)
         .build()
         .translate(pattern, &ast)
-        .map_err(|e| Error::Translate(e.to_string()))
+        .map_err(|e| Error::Translate(e.to_string()))?;
+    Ok(hir_optimize::optimize(hir))
 }
 
 impl Regex {
@@ -10454,7 +10456,7 @@ mod tests {
         // break paths) and track `nb_counter_free_mae` separately.
         test_tier3_counter_free_mae_multi_counter {
             pattern: "^c{2,12}.{6,6}(a?)?$",
-            memory: 1728,
+            memory: 1695,
             min_tier: 1,
             inputs: [
                 ("ccaaaaaa", true),
@@ -10531,7 +10533,7 @@ mod tests {
         // rejects such patterns from tier 2/3 (demoted to tier 4).
         test_counter_self_loop_possessive_plus {
             pattern: "^.{6,9}++$",
-            memory: 1398,
+            memory: 1365,
             min_tier: 1,
             inputs: [
                 ("aaaaaa", true),       // len=6: one rep of 6
@@ -10574,7 +10576,7 @@ mod tests {
         // Same self-loop via +* wrapping counted repetition.
         test_counter_self_loop_plus_star {
             pattern: "^.{6,9}+*$",
-            memory: 1398,
+            memory: 1365,
             min_tier: 1,
             inputs: [
                 ("", true),             // len=0: * allows zero reps
@@ -10975,7 +10977,7 @@ mod tests {
         // in the post-transition clean_nb state.
         test_tier3_contaminated_cf_mae_empty_nfa {
             pattern: r"^(.{8,8}|f{5,26}|f{5,26})$",
-            memory: 3081,
+            memory: 2190,
             min_tier: 1,
             inputs: [
                 ("fffffabc", true),            // Bug 24: .{8,8} via counter-free path
@@ -11732,7 +11734,7 @@ mod tests {
         // states cannot contribute to match_at_end at end-of-input.
         test_tier3_eoi_tail_false_positive {
             pattern: r"a{1,2}(.|\b|\b|a)c$",
-            memory: 1332,
+            memory: 1266,
             min_tier: 1,
             inputs: [
                 ("a", false),                   // 8E regression: \b(a,EOI) passes but c never consumed
@@ -11781,7 +11783,7 @@ mod tests {
         // blocks the path.
         test_tier3_chained_contradictory_asserts {
             pattern: r"^.{2,26}\b\B(a?)?$",
-            memory: 2058,
+            memory: 2025,
             min_tier: 1,
             inputs: [
                 ("cc", false),              // \b passes at EOI but \B fails → never matches
@@ -13105,16 +13107,16 @@ mod tests {
             ("a{1,1}{1,1}", 1), // stacked: 1 × (1 × 1)
             // Zero-min = optional
             ("a{0,1}", 2), // same as a?: 1 + 1
-            // Nested quantifiers
-            ("(a?)?", 3),    // inner=2, outer ?: 2+1=3
-            ("((a?)?)?", 4), // inner=3, outer ?: 3+1=4
-            ("(a+)+", 2),    // inner a+=1 (self-loop), outer + generic: 1+1
-            ("(a*)*", 3),    // inner a*=2, outer *: 2+1
-            ("(a+)*", 2),    // inner a+=1, outer *: 1+1
+            // Nested quantifiers (optimized: HIR pass collapses these)
+            ("(a?)?", 2),    // collapsed to a? → 2
+            ("((a?)?)?", 2), // collapsed to a? → 2
+            ("(a+)+", 1),    // collapsed to a+ (self-loop) → 1
+            ("(a*)*", 2),    // collapsed to a* → 2
+            ("(a+)*", 2),    // collapsed to a* → 2
             // Alternation with empty branch
             ("(a|)", 2),  // alt: 1+0 + 1 Split
             ("(|a)", 2),  // same
-            ("(||a)", 3), // alt: 0+0+1 + 2 Splits
+            ("(||a)", 2), // deduped to (|a) → 2
             // Concat with zero-count segment
             ("a{0,0}b", 1), // 0 + 1
             // HIR merges alternation to class
