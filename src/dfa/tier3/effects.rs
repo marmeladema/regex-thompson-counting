@@ -1577,45 +1577,19 @@ mod tests {
 
     /// Build a compiled `Regex` from a pattern string (test helper).
     fn build_regex(pattern: &str) -> crate::Regex {
-        use regex_syntax::ast::parse::ParserBuilder;
-        use regex_syntax::hir::translate::TranslatorBuilder;
-
-        let ast = ParserBuilder::new()
-            .build()
-            .parse(pattern)
-            .expect("regex-syntax AST parse should succeed");
-        let hir = TranslatorBuilder::new()
-            .unicode(false)
-            .utf8(false)
-            .dot_matches_new_line(true)
-            .build()
-            .translate(pattern, &ast)
-            .expect("regex-syntax HIR translation should succeed");
-        crate::RegexBuilder::default()
-            .build(&hir)
-            .expect("builder should accept the HIR")
+        crate::Regex::new(pattern).expect("builder should accept the pattern")
     }
 
     /// Build a compiled `Regex` with custom unroll limit (test helper).
     fn build_regex_unroll(pattern: &str, unroll: usize) -> crate::Regex {
-        use regex_syntax::ast::parse::ParserBuilder;
-        use regex_syntax::hir::translate::TranslatorBuilder;
-
-        let ast = ParserBuilder::new()
-            .build()
-            .parse(pattern)
-            .expect("regex-syntax AST parse should succeed");
-        let hir = TranslatorBuilder::new()
-            .unicode(false)
-            .utf8(false)
-            .dot_matches_new_line(true)
-            .build()
-            .translate(pattern, &ast)
-            .expect("regex-syntax HIR translation should succeed");
-        crate::RegexBuilder::default()
-            .max_unroll_states(unroll)
-            .build(&hir)
-            .expect("builder should accept the HIR")
+        crate::Regex::with_config(
+            pattern,
+            crate::RegexConfig {
+                max_unroll_states: unroll,
+                ..Default::default()
+            },
+        )
+        .expect("builder should accept the pattern")
     }
 
     /// Find the first NFA state index with `State::Assert { kind, .. }`

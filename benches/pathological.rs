@@ -35,7 +35,6 @@ const PATTERN: &str = r".{0,1000}.{0,1000}.{0,1000}a";
 fn parse_hir(pattern: &str) -> regex_thompson_counting::Hir {
     use regex_syntax::ast::parse::ParserBuilder;
     use regex_syntax::hir::translate::TranslatorBuilder;
-
     let ast = ParserBuilder::new().build().parse(pattern).unwrap();
     TranslatorBuilder::new()
         .unicode(false)

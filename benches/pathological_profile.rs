@@ -20,7 +20,6 @@ const HAYSTACK_SIZE: usize = 128 * 1024;
 fn parse_hir(pattern: &str) -> regex_syntax::hir::Hir {
     use regex_syntax::ast::parse::ParserBuilder;
     use regex_syntax::hir::translate::TranslatorBuilder;
-
     let ast = ParserBuilder::new().build().parse(pattern).unwrap();
     TranslatorBuilder::new()
         .unicode(false)

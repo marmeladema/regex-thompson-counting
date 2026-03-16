@@ -116,6 +116,10 @@ pub enum Error {
     /// The pattern requires more than 256 counters (the maximum supported
     /// by the `CounterIdx(u8)` representation).
     TooManyCounters,
+    /// The pattern string could not be parsed into an AST.
+    Parse(String),
+    /// The AST could not be translated into an HIR.
+    Translate(String),
 }
 
 impl fmt::Display for Error {
@@ -133,6 +137,8 @@ impl fmt::Display for Error {
             Self::TooManyCounters => {
                 write!(f, "pattern requires more than {} counters", MAX_COUNTERS)
             }
+            Self::Parse(msg) => write!(f, "regex parse error: {}", msg),
+            Self::Translate(msg) => write!(f, "regex HIR translation error: {}", msg),
         }
     }
 }
@@ -942,7 +948,54 @@ pub struct Regex {
     /// Avoids scanning all NFA states at DFA populate time.
     pub(crate) counter_break_can_match: Box<[bool]>,
 }
+/// Parse a regex pattern string into an HIR using the engine's standard
+/// settings: `unicode(false)`, `utf8(false)`, `dot_matches_new_line(true)`.
+///
+/// Useful when callers need the HIR for inspection before passing it to
+/// [`RegexBuilder::build`].  Most callers should use [`Regex::new`] or
+/// [`Regex::with_config`] instead.
+pub(crate) fn parse_hir(pattern: &str) -> Result<Hir, Error> {
+    use regex_syntax::ast::parse::ParserBuilder;
+    use regex_syntax::hir::translate::TranslatorBuilder;
+    let ast = ParserBuilder::new()
+        .build()
+        .parse(pattern)
+        .map_err(|e| Error::Parse(e.to_string()))?;
+    TranslatorBuilder::new()
+        .unicode(false)
+        .utf8(false)
+        .dot_matches_new_line(true)
+        .build()
+        .translate(pattern, &ast)
+        .map_err(|e| Error::Translate(e.to_string()))
+}
+
 impl Regex {
+    /// Compile a regex from a pattern string with default settings.
+    ///
+    /// This is the most common entry point.  Equivalent to:
+    /// ```ignore
+    /// Regex::with_config(pattern, RegexConfig::default())
+    /// ```
+    pub fn new(pattern: &str) -> Result<Regex, Error> {
+        Self::with_config(pattern, RegexConfig::default())
+    }
+
+    /// Compile a regex from a pattern string with custom configuration.
+    ///
+    /// ```ignore
+    /// use regex_thompson_counting::{Regex, RegexConfig};
+    /// let re = Regex::with_config("a{1,500}", RegexConfig {
+    ///     max_unroll_states: 0,
+    ///     ..Default::default()
+    /// })?;
+    /// ```
+    pub fn with_config(pattern: &str, config: RegexConfig) -> Result<Regex, Error> {
+        let hir = parse_hir(pattern)?;
+        let mut builder = RegexBuilder::with_config(config);
+        builder.build(&hir)
+    }
+
     /// Return the total memory footprint (in bytes) of this compiled
     /// regex, including both inline and heap-allocated data.
     ///
@@ -1283,6 +1336,52 @@ impl Regex {
 ///    fragment to the `Match` state.
 use indexmap::IndexSet;
 
+// ---------------------------------------------------------------------------
+// Compilation configuration
+// ---------------------------------------------------------------------------
+
+/// Compile-time knobs for [`RegexBuilder`] and [`Regex::with_config`].
+///
+/// All fields are public — create with struct literal syntax or
+/// [`Default::default()`] and override individual fields.
+///
+/// ```
+/// use regex_thompson_counting::RegexConfig;
+/// let cfg = RegexConfig { max_unroll_states: 0, ..Default::default() };
+/// ```
+#[derive(Clone, Debug)]
+pub struct RegexConfig {
+    /// Maximum allowed `max` value for bounded repetitions (e.g.
+    /// `a{1,1000}`).  Patterns exceeding this limit are rejected at
+    /// compile time.  Default: 1000.
+    pub max_repetition: usize,
+    /// Maximum NFA states that may be produced by unrolling a repetition
+    /// (fixed or non-fixed) of a simple body into concatenated copies.
+    /// Set to 0 to disable unrolling entirely.  Default: 32.
+    pub max_unroll_states: usize,
+    /// Whether to merge consecutive bounded repetitions with identical
+    /// bodies (e.g. `.{0,1000}.{0,1000}` → `.{0,2000}`).  Default: true.
+    ///
+    /// Disabled alongside `max_unroll_states=0` in the `match_tests!`
+    /// macro to preserve the multi-counter Tier 3 structures that tests
+    /// are designed to exercise.
+    pub merge_repetitions: bool,
+}
+
+impl Default for RegexConfig {
+    fn default() -> Self {
+        Self {
+            max_repetition: 1000,
+            max_unroll_states: DEFAULT_MAX_UNROLL_STATES,
+            merge_repetitions: true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NFA compiler
+// ---------------------------------------------------------------------------
+
 #[derive(Debug)]
 pub struct RegexBuilder {
     postfix: Vec<RegexHirNode>,
@@ -1295,25 +1394,19 @@ pub struct RegexBuilder {
     /// Byte dispatch tables created by the post-construction
     /// [`optimize_byte_tables`](Self::optimize_byte_tables) pass.
     byte_tables: Vec<ByteMap>,
-    /// Maximum allowed `max` value for bounded repetitions (e.g.
-    /// `a{1,1000}`).  Patterns exceeding this limit are rejected at
-    /// compile time.  Default: 1000.
-    max_repetition: usize,
-    /// Maximum NFA states that may be produced by unrolling a repetition
-    /// (fixed or non-fixed) of a simple body into concatenated copies.
-    /// Set to 0 to disable unrolling entirely.  Default: 32.
-    max_unroll_states: usize,
-    /// Whether to merge consecutive bounded repetitions with identical
-    /// bodies (e.g. `.{0,1000}.{0,1000}` → `.{0,2000}`).  Default: true.
-    ///
-    /// Disabled alongside `max_unroll_states=0` in the `match_tests!`
-    /// macro to preserve the multi-counter Tier 3 structures that tests
-    /// are designed to exercise.
-    merge_repetitions: bool,
+    /// Compilation configuration (knobs).
+    config: RegexConfig,
 }
 
 impl Default for RegexBuilder {
     fn default() -> Self {
+        Self::with_config(RegexConfig::default())
+    }
+}
+
+impl RegexBuilder {
+    /// Create a builder with the given configuration.
+    pub fn with_config(config: RegexConfig) -> Self {
         Self {
             postfix: Vec::new(),
             states: Vec::new(),
@@ -1321,18 +1414,20 @@ impl Default for RegexBuilder {
             counters: Vec::new(),
             classes: IndexSet::new(),
             byte_tables: Vec::new(),
-            max_repetition: 1000,
-            max_unroll_states: DEFAULT_MAX_UNROLL_STATES,
-            merge_repetitions: true,
+            config,
         }
     }
-}
-impl RegexBuilder {
+
+    /// Return a mutable reference to the configuration.
+    pub fn config_mut(&mut self) -> &mut RegexConfig {
+        &mut self.config
+    }
+
     /// Set the maximum allowed `max` value for bounded repetitions
     /// (e.g. `a{1,1000}`).  Patterns exceeding this limit are rejected
     /// at compile time.  Default: 1000.
     pub fn max_repetition(&mut self, limit: usize) -> &mut Self {
-        self.max_repetition = limit;
+        self.config.max_repetition = limit;
         self
     }
 
@@ -1340,15 +1435,24 @@ impl RegexBuilder {
     /// repetition of a simple body into concatenated copies.  Set to 0
     /// to disable unrolling entirely.  Default: 32.
     pub fn max_unroll_states(&mut self, limit: usize) -> &mut Self {
-        self.max_unroll_states = limit;
+        self.config.max_unroll_states = limit;
         self
     }
 
     /// Enable or disable merging of consecutive bounded repetitions
     /// with identical bodies.  Default: true.
     pub fn merge_repetitions(&mut self, enable: bool) -> &mut Self {
-        self.merge_repetitions = enable;
+        self.config.merge_repetitions = enable;
         self
+    }
+
+    /// Parse a pattern string and compile it into a [`Regex`].
+    ///
+    /// Convenience method equivalent to `parse_hir(pattern)` followed
+    /// by `self.build(&hir)`.
+    pub fn compile(&mut self, pattern: &str) -> Result<Regex, Error> {
+        let hir = parse_hir(pattern)?;
+        self.build(&hir)
     }
 
     /// Allocate a fresh counter index.
@@ -1760,7 +1864,7 @@ impl RegexBuilder {
         }
         // Try to unroll.
         let body_nfa = Self::estimate_nfa_states(sub).unwrap_or(0);
-        let limit = self.max_unroll_states;
+        let limit = self.config.max_unroll_states;
         if min > 0 && self.try_unroll(min, max, body_nfa, limit, sub)? {
             // Unrolled — no counter needed.
         } else if min == 0
@@ -1898,7 +2002,7 @@ impl RegexBuilder {
                     //
                     // Only merge genuine bounded counters (max > 1, finite)
                     // — not `?` (0,1), `*` (0,∞), or `+` (1,∞).
-                    if self.merge_repetitions
+                    if self.config.merge_repetitions
                         && let HirKind::Repetition(rep) = children[i].kind()
                         && let Some(rep_max) = rep.max
                         && rep_max > 1
@@ -1991,8 +2095,8 @@ impl RegexBuilder {
                 }
 
                 // Reject repetitions exceeding the compile-time cap.
-                if max != usize::MAX && max > self.max_repetition {
-                    return Err(Error::RepetitionTooLarge(max, self.max_repetition));
+                if max != usize::MAX && max > self.config.max_repetition {
+                    return Err(Error::RepetitionTooLarge(max, self.config.max_repetition));
                 }
 
                 // Special-case common quantifiers to avoid counter overhead.
@@ -2026,7 +2130,7 @@ impl RegexBuilder {
 
                 // Try to unroll simple bodies to eliminate the counter.
                 let body_nfa = Self::estimate_nfa_states(&rep.sub).unwrap_or(0);
-                let limit = self.max_unroll_states;
+                let limit = self.config.max_unroll_states;
 
                 if min > 0 && self.try_unroll(min, max, body_nfa, limit, &rep.sub)? {
                     // Successfully unrolled — no counter needed.
@@ -4707,27 +4811,6 @@ mod tests {
     // Regex matching tests
     // -----------------------------------------------------------------------
 
-    /// Parse a pattern in full byte mode (no UTF-8 validity requirement).
-    /// Parses `pattern` into HIR in byte mode: Unicode disabled, dot
-    /// matches any byte (including newline).  Equivalent to prepending
-    /// `(?s-u)` but configured via the builder API instead.
-    fn parse_hir_bytes(pattern: &str) -> Hir {
-        use regex_syntax::ast::parse::ParserBuilder;
-        use regex_syntax::hir::translate::TranslatorBuilder;
-
-        let ast = ParserBuilder::new()
-            .build()
-            .parse(pattern)
-            .expect("regex-syntax AST parse should succeed");
-        TranslatorBuilder::new()
-            .unicode(false)
-            .utf8(false)
-            .dot_matches_new_line(true)
-            .build()
-            .translate(pattern, &ast)
-            .expect("regex-syntax HIR translation should succeed")
-    }
-
     /// Assert that a compiled [`Regex`]'s memory footprint equals
     /// `expected_bytes`.  Placed at the end of tests so that matching
     /// failures are surfaced before size mismatches.
@@ -4790,17 +4873,19 @@ mod tests {
     /// asserting a specific memory size.  Used by dedup tests that
     /// compare sizes relatively rather than absolutely.
     fn build_regex_unchecked(pattern: &str) -> Regex {
-        build_regex_with_unroll(pattern, DEFAULT_MAX_UNROLL_STATES)
+        Regex::new(pattern).expect("our builder should accept the pattern")
     }
 
     /// Build a compiled [`Regex`] with a specific unroll limit.
     fn build_regex_with_unroll(pattern: &str, max_unroll_states: usize) -> Regex {
-        let hir = parse_hir_bytes(pattern);
-        let mut builder = RegexBuilder::default();
-        builder.max_unroll_states(max_unroll_states);
-        builder
-            .build(&hir)
-            .expect("our builder should accept the HIR")
+        Regex::with_config(
+            pattern,
+            RegexConfig {
+                max_unroll_states,
+                ..Default::default()
+            },
+        )
+        .expect("our builder should accept the pattern")
     }
     // -----------------------------------------------------------------------
     // Data-driven test infrastructure
@@ -12600,7 +12685,8 @@ mod tests {
         let mut builder = RegexBuilder::default();
         builder.max_unroll_states(0);
         builder.merge_repetitions(false);
-        let result = builder.build(&regex_syntax::parse(&pattern).unwrap());
+        let hir = super::parse_hir(&pattern).unwrap();
+        let result = builder.build(&hir);
         assert!(
             matches!(result, Err(Error::TooManyCounters)),
             "expected TooManyCounters error, got {result:?}"
@@ -12619,7 +12705,8 @@ mod tests {
         let mut builder = RegexBuilder::default();
         builder.max_unroll_states(0);
         builder.merge_repetitions(false);
-        let result = builder.build(&regex_syntax::parse(&pattern).unwrap());
+        let hir = super::parse_hir(&pattern).unwrap();
+        let result = builder.build(&hir);
         assert!(
             result.is_ok(),
             "256 counters should succeed, got {result:?}"
@@ -12673,30 +12760,14 @@ mod tests {
     /// inputs, comparing the oracle (`regex` crate) against every eligible
     /// rethoc tier.
     fn fuzz_oracle_and_tiers(pattern: &str, inputs: &[Vec<u8>]) {
-        // Parse with regex-syntax in byte mode.
-        use regex_syntax::ast::parse::ParserBuilder;
-        use regex_syntax::hir::translate::TranslatorBuilder;
-
-        let ast = match ParserBuilder::new().build().parse(pattern) {
-            Ok(a) => a,
-            Err(_) => return, // unparseable — skip
-        };
-        let hir = match TranslatorBuilder::new()
-            .unicode(false)
-            .utf8(false)
-            .dot_matches_new_line(true)
-            .build()
-            .translate(pattern, &ast)
-        {
+        let hir = match super::parse_hir(pattern) {
             Ok(h) => h,
             Err(_) => return,
         };
-
-        // Compile with rethoc.
         let mut builder = RegexBuilder::default();
         let re = match builder.build(&hir) {
             Ok(r) => r,
-            Err(_) => return, // unsupported construct — skip
+            Err(_) => return,
         };
 
         // Compile with the regex crate oracle.
@@ -12900,16 +12971,6 @@ mod tests {
     /// Fallible HIR parse in byte mode — returns `None` if the pattern
     /// is rejected by `regex-syntax`.
     fn parse_hir_bytes_fallible(pattern: &str) -> Option<Hir> {
-        use regex_syntax::ast::parse::ParserBuilder;
-        use regex_syntax::hir::translate::TranslatorBuilder;
-
-        let ast = ParserBuilder::new().build().parse(pattern).ok()?;
-        TranslatorBuilder::new()
-            .unicode(false)
-            .utf8(false)
-            .dot_matches_new_line(true)
-            .build()
-            .translate(pattern, &ast)
-            .ok()
+        super::parse_hir(pattern).ok()
     }
 }

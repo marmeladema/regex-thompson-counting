@@ -1,36 +1,16 @@
-use regex_syntax::ast::parse::ParserBuilder;
-use regex_syntax::hir::translate::TranslatorBuilder;
-
-use regex_thompson_counting::{MatcherMemory, Regex, RegexBuilder};
+use regex_thompson_counting::{MatcherMemory, Regex, RegexConfig};
 
 use std::io::{self, Write};
 use std::process;
 
 fn parse_pattern(pattern: &str, unroll_limit: Option<usize>, merge: bool) -> Regex {
-    let ast = ParserBuilder::new()
-        .build()
-        .parse(pattern)
-        .unwrap_or_else(|e| {
-            eprintln!("error: failed to parse pattern: {e}");
-            process::exit(1);
-        });
-    let hir = TranslatorBuilder::new()
-        .unicode(false)
-        .utf8(false)
-        .dot_matches_new_line(true)
-        .build()
-        .translate(pattern, &ast)
-        .unwrap_or_else(|e| {
-            eprintln!("error: failed to translate pattern: {e}");
-            process::exit(1);
-        });
-    let mut builder = RegexBuilder::default();
-    if let Some(limit) = unroll_limit {
-        builder.max_unroll_states(limit);
-    }
-    builder.merge_repetitions(merge);
-    builder.build(&hir).unwrap_or_else(|e| {
-        eprintln!("error: failed to compile pattern: {e}");
+    let config = RegexConfig {
+        max_unroll_states: unroll_limit.unwrap_or(RegexConfig::default().max_unroll_states),
+        merge_repetitions: merge,
+        ..Default::default()
+    };
+    Regex::with_config(pattern, config).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
         process::exit(1);
     })
 }

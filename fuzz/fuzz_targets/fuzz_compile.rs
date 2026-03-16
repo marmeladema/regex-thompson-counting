@@ -96,7 +96,6 @@ fuzz_target!(|data: &[u8]| {
 fn parse_hir_bytes(pattern: &str) -> Option<regex_thompson_counting::Hir> {
     use regex_syntax::ast::parse::ParserBuilder;
     use regex_syntax::hir::translate::TranslatorBuilder;
-
     let ast = ParserBuilder::new().build().parse(pattern).ok()?;
     TranslatorBuilder::new()
         .unicode(false)

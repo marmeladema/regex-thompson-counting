@@ -586,21 +586,15 @@ mod tests {
     use super::*;
 
     fn build(pattern: &str) -> crate::Regex {
-        use regex_syntax::ast::parse::ParserBuilder;
-        use regex_syntax::hir::translate::TranslatorBuilder;
-        let ast = ParserBuilder::new().build().parse(pattern).unwrap();
-        let hir = TranslatorBuilder::new()
-            .unicode(false)
-            .utf8(false)
-            .dot_matches_new_line(true)
-            .build()
-            .translate(pattern, &ast)
-            .unwrap();
-        crate::RegexBuilder::default()
-            .max_unroll_states(0)
-            .merge_repetitions(false)
-            .build(&hir)
-            .unwrap()
+        crate::Regex::with_config(
+            pattern,
+            crate::RegexConfig {
+                max_unroll_states: 0,
+                merge_repetitions: false,
+                ..Default::default()
+            },
+        )
+        .unwrap()
     }
 
     fn probe_result(regex: &crate::Regex) -> Tier2OverlapStats {
@@ -887,21 +881,15 @@ mod tests {
     }
 
     fn build_checked(pattern: &str) -> Option<crate::Regex> {
-        use regex_syntax::ast::parse::ParserBuilder;
-        use regex_syntax::hir::translate::TranslatorBuilder;
-        let ast = ParserBuilder::new().build().parse(pattern).ok()?;
-        let hir = TranslatorBuilder::new()
-            .unicode(false)
-            .utf8(false)
-            .dot_matches_new_line(true)
-            .build()
-            .translate(pattern, &ast)
-            .ok()?;
-        crate::RegexBuilder::default()
-            .max_unroll_states(0)
-            .merge_repetitions(false)
-            .build(&hir)
-            .ok()
+        crate::Regex::with_config(
+            pattern,
+            crate::RegexConfig {
+                max_unroll_states: 0,
+                merge_repetitions: false,
+                ..Default::default()
+            },
+        )
+        .ok()
     }
 
     fn check_inputs(
