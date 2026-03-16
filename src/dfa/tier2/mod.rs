@@ -943,8 +943,7 @@ impl Tier2DfaCache {
             }
 
             // Phase 2: consuming states consume `byte`.
-            let nfa_states = self.inner.states[from.idx()].nfa_states.clone();
-            for &idx in nfa_states.iter() {
+            for &idx in &self.inner.states[from.idx()].nfa_states {
                 if let Some((t, te)) = consume_byte(idx, byte, regex) {
                     targets.push(t);
                     if te != StateIdx::NONE {
