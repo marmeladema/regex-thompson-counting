@@ -13089,6 +13089,41 @@ mod tests {
             ("(a{1,3}){2,4}", 14), // 4×3 + (4-2) = 14
             // Concatenation
             ("a[a-z]b", 3), // 1 + 1 + 1
+            // ── Adversarial / edge cases ──
+            // Zero-count repetitions
+            (".{0,0}", 0),          // fixed 0 × 1 = 0
+            ("(.{0,0})?", 0),       // inner=0 → early return 0
+            ("(.{0,0}){5}", 0),     // inner=0 → early return 0
+            ("(a{0,0}b{0,0})?", 0), // concat of two zeros = 0 inner
+            ("(a{1,2}){0,0}", 0),   // outer fixed 0 × inner
+            ("(.{0,1}){0,0}", 0),   // same
+            // Plus/star of empty body
+            ("(?:a{0,0})+", 0), // inner=0 → early return 0
+            ("(a{0,0})*", 0),   // inner=0 → early return 0
+            // Degenerate fixed repetitions
+            ("a{1,1}", 1),      // fixed: 1 × 1
+            ("a{1,1}{1,1}", 1), // stacked: 1 × (1 × 1)
+            // Zero-min = optional
+            ("a{0,1}", 2), // same as a?: 1 + 1
+            // Nested quantifiers
+            ("(a?)?", 3),    // inner=2, outer ?: 2+1=3
+            ("((a?)?)?", 4), // inner=3, outer ?: 3+1=4
+            ("(a+)+", 2),    // inner a+=1 (self-loop), outer + generic: 1+1
+            ("(a*)*", 3),    // inner a*=2, outer *: 2+1
+            ("(a+)*", 2),    // inner a+=1, outer *: 1+1
+            // Alternation with empty branch
+            ("(a|)", 2),  // alt: 1+0 + 1 Split
+            ("(|a)", 2),  // same
+            ("(||a)", 3), // alt: 0+0+1 + 2 Splits
+            // Concat with zero-count segment
+            ("a{0,0}b", 1), // 0 + 1
+            // HIR merges alternation to class
+            ("(a|b|c|d|e|f|g|h){1,2}", 2), // [a-h] single atom → dense max=2
+            // Empty pattern
+            ("", 0),
+            // Capture wrapper transparency
+            ("(((a)))", 1), // nested captures → still 1 atom
+            ("(a){3}", 3),  // capture + fixed: 3 × 1
         ];
 
         for &(pattern, expected) in cases {
