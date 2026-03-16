@@ -248,6 +248,7 @@ cargo run --release -- info --unroll-limit 0 '<pattern>'  # disable unrolling (f
 cargo run --release -- match --unroll-limit 0 '<pattern>' 'input' # match with counters only
 cargo run --release -- info --no-merge '<pattern>'       # disable same-body repetition merging
 cargo run --release -- match --no-merge --unroll-limit 0 '<pattern>' 'input' # no merge + no unroll
+cargo run --release -- info --max-states 4096 '<pattern>'  # raise estimated-states limit (default: 2048)
 cargo run --release -- dump '<pattern>'                 # NFA states, counters, byte classes, aux arrays
 cargo run --release -- dump --dfa '<pattern>'           # + tier-specific DFA analysis (Tier 2/3)
 cargo run --release -- dump --format debug '<pattern>'  # Rust {:#?} of the Regex struct

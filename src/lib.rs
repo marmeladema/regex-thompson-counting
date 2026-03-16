@@ -1361,7 +1361,7 @@ pub struct RegexConfig {
     /// at compile time with [`Error::PatternTooComplex`].
     ///
     /// This bounds the worst-case memory and compilation time for
-    /// untrusted patterns.  Default: 1024.
+    /// untrusted patterns.  Default: 2048.
     pub max_estimated_states: usize,
 }
 
@@ -1371,7 +1371,7 @@ impl Default for RegexConfig {
             max_repetition: 1000,
             max_unroll_states: DEFAULT_MAX_UNROLL_STATES,
             merge_repetitions: true,
-            max_estimated_states: 1024,
+            max_estimated_states: 2048,
         }
     }
 }
