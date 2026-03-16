@@ -2133,18 +2133,44 @@ impl RegexBuilder {
             }
             RegexHirNode::RepeatOnePlus => {
                 let e = self.frags.pop().unwrap();
-                let s = self.state(State::Split {
-                    out: e.start,
-                    out1: StateIdx::NONE,
-                });
-                self.patch(&e.outs, s);
-                Fragment::with_outs(
-                    e.start,
-                    vec![PatchRef {
-                        state: s,
-                        slot: PatchSlot::Out1,
-                    }],
-                )
+                // Dense single-atom path: Consume(out=self, out_exit=EXIT).
+                // Saves one Split state compared to the generic encoding.
+                if e.outs.len() == 1
+                    && e.outs[0].slot == PatchSlot::Out
+                    && e.outs[0].state == e.start
+                    && matches!(
+                        self.states.as_slice()[e.start],
+                        State::Byte { out_exit, .. }
+                        | State::ByteCI { out_exit, .. }
+                        | State::ByteClass { out_exit, .. }
+                            if out_exit == StateIdx::NONE
+                    )
+                {
+                    // Wire out → self (loop).
+                    *patch_slot_mut(&mut self.states.as_mut_slice()[e.start], PatchSlot::Out) =
+                        e.start;
+                    // out_exit is the dangling exit.
+                    Fragment::with_outs(
+                        e.start,
+                        vec![PatchRef {
+                            state: e.start,
+                            slot: PatchSlot::OutExit,
+                        }],
+                    )
+                } else {
+                    let s = self.state(State::Split {
+                        out: e.start,
+                        out1: StateIdx::NONE,
+                    });
+                    self.patch(&e.outs, s);
+                    Fragment::with_outs(
+                        e.start,
+                        vec![PatchRef {
+                            state: s,
+                            slot: PatchSlot::Out1,
+                        }],
+                    )
+                }
             }
             RegexHirNode::CounterLoop { counter, min, max } => {
                 // Single-copy NFA:
@@ -5506,7 +5532,7 @@ mod tests {
         }
         test_one_plus_basic {
             pattern: "^a+$",
-            memory: 845,
+            memory: 812,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -5521,7 +5547,7 @@ mod tests {
         }
         test_one_plus_wildcard {
             pattern: "^.+$",
-            memory: 1101,
+            memory: 1068,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -5532,7 +5558,7 @@ mod tests {
         }
         test_one_plus_catenation {
             pattern: "^a+b+$",
-            memory: 911,
+            memory: 845,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -5560,7 +5586,7 @@ mod tests {
         }
         test_one_plus_alternate {
             pattern: "^(a|b)+$",
-            memory: 1101,
+            memory: 1068,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -5579,7 +5605,7 @@ mod tests {
         }
         test_one_plus_with_counting {
             pattern: "^.*a.{3}b+c$",
-            memory: 1332,
+            memory: 1299,
             min_tier: 1,
             inputs: [
                 ("a123bc", true),
@@ -5628,7 +5654,7 @@ mod tests {
         }
         test_one_plus_inside_repetition {
             pattern: "^(a+){2,3}$",
-            memory: 1010,
+            memory: 911,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -5644,7 +5670,7 @@ mod tests {
         }
         test_one_plus_alternation_inside_repetition {
             pattern: "^((a|b)+){2,4}$",
-            memory: 1365,
+            memory: 1233,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -5655,7 +5681,7 @@ mod tests {
         }
         test_mixed_plus_and_repetition_inside_one_plus {
             pattern: "^(a+b{2,3})+$",
-            memory: 1010,
+            memory: 977,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -5775,7 +5801,7 @@ mod tests {
         }
         test_one_plus_inside_min_zero_repetition {
             pattern: "^(a+){0,3}$",
-            memory: 1076,
+            memory: 977,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -5985,7 +6011,7 @@ mod tests {
         }
         test_min_n_unbounded {
             pattern: "^a{2,}$",
-            memory: 878,
+            memory: 845,
             min_tier: 1,
             inputs: [
                 ("aa", true),
@@ -6050,7 +6076,7 @@ mod tests {
         }
         test_unroll_byte_class_unbounded {
             pattern: "[0-9a-f]{2,}",
-            memory: 1068,
+            memory: 1035,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -6171,7 +6197,7 @@ mod tests {
         }
         test_unroll_concat_with_inner_rep {
             pattern: "(a+b){2,3}",
-            memory: 1043,
+            memory: 944,
             min_tier: 1,
             inputs: [
                 ("abab", true),
@@ -6227,7 +6253,7 @@ mod tests {
         }
         test_byte_class_one_plus {
             pattern: "^[a-c]+$",
-            memory: 1101,
+            memory: 1068,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -6266,7 +6292,7 @@ mod tests {
         }
         test_byte_class_multi_range {
             pattern: "^[a-cx-z]+$",
-            memory: 1101,
+            memory: 1068,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -6309,7 +6335,7 @@ mod tests {
         }
         test_digit_plus {
             pattern: r#"^\d+$"#,
-            memory: 1101,
+            memory: 1068,
             min_tier: 1,
             inputs: [
                 ("0", true),
@@ -6357,7 +6383,7 @@ mod tests {
         }
         test_non_digit_plus {
             pattern: r#"^\D+$"#,
-            memory: 1101,
+            memory: 1068,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6386,7 +6412,7 @@ mod tests {
         }
         test_space_plus {
             pattern: r#"^\s+$"#,
-            memory: 1101,
+            memory: 1068,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -6415,7 +6441,7 @@ mod tests {
         }
         test_non_space_plus {
             pattern: r#"^\S+$"#,
-            memory: 1101,
+            memory: 1068,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6446,7 +6472,7 @@ mod tests {
         }
         test_word_plus {
             pattern: r#"^\w+$"#,
-            memory: 1101,
+            memory: 1068,
             min_tier: 1,
             inputs: [
                 ("hello", true),
@@ -6492,7 +6518,7 @@ mod tests {
         }
         test_non_word_plus {
             pattern: r#"^\W+$"#,
-            memory: 1101,
+            memory: 1068,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -6507,7 +6533,7 @@ mod tests {
         }
         test_predefined_mixed {
             pattern: r#"^\d+\s+\w+$"#,
-            memory: 1745,
+            memory: 1646,
             min_tier: 1,
             inputs: [
                 ("42 hello", true),
@@ -6597,7 +6623,7 @@ mod tests {
         }
         test_both_anchors_quantifiers {
             pattern: "^a+b+$",
-            memory: 911,
+            memory: 845,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -6614,7 +6640,7 @@ mod tests {
         }
         test_unanchored_quantifiers {
             pattern: "a+b+",
-            memory: 845,
+            memory: 779,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -6633,7 +6659,7 @@ mod tests {
         }
         test_anchor_start_one_plus {
             pattern: "^a+",
-            memory: 812,
+            memory: 779,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -6648,7 +6674,7 @@ mod tests {
         }
         test_anchor_end_one_plus {
             pattern: "a+$",
-            memory: 812,
+            memory: 779,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -6828,7 +6854,7 @@ mod tests {
         }
         test_multiline_with_dot_plus {
             pattern: "(?m)^.+$",
-            memory: 1101,
+            memory: 1068,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6982,7 +7008,7 @@ mod tests {
         }
         test_crlf_with_dot_plus {
             pattern: "(?Rm)^.+$",
-            memory: 1101,
+            memory: 1068,
             min_tier: 0,
             inputs: [
                 ("abc", true),
@@ -7091,7 +7117,7 @@ mod tests {
         }
         test_word_boundary_quantifiers {
             pattern: r#"\b\w+\b"#,
-            memory: 1101,
+            memory: 1068,
             min_tier: 1,
             inputs: [
                 ("hello", true),
@@ -7131,7 +7157,7 @@ mod tests {
         }
         test_word_boundary_digits_underscore_1 {
             pattern: r#"\b\d+\b"#,
-            memory: 1101,
+            memory: 1068,
             min_tier: 1,
             inputs: [("123", true), (" 456 ", true), ("abc123def", false)],
         }
@@ -7516,7 +7542,7 @@ mod tests {
         }
         test_unanchored_counter_unbounded {
             pattern: "a{2,}",
-            memory: 812,
+            memory: 779,
             min_tier: 1,
             inputs: [
                 ("aa", true),
@@ -7595,7 +7621,7 @@ mod tests {
         }
         test_unanchored_byte_class_1 {
             pattern: r#"\d+"#,
-            memory: 1035,
+            memory: 1002,
             min_tier: 1,
             inputs: [
                 ("123", true),
@@ -7606,7 +7632,7 @@ mod tests {
         }
         test_unanchored_byte_class_2 {
             pattern: r#"\w+"#,
-            memory: 1035,
+            memory: 1002,
             min_tier: 1,
             inputs: [
                 ("hello", true),
@@ -7617,7 +7643,7 @@ mod tests {
         }
         test_unanchored_byte_class_3 {
             pattern: "[a-c]+",
-            memory: 1035,
+            memory: 1002,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -8030,7 +8056,7 @@ mod tests {
         // Word-start and word-end boundary assertions
         test_word_start_basic {
             pattern: r#"\b{start}\w+\b{end}"#,
-            memory: 1101,
+            memory: 1068,
             min_tier: 1,
             inputs: [
                 ("hello", true),
@@ -8512,7 +8538,7 @@ mod tests {
         }
         test_ci_one_plus {
             pattern: "^(?i)a+$",
-            memory: 845,
+            memory: 812,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -8721,7 +8747,7 @@ mod tests {
         }
         test_ci_byte_class_alpha_digit {
             pattern: "^(?i)[a-z0-9]+$",
-            memory: 1101,
+            memory: 1068,
             min_tier: 1,
             inputs: [
                 ("abc123", true),
@@ -8804,7 +8830,7 @@ mod tests {
         }
         test_ci_catenation_one_plus {
             pattern: "^(?i)a+b+c+$",
-            memory: 977,
+            memory: 878,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -8845,7 +8871,7 @@ mod tests {
         }
         test_ci_digit_then_hex {
             pattern: r#"^(?i)\d+[a-f]+$"#,
-            memory: 1423,
+            memory: 1357,
             min_tier: 1,
             inputs: [
                 ("1a", true),
@@ -8864,7 +8890,7 @@ mod tests {
         }
         test_ci_word_class {
             pattern: r#"^(?i)\w+$"#,
-            memory: 1101,
+            memory: 1068,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -9136,7 +9162,7 @@ mod tests {
         }
         test_partial_ci_quantified_group {
             pattern: "^a(?i:b)+c$",
-            memory: 911,
+            memory: 878,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -9291,7 +9317,7 @@ mod tests {
         }
         test_partial_ci_waf_keyword_prefix {
             pattern: r#"(?i:select)\s+\w+"#,
-            memory: 1555,
+            memory: 1489,
             min_tier: 1,
             inputs: [
                 ("select foo", true),
@@ -10172,7 +10198,7 @@ mod tests {
         // lacked dedup, causing the counter to never reach its minimum.)
         test_tier3_varlen_plus_body_dedup {
             pattern: ".a+{9,28}",
-            memory: 1135,
+            memory: 1102,
             min_tier: 3,
             inputs: [
                 ("aaaaaaaaaa", true),      // 10 a's: . + a+{9} (each a+ = 1 a)
@@ -10436,7 +10462,7 @@ mod tests {
         // counter 1 at value 1.
         test_tier3_seed_filtering_revert {
             pattern: "^(0{8,31}(0+x{6,50}1y?)?(a?a?)?)?$",
-            memory: 2331,
+            memory: 2298,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -10672,7 +10698,7 @@ mod tests {
         // counter breaks.
         test_tier3_clean_counter_free_mae_preserves_legit {
             pattern: r"^(.{0,2}|d+)$",
-            memory: 1266,
+            memory: 1233,
             min_tier: 1,
             inputs: [
                 ("", true),        // optional .{0,2} matches empty via 0-count
@@ -10893,7 +10919,7 @@ mod tests {
         // — producing false negatives on long inputs.
         test_tier3_instance_dedup_self_loop {
             pattern: r".a+{9,28}",
-            memory: 1135,
+            memory: 1102,
             min_tier: 3,
             inputs: [
                 ("aaaaaaaaa", false),
@@ -10912,7 +10938,7 @@ mod tests {
         // The `?` makes every input match via the empty-to-`$` path.
         test_tier3_counter_free_mae_optional_group {
             pattern: r"([b-e].+{4,43})?$",
-            memory: 1457,
+            memory: 1424,
             min_tier: 3,
             inputs: [
                 ("zzz", true),
@@ -11970,7 +11996,7 @@ mod tests {
         // should return true.
         test_tier3_cov_contaminated_clean_nb_deferred_pass {
             pattern: r"^(.{3,10}.{3,10}|x+)\b$",
-            memory: 1860,
+            memory: 1827,
             min_tier: 1,
             inputs: [
                 ("xxx", true),           // x+ path, \b at EOI, counter-free
