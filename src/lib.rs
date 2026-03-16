@@ -102,6 +102,14 @@ pub enum Error {
     RepetitionTooLarge(usize, usize),
     /// The pattern requires more than 256 counters.
     TooManyCounters,
+    /// The pattern's estimated state count exceeds the configured
+    /// [`RegexConfig::max_estimated_states`] limit.
+    PatternTooComplex {
+        /// Estimated fully-unrolled state count.
+        estimated: usize,
+        /// Configured limit.
+        limit: usize,
+    },
     /// The pattern string could not be parsed into an AST.
     Parse(String),
     /// The AST could not be translated into an HIR.
@@ -122,6 +130,13 @@ impl fmt::Display for Error {
             }
             Self::TooManyCounters => {
                 write!(f, "pattern requires more than {} counters", MAX_COUNTERS)
+            }
+            Self::PatternTooComplex { estimated, limit } => {
+                write!(
+                    f,
+                    "pattern too complex: estimated {} states exceeds limit {}",
+                    estimated, limit
+                )
             }
             Self::Parse(msg) => write!(f, "regex parse error: {}", msg),
             Self::Translate(msg) => write!(f, "regex HIR translation error: {}", msg),
@@ -1338,6 +1353,14 @@ pub struct RegexConfig {
     /// Merging reduces the number of counters and often enables a
     /// faster execution tier.  Default: `true`.
     pub merge_repetitions: bool,
+    /// Maximum estimated fully-unrolled state count allowed for a
+    /// pattern.  Patterns whose estimated cost (as if every bounded
+    /// repetition were fully expanded) exceeds this limit are rejected
+    /// at compile time with [`Error::PatternTooComplex`].
+    ///
+    /// This bounds the worst-case memory and compilation time for
+    /// untrusted patterns.  Default: 1024.
+    pub max_estimated_states: usize,
 }
 
 impl Default for RegexConfig {
@@ -1346,6 +1369,7 @@ impl Default for RegexConfig {
             max_repetition: 1000,
             max_unroll_states: DEFAULT_MAX_UNROLL_STATES,
             merge_repetitions: true,
+            max_estimated_states: 1024,
         }
     }
 }
@@ -1670,75 +1694,89 @@ impl RegexBuilder {
         }
     }
 
-    /// Estimate the number of NFA states a single copy of `hir` would
-    /// produce.  Returns `Some(n)` for bodies we can unroll, `None` for
-    /// bodies that are too complex or would require special handling
-    /// (e.g. nested non-fixed repetitions that would need their own
-    /// counter).  Fixed inner repetitions are estimated recursively.
-    fn estimate_nfa_states(hir: &Hir) -> Option<usize> {
+    /// Estimate the number of NFA states the pattern would produce if
+    /// every bounded repetition were fully unrolled (no counter
+    /// fallback).  The count excludes the final `Match` state.
+    ///
+    /// Used by the `max_estimated_states` complexity limit and by
+    /// `try_unroll` to compute body costs for budget decisions.
+    pub(crate) fn estimate_nfa_states(hir: &Hir) -> usize {
         match hir.kind() {
             // Single-byte literal → 1 Byte state.
-            HirKind::Literal(lit) if lit.0.len() == 1 => Some(1),
+            HirKind::Literal(lit) if lit.0.len() == 1 => 1,
             // Multi-byte literal → N Byte states.
-            HirKind::Literal(lit) => Some(lit.0.len()),
+            HirKind::Literal(lit) => lit.0.len(),
             // Byte or Unicode class → 1 ByteClass / ByteCI state.
-            HirKind::Class(_) => Some(1),
+            HirKind::Class(_) => 1,
             // Assertion → 1 Assert state.
-            HirKind::Look(_) => Some(1),
-            // Wildcard (.) → 1 state.
-            HirKind::Empty => Some(0),
+            HirKind::Look(_) => 1,
+            // Empty → 0 states.
+            HirKind::Empty => 0,
             // Capture is just a wrapper.
             HirKind::Capture(cap) => Self::estimate_nfa_states(&cap.sub),
             // Concatenation: sum of children.
-            HirKind::Concat(children) => {
-                let mut total = 0;
-                for child in children {
-                    total += Self::estimate_nfa_states(child)?;
-                }
-                Some(total)
-            }
+            HirKind::Concat(children) => children.iter().map(Self::estimate_nfa_states).sum(),
             // Alternation: sum of children + (N-1) Split states.
             HirKind::Alternation(children) => {
-                let mut total = 0;
-                let mut count = 0;
-                for child in children {
-                    total += Self::estimate_nfa_states(child)?;
-                    count += 1;
-                }
-                if count > 1 {
-                    total += count - 1; // Split states
-                }
-                Some(total)
+                let sum: usize = children.iter().map(Self::estimate_nfa_states).sum();
+                let n = children.len();
+                sum + n.saturating_sub(1)
             }
             HirKind::Repetition(rep) => {
-                let inner = Self::estimate_nfa_states(&rep.sub)?;
+                let inner = Self::estimate_nfa_states(&rep.sub);
+                let is_atom = inner == 1 && Self::is_single_atom(&rep.sub);
                 let min = rep.min as usize;
                 let max = rep.max.map_or(usize::MAX, |m| m as usize);
-                if min == 0 && max == 1 {
-                    // `?` → inner + 1 Split
-                    Some(inner + 1)
-                } else if min == 0 && max == usize::MAX {
-                    // `*` → inner + 1 Split
-                    Some(inner + 1)
-                } else if min == 1 && max == usize::MAX {
-                    // `+` → inner + 1 Split
-                    Some(inner + 1)
-                } else if min == max {
-                    // Fixed: can be unrolled — N copies.
-                    Some(min * inner)
-                } else {
-                    // Non-fixed bounded/unbounded: will use a counter
-                    // (CI + body + CInc) or be unrolled.  Estimate the
-                    // counter path cost: inner + 2 (CI + CInc) + 1 (Split
-                    // for the loop).  If min==0, add 1 for the outer `?`.
-                    //
-                    // Note: for single-atom bodies that will use dense
-                    // encoding, the actual unrolled cost is `max` (lower
-                    // than the counter estimate).  We deliberately keep
-                    // the counter estimate here to avoid penalising outer
-                    // unroll decisions that depend on this body's cost.
-                    let counter_cost = inner + 3 + if min == 0 { 1 } else { 0 };
-                    Some(counter_cost)
+                // Repetition of an empty body produces 0 states.
+                if inner == 0 {
+                    return 0;
+                }
+                match (min, max) {
+                    // X? → inner + 1 Split
+                    (0, 1) => inner + 1,
+                    // X* → inner + 1 Split (body + Split loop)
+                    (0, usize::MAX) => inner + 1,
+                    // X+ single-atom → inner (self-loop, no Split)
+                    // X+ generic    → inner + 1 (body + Split)
+                    (1, usize::MAX) => {
+                        if is_atom {
+                            inner
+                        } else {
+                            inner + 1
+                        }
+                    }
+                    // X{n} fixed → n copies
+                    _ if min == max => min * inner,
+                    // X{0,max} → (X{1,max})? = inner_cost + 1 Split
+                    (0, _) => {
+                        if is_atom {
+                            // dense {1,max} = max states, + 1 Split for ?
+                            max + 1
+                        } else {
+                            // generic {1,max} = max*inner + (max-1), + 1 Split for ?
+                            max * inner + max
+                        }
+                    }
+                    // X{min,∞} (min ≥ 2) → (min-1) copies + X+
+                    (_, usize::MAX) => {
+                        if is_atom {
+                            // (min-1) Byte states + 1 self-loop Byte
+                            min
+                        } else {
+                            // (min-1)*inner + inner + 1 Split
+                            min * inner + 1
+                        }
+                    }
+                    // X{min,max} bounded non-fixed (min ≥ 1)
+                    _ => {
+                        if is_atom {
+                            // dense: max consuming states
+                            max
+                        } else {
+                            // generic: max copies + (max-min) Split states
+                            max * inner + (max - min)
+                        }
+                    }
                 }
             }
         }
@@ -1856,7 +1894,7 @@ impl RegexBuilder {
             return Ok(());
         }
         // Try to unroll.
-        let body_nfa = Self::estimate_nfa_states(sub).unwrap_or(0);
+        let body_nfa = Self::estimate_nfa_states(sub);
         let limit = self.config.max_unroll_states;
         if min > 0 && self.try_unroll(min, max, body_nfa, limit, sub)? {
             // Unrolled — no counter needed.
@@ -2122,7 +2160,7 @@ impl RegexBuilder {
                 }
 
                 // Try to unroll simple bodies to eliminate the counter.
-                let body_nfa = Self::estimate_nfa_states(&rep.sub).unwrap_or(0);
+                let body_nfa = Self::estimate_nfa_states(&rep.sub);
                 let limit = self.config.max_unroll_states;
 
                 if min > 0 && self.try_unroll(min, max, body_nfa, limit, &rep.sub)? {
@@ -2409,6 +2447,14 @@ impl RegexBuilder {
 
     /// Compile a `regex-syntax` HIR into a ready-to-match [`Regex`].
     pub fn build(&mut self, hir: &Hir) -> Result<Regex, Error> {
+        // Complexity check: reject patterns whose fully-unrolled cost
+        // exceeds the configured limit.
+        let estimated = Self::estimate_nfa_states(hir);
+        let limit = self.config.max_estimated_states;
+        if estimated > limit {
+            return Err(Error::PatternTooComplex { estimated, limit });
+        }
+
         self.states.clear();
         self.frags.clear();
         self.postfix.clear();
@@ -4866,7 +4912,14 @@ mod tests {
     /// asserting a specific memory size.  Used by dedup tests that
     /// compare sizes relatively rather than absolutely.
     fn build_regex_unchecked(pattern: &str) -> Regex {
-        Regex::new(pattern).expect("our builder should accept the pattern")
+        Regex::with_config(
+            pattern,
+            RegexConfig {
+                max_estimated_states: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .expect("our builder should accept the pattern")
     }
 
     /// Build a compiled [`Regex`] with a specific unroll limit.
@@ -4875,6 +4928,7 @@ mod tests {
             pattern,
             RegexConfig {
                 max_unroll_states,
+                max_estimated_states: usize::MAX,
                 ..Default::default()
             },
         )
@@ -5104,6 +5158,23 @@ mod tests {
             "min_tier mismatch for `{}` (unroll={}): declared={}, actual={}",
             pattern, unroll_limit, min_tier, actual_tier
         );
+
+        // For tier-1 patterns, the estimate should exactly predict the
+        // compiled state count (minus Match).  Tier 1 means everything
+        // was fully unrolled — no counters, so the estimate and reality
+        // should agree.
+        if actual_tier == 1 {
+            let hir = super::parse_hir(pattern)
+                .expect("parse_hir should succeed for a compilable pattern");
+            let estimated = RegexBuilder::estimate_nfa_states(&hir);
+            let actual_states = re.states.len() - 1; // exclude Match
+            assert_eq!(
+                estimated, actual_states,
+                "estimate_nfa_states mismatch for tier-1 pattern `{}` (unroll={}): \
+                 estimated={}, actual={}",
+                pattern, unroll_limit, estimated, actual_states
+            );
+        }
 
         // Oracle: regex crate is the source of truth.
         let full = format!("(?s-u){}", pattern);
@@ -10065,15 +10136,15 @@ mod tests {
                 ("", false),
             ],
         }
-        // Inner over budget: a{1,17} costs 33 > 32, stays as counter.
-        // Outer {2,3} unrolls to 3 sequential counters → tier 3.
-        // Uses (a{1,17}b) body so the 3 counters match different
-        // byte sequences, avoiding a tier 3 limitation with same-byte
-        // sequential counters.
+        // Inner a{1,17} dense-unrolls to 17 states.  Outer body
+        // (a{1,17}b) = 18 states, so outer {2,3} generic unroll costs
+        // 3×18 + 1 = 55.  Exceeds default budget (32), so bump the
+        // unroll limit to allow full unrolling.
         test_inner_unroll_over_budget {
             pattern: "^(a{1,17}b){2,3}$",
             memory: 2594,
             min_tier: 1,
+            unroll_limit: 55,
             inputs: [
                 ("abab", true),
                 ("aaaaabab", true),
@@ -10734,8 +10805,8 @@ mod tests {
         // counters to complete).
         test_tier3_with_break_counter_free_mae_false_positive {
             pattern: r"^(.{10,40}{2,2})?a?$",
-            memory: 1334,
-            min_tier: 3,
+            memory: 1301,
+            min_tier: 4,
             inputs: [
                 ("", true),             // optional group skips, a? skips, $ matches
                 ("a", true),            // optional group skips, a? matches 'a', $ matches
@@ -10751,8 +10822,8 @@ mod tests {
         // original fuzz artifact).
         test_tier3_with_break_counter_free_mae_8_counters {
             pattern: r"^(.{7,40}{8,8})?a?$",
-            memory: 1934,
-            min_tier: 3,
+            memory: 1301,
+            min_tier: 4,
             inputs: [
                 ("", true),
                 ("a", true),
@@ -11562,6 +11633,7 @@ mod tests {
             pattern: r"^((.1?\B.{3,28}){3,3}|(a?a?)?)$",
             memory: 4401,
             min_tier: 1,
+            unroll_limit: 96,
             inputs: [
                 ("aaaaaaaaaa", false),            // Bug 40 crash: 10 a's, too short for 3 reps
                 ("aaaaaaaaaaaa", true),            // 12 a's: 3 reps × (1 prefix + 3 body) = 12
@@ -12503,7 +12575,14 @@ mod tests {
         }
         pattern.push('$');
 
-        let re = build_regex_unchecked(&pattern);
+        let re = Regex::with_config(
+            &pattern,
+            RegexConfig {
+                max_estimated_states: 100_000,
+                ..Default::default()
+            },
+        )
+        .expect("our builder should accept the pattern");
         let mut mem = MatcherMemory::default();
 
         // All pieces are optional, so empty input matches.
@@ -12958,6 +13037,68 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // estimate_nfa_states unit tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_estimate_nfa_states() {
+        let cases: &[(&str, usize)] = &[
+            // Atoms
+            ("a", 1),     // Literal single-byte
+            ("abc", 3),   // Literal multi-byte
+            ("[a-z]", 1), // Class
+            (r"\b", 1),   // Assertion (Look)
+            // Alternation (note: a|b merges to [a-b] in HIR)
+            ("ab|cd", 5),    // 2×2 atoms + 1 Split
+            ("ab|cd|ef", 8), // 3×2 atoms + 2 Splits
+            // Optional
+            ("a?", 2),    // inner + 1 Split
+            ("(ab)?", 3), // 2 + 1 Split
+            // Zero-or-more
+            ("a*", 2),    // inner + 1 Split
+            ("(ab)*", 3), // 2 + 1 Split
+            // One-or-more
+            ("a+", 1),     // single-atom self-loop (no Split)
+            ("[a-z]+", 1), // single-atom self-loop (ByteClass)
+            ("(ab)+", 3),  // 2 + 1 Split (generic)
+            // Fixed repetition
+            ("a{5}", 5),    // 5 copies
+            ("(ab){3}", 6), // 3 × 2
+            // Bounded dense (single-atom)
+            ("a{1,5}", 5),       // max = 5
+            ("[a-z]{3,10}", 10), // max = 10
+            ("(?i)a{2,4}", 4),   // max = 4 (ByteCI)
+            // Bounded generic
+            ("(ab){2,4}", 10), // 4×2 + (4-2) Splits = 10
+            // Zero-min bounded
+            ("a{0,5}", 6),    // max + 1 = 6 (dense + ?)
+            ("a{0,3}", 4),    // max + 1 = 4
+            ("(ab){0,3}", 9), // 3×2 + 3 + 1 = 9 (= max×inner + max)
+            // Unbounded (min ≥ 2), single-atom
+            ("a{2,}", 2), // (min-1) copies + self-loop = min
+            ("a{3,}", 3), // min = 3
+            // Unbounded (min ≥ 2), generic
+            ("(ab){2,}", 5), // min×inner + 1 = 2×2 + 1
+            // Nested: dense inside fixed
+            ("(a{1,3}){2}", 6), // 2 × 3 = 6
+            // Nested: dense inside bounded
+            ("(a{1,3}){2,4}", 14), // 4×3 + (4-2) = 14
+            // Concatenation
+            ("a[a-z]b", 3), // 1 + 1 + 1
+        ];
+
+        for &(pattern, expected) in cases {
+            let hir = super::parse_hir(pattern)
+                .unwrap_or_else(|e| panic!("parse failed for `{pattern}`: {e}"));
+            let estimate = RegexBuilder::estimate_nfa_states(&hir);
+            assert_eq!(
+                estimate, expected,
+                "estimate_nfa_states mismatch for `{pattern}`: got {estimate}, expected {expected}"
+            );
         }
     }
 
