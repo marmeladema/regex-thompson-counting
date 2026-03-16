@@ -1465,6 +1465,14 @@ impl RegexBuilder {
         self
     }
 
+    /// Set the maximum estimated fully-unrolled state count allowed
+    /// for a pattern.  Patterns exceeding this limit are rejected
+    /// at compile time.  Default: 2048.
+    pub fn max_estimated_states(&mut self, limit: usize) -> &mut Self {
+        self.config.max_estimated_states = limit;
+        self
+    }
+
     /// Parse a pattern string and compile it into a [`Regex`].
     ///
     /// Equivalent to parsing the pattern and calling

@@ -93,11 +93,16 @@ fn bench_no_match(c: &mut Criterion) {
     let hir = parse_hir(PATTERN);
     // Default compilation: merges .{0,1000}.{0,1000}.{0,1000} → .{0,3000}
     // (single counter, Tier 2).
-    let rethoc_merged = RegexBuilder::default().build(&hir).unwrap();
+    let rethoc_merged = RegexBuilder::default()
+        .max_estimated_states(4096)
+        .build(&hir)
+        .unwrap();
+    assert_eq!(rethoc_merged.min_tier(), 2);
     // No-merge compilation: preserves 3 separate counters for tier3/tier4/nfa
     // benchmarks that need the multi-counter structure.
     let rethoc_re = RegexBuilder::default()
         .merge_repetitions(false)
+        .max_estimated_states(4096)
         .build(&hir)
         .unwrap();
     let regex_re = regex::bytes::RegexBuilder::new(PATTERN)
@@ -122,6 +127,20 @@ fn bench_no_match(c: &mut Criterion) {
             m.finish();
             b.iter(|| {
                 let mut m = mem.matcher(&rethoc_merged);
+                m.chunk(black_box(hay));
+                black_box(m.finish())
+            })
+        });
+
+        // rethoc tier 2 (merged - differential-counter DFA, 1 counter)
+        group.bench_with_input(BenchmarkId::new("rethoc/tier2", size), &hay, |b, hay| {
+            let mut mem = MatcherMemory::default();
+            // Warm up the DFA cache.
+            let mut m = mem.matcher_for_tier(&rethoc_merged, 2).unwrap();
+            m.chunk(hay);
+            m.finish();
+            b.iter(|| {
+                let mut m = mem.matcher_for_tier(&rethoc_merged, 2).unwrap();
                 m.chunk(black_box(hay));
                 black_box(m.finish())
             })
@@ -183,9 +202,14 @@ fn bench_no_match(c: &mut Criterion) {
 
 fn bench_match_at_end(c: &mut Criterion) {
     let hir = parse_hir(PATTERN);
-    let rethoc_merged = RegexBuilder::default().build(&hir).unwrap();
+    let rethoc_merged = RegexBuilder::default()
+        .max_estimated_states(4096)
+        .build(&hir)
+        .unwrap();
+    assert_eq!(rethoc_merged.min_tier(), 2);
     let rethoc_re = RegexBuilder::default()
         .merge_repetitions(false)
+        .max_estimated_states(4096)
         .build(&hir)
         .unwrap();
     let regex_re = regex::bytes::RegexBuilder::new(PATTERN)
@@ -211,6 +235,19 @@ fn bench_match_at_end(c: &mut Criterion) {
             m.finish();
             b.iter(|| {
                 let mut m = mem.matcher(&rethoc_merged);
+                m.chunk(black_box(hay));
+                black_box(m.finish())
+            })
+        });
+
+        // rethoc tier 2 (merged - differential-counter DFA, 1 counter)
+        group.bench_with_input(BenchmarkId::new("rethoc/tier2", size), &hay, |b, hay| {
+            let mut mem = MatcherMemory::default();
+            let mut m = mem.matcher_for_tier(&rethoc_merged, 2).unwrap();
+            m.chunk(hay);
+            m.finish();
+            b.iter(|| {
+                let mut m = mem.matcher_for_tier(&rethoc_merged, 2).unwrap();
                 m.chunk(black_box(hay));
                 black_box(m.finish())
             })

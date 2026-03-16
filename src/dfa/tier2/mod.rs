@@ -1130,13 +1130,16 @@ impl Tier2DfaCache {
 
             // Counters reachable from deferred assertions (for pre-reset
             // snapshot in step_inner).
-            let dcm = probe.deferred_asserts.iter().fold(0u64, |acc, &assert_idx| {
-                if let State::Assert { out, .. } = regex.states[assert_idx] {
-                    acc | analysis.cinc_reachable_from(out)
-                } else {
-                    acc
-                }
-            });
+            let dcm = probe
+                .deferred_asserts
+                .iter()
+                .fold(0u64, |acc, &assert_idx| {
+                    if let State::Assert { out, .. } = regex.states[assert_idx] {
+                        acc | analysis.cinc_reachable_from(out)
+                    } else {
+                        acc
+                    }
+                });
 
             // For L=1 counter bodies with deferred assertions gating
             // CInc, the probe can't see through the deferred assertion
