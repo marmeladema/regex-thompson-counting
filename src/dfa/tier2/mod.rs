@@ -1550,13 +1550,10 @@ impl<'a> Tier2DfaMatcher<'a> {
         {
             self.current = t.no_break;
             self.match_at_end = t.no_break_is_match_at_end;
-            if t.no_break_is_match {
-                self.ever_matched = true;
-            }
+            self.ever_matched = self.ever_matched || t.no_break_is_match;
             return;
         }
 
-        self.match_at_end = false;
         let mut any_can_break = false;
 
         // Apply pre_seeds BEFORE counter_increment.
@@ -1586,20 +1583,12 @@ impl<'a> Tier2DfaMatcher<'a> {
         // Select DFA successor and record match flags.
         if any_can_break {
             self.current = t.with_break;
-            if t.with_break_is_match {
-                self.ever_matched = true;
-            }
-            if t.with_break_is_match_at_end {
-                self.match_at_end = true;
-            }
+            self.ever_matched = self.ever_matched || t.with_break_is_match;
+            self.match_at_end = t.with_break_is_match_at_end;
         } else {
             self.current = t.no_break;
-            if t.no_break_is_match {
-                self.ever_matched = true;
-            }
-            if t.no_break_is_match_at_end {
-                self.match_at_end = true;
-            }
+            self.ever_matched = self.ever_matched || t.no_break_is_match;
+            self.match_at_end = t.no_break_is_match_at_end;
         }
 
         // Apply counter_reset: clear instances for counters whose body
