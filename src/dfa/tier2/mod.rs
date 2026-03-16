@@ -163,12 +163,6 @@ impl DiffCounter {
         }
     }
 
-    /// Allocate a new instance with value 0 (youngest).
-    #[inline]
-    fn alloc_new(&mut self) {
-        self.alloc_new_with_value(0);
-    }
-
     #[inline]
     fn is_empty(&self) -> bool {
         self.count == 0
@@ -569,6 +563,9 @@ pub(crate) struct CounterState {
     /// Total number of phase slots (sum of num_phases across counters).
     /// Computed once in [`Tier2DfaCache::prepare`].
     total_phases: usize,
+    /// Number of phases with at least one live instance.  Maintained
+    /// incrementally so that [`has_live`](Self::has_live) is O(1).
+    live_count: usize,
 }
 
 impl CounterState {
@@ -577,6 +574,7 @@ impl CounterState {
             phases: Vec::new(),
             meta: Vec::new(),
             total_phases: 0,
+            live_count: 0,
         }
     }
 
@@ -633,6 +631,7 @@ impl CounterState {
         for m in &mut self.meta {
             m.active_phase = 0;
         }
+        self.live_count = 0;
     }
 
     /// Clear everything including metadata (used when switching regex).
@@ -640,6 +639,7 @@ impl CounterState {
         self.phases.clear();
         self.meta.clear();
         self.total_phases = 0;
+        self.live_count = 0;
     }
 
     /// Increment the active phase of counter `c_idx`.
@@ -661,6 +661,9 @@ impl CounterState {
             while !phase.is_empty() && phase.oldest >= max {
                 phase.dealloc_oldest();
             }
+            if phase.is_empty() {
+                self.live_count -= 1;
+            }
         }
         can_break
     }
@@ -671,7 +674,10 @@ impl CounterState {
         let start = self.meta[c_idx].phase_start;
         let end = start + self.meta[c_idx].num_phases;
         for p in &mut self.phases[start..end] {
-            p.clear();
+            if !p.is_empty() {
+                self.live_count -= 1;
+                p.clear();
+            }
         }
     }
 
@@ -690,13 +696,19 @@ impl CounterState {
         let nph = m.num_phases;
         let target_phase = (m.active_phase + nph - 1) % nph;
         let phase_idx = m.phase_start + target_phase;
+        let was_empty = self.phases[phase_idx].is_empty();
         self.phases[phase_idx].alloc_new_with_value(initial_value);
+        if was_empty {
+            self.live_count += 1;
+        }
     }
 
-    /// Check if any phase has live instances.
+    /// Check if any phase has live instances.  O(1) via incremental
+    /// tracking in [`seed`], [`increment`], [`reset_counter`], and
+    /// [`reset`].
     #[inline]
     fn has_live(&self) -> bool {
-        self.phases.iter().any(|p| !p.is_empty())
+        self.live_count > 0
     }
 }
 
@@ -1464,19 +1476,12 @@ impl<'a> Tier2DfaMatcher<'a> {
         // this block is skipped entirely — no counter work at all.
         let mut has_live = false;
         if !cache.start_seeds.is_empty() {
-            // Iterate start_seeds by index to avoid borrow conflict with
-            // seed_counter (which borrows cache mutably).
             let num_start_seeds = cache.start_seeds.len();
             for si in 0..num_start_seeds {
-                let (counter, _initial_value) = cache.start_seeds[si];
-                let c_idx = counter.idx();
-                let m = &cache.counters.meta[c_idx];
-                let nph = m.num_phases;
-                let target_phase = (nph - 1) % nph;
-                let phase_idx = m.phase_start + target_phase;
-                cache.counters.phases[phase_idx].alloc_new();
+                let (counter, initial_value) = cache.start_seeds[si];
+                cache.counters.seed(counter.idx(), initial_value);
             }
-            has_live = true;
+            has_live = cache.counters.has_live();
         }
 
         Tier2DfaMatcher {
@@ -2360,5 +2365,82 @@ mod tests {
         let mut cs = make_counter_state(&[(1, 10, 1)]);
         assert!(!cs.increment(0));
         assert!(!cs.has_live());
+    }
+
+    // ── live_count tracking ──
+
+    #[test]
+    fn test_counter_state_live_count_seed_into_already_live() {
+        // Seeding into an already-live phase should not double-count.
+        let mut cs = make_counter_state(&[(1, 100, 1)]);
+        cs.seed(0, 0);
+        assert!(cs.has_live());
+        assert_eq!(cs.live_count, 1);
+        cs.seed(0, 0); // second instance in same phase
+        assert_eq!(cs.live_count, 1); // still 1 live phase
+    }
+
+    #[test]
+    fn test_counter_state_live_count_increment_evicts_all() {
+        // Single instance, increment to max → evicted → phase empty.
+        let mut cs = make_counter_state(&[(1, 2, 1)]);
+        cs.seed(0, 0);
+        assert_eq!(cs.live_count, 1);
+        cs.increment(0); // value=1
+        assert_eq!(cs.live_count, 1); // still live
+        cs.increment(0); // value=2 == max → evicted
+        assert_eq!(cs.live_count, 0);
+        assert!(!cs.has_live());
+    }
+
+    #[test]
+    fn test_counter_state_live_count_multi_phase() {
+        // body_len=2 → 2 phases.  Seed into different phases.
+        let mut cs = make_counter_state(&[(1, 10, 2)]);
+        // Phase 0 is active initially. seed targets (active + nph - 1) % nph = 1.
+        cs.seed(0, 0);
+        assert_eq!(cs.live_count, 1); // phase 1 is live
+        cs.advance_all_phases(); // active = 1
+        cs.seed(0, 0); // targets (1 + 2 - 1) % 2 = 0
+        assert_eq!(cs.live_count, 2); // both phases live
+        cs.reset_counter(0);
+        assert_eq!(cs.live_count, 0);
+    }
+
+    #[test]
+    fn test_counter_state_live_count_reset_counter_partial() {
+        // Two counters, reset one.
+        let mut cs = make_counter_state(&[(1, 10, 1), (1, 10, 1)]);
+        cs.seed(0, 0);
+        cs.seed(1, 0);
+        assert_eq!(cs.live_count, 2);
+        cs.reset_counter(0);
+        assert_eq!(cs.live_count, 1);
+        cs.reset_counter(1);
+        assert_eq!(cs.live_count, 0);
+    }
+
+    #[test]
+    fn test_counter_state_live_count_reset_already_empty() {
+        // Resetting a counter that's already empty should be harmless.
+        let mut cs = make_counter_state(&[(1, 10, 1)]);
+        assert_eq!(cs.live_count, 0);
+        cs.reset_counter(0); // no-op
+        assert_eq!(cs.live_count, 0);
+    }
+
+    #[test]
+    fn test_counter_state_live_count_through_full_cycle() {
+        // Seed, increment past max (evict), re-seed — live_count
+        // should track correctly through the full lifecycle.
+        let mut cs = make_counter_state(&[(1, 2, 1)]);
+        assert_eq!(cs.live_count, 0);
+        cs.seed(0, 0);
+        assert_eq!(cs.live_count, 1);
+        cs.increment(0); // value=1
+        cs.increment(0); // value=2 == max → evicted
+        assert_eq!(cs.live_count, 0);
+        cs.seed(0, 0); // re-seed
+        assert_eq!(cs.live_count, 1);
     }
 }
