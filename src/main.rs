@@ -1,6 +1,7 @@
 use regex_thompson_counting::{MatcherMemory, Regex, RegexConfig};
 
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Write};
 use std::process;
 
 fn parse_pattern(pattern: &str, config: RegexConfig) -> Regex {
@@ -28,6 +29,7 @@ Commands:
   info  <pattern>                Print diagnostic information about the compiled regex
   dot   <pattern>                Output DOT (Graphviz) representation of the NFA
   match <pattern> <input>...     Match pattern against one or more inputs
+  grep  <pattern> [file]         Print matching lines from file (or stdin)
   dump  <pattern>                Dump compiled NFA states, counters, and analysis
 
 Options:
@@ -60,6 +62,11 @@ enum Command {
         tier: Option<u8>,
         config: RegexConfig,
         debug: bool,
+    },
+    Grep {
+        pattern: String,
+        file: Option<String>,
+        config: RegexConfig,
     },
     Dump {
         pattern: String,
@@ -236,6 +243,17 @@ fn parse_args() -> Command {
                 debug,
             }
         }
+        "grep" => {
+            if positional.len() < 2 || positional.len() > 3 {
+                eprintln!("error: 'grep' command takes a pattern and an optional file");
+                process::exit(1);
+            }
+            Command::Grep {
+                pattern: positional[1].clone(),
+                file: positional.get(2).cloned(),
+                config,
+            }
+        }
         "dump" => {
             if positional.len() != 2 {
                 eprintln!("error: 'dump' command takes exactly one pattern argument");
@@ -380,6 +398,43 @@ fn run_match(
     }
 }
 
+fn run_grep(pattern: &str, file: Option<&str>, config: RegexConfig) {
+    let regex = parse_pattern(pattern, config);
+    let mut memory = MatcherMemory::default();
+
+    let reader: Box<dyn BufRead> = match file {
+        Some(path) => {
+            let f = File::open(path).unwrap_or_else(|e| {
+                eprintln!("error: cannot open {path}: {e}");
+                process::exit(1);
+            });
+            Box::new(BufReader::new(f))
+        }
+        None => Box::new(BufReader::new(io::stdin())),
+    };
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let mut any_matched = false;
+
+    for line_result in reader.lines() {
+        let line = line_result.unwrap_or_else(|e| {
+            eprintln!("error: reading input: {e}");
+            process::exit(1);
+        });
+        let mut matcher = memory.matcher(&regex);
+        matcher.chunk(line.as_bytes());
+        if matcher.finish() {
+            writeln!(out, "{}", line).unwrap();
+            any_matched = true;
+        }
+    }
+
+    if !any_matched {
+        process::exit(1);
+    }
+}
+
 fn main() {
     match parse_args() {
         Command::Info {
@@ -396,6 +451,11 @@ fn main() {
             config,
             debug,
         } => run_match(&pattern, &inputs, chunk_size, tier, config, debug),
+        Command::Grep {
+            pattern,
+            file,
+            config,
+        } => run_grep(&pattern, file.as_deref(), config),
         Command::Dump {
             pattern,
             config,
