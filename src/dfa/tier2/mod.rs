@@ -644,21 +644,19 @@ impl CounterState {
 
     /// Increment the active phase of counter `c_idx`.
     /// Returns `true` if any instance can break (oldest >= min).
-    #[inline]
+    #[inline(always)]
     fn increment(&mut self, c_idx: usize) -> bool {
         let m = &self.meta[c_idx];
         let phase_idx = m.phase_start + m.active_phase;
-        let min = m.min;
-        let max = m.max;
 
         let phase = &mut self.phases[phase_idx];
         if phase.is_empty() {
             return false;
         }
         phase.increment_all();
-        let can_break = phase.oldest >= min;
+        let can_break = phase.oldest >= m.min;
         if can_break {
-            while !phase.is_empty() && phase.oldest >= max {
+            while !phase.is_empty() && phase.oldest >= m.max {
                 phase.dealloc_oldest();
             }
             if phase.is_empty() {
@@ -690,7 +688,7 @@ impl CounterState {
     }
 
     /// Seed a new counter instance into the appropriate phase.
-    #[inline]
+    #[inline(always)]
     fn seed(&mut self, c_idx: usize, initial_value: u32) {
         let m = &self.meta[c_idx];
         let nph = m.num_phases;
