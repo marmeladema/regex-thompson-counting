@@ -12019,7 +12019,7 @@ mod tests {
         // After both counters complete, subsequent bytes (or EOI) go
         // through the fast path while the state is contaminated.
         // Tests that cf_mae uses clean_nb_cf_mae correctly.
-        test_tier3_cov_fast_path_contaminated {
+         test_tier3_cov_fast_path_contaminated {
             pattern: r"^(.{3,5}.{3,5})?$",
             memory: 1431,
             min_tier: 1,
@@ -12030,6 +12030,120 @@ mod tests {
                 ("", true),              // ? skips entirely
                 ("aaaaa", false),        // 5 chars: can't split into 3+3
                 ("aaaaaaaaaaa", false),  // 11 chars: 5+5=10 max + 1 extra
+            ],
+        }
+
+        // ---------------------------------------------------------------
+        // Dense single-atom unroll tests (Byte-exit-branch patch series)
+        // ---------------------------------------------------------------
+
+        // Structural: verify denser NFA for bounded single-atom repeats.
+        test_dense_unroll_byte_a1_20 {
+            pattern: "a{1,20}",
+            memory: 1406,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("aaaaa", true),
+                ("aaaaaaaaaaaaaaaaaaaa", true),  // 20 a's
+                ("aaaaaaaaaaaaaaaaaaaaa", true), // 21 a's (unanchored)
+                ("", false),
+                ("b", false),
+            ],
+        }
+        test_dense_unroll_byteclass_not_slash {
+            pattern: "[^/]{1,20}",
+            memory: 1662,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("hello world", true),
+                ("abcdefghijklmnopqrst", true), // 20 chars
+                ("/", false),
+            ],
+        }
+        test_dense_unroll_digit_3_5 {
+            pattern: r"\d{3,5}",
+            memory: 1167,
+            min_tier: 1,
+            inputs: [
+                ("123", true),
+                ("12345", true),
+                ("1234567", true),    // unanchored, matches first 5
+                ("12", false),
+                ("abc", false),
+            ],
+        }
+
+        // Tier 0 behavior: fused consume-and-branch semantics.
+        test_dense_unroll_a1_3_anchored {
+            pattern: "^a{1,3}$",
+            memory: 911,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("aa", true),
+                ("aaa", true),
+                ("", false),
+                ("aaaa", false),
+                ("b", false),
+            ],
+        }
+        test_dense_unroll_not_slash_1_4 {
+            pattern: "^[^/]{1,4}$",
+            memory: 1200,
+            min_tier: 1,
+            inputs: [
+                ("a", true),
+                ("ab", true),
+                ("abcd", true),
+                ("", false),
+                ("abcde", false),
+                ("/", false),
+            ],
+        }
+        test_dense_unroll_ci_a2_4 {
+            pattern: "^(?i)a{2,4}$",
+            memory: 944,
+            min_tier: 1,
+            inputs: [
+                ("aa", true),
+                ("AA", true),
+                ("aA", true),
+                ("Aaa", true),
+                ("AAAA", true),
+                ("a", false),
+                ("aaaaa", false),
+            ],
+        }
+
+        // Motivating pattern: inner [^/]{1,20} dense-unrolled, outer
+        // {1,10} uses a single counter → Tier 3 (not Tier 4).
+        test_dense_unroll_motivating_path_pattern {
+            pattern: "(?i)file[^/]{1,20}(/[^/]{1,20}){1,10}",
+            memory: 2587,
+            min_tier: 3,
+            inputs: [
+                ("fileA/B", true),
+                ("FILEabcdef/ghij/klmno", true),
+                ("filexxxxxxxxx/y/z/w/v/u/t/s/r/q", true),
+                ("file/x", false),          // inner needs >= 1 non-slash
+                ("FILEx", false),            // needs at least one /...
+            ],
+        }
+
+        // Dense inside counter body: (.{1,5}){1,100}z — the dense
+        // body with out_exit feeds CInc correctly.
+        test_dense_unroll_inside_counter {
+            pattern: "(.{1,5}){1,100}z",
+            memory: 1267,
+            min_tier: 3,
+            inputs: [
+                ("az", true),
+                ("abcdez", true),
+                ("abcdeabcdez", true),
+                ("z", false),        // body needs >= 1 char
+                ("abcdef", false),   // no trailing z
             ],
         }
     }
