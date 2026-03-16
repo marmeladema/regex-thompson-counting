@@ -12340,6 +12340,29 @@ mod tests {
                 ("abcdef", false),   // no trailing z
             ],
         }
+
+        // ---------------------------------------------------------------
+        // Anchor-in-alternation regression tests
+        // ---------------------------------------------------------------
+
+        // (?:^|/) alternation: ^ branch fires at position 0, / branch
+        // fires mid-string.  (?:/|$) at the end mirrors the pattern.
+        test_anchor_alt_open_url {
+            pattern: "(?i)(?:^|/)(?:open-url|open-stack-frame)(?:/|$)",
+            memory: 1667,
+            min_tier: 1,
+            inputs: [
+                ("open-url", true),               // ^ at start, $ at end
+                ("OPEN-URL", true),                // case insensitive
+                ("/open-url/", true),              // / delimited
+                ("foo/open-stack-frame/bar", true), // mid-string / delimited
+                ("open-stack-frame", true),         // ^ at start, $ at end
+                ("/OPEN-STACK-FRAME/", true),       // case insensitive + /
+                ("nope", false),
+                ("open-ur", false),                // prefix only
+                ("xopen-url", false),              // no ^ or / before
+            ],
+        }
     }
 
     /// Tier 2 encodes counter identity in `u64` bitmasks, so patterns with
