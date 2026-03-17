@@ -36,6 +36,7 @@ fn format_byte(b: u8, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 /// Groups consecutive matching bytes into `lo-hi` ranges (or single
 /// values when `lo == hi`).  Uses the same printable/hex notation as
 /// [`format_byte`].
+#[allow(dead_code)]
 fn format_byte_class(class: &ByteClass, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(f, "[")?;
 
@@ -48,6 +49,42 @@ fn format_byte_class(class: &ByteClass, f: &mut fmt::Formatter<'_>) -> fmt::Resu
         }
         let lo = i as u8;
         while i < 256 && class.0[i] {
+            i += 1;
+        }
+        let hi = (i - 1) as u8;
+
+        if !first {
+            write!(f, ", ")?;
+        }
+        first = false;
+
+        if lo == hi {
+            format_byte(lo, f)?;
+        } else {
+            format_byte(lo, f)?;
+            write!(f, "-")?;
+            format_byte(hi, f)?;
+        }
+    }
+    write!(f, "]")
+}
+
+/// Format a [`ByteClassBits`] as a compact set of byte ranges.
+///
+/// Same visual format as [`format_byte_class`] but reads membership
+/// via [`ByteClassBits::contains`].
+fn format_byte_class_bits(class: &crate::ByteClassBits, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "[")?;
+
+    let mut first = true;
+    let mut i: usize = 0;
+    while i < 256 {
+        if !class.contains(i as u8) {
+            i += 1;
+            continue;
+        }
+        let lo = i as u8;
+        while i < 256 && class.contains(i as u8) {
             i += 1;
         }
         let hi = (i - 1) as u8;
@@ -132,12 +169,26 @@ impl fmt::Display for DumpState<'_> {
                 }
                 Ok(())
             }
-            State::ByteClass {
+            State::Wildcard { out, out_exit } => {
+                write!(f, "Wildcard → {out}")?;
+                if out_exit != StateIdx::NONE {
+                    write!(f, " | exit:{out_exit}")?;
+                }
+                Ok(())
+            }
+            State::ByteClassStatic { out, out_exit, .. } => {
+                write!(f, "ByteClassStatic → {out}")?;
+                if out_exit != StateIdx::NONE {
+                    write!(f, " | exit:{out_exit}")?;
+                }
+                Ok(())
+            }
+            State::ByteClassCustom {
                 class,
                 out,
                 out_exit,
             } => {
-                write!(f, "ByteClass(cls:{}) → {out}", class.idx())?;
+                write!(f, "ByteClassCustom(cls:{}) → {out}", class.idx())?;
                 if out_exit != StateIdx::NONE {
                     write!(f, " | exit:{out_exit}")?;
                 }
@@ -253,7 +304,9 @@ fn fmt_origin_effects(
         for (i, oe) in entries {
             let label = match states.get(i) {
                 Some(State::Byte { byte, .. }) => format!("Byte('{}')", *byte as char),
-                Some(State::ByteClass { .. }) => "ByteClass".to_string(),
+                Some(State::Wildcard { .. }) => "Wildcard".to_string(),
+                Some(State::ByteClassStatic { .. }) => "ByteClassStatic".to_string(),
+                Some(State::ByteClassCustom { .. }) => "ByteClassCustom".to_string(),
                 Some(State::ByteTable { .. }) => "ByteTable".to_string(),
                 Some(State::ByteCI { .. }) => "ByteCI".to_string(),
                 _ => "?".to_string(),
@@ -315,7 +368,7 @@ impl fmt::Display for DumpRegex<'_> {
             writeln!(f, "Byte Classes ({}):", r.classes.len())?;
             for (i, class) in r.classes.iter().enumerate() {
                 write!(f, "  cls:{i}: ")?;
-                format_byte_class(class, f)?;
+                format_byte_class_bits(class, f)?;
                 writeln!(f)?;
             }
             writeln!(f)?;

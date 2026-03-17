@@ -20,7 +20,7 @@
 //! that proves `counting_mask.count_ones() <= 1` for all reachable
 //! transitions even when raw byte sets overlap.
 
-use crate::{AssertKind, ByteClass, ByteMap, CounterIdx, State, StateIdx};
+use crate::{AssertKind, ByteClassBits, ByteMap, CounterIdx, State, StateIdx};
 
 // ---------------------------------------------------------------------------
 // Eligibility result
@@ -91,7 +91,7 @@ impl Tier2Eligibility {
 /// (it is shared with other tier checks).
 pub(crate) fn compute_tier2_eligibility(
     states: &[State],
-    classes: &indexmap::set::IndexSet<ByteClass>,
+    classes: &indexmap::set::IndexSet<ByteClassBits>,
     byte_tables: &[ByteMap],
     counters_len: usize,
     has_deferred_in_counter_body: bool,
@@ -178,7 +178,7 @@ fn build_counter_info(
 /// is correct for multiple counters.
 pub(crate) fn counter_bodies_have_disjoint_bytes(
     states: &[State],
-    classes: &indexmap::set::IndexSet<ByteClass>,
+    classes: &indexmap::set::IndexSet<ByteClassBits>,
     byte_tables: &[ByteMap],
 ) -> bool {
     let counter_bytes = collect_counter_byte_sets(states, classes, byte_tables);
@@ -205,7 +205,7 @@ pub(crate) fn counter_bodies_have_disjoint_bytes(
 /// progress).  This causes Tier 2's differential counter model to overcount.
 pub(crate) fn counter_bodies_have_identical_bytes(
     states: &[State],
-    classes: &indexmap::set::IndexSet<ByteClass>,
+    classes: &indexmap::set::IndexSet<ByteClassBits>,
     byte_tables: &[ByteMap],
 ) -> bool {
     let counter_bytes = collect_counter_byte_sets(states, classes, byte_tables);
@@ -225,7 +225,7 @@ pub(crate) fn counter_bodies_have_identical_bytes(
 /// Collect per-counter byte sets (shared by disjoint and identical checks).
 fn collect_counter_byte_sets(
     states: &[State],
-    classes: &indexmap::set::IndexSet<ByteClass>,
+    classes: &indexmap::set::IndexSet<ByteClassBits>,
     byte_tables: &[ByteMap],
 ) -> Vec<(CounterIdx, [bool; 256])> {
     let mut counter_bytes: Vec<(CounterIdx, [bool; 256])> = Vec::new();
@@ -274,15 +274,38 @@ fn collect_counter_byte_sets(
                             stack.push(out_exit);
                         }
                     }
-                    State::ByteClass {
+                    State::Wildcard { out, out_exit } => {
+                        for b in 0..=255u8 {
+                            bytes[b as usize] = true;
+                        }
+                        stack.push(out);
+                        if out_exit != StateIdx::NONE {
+                            stack.push(out_exit);
+                        }
+                    }
+                    State::ByteClassStatic {
+                        table,
+                        out,
+                        out_exit,
+                    } => {
+                        for b in 0..=255u8 {
+                            if table[b as usize] {
+                                bytes[b as usize] = true;
+                            }
+                        }
+                        stack.push(out);
+                        if out_exit != StateIdx::NONE {
+                            stack.push(out_exit);
+                        }
+                    }
+                    State::ByteClassCustom {
                         class,
                         out,
                         out_exit,
-                        ..
                     } => {
-                        let table = &classes[class.idx()];
+                        let bc = &classes[class.idx()];
                         for b in 0..=255u8 {
-                            if table[b] {
+                            if bc.contains(b) {
                                 bytes[b as usize] = true;
                             }
                         }
@@ -368,7 +391,9 @@ pub(crate) fn counter_body_length(
             }
             State::Byte { out, out_exit, .. }
             | State::ByteCI { out, out_exit, .. }
-            | State::ByteClass { out, out_exit, .. } => {
+            | State::Wildcard { out, out_exit }
+            | State::ByteClassStatic { out, out_exit, .. }
+            | State::ByteClassCustom { out, out_exit, .. } => {
                 let nd = depth + 1;
                 let si = out.idx();
                 if !in_stack[si] {
@@ -476,7 +501,9 @@ pub(crate) fn body_has_deferred(
             State::CounterInstance { out, .. } => stack.push(out),
             State::Byte { out, out_exit, .. }
             | State::ByteCI { out, out_exit, .. }
-            | State::ByteClass { out, out_exit, .. } => {
+            | State::Wildcard { out, out_exit }
+            | State::ByteClassStatic { out, out_exit, .. }
+            | State::ByteClassCustom { out, out_exit, .. } => {
                 stack.push(out);
                 if out_exit != StateIdx::NONE {
                     stack.push(out_exit);

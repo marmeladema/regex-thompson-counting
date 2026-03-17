@@ -11,7 +11,7 @@
 use std::fmt;
 
 use crate::memclass::MemclassTable;
-use crate::{ByteClass, ByteMap, State, StateIdx};
+use crate::{ByteMap, State, StateIdx};
 
 /// A prefilter for skipping non-matching bytes in the input.
 ///
@@ -87,7 +87,7 @@ impl fmt::Display for Prefilter {
 pub(crate) fn compute_prefilter(
     start: StateIdx,
     states: &[State],
-    classes: &[ByteClass],
+    classes: &[crate::ByteClassBits],
     byte_tables: &[ByteMap],
 ) -> Prefilter {
     let mut start_bytes = [false; 256];
@@ -120,9 +120,23 @@ pub(crate) fn compute_prefilter(
                 start_bytes[(byte ^ 0x20) as usize] = true;
                 found_any = true;
             }
-            State::ByteClass { class, .. } => {
+            State::Wildcard { .. } => {
                 for b in 0..=255u8 {
-                    if classes[class.idx()][b] {
+                    start_bytes[b as usize] = true;
+                }
+                found_any = true;
+            }
+            State::ByteClassStatic { table, .. } => {
+                for b in 0..=255u8 {
+                    if table[b as usize] {
+                        start_bytes[b as usize] = true;
+                    }
+                }
+                found_any = true;
+            }
+            State::ByteClassCustom { class, .. } => {
+                for b in 0..=255u8 {
+                    if classes[class.idx()].contains(b) {
                         start_bytes[b as usize] = true;
                     }
                 }

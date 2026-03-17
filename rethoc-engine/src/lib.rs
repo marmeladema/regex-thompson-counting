@@ -150,49 +150,8 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// A 256-entry boolean lookup table indicating which byte values belong
-/// to a character class.  `class[b]` is `true` when byte `b` matches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct ByteClass([bool; 256]);
-
-impl ByteClass {
-    /// A class that matches every byte value (`[true; 256]` — equivalent to `.`).
-    #[allow(dead_code)]
-    const ALL: Self = Self([true; 256]);
-
-    /// A class that matches no byte value.
-    const NONE: Self = Self([false; 256]);
-}
-
-/// `class[byte]` — test whether a byte matches this class.
-impl Index<u8> for ByteClass {
-    type Output = bool;
-
-    #[inline]
-    fn index(&self, byte: u8) -> &bool {
-        &self.0[byte as usize]
-    }
-}
-
-/// Index into the byte-class lookup tables ([`Regex::classes`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct ClassIdx(usize);
-
-impl ClassIdx {
-    #[inline]
-    fn idx(self) -> usize {
-        self.0
-    }
-}
-
-/// `classes[class_idx]` — typed access to byte-class lookup tables.
-impl Index<ClassIdx> for [ByteClass] {
-    type Output = ByteClass;
-
-    #[inline]
-    fn index(&self, idx: ClassIdx) -> &ByteClass {
-        &self[idx.idx()]
-    }
-}
+mod classes;
+pub(crate) use classes::{ByteClass, ByteClassBits, ClassIdx, static_classes};
 
 /// Index into the byte-dispatch tables ([`Regex::byte_tables`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -519,8 +478,8 @@ impl AssertKind {
 ///
 /// Epsilon states (`Split`, `CounterInstance`, `CounterIncrement`,
 /// `Assert`) are followed during [`Matcher::addstate`].
-/// Byte-consuming states (`Byte`, `ByteClass`) are stepped over in
-/// [`Matcher::step`].
+/// Byte-consuming states (`Byte`, `Wildcard`, `ByteClassStatic`,
+/// `ByteClassCustom`) are stepped over in [`Matcher::step`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum State {
     /// Epsilon fork: follow both `out` and `out1`.
@@ -563,7 +522,7 @@ pub(crate) enum State {
     /// Matches both `byte` and `byte ^ 0x20` (the uppercase variant)
     /// via [`byte_match_ci`].
     ///
-    /// Emitted instead of [`ByteClass`] when the class contains exactly
+    /// Emitted instead of a byte-class state when the class contains exactly
     /// one ASCII letter pair (e.g. `[cC]` under `(?i)`).  Avoids the
     /// 256-byte class table lookup — match is a single `OR` + `CMP`.
     ///
@@ -575,16 +534,35 @@ pub(crate) enum State {
         out_exit: StateIdx,
     },
 
-    /// Match any byte in the class (lookup table), then follow `out`.
-    ///
-    /// `class` is an index into [`Regex::classes`], a side-table of
-    /// [`ByteClass`] lookup tables — one per possible byte value.
-    /// A full-range table ([`ByteClass::ALL`]) is equivalent to the old
-    /// `Wildcard` state.
+    /// Match any byte (wildcard `.`), then follow `out`.
     ///
     /// When `out_exit != StateIdx::NONE`, behaves as a fused
-    /// `ConsumeClass(class) → Split(out, out_exit)`.
-    ByteClass {
+    /// `ConsumeAny → Split(out, out_exit)`.
+    Wildcard { out: StateIdx, out_exit: StateIdx },
+
+    /// Match a byte using a predefined static class table (e.g.
+    /// `\d`, `\w`, `\s` and their negations), then follow `out`.
+    ///
+    /// `table` points to a `[bool; 256]` in `.rodata` — no heap
+    /// allocation.
+    ///
+    /// When `out_exit != StateIdx::NONE`, behaves as a fused
+    /// `ConsumeStaticClass → Split(out, out_exit)`.
+    ByteClassStatic {
+        table: &'static [bool; 256],
+        out: StateIdx,
+        out_exit: StateIdx,
+    },
+
+    /// Match a byte using a custom class (bit-packed lookup), then
+    /// follow `out`.
+    ///
+    /// `class` is an index into [`Regex::classes`], a side-table of
+    /// [`ByteClassBits`] bit arrays.
+    ///
+    /// When `out_exit != StateIdx::NONE`, behaves as a fused
+    /// `ConsumeCustomClass → Split(out, out_exit)`.
+    ByteClassCustom {
         class: ClassIdx,
         out: StateIdx,
         out_exit: StateIdx,
@@ -619,13 +597,14 @@ pub(crate) enum State {
 /// fragment construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PatchSlot {
-    /// The primary `out` field (Byte, ByteCI, ByteClass, CounterInstance,
-    /// Assert, Split.out).
+    /// The primary `out` field (Byte, ByteCI, Wildcard, ByteClassStatic,
+    /// ByteClassCustom, CounterInstance, Assert, Split.out).
     Out,
     /// The secondary `out1` field (Split.out1, CounterIncrement.out1).
     Out1,
     /// The exit edge on consuming states (Byte.out_exit, ByteCI.out_exit,
-    /// ByteClass.out_exit).  Wired up when `out_exit` fields are added.
+    /// Wildcard.out_exit, ByteClassStatic.out_exit, ByteClassCustom.out_exit).
+    /// Wired up when `out_exit` fields are added.
     #[allow(dead_code)]
     OutExit,
 }
@@ -652,7 +631,9 @@ fn patch_slot_mut(state: &mut State, slot: PatchSlot) -> &mut StateIdx {
         PatchSlot::Out => match state {
             State::Byte { out, .. }
             | State::ByteCI { out, .. }
-            | State::ByteClass { out, .. }
+            | State::Wildcard { out, .. }
+            | State::ByteClassStatic { out, .. }
+            | State::ByteClassCustom { out, .. }
             | State::CounterInstance { out, .. }
             | State::Assert { out, .. }
             | State::Split { out, .. }
@@ -672,7 +653,9 @@ fn patch_slot_mut(state: &mut State, slot: PatchSlot) -> &mut StateIdx {
         PatchSlot::OutExit => match state {
             State::Byte { out_exit, .. }
             | State::ByteCI { out_exit, .. }
-            | State::ByteClass { out_exit, .. } => out_exit,
+            | State::Wildcard { out_exit, .. }
+            | State::ByteClassStatic { out_exit, .. }
+            | State::ByteClassCustom { out_exit, .. } => out_exit,
             _ => panic!(
                 "patch_slot_mut: PatchSlot::OutExit not available on {:?}",
                 state
@@ -779,8 +762,12 @@ enum RegexHirNode {
     RepeatZeroOne,
     RepeatZeroPlus,
     RepeatOnePlus,
-    /// Index into [`RegexBuilder::classes`].
-    ByteClass(ClassIdx),
+    /// Wildcard: matches any byte.
+    Wildcard,
+    /// Predefined static byte class (e.g. `\d`, `\w`, `\s`).
+    ByteClassStatic(&'static [bool; 256]),
+    /// Custom byte class — index into [`RegexBuilder::classes`].
+    ByteClassCustom(ClassIdx),
     /// Single-copy counter loop: pops the body fragment and wires
     /// CI → body → CInc with a break exit.
     CounterLoop {
@@ -832,8 +819,9 @@ pub struct Regex {
     pub(crate) start: StateIdx,
     /// Number of counter variables allocated during compilation.
     pub(crate) num_counters: usize,
-    /// Byte-class lookup tables referenced by [`State::ByteClass::class`].
-    pub(crate) classes: Box<[ByteClass]>,
+    /// Byte-class lookup tables ([`ByteClassBits`]) referenced by
+    /// [`State::ByteClassCustom::class`].
+    pub(crate) classes: Box<[ByteClassBits]>,
     /// Byte dispatch tables referenced by [`State::ByteTable::table`].
     /// Each entry maps a byte value to a target state index, or
     /// [`StateIdx::NONE`] for "no transition".
@@ -841,7 +829,8 @@ pub struct Regex {
     /// Precomputed epsilon closure of the start state (consuming leaves only).
     ///
     /// If the start state's epsilon closure contains only `Split` transitions
-    /// leading to consuming states (`Byte`, `ByteClass`, `ByteTable`) or
+    /// leading to consuming states (`Byte`, `Wildcard`, `ByteClassStatic`,
+    /// `ByteClassCustom`, `ByteTable`) or
     /// `Match`, the consuming leaves are cached here.  `Match` states are
     /// recorded separately in [`start_closure_matches`] and excluded from
     /// this array so the re-seed loop needs no per-state type check.
@@ -986,7 +975,7 @@ impl Regex {
     pub fn memory_size(&self) -> usize {
         let inline = std::mem::size_of::<Self>();
         let states_alloc = self.states.len() * std::mem::size_of::<State>();
-        let classes_alloc = self.classes.len() * std::mem::size_of::<ByteClass>();
+        let classes_alloc = self.classes.len() * std::mem::size_of::<ByteClassBits>();
         let byte_tables_alloc = self.byte_tables.len() * std::mem::size_of::<ByteMap>();
         let reach_match_alloc = self.state_can_reach_match.len() * std::mem::size_of::<bool>();
         let break_match_alloc = self.counter_break_can_match.len() * std::mem::size_of::<bool>();
@@ -1038,7 +1027,9 @@ impl Regex {
                 State::Split { .. } => n_split += 1,
                 State::Byte { .. } => n_byte += 1,
                 State::ByteCI { .. } => n_byte_ci += 1,
-                State::ByteClass { .. } => n_byte_class += 1,
+                State::Wildcard { .. }
+                | State::ByteClassStatic { .. }
+                | State::ByteClassCustom { .. } => n_byte_class += 1,
                 State::ByteTable { .. } => n_byte_table += 1,
                 State::Assert { .. } => n_assert += 1,
                 State::CounterInstance { .. } => n_counter_instance += 1,
@@ -1103,12 +1094,12 @@ impl Regex {
             memory: MemoryInfo {
                 total: self.memory_size(),
                 states: self.states.len() * std::mem::size_of::<State>(),
-                classes: self.classes.len() * std::mem::size_of::<ByteClass>(),
+                classes: self.classes.len() * std::mem::size_of::<ByteClassBits>(),
                 byte_tables: self.byte_tables.len() * std::mem::size_of::<ByteMap>(),
                 num_states: self.states.len(),
                 state_size: std::mem::size_of::<State>(),
                 num_classes: self.classes.len(),
-                class_size: std::mem::size_of::<ByteClass>(),
+                class_size: std::mem::size_of::<ByteClassBits>(),
                 num_byte_tables: self.byte_tables.len(),
                 byte_table_size: std::mem::size_of::<ByteMap>(),
             },
@@ -1216,15 +1207,40 @@ impl Regex {
                     writeln!(buffer, "\t{} -> {} [style=dashed];", idx, out_exit).unwrap();
                 }
             }
-            State::ByteClass {
+            State::Wildcard { out, out_exit } => {
+                stack.push(out);
+                writeln!(buffer, "\t{} -> {} [label=\".\"];", idx, out).unwrap();
+                if out_exit != StateIdx::NONE {
+                    writeln!(buffer, "\t{} -> {} [style=dashed];", idx, out_exit).unwrap();
+                }
+            }
+            State::ByteClassStatic {
+                table,
+                out,
+                out_exit,
+            } => {
+                stack.push(out);
+                let count = table.iter().filter(|&&b| b).count();
+                if count == 256 {
+                    writeln!(buffer, "\t{} -> {} [label=\".\"];", idx, out).unwrap();
+                } else {
+                    writeln!(buffer, "\t{} -> {} [label=\"[{}B]\"];", idx, out, count).unwrap();
+                }
+                if out_exit != StateIdx::NONE {
+                    writeln!(buffer, "\t{} -> {} [style=dashed];", idx, out_exit).unwrap();
+                }
+            }
+            State::ByteClassCustom {
                 class,
                 out,
                 out_exit,
             } => {
                 stack.push(out);
-                // Summarise the class for the label.
-                let table = &self.classes[class];
-                let count = table.0.iter().filter(|&&b| b).count();
+                let count: u32 = self.classes[class.idx()]
+                    .0
+                    .iter()
+                    .map(|w| w.count_ones())
+                    .sum();
                 if count == 256 {
                     writeln!(buffer, "\t{} -> {} [label=\".\"];", idx, out).unwrap();
                 } else {
@@ -1363,8 +1379,8 @@ pub struct RegexBuilder {
     frags: Vec<Fragment>,
     counters: Vec<usize>,
     /// Deduplicated byte-class lookup tables; indices are stored in
-    /// [`RegexHirNode::ByteClass`] and [`State::ByteClass`].
-    classes: IndexSet<ByteClass>,
+    /// [`RegexHirNode::ByteClassCustom`] and [`State::ByteClassCustom`].
+    classes: IndexSet<ByteClassBits>,
     /// Byte dispatch tables created by the post-construction
     /// [`optimize_byte_tables`](Self::optimize_byte_tables) pass.
     byte_tables: Vec<ByteMap>,
@@ -1449,11 +1465,12 @@ impl RegexBuilder {
 
     /// Return the index of `table` in `self.classes`, inserting it if it
     /// is not already present.  Identical tables are deduplicated so that
-    /// patterns like `\d{3,5}` (which unroll to multiple ByteClass states)
+    /// patterns like `\d{3,5}` (which unroll to multiple byte-class states)
     /// share a single lookup table.
     fn intern_class(&mut self, table: ByteClass) -> ClassIdx {
-        let (idx, _) = self.classes.insert_full(table);
-        ClassIdx(idx)
+        let bits = table.to_bits();
+        let (idx, _) = self.classes.insert_full(bits);
+        ClassIdx(idx as u16)
     }
 
     /// Detect a case-insensitive ASCII letter pair in a byte-class.
@@ -1527,7 +1544,7 @@ impl RegexBuilder {
     /// index for that byte and `num_classes` is the total count.
     fn compute_byte_classes(
         states: &[State],
-        classes: &[ByteClass],
+        classes: &[ByteClassBits],
         byte_tables: &[ByteMap],
         has_deferred_assert: bool,
     ) -> ([u8; 256], usize) {
@@ -1547,7 +1564,9 @@ impl RegexBuilder {
             .filter_map(|(i, s)| match s {
                 State::Byte { .. }
                 | State::ByteCI { .. }
-                | State::ByteClass { .. }
+                | State::Wildcard { .. }
+                | State::ByteClassStatic { .. }
+                | State::ByteClassCustom { .. }
                 | State::ByteTable { .. } => Some(i),
                 _ => None,
             })
@@ -1599,12 +1618,32 @@ impl RegexBuilder {
                         }
                         continue;
                     }
-                    State::ByteClass {
+                    State::Wildcard { out, out_exit } => {
+                        // Wildcard always matches.
+                        sig.push(1 + out.0);
+                        sig.push(out_exit.0);
+                        continue;
+                    }
+                    State::ByteClassStatic {
+                        table,
+                        out,
+                        out_exit,
+                    } => {
+                        if table[b as usize] {
+                            sig.push(1 + out.0);
+                            sig.push(out_exit.0);
+                        } else {
+                            sig.push(0);
+                            sig.push(0);
+                        }
+                        continue;
+                    }
+                    State::ByteClassCustom {
                         class,
                         out,
                         out_exit,
                     } => {
-                        if classes[class][b] {
+                        if classes[class.idx()].contains(b) {
                             sig.push(1 + out.0);
                             sig.push(out_exit.0);
                         } else {
@@ -1646,12 +1685,12 @@ impl RegexBuilder {
     /// repetitions share the same body copy (each gets its own counter
     /// index, no remapping needed).
     /// Returns `true` if `hir` lowers to a single consuming atom state
-    /// (`Byte`, `ByteCI`, or `ByteClass`).
+    /// (`Byte`, `ByteCI`, `Wildcard`, `ByteClassStatic`, or `ByteClassCustom`).
     fn is_single_atom(hir: &Hir) -> bool {
         match hir.kind() {
             // Single-byte literal → 1 Byte state.
             HirKind::Literal(lit) if lit.0.len() == 1 => true,
-            // Byte or Unicode class → 1 ByteClass / ByteCI state.
+            // Byte or Unicode class → 1 byte-class / ByteCI state.
             HirKind::Class(_) => true,
             // Capture is just a wrapper.
             HirKind::Capture(cap) => Self::is_single_atom(&cap.sub),
@@ -1671,7 +1710,7 @@ impl RegexBuilder {
             HirKind::Literal(lit) if lit.0.len() == 1 => 1,
             // Multi-byte literal → N Byte states.
             HirKind::Literal(lit) => lit.0.len(),
-            // Byte or Unicode class → 1 ByteClass / ByteCI state.
+            // Byte or Unicode class → 1 byte-class / ByteCI state.
             HirKind::Class(_) => 1,
             // Assertion → 1 Assert state.
             HirKind::Look(_) => 1,
@@ -1939,8 +1978,15 @@ impl RegexBuilder {
                         table.0[b as usize] = true;
                     }
                 }
-                let idx = self.intern_class(table);
-                self.postfix.push(RegexHirNode::ByteClass(idx));
+                if table.is_all() {
+                    self.postfix.push(RegexHirNode::Wildcard);
+                } else if let Some(static_table) = static_classes::detect(&table.0) {
+                    self.postfix
+                        .push(RegexHirNode::ByteClassStatic(static_table));
+                } else {
+                    let idx = self.intern_class(table);
+                    self.postfix.push(RegexHirNode::ByteClassCustom(idx));
+                }
                 Ok(())
             }
             HirKind::Class(hir::Class::Unicode(class)) => {
@@ -1967,8 +2013,15 @@ impl RegexBuilder {
                         table.0[b as usize] = true;
                     }
                 }
-                let idx = self.intern_class(table);
-                self.postfix.push(RegexHirNode::ByteClass(idx));
+                if table.is_all() {
+                    self.postfix.push(RegexHirNode::Wildcard);
+                } else if let Some(static_table) = static_classes::detect(&table.0) {
+                    self.postfix
+                        .push(RegexHirNode::ByteClassStatic(static_table));
+                } else {
+                    let idx = self.intern_class(table);
+                    self.postfix.push(RegexHirNode::ByteClassCustom(idx));
+                }
                 Ok(())
             }
             HirKind::Look(look) => {
@@ -2242,7 +2295,9 @@ impl RegexBuilder {
                         self.states.as_slice()[e.start],
                         State::Byte { out_exit, .. }
                         | State::ByteCI { out_exit, .. }
-                        | State::ByteClass { out_exit, .. }
+                        | State::Wildcard { out_exit, .. }
+                        | State::ByteClassStatic { out_exit, .. }
+                        | State::ByteClassCustom { out_exit, .. }
                             if out_exit == StateIdx::NONE
                     )
                 {
@@ -2361,7 +2416,9 @@ impl RegexBuilder {
                     cursor = match self.states.as_slice()[cursor] {
                         State::Byte { out, .. }
                         | State::ByteCI { out, .. }
-                        | State::ByteClass { out, .. } => out,
+                        | State::Wildcard { out, .. }
+                        | State::ByteClassStatic { out, .. }
+                        | State::ByteClassCustom { out, .. } => out,
                         _ => unreachable!(),
                     };
                 }
@@ -2369,8 +2426,23 @@ impl RegexBuilder {
 
                 Fragment::with_outs(prev, outs)
             }
-            RegexHirNode::ByteClass(class) => {
-                let idx = self.state(State::ByteClass {
+            RegexHirNode::Wildcard => {
+                let idx = self.state(State::Wildcard {
+                    out: StateIdx::NONE,
+                    out_exit: StateIdx::NONE,
+                });
+                Fragment::new(idx, idx)
+            }
+            RegexHirNode::ByteClassStatic(table) => {
+                let idx = self.state(State::ByteClassStatic {
+                    table,
+                    out: StateIdx::NONE,
+                    out_exit: StateIdx::NONE,
+                });
+                Fragment::new(idx, idx)
+            }
+            RegexHirNode::ByteClassCustom(class) => {
+                let idx = self.state(State::ByteClassCustom {
                     class,
                     out: StateIdx::NONE,
                     out_exit: StateIdx::NONE,
@@ -2610,7 +2682,9 @@ impl RegexBuilder {
                             // behind byte-consuming instructions.
                             State::Byte { out, out_exit, .. }
                             | State::ByteCI { out, out_exit, .. }
-                            | State::ByteClass { out, out_exit, .. } => {
+                            | State::Wildcard { out, out_exit, .. }
+                            | State::ByteClassStatic { out, out_exit, .. }
+                            | State::ByteClassCustom { out, out_exit, .. } => {
                                 stack.push(out);
                                 if out_exit != StateIdx::NONE {
                                     stack.push(out_exit);
@@ -2708,7 +2782,7 @@ impl RegexBuilder {
         let mut tier2_overlap_proven = false;
 
         // Compute byte equivalence classes before moving data out.
-        let classes_slice: Vec<ByteClass> = self.classes.iter().copied().collect();
+        let classes_slice: Vec<ByteClassBits> = self.classes.iter().copied().collect();
         let byte_tables_slice: Vec<ByteMap> = self.byte_tables.to_vec();
         // Deferred assertions need word-ness splitting.
         let has_any_deferred = self.states.iter().any(|s| {
@@ -2852,7 +2926,7 @@ impl RegexBuilder {
 
     /// Try to collect all `Byte` leaf states reachable from `idx` through
     /// a pure `Split` chain.  Returns `None` if any leaf is not a `Byte`
-    /// state (e.g. `ByteClass`, `CounterInstance`, etc.) or if two leaves
+    /// state (e.g. `ByteClassCustom`, `CounterInstance`, etc.) or if two leaves
     /// share the same byte value.
     fn collect_byte_leaves(&self, idx: StateIdx, out: &mut Vec<(u8, StateIdx)>) -> bool {
         match self.states.as_slice()[idx] {
@@ -2923,7 +2997,8 @@ impl RegexBuilder {
     // -----------------------------------------------------------------------
 
     /// Walk the epsilon closure of `start` through `Split` states only.
-    /// If every leaf is a consuming state (`Byte`, `ByteClass`, `ByteTable`)
+    /// If every leaf is a consuming state (`Byte`, `Wildcard`, `ByteClassStatic`,
+    /// `ByteClassCustom`, `ByteTable`)
     /// or `Match`, return the collected list.  Returns `None` if any
     /// `CounterInstance`, `CounterIncrement`, or `Assert` is encountered,
     /// since those require context manipulation during traversal.
@@ -2932,8 +3007,9 @@ impl RegexBuilder {
     /// `result[i]` is `true` iff the `Match` state is reachable from state `i`
     /// through epsilon transitions: `Split`, `Assert` (optimistically — any
     /// assertion is assumed passable), `CounterInstance`, and the continue
-    /// path of `CounterIncrement`.  Consuming states (`Byte`, `ByteClass`,
-    /// `ByteTable`, `ByteCI`) block the walk.
+    /// path of `CounterIncrement`.  Consuming states (`Byte`, `Wildcard`,
+    /// `ByteClassStatic`, `ByteClassCustom`, `ByteTable`, `ByteCI`) block
+    /// the walk.
     fn compute_can_reach_match(states: &[State]) -> Box<[bool]> {
         let n = states.len();
         let mut result = vec![false; n];
@@ -3015,7 +3091,9 @@ impl RegexBuilder {
                 }
                 State::Byte { .. }
                 | State::ByteCI { .. }
-                | State::ByteClass { .. }
+                | State::Wildcard { .. }
+                | State::ByteClassStatic { .. }
+                | State::ByteClassCustom { .. }
                 | State::ByteTable { .. } => {
                     leaves.push(idx);
                 }
@@ -3617,8 +3695,9 @@ impl<'a> fmt::Display for AnyMatcher<'a> {
 #[derive(Debug)]
 pub struct NfaMatcher<'a> {
     states: &'a [State],
-    /// Byte-class lookup tables referenced by [`State::ByteClass::class`].
-    classes: &'a [ByteClass],
+    /// Byte-class lookup tables ([`ByteClassBits`]) referenced by
+    /// [`State::ByteClassCustom::class`].
+    classes: &'a [ByteClassBits],
     /// Byte dispatch tables referenced by [`State::ByteTable::table`].
     byte_tables: &'a [ByteMap],
     /// Per-state deduplication stamp (compared against `listid`).
@@ -3879,7 +3958,9 @@ impl<'a> NfaMatcher<'a> {
                         // Consuming states: record in nlist for step().
                         State::Byte { .. }
                         | State::ByteCI { .. }
-                        | State::ByteClass { .. }
+                        | State::Wildcard { .. }
+                        | State::ByteClassStatic { .. }
+                        | State::ByteClassCustom { .. }
                         | State::ByteTable { .. } => {
                             self.addstack.push(AddStateOp::PostPush(idx, ctx));
                         }
@@ -3980,11 +4061,17 @@ impl<'a> NfaMatcher<'a> {
                     out,
                     out_exit,
                 } if byte_match_ci(b, b2) => (out, out_exit),
-                State::ByteClass {
+                State::Wildcard { out, out_exit } => (out, out_exit),
+                State::ByteClassStatic {
+                    table,
+                    out,
+                    out_exit,
+                } if table[b as usize] => (out, out_exit),
+                State::ByteClassCustom {
                     class,
                     out,
                     out_exit,
-                } if self.classes[class][b] => (out, out_exit),
+                } if self.classes[class.idx()].contains(b) => (out, out_exit),
                 State::ByteTable { table } => {
                     let t = self.byte_tables[table][b];
                     if t == StateIdx::NONE {
@@ -4509,9 +4596,9 @@ mod tests {
 
     #[test]
     fn test_byte_table_no_optimization_on_byte_class_leaf() {
-        // ([a-c]x|dy|ez) — leaves are ByteClass, not Byte, for [a-c].
+        // ([a-c]x|dy|ez) — leaves are byte-class, not Byte, for [a-c].
         let re = build_regex_unchecked("^([a-c]x|dy|ez)$");
-        // The Split should not be optimised since [a-c] is a ByteClass leaf.
+        // The Split should not be optimised since [a-c] is a byte-class leaf.
         assert_eq!(count_byte_tables(&re), 0);
         let mut mem = MatcherMemory::default();
         for input in &[b"ax" as &[u8], b"bx", b"cx", b"dy", b"ez"] {
@@ -4696,7 +4783,7 @@ mod tests {
     }
 
     // -- ByteTable: surrounding literal context ------------------------------
-    // -- ByteTable: single-char branches → ByteClass (no optimisation) -------
+    // -- ByteTable: single-char branches → byte-class (no optimisation) ------
 
     /// `(a|b|c)` is collapsed to `[abc]` by regex-syntax, so no ByteTable.
     #[test]
@@ -4705,7 +4792,7 @@ mod tests {
         assert_eq!(
             count_byte_tables(&re),
             0,
-            "single-char alt should be ByteClass, not ByteTable"
+            "single-char alt should be byte-class, not ByteTable"
         );
         // Still matches correctly.
         let mut mem = MatcherMemory::default();
@@ -4722,7 +4809,7 @@ mod tests {
     }
 
     /// `(a|b|c|d|e|f|g)` — even many single-char branches become one
-    /// ByteClass, not a ByteTable.
+    /// byte-class, not a ByteTable.
     #[test]
     fn test_byte_table_many_single_char_alt_still_byte_class() {
         let re = build_regex_unchecked("^(a|b|c|d|e|f|g)$");
@@ -5310,7 +5397,58 @@ mod tests {
                 }
             }
 
-            State::ByteClass {
+            State::Wildcard { out: next, .. } => {
+                if out.len() >= GEN_MAX_INPUT_LEN {
+                    return false;
+                }
+                // Wildcard matches any byte; prefer 'a'.
+                out.push(b'a');
+                if gen_walk_rec(
+                    regex,
+                    next,
+                    schedule,
+                    counter_counts,
+                    out,
+                    GEN_EPSILON_BUDGET,
+                    steps,
+                ) {
+                    true
+                } else {
+                    out.pop();
+                    false
+                }
+            }
+
+            State::ByteClassStatic {
+                table, out: next, ..
+            } => {
+                if out.len() >= GEN_MAX_INPUT_LEN {
+                    return false;
+                }
+                // Prefer 'a' (word char), then '0', ' ', then first match.
+                let byte = [b'a', b'0', b' ']
+                    .into_iter()
+                    .find(|&b| table[b as usize])
+                    .or_else(|| (0..=255u8).find(|&b| table[b as usize]));
+                let Some(byte) = byte else { return false };
+                out.push(byte);
+                if gen_walk_rec(
+                    regex,
+                    next,
+                    schedule,
+                    counter_counts,
+                    out,
+                    GEN_EPSILON_BUDGET,
+                    steps,
+                ) {
+                    true
+                } else {
+                    out.pop();
+                    false
+                }
+            }
+
+            State::ByteClassCustom {
                 class, out: next, ..
             } => {
                 if out.len() >= GEN_MAX_INPUT_LEN {
@@ -5320,8 +5458,8 @@ mod tests {
                 // Prefer 'a' (word char), then '0', ' ', then first match.
                 let byte = [b'a', b'0', b' ']
                     .into_iter()
-                    .find(|&b| bc[b])
-                    .or_else(|| (0..=255u8).find(|&b| bc[b]));
+                    .find(|&b| bc.contains(b))
+                    .or_else(|| (0..=255u8).find(|&b| bc.contains(b)));
                 let Some(byte) = byte else { return false };
                 out.push(byte);
                 if gen_walk_rec(
@@ -5494,7 +5632,7 @@ mod tests {
     match_tests! {
         test_counting {
             pattern: "^.*a.{3}bc$",
-            memory: 1395,
+            memory: 1139,
             min_tier: 1,
             inputs: [
                 ("aybzbc", true),
@@ -5601,7 +5739,7 @@ mod tests {
         }
         test_one_plus_wildcard {
             pattern: "^.+$",
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -5640,7 +5778,7 @@ mod tests {
         }
         test_one_plus_alternate {
             pattern: "^(a|b)+$",
-            memory: 1164,
+            memory: 940,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -5659,7 +5797,7 @@ mod tests {
         }
         test_one_plus_with_counting {
             pattern: "^.*a.{3}b+c$",
-            memory: 1395,
+            memory: 1139,
             min_tier: 1,
             inputs: [
                 ("a123bc", true),
@@ -5724,7 +5862,7 @@ mod tests {
         }
         test_one_plus_alternation_inside_repetition {
             pattern: "^((a|b)+){2,4}$",
-            memory: 1329,
+            memory: 1105,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -5870,7 +6008,7 @@ mod tests {
         }
         test_min_zero_wildcard {
             pattern: "^.{0,3}$",
-            memory: 1263,
+            memory: 1007,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -5928,7 +6066,7 @@ mod tests {
         }
         test_dot_single {
             pattern: "^.$",
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -5958,7 +6096,7 @@ mod tests {
         }
         test_alternation_three_way {
             pattern: "^(a|b|c)$",
-            memory: 1164,
+            memory: 940,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -6117,7 +6255,7 @@ mod tests {
         // ── Non-fixed unrolling edge-case tests ──────────────────────────
         test_unroll_byte_class_bounded {
             pattern: "[0-9a-f]{1,4}",
-            memory: 1197,
+            memory: 941,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -6130,7 +6268,7 @@ mod tests {
         }
         test_unroll_byte_class_unbounded {
             pattern: "[0-9a-f]{2,}",
-            memory: 1131,
+            memory: 875,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -6237,7 +6375,7 @@ mod tests {
         }
         test_unroll_ipv4_octets {
             pattern: r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}",
-            memory: 1560,
+            memory: 1304,
             min_tier: 1,
             inputs: [
                 ("192.168.1.1", true),
@@ -6280,7 +6418,7 @@ mod tests {
         }
         test_wildcard_fixed_unrolled {
             pattern: "^a.{3}b$",
-            memory: 1296,
+            memory: 1040,
             min_tier: 1,
             inputs: [
                 ("a123b", true),
@@ -6294,7 +6432,7 @@ mod tests {
         }
         test_byte_class_range {
             pattern: "^[a-c]$",
-            memory: 1164,
+            memory: 940,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -6307,7 +6445,7 @@ mod tests {
         }
         test_byte_class_one_plus {
             pattern: "^[a-c]+$",
-            memory: 1164,
+            memory: 940,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -6320,7 +6458,7 @@ mod tests {
         }
         test_byte_class_counted {
             pattern: "^[a-c]{2,3}$",
-            memory: 1230,
+            memory: 1006,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -6334,7 +6472,7 @@ mod tests {
         }
         test_byte_class_disjoint {
             pattern: "^[ax]$",
-            memory: 1164,
+            memory: 940,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -6346,7 +6484,7 @@ mod tests {
         }
         test_byte_class_multi_range {
             pattern: "^[a-cx-z]+$",
-            memory: 1164,
+            memory: 940,
             min_tier: 1,
             inputs: [
                 ("", false),
@@ -6360,7 +6498,7 @@ mod tests {
         }
         test_byte_class_with_wildcard {
             pattern: "^[a-c].*[x-z]$",
-            memory: 1775,
+            memory: 1071,
             min_tier: 1,
             inputs: [
                 ("ax", true),
@@ -6373,7 +6511,7 @@ mod tests {
         }
         test_digit {
             pattern: r#"^\d$"#,
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 ("0", true),
@@ -6389,7 +6527,7 @@ mod tests {
         }
         test_digit_plus {
             pattern: r#"^\d+$"#,
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 ("0", true),
@@ -6405,7 +6543,7 @@ mod tests {
         }
         test_digit_counted {
             pattern: r#"^\d{3,5}$"#,
-            memory: 1296,
+            memory: 1040,
             min_tier: 1,
             inputs: [
                 ("123", true),
@@ -6421,7 +6559,7 @@ mod tests {
         }
         test_non_digit {
             pattern: r#"^\D$"#,
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -6437,7 +6575,7 @@ mod tests {
         }
         test_non_digit_plus {
             pattern: r#"^\D+$"#,
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6451,7 +6589,7 @@ mod tests {
         }
         test_space {
             pattern: r#"^\s$"#,
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -6466,7 +6604,7 @@ mod tests {
         }
         test_space_plus {
             pattern: r#"^\s+$"#,
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -6480,7 +6618,7 @@ mod tests {
         }
         test_non_space {
             pattern: r#"^\S$"#,
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -6495,7 +6633,7 @@ mod tests {
         }
         test_non_space_plus {
             pattern: r#"^\S+$"#,
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6509,7 +6647,7 @@ mod tests {
         }
         test_word {
             pattern: r#"^\w$"#,
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -6526,7 +6664,7 @@ mod tests {
         }
         test_word_plus {
             pattern: r#"^\w+$"#,
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 ("hello", true),
@@ -6541,7 +6679,7 @@ mod tests {
         }
         test_word_counted {
             pattern: r#"^\w{2,4}$"#,
-            memory: 1263,
+            memory: 1007,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -6556,7 +6694,7 @@ mod tests {
         }
         test_non_word {
             pattern: r#"^\W$"#,
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -6572,7 +6710,7 @@ mod tests {
         }
         test_non_word_plus {
             pattern: r#"^\W+$"#,
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 (" ", true),
@@ -6587,7 +6725,7 @@ mod tests {
         }
         test_predefined_mixed {
             pattern: r#"^\d+\s+\w+$"#,
-            memory: 1742,
+            memory: 974,
             min_tier: 1,
             inputs: [
                 ("42 hello", true),
@@ -6651,7 +6789,7 @@ mod tests {
         }
         test_anchor_start_wildcard {
             pattern: "^a.b",
-            memory: 1197,
+            memory: 941,
             min_tier: 1,
             inputs: [
                 ("axb", true),
@@ -6664,7 +6802,7 @@ mod tests {
         }
         test_anchor_end_wildcard {
             pattern: "a.b$",
-            memory: 1197,
+            memory: 941,
             min_tier: 1,
             inputs: [
                 ("axb", true),
@@ -6762,7 +6900,7 @@ mod tests {
         }
         test_unanchored_alternation {
             pattern: "(a|b)",
-            memory: 1098,
+            memory: 874,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -6908,7 +7046,7 @@ mod tests {
         }
         test_multiline_with_dot_plus {
             pattern: "(?m)^.+$",
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -6922,7 +7060,7 @@ mod tests {
         }
         test_multiline_with_counting {
             pattern: r#"(?m)^\d{2,4}$"#,
-            memory: 1263,
+            memory: 1007,
             min_tier: 1,
             inputs: [
                 ("12", true),
@@ -7062,7 +7200,7 @@ mod tests {
         }
         test_crlf_with_dot_plus {
             pattern: "(?Rm)^.+$",
-            memory: 1164,
+            memory: 908,
             min_tier: 0,
             inputs: [
                 ("abc", true),
@@ -7076,7 +7214,7 @@ mod tests {
         }
         test_crlf_with_counting {
             pattern: r#"(?Rm)^\d{2,4}$"#,
-            memory: 1263,
+            memory: 1007,
             min_tier: 0,
             inputs: [
                 ("12", true),
@@ -7171,7 +7309,7 @@ mod tests {
         }
         test_word_boundary_quantifiers {
             pattern: r#"\b\w+\b"#,
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 ("hello", true),
@@ -7184,7 +7322,7 @@ mod tests {
         }
         test_word_boundary_counter {
             pattern: r#"\b\w{3,5}\b"#,
-            memory: 1296,
+            memory: 1040,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -7211,7 +7349,7 @@ mod tests {
         }
         test_word_boundary_digits_underscore_1 {
             pattern: r#"\b\d+\b"#,
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [("123", true), (" 456 ", true), ("abc123def", false)],
         }
@@ -7402,7 +7540,7 @@ mod tests {
         // 13 chars: MATCH (\b passes at word→end).
         test_tier3_multi_counter_deferred_break {
             pattern: r#"^.{6,39}.{7,31}\b$"#,
-            memory: 1264,
+            memory: 1008,
             min_tier: 2,
             inputs: [
                 ("aaaaaaaaaaaa", false),
@@ -7413,7 +7551,7 @@ mod tests {
         // Same pattern with \B instead: \B fails at word→end.
         test_tier3_multi_counter_deferred_break_neg {
             pattern: r#"^.{6,39}.{7,31}\B$"#,
-            memory: 1264,
+            memory: 1008,
             min_tier: 2,
             inputs: [
                 ("aaaaaaaaaaaaa", false),
@@ -7488,7 +7626,7 @@ mod tests {
 
         test_unanchored_counter_simple_1 {
             pattern: r#"\w{3,5}"#,
-            memory: 1230,
+            memory: 974,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -7519,7 +7657,7 @@ mod tests {
         }
         test_unanchored_counter_simple_3 {
             pattern: "[0-9]{4}",
-            memory: 1197,
+            memory: 941,
             min_tier: 1,
             inputs: [
                 ("1234", true),
@@ -7567,7 +7705,7 @@ mod tests {
         }
         test_unanchored_counter_nested {
             pattern: "((a|b){1,2}){2,3}",
-            memory: 1296,
+            memory: 1072,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -7610,7 +7748,7 @@ mod tests {
         }
         test_unanchored_counter_wildcard_body {
             pattern: ".{3,5}",
-            memory: 1230,
+            memory: 974,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -7636,7 +7774,7 @@ mod tests {
         }
         test_partial_anchor_start_counter_2 {
             pattern: r#"^\d{2,4}"#,
-            memory: 1230,
+            memory: 974,
             min_tier: 1,
             inputs: [
                 ("12", true),
@@ -7662,7 +7800,7 @@ mod tests {
         }
         test_partial_anchor_end_counter_2 {
             pattern: r#"\d{2,4}$"#,
-            memory: 1230,
+            memory: 974,
             min_tier: 1,
             inputs: [
                 ("12", true),
@@ -7675,7 +7813,7 @@ mod tests {
         }
         test_unanchored_byte_class_1 {
             pattern: r#"\d+"#,
-            memory: 1098,
+            memory: 842,
             min_tier: 1,
             inputs: [
                 ("123", true),
@@ -7686,7 +7824,7 @@ mod tests {
         }
         test_unanchored_byte_class_2 {
             pattern: r#"\w+"#,
-            memory: 1098,
+            memory: 842,
             min_tier: 1,
             inputs: [
                 ("hello", true),
@@ -7697,7 +7835,7 @@ mod tests {
         }
         test_unanchored_byte_class_3 {
             pattern: "[a-c]+",
-            memory: 1098,
+            memory: 874,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -7772,7 +7910,7 @@ mod tests {
         }
         test_unanchored_byte_class_counter {
             pattern: r#"\d{2,4}"#,
-            memory: 1197,
+            memory: 941,
             min_tier: 1,
             inputs: [
                 ("12", true),
@@ -7828,7 +7966,7 @@ mod tests {
         // Deferred assertion in L=1 counter body (promoted to tier 2)
         test_counter_body_word_boundary_end_1 {
             pattern: r"(\w\b){1,3}",
-            memory: 1329,
+            memory: 1073,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -7842,7 +7980,7 @@ mod tests {
         }
         test_counter_body_word_boundary_end_2 {
             pattern: r"(\w\b){2,4}",
-            memory: 1395,
+            memory: 1139,
             min_tier: 1,
             inputs: [
                 ("a", false),
@@ -7854,7 +7992,7 @@ mod tests {
         }
         test_counter_body_word_boundary_end_3 {
             pattern: r"(\w\b){1,2}",
-            memory: 1230,
+            memory: 974,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -7866,7 +8004,7 @@ mod tests {
         }
         test_counter_body_dot_boundary {
             pattern: r"(.\b){2,4}",
-            memory: 1395,
+            memory: 1139,
             min_tier: 1,
             inputs: [
                 ("a b", true),
@@ -7896,7 +8034,7 @@ mod tests {
         // only fire at actual EOI (not mid-stream via match_at_end).
         test_counter_body_non_word_boundary_1 {
             pattern: r"^(.\B){1,2}$",
-            memory: 1296,
+            memory: 1040,
             min_tier: 1,
             inputs: [
                 (" ", true),    // 1 non-word: \B passes at EOI
@@ -7908,7 +8046,7 @@ mod tests {
         }
         test_counter_body_non_word_boundary_2 {
             pattern: r"^(.\B){2,3}$",
-            memory: 1362,
+            memory: 1106,
             min_tier: 1,
             inputs: [
                 ("  ", true),
@@ -7921,7 +8059,7 @@ mod tests {
         }
         test_counter_body_non_word_boundary_3 {
             pattern: r"^(.\B){1,12}$",
-            memory: 1264,
+            memory: 1008,
             min_tier: 2,
             inputs: [
                 (" ", true),
@@ -7951,7 +8089,7 @@ mod tests {
         // before increment so the counter is non-empty when CInc fires.
         test_deferred_assert_before_counter_1 {
             pattern: r"\b.{1,2}",
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -7963,7 +8101,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_2 {
             pattern: r"^(\b.{1,34}?)?$",
-            memory: 1297,
+            memory: 1041,
             min_tier: 2,
             inputs: [
                 ("a", true),
@@ -7974,7 +8112,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_3 {
             pattern: r"^(\b((.{1,34}|a?))?)?$",
-            memory: 1429,
+            memory: 1173,
             min_tier: 2,
             inputs: [
                 ("x", true),
@@ -7984,7 +8122,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_4 {
             pattern: r"^(\B.{1,34}?)?$",
-            memory: 1297,
+            memory: 1041,
             min_tier: 2,
             inputs: [
                 ("\x00", true), // \B: non-word→non-word
@@ -8016,7 +8154,7 @@ mod tests {
         // can_reach_match_at_end().
         test_contradictory_adjacent_asserts {
             pattern: r"^.{10,31}\B\b$",
-            memory: 2220,
+            memory: 1964,
             min_tier: 1,
             inputs: [
                 ("yyyyyyyyyy0aaaaaaaaaaaaaaaaa", false), // \B\b always fails
@@ -8110,7 +8248,7 @@ mod tests {
         // Word-start and word-end boundary assertions
         test_word_start_basic {
             pattern: r#"\b{start}\w+\b{end}"#,
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 ("hello", true),
@@ -8159,7 +8297,7 @@ mod tests {
         }
         test_word_start_with_counter {
             pattern: r#"\b{start}\w{3,5}\b{end}"#,
-            memory: 1296,
+            memory: 1040,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -8300,7 +8438,7 @@ mod tests {
         }
         test_nested_dotdot_x2 {
             pattern: "(..){2}",
-            memory: 1197,
+            memory: 941,
             min_tier: 1,
             inputs: [
                 ("aaa", false),
@@ -8442,7 +8580,7 @@ mod tests {
         }
         test_byte_table_after_wildcard {
             pattern: "^..(ab|cd|ef)$",
-            memory: 2485,
+            memory: 2229,
             min_tier: 1,
             inputs: [
                 ("xxab", true),
@@ -8457,7 +8595,7 @@ mod tests {
         }
         test_byte_table_followed_by_wildcard {
             pattern: "^(ab|cd|ef).*x$",
-            memory: 2518,
+            memory: 2262,
             min_tier: 1,
             inputs: [
                 ("abx", true),
@@ -8474,7 +8612,7 @@ mod tests {
         }
         test_byte_table_sandwiched_by_wildcards {
             pattern: "^.*(ab|cd|ef).*$",
-            memory: 2551,
+            memory: 2295,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -8491,7 +8629,7 @@ mod tests {
         }
         test_step_fused_multi_counter_same_byte {
             pattern: "a{2}.*a{3}",
-            memory: 1296,
+            memory: 1040,
             min_tier: 1,
             inputs: [
                 ("aaaaa", true),
@@ -8520,7 +8658,7 @@ mod tests {
         }
         test_step_fused_byteclass_and_literal {
             pattern: "[a-z]{2}a{2}",
-            memory: 1197,
+            memory: 941,
             min_tier: 1,
             inputs: [
                 ("xyaa", true),
@@ -8763,7 +8901,7 @@ mod tests {
         }
         test_ci_byte_class {
             pattern: "^(?i)[abc]$",
-            memory: 1164,
+            memory: 940,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -8783,7 +8921,7 @@ mod tests {
         }
         test_ci_byte_class_full_alpha {
             pattern: "^(?i)[a-z]$",
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -8801,7 +8939,7 @@ mod tests {
         }
         test_ci_byte_class_alpha_digit {
             pattern: "^(?i)[a-z0-9]+$",
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 ("abc123", true),
@@ -8905,7 +9043,7 @@ mod tests {
         }
         test_ci_wildcard {
             pattern: "^(?i).*foo.*$",
-            memory: 1362,
+            memory: 1106,
             min_tier: 1,
             inputs: [
                 ("foo", true),
@@ -8925,7 +9063,7 @@ mod tests {
         }
         test_ci_digit_then_hex {
             pattern: r#"^(?i)\d+[a-f]+$"#,
-            memory: 1453,
+            memory: 973,
             min_tier: 1,
             inputs: [
                 ("1a", true),
@@ -8944,7 +9082,7 @@ mod tests {
         }
         test_ci_word_class {
             pattern: r#"^(?i)\w+$"#,
-            memory: 1164,
+            memory: 908,
             min_tier: 1,
             inputs: [
                 ("abc", true),
@@ -9011,7 +9149,7 @@ mod tests {
         }
         test_ci_counted_alternation {
             pattern: "^(?i)(a|b){1,2}$",
-            memory: 1197,
+            memory: 973,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -9039,7 +9177,7 @@ mod tests {
         }
         test_ci_dot_in_middle {
             pattern: "^(?i)x.y$",
-            memory: 1230,
+            memory: 974,
             min_tier: 1,
             inputs: [
                 ("xay", true),
@@ -9057,7 +9195,7 @@ mod tests {
         }
         test_ci_negated_class {
             pattern: "^(?i)[^a-z]$",
-            memory: 1164,
+            memory: 940,
             min_tier: 1,
             inputs: [
                 ("0", true),
@@ -9077,7 +9215,7 @@ mod tests {
         }
         test_ci_counted_wildcard {
             pattern: "^(?i).{2,4}$",
-            memory: 1263,
+            memory: 1007,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -9118,7 +9256,7 @@ mod tests {
         }
         test_ci_non_word_class {
             pattern: r#"^(?i)a\Wb$"#,
-            memory: 1230,
+            memory: 974,
             min_tier: 1,
             inputs: [
                 ("a b", true),
@@ -9371,7 +9509,7 @@ mod tests {
         }
         test_partial_ci_waf_keyword_prefix {
             pattern: r#"(?i:select)\s+\w+"#,
-            memory: 1585,
+            memory: 1073,
             min_tier: 1,
             inputs: [
                 ("select foo", true),
@@ -9442,7 +9580,7 @@ mod tests {
         }
         test_partial_ci_class_in_group {
             pattern: "^a(?i:[b-d])e$",
-            memory: 1230,
+            memory: 1006,
             min_tier: 1,
             inputs: [
                 ("abe", true),
@@ -9503,7 +9641,7 @@ mod tests {
 
         test_multi_counter_two_fixed {
             pattern: "^[A-Z]{4}[0-9]{16}$",
-            memory: 2047,
+            memory: 1535,
             min_tier: 1,
             inputs: [
                 ("ABCD1234567890123456", true),
@@ -9574,7 +9712,7 @@ mod tests {
         }
         test_multi_counter_unanchored {
             pattern: "[A-Z]{3}[0-9]{3}",
-            memory: 1519,
+            memory: 1007,
             min_tier: 1,
             inputs: [
                 ("ABC123", true),
@@ -9587,7 +9725,7 @@ mod tests {
         }
         test_multi_counter_with_literal_prefix {
             pattern: "^ID-[A-Z]{4}-[0-9]{6}$",
-            memory: 1849,
+            memory: 1337,
             min_tier: 1,
             inputs: [
                 ("ID-ABCD-123456", true),
@@ -9603,7 +9741,7 @@ mod tests {
         // Overlapping character classes: must NOT be tier 2.
         test_multi_counter_overlapping_falls_to_tier3 {
             pattern: r"^\w{3}\d{2}$",
-            memory: 1552,
+            memory: 1040,
             min_tier: 1,
             inputs: [
                 ("abc12", true),
@@ -9860,7 +9998,7 @@ mod tests {
         // analysis is added.
         test_tier2_overlap_safe_word_digit {
             pattern: r"^\w{300}\d{200}$",
-            memory: 1587,
+            memory: 1075,
             min_tier: 3,
             inputs: [
                 ("aaa111", false),             // too short
@@ -9870,7 +10008,7 @@ mod tests {
 
         test_tier2_overlap_safe_hex_subset {
             pattern: r"^[0-9A-F]{400}[A-F]{200}$",
-            memory: 1587,
+            memory: 1107,
             min_tier: 3,
             inputs: [
                 ("AABB", false),               // too short
@@ -9879,7 +10017,7 @@ mod tests {
 
         test_tier2_overlap_safe_separator {
             pattern: r"^\w{300}-\d{200}$",
-            memory: 1620,
+            memory: 1108,
             min_tier: 3,
             inputs: [
                 ("aaa-111", false),            // too short
@@ -9891,7 +10029,7 @@ mod tests {
         // Variable split over overlapping alphabets.
         test_tier2_overlap_unsafe_variable {
             pattern: r"^\w{100,300}\d{100,200}$",
-            memory: 1587,
+            memory: 1075,
             min_tier: 3,
             inputs: [
                 ("aaa111", false),
@@ -9903,7 +10041,7 @@ mod tests {
         // The unroll=0+no-merge re-run exercises the multi-counter path.
         test_tier2_overlap_unsafe_wildcard {
             pattern: r"^.{0,200}.{0,200}$",
-            memory: 1264,
+            memory: 1008,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -9915,7 +10053,7 @@ mod tests {
         // L=2 body overlap — counter_reset/preservation ambiguity.
         test_tier2_overlap_unsafe_l2_word_digit {
             pattern: r"^(?:\w\w){1,2}(?:\d\d){1,2}$",
-            memory: 1717,
+            memory: 1205,
             min_tier: 1,
             inputs: [
                 ("ab12", true),
@@ -9931,7 +10069,7 @@ mod tests {
         // L=2 hex subset overlap.
         test_tier2_overlap_unsafe_l2_hex {
             pattern: r"^(?:[0-9A-F][0-9A-F]){1,2}(?:[A-F][A-F]){1,2}$",
-            memory: 1717,
+            memory: 1237,
             min_tier: 1,
             inputs: [
                 ("0AFF", true),
@@ -10063,7 +10201,7 @@ mod tests {
         // The motivating pattern from the rebar benchmarks.
         test_inner_unroll_ip_pattern {
             pattern: r"(?i)(?:(?:[0-9]{1,3}\.){3}[0-9]{1,3}|(?:[0-9a-f]{1,4}::?){2,7}[0-9a-f]{1,4}):$",
-            memory: 2345,
+            memory: 1833,
             min_tier: 3,
             inputs: [
                 ("192.168.1.1:", true),
@@ -10109,7 +10247,7 @@ mod tests {
         // Dot-based inner repetition inside counter.
         test_inner_unroll_dot_body {
             pattern: "^(.{1,3}x){2,3}$",
-            memory: 1560,
+            memory: 1304,
             min_tier: 1,
             inputs: [
                 ("axbx", true),
@@ -10170,7 +10308,7 @@ mod tests {
         // All bytes match at every origin, so ranges grow uniformly.
         test_tier3_varlen_dot_range_body {
             pattern: "(.{1,5}){1,100}z",
-            memory: 1330,
+            memory: 1074,
             min_tier: 3,
             inputs: [
                 ("az", true),
@@ -10185,7 +10323,7 @@ mod tests {
         // any byte.  The 'b' branch bypasses origin 1 entirely.
         test_tier3_varlen_mixed_selectivity {
             pattern: "(a.|b){1,50}c",
-            memory: 1297,
+            memory: 1041,
             min_tier: 3,
             inputs: [
                 ("axc", true),
@@ -10200,7 +10338,7 @@ mod tests {
         // range merge at 10 origins, 1000 max iterations.
         test_tier3_varlen_large_body_high_count {
             pattern: ".{0,1000}(.{1,10}){0,1000}c",
-            memory: 1661,
+            memory: 1405,
             min_tier: 3,
             inputs: [
                 ("c", true),
@@ -10252,7 +10390,7 @@ mod tests {
         // lacked dedup, causing the counter to never reach its minimum.)
         test_tier3_varlen_plus_body_dedup {
             pattern: ".a+{9,28}",
-            memory: 1198,
+            memory: 942,
             min_tier: 3,
             inputs: [
                 ("aaaaaaaaaa", true),      // 10 a's: . + a+{9} (each a+ = 1 a)
@@ -10278,7 +10416,7 @@ mod tests {
         // tracker detects this when counter 0 breaks.
         test_tier3_post_break_tail_literal {
             pattern: "^a.{3}b$",
-            memory: 1296,
+            memory: 1040,
             min_tier: 1,
             inputs: [
                 ("a123b", true),
@@ -10294,7 +10432,7 @@ mod tests {
         // `$ → Match`.
         test_tier3_post_break_tail_wildcard {
             pattern: "^.{3,5}.$",
-            memory: 1329,
+            memory: 1073,
             min_tier: 1,
             inputs: [
                 ("abcd", true),
@@ -10309,7 +10447,7 @@ mod tests {
         // through the two-hop path `b → c → $ → Match`.
         test_tier3_post_break_tail_two_hop {
             pattern: "^.{2,4}bc$",
-            memory: 1329,
+            memory: 1073,
             min_tier: 1,
             inputs: [
                 ("aabc", true),
@@ -10333,7 +10471,7 @@ mod tests {
         // the Advance-action origin's `target_is_match_at_end` was ignored.
         test_tier3_counter_free_mae_advance {
             pattern: "^(.{0,2}.a?)?$",
-            memory: 1362,
+            memory: 1106,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -10358,7 +10496,7 @@ mod tests {
         // break paths) and track `nb_counter_free_mae` separately.
         test_tier3_counter_free_mae_multi_counter {
             pattern: "^c{2,12}.{6,6}(a?)?$",
-            memory: 1791,
+            memory: 1535,
             min_tier: 1,
             inputs: [
                 ("ccaaaaaa", true),
@@ -10375,7 +10513,7 @@ mod tests {
         }
         test_tier3_counter_free_mae_two_counters_optional {
             pattern: "^.{0,2}.{4,4}a?$",
-            memory: 1428,
+            memory: 1172,
             min_tier: 1,
             inputs: [
                 ("aaaa", true),
@@ -10397,7 +10535,7 @@ mod tests {
         // was overwritten to false on every byte, causing false negatives.
         test_tier3_counter_free_mae_optional_skip {
             pattern: "([b-ed-ie-f].{4,43})?$",
-            memory: 1520,
+            memory: 1040,
             min_tier: 2,
             inputs: [
                 ("zzz", true),       // optional group skipped, $ matches at end
@@ -10417,7 +10555,7 @@ mod tests {
         // the fix, finish() missed the `$ → Match` path.
         test_tier3_post_break_advance_mae {
             pattern: "^.{7,23}.a?$",
-            memory: 1989,
+            memory: 1733,
             min_tier: 1,
             inputs: [
                 ("aaaaaaaa", true),    // len=8: min+1, match via $ after .
@@ -10435,7 +10573,7 @@ mod tests {
         // rejects such patterns from tier 2/3 (demoted to tier 4).
         test_counter_self_loop_possessive_plus {
             pattern: "^.{6,9}++$",
-            memory: 1461,
+            memory: 1205,
             min_tier: 1,
             inputs: [
                 ("aaaaaa", true),       // len=6: one rep of 6
@@ -10449,7 +10587,7 @@ mod tests {
         // Same self-loop via {6,9}+ parsed as possessive (one-or-more).
         test_counter_self_loop_possessive {
             pattern: "^.{6,9}+$",
-            memory: 1461,
+            memory: 1205,
             min_tier: 1,
             inputs: [
                 ("aaaaaa", true),       // len=6
@@ -10464,7 +10602,7 @@ mod tests {
         // Same self-loop via * wrapping counted repetition.
         test_counter_self_loop_star {
             pattern: "^.{6,9}*$",
-            memory: 1461,
+            memory: 1205,
             min_tier: 1,
             inputs: [
                 ("", true),             // len=0: zero reps
@@ -10478,7 +10616,7 @@ mod tests {
         // Same self-loop via +* wrapping counted repetition.
         test_counter_self_loop_plus_star {
             pattern: "^.{6,9}+*$",
-            memory: 1461,
+            memory: 1205,
             min_tier: 1,
             inputs: [
                 ("", true),             // len=0: * allows zero reps
@@ -10492,7 +10630,7 @@ mod tests {
         // with >= 6 chars matches (a 6-9 substring always exists).
         test_counter_self_loop_unanchored {
             pattern: ".{6,9}+",
-            memory: 1395,
+            memory: 1139,
             min_tier: 1,
             inputs: [
                 ("aaaaaa", true),       // len=6: exact match
@@ -10547,7 +10685,7 @@ mod tests {
         // handoff.
         test_tier3_counter_dep_seed_false_positive {
             pattern: "^(.{6,39}.0?.{8,8}a?)?$",
-            memory: 1693,
+            memory: 1437,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -10580,7 +10718,7 @@ mod tests {
         // (Tier 2), L=6 (Tier 2), and L=6..16 (Tier 3).
         test_deferred_assert_before_counter_l2_body {
             pattern: r"^...\B(ee){6,40}$",
-            memory: 1396,
+            memory: 1140,
             min_tier: 2,
             inputs: [
                 ("aaaeeeeeeeeeeee", true),     // 3 + 12 = 15 (6 iterations of ee)
@@ -10593,7 +10731,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_l6_body {
             pattern: r"^...\Be{6,6}{6,40}$",
-            memory: 1528,
+            memory: 1272,
             min_tier: 2,
             inputs: [
                 ("aaaeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", true), // 3+36=39 (6 iters)
@@ -10604,7 +10742,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_varlen_body {
             pattern: r"^...\Be{6,16}{6,40}$",
-            memory: 1858,
+            memory: 1602,
             min_tier: 3,
             inputs: [
                 ("aaaeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", true), // 3+36=39
@@ -10615,7 +10753,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_two_counters {
             pattern: r"^.{3,5}\Be{6,16}{6,40}c{6,33}$",
-            memory: 2024,
+            memory: 1768,
             min_tier: 3,
             inputs: [
                 // 3 a's + 36 e's + 6 c's = 45: min scenario (3 prefix, 6*6 e body, 6 c's)
@@ -10637,7 +10775,7 @@ mod tests {
         // classifying resolved seeds as break-gated.
         test_deferred_assert_rwb_break_seed {
             pattern: r"^\b(b{2,8})?.{9,9}$",
-            memory: 1758,
+            memory: 1502,
             min_tier: 1,
             inputs: [
                 ("aaaaaaaaa", true),       // \b satisfied, (b{2,8})? zero iters, .{9,9} matches
@@ -10652,7 +10790,7 @@ mod tests {
         }
         test_deferred_assert_rwb_break_seed_star {
             pattern: r"^\b(b{2,8}b)*.{9,9}$",
-            memory: 1791,
+            memory: 1535,
             min_tier: 1,
             inputs: [
                 ("aaaaaaaaa", true),        // zero iters of (b{2,8}b)*, .{9,9}
@@ -10709,7 +10847,7 @@ mod tests {
         // counters to complete).
         test_tier3_with_break_counter_free_mae_false_positive {
             pattern: r"^(.{10,40}{2,2})?a?$",
-            memory: 1397,
+            memory: 1141,
             min_tier: 4,
             inputs: [
                 ("", true),             // optional group skips, a? skips, $ matches
@@ -10726,7 +10864,7 @@ mod tests {
         // original fuzz artifact).
         test_tier3_with_break_counter_free_mae_8_counters {
             pattern: r"^(.{7,40}{8,8})?a?$",
-            memory: 1397,
+            memory: 1141,
             min_tier: 4,
             inputs: [
                 ("", true),
@@ -10752,7 +10890,7 @@ mod tests {
         // counter breaks.
         test_tier3_clean_counter_free_mae_preserves_legit {
             pattern: r"^(.{0,2}|d+)$",
-            memory: 1296,
+            memory: 1040,
             min_tier: 1,
             inputs: [
                 ("", true),        // optional .{0,2} matches empty via 0-count
@@ -10776,7 +10914,7 @@ mod tests {
         // gives a false negative.
         test_tier3_single_counter_break_path_mae {
             pattern: r"^.{0,36}c{2,12}e?((a?a?)?(a?a?)?)?$",
-            memory: 2089,
+            memory: 1833,
             min_tier: 2,
             inputs: [
                 ("cc", true),       // .{0,36} = "", c{2,12} = "cc"
@@ -10811,7 +10949,7 @@ mod tests {
         // an origin is genuinely reachable without counter breaks.
         test_tier3_contaminated_no_break_chain_false_positive {
             pattern: r"^(.{7,25}.{7,25})?((a?a?)?(a?a?)?)?$",
-            memory: 1627,
+            memory: 1371,
             min_tier: 2,
             inputs: [
                 ("", true),              // optional group skips, suffix skips, $ matches
@@ -10879,7 +11017,7 @@ mod tests {
         // in the post-transition clean_nb state.
         test_tier3_contaminated_cf_mae_empty_nfa {
             pattern: r"^(.{8,8}|f{5,26}|f{5,26})$",
-            memory: 2286,
+            memory: 2030,
             min_tier: 1,
             inputs: [
                 ("fffffabc", true),            // Bug 24: .{8,8} via counter-free path
@@ -10911,7 +11049,7 @@ mod tests {
         // are handled by `break_seeds` and `post_break_tails` at runtime.
         test_tier3_break_closure_stops_at_ci {
             pattern: "^.{1,2}.{4,4}$",
-            memory: 1329,
+            memory: 1073,
             min_tier: 1,
             inputs: [
                 ("aaaaa", true),
@@ -10973,7 +11111,7 @@ mod tests {
         // — producing false negatives on long inputs.
         test_tier3_instance_dedup_self_loop {
             pattern: r".a+{9,28}",
-            memory: 1198,
+            memory: 942,
             min_tier: 3,
             inputs: [
                 ("aaaaaaaaa", false),
@@ -10992,7 +11130,7 @@ mod tests {
         // The `?` makes every input match via the empty-to-`$` path.
         test_tier3_counter_free_mae_optional_group {
             pattern: r"([b-e].+{4,43})?$",
-            memory: 1520,
+            memory: 1040,
             min_tier: 3,
             inputs: [
                 ("zzz", true),
@@ -11010,7 +11148,7 @@ mod tests {
         // the triggering counter didn't break (Bug 14).
         test_tier3_optional_anchored_false_positive {
             pattern: r"^(a?.{2,2}\Bx{2,2})?$",
-            memory: 1395,
+            memory: 1139,
             min_tier: 1,
             inputs: [
                 ("", true),
@@ -11033,7 +11171,7 @@ mod tests {
         // flag must be replaced by the clean chain's flag.
         test_tier3_contaminated_no_break_is_match {
             pattern: r"^.{0,46}x{10,35}f",
-            memory: 1364,
+            memory: 1108,
             min_tier: 3,
             inputs: [
                 ("xxxxxxxxxf", false),          // 9 x's — c1 max count 9 < min 10
@@ -11055,7 +11193,7 @@ mod tests {
         // pass (prev='c' word, next='a' word → non-boundary).
         test_tier3_counter_break_deferred_assert_mid_input {
             pattern: r".{2,38}c{4,10}\B",
-            memory: 1528,
+            memory: 1272,
             min_tier: 2,
             inputs: [
                 ("cccccca", true),              // 6c + a: c1 breaks, \B(c,a) passes
@@ -11077,7 +11215,7 @@ mod tests {
         // false match_at_end.
         test_tier3_break_seed_deferred_assert_gate {
             pattern: r"^.{0,13}\b.{2,2}$",
-            memory: 1692,
+            memory: 1436,
             min_tier: 1,
             inputs: [
                 ("abc", false),                 // all word chars — no \b boundary
@@ -11097,7 +11235,7 @@ mod tests {
         // never seeded through that path.
         test_tier3_pending_break_seed {
             pattern: r"^f{3,4}\b.{5,10}a?$",
-            memory: 1692,
+            memory: 1436,
             min_tier: 1,
             inputs: [
                 ("fff abcde", true),            // \b between 'f' and ' '
@@ -11118,7 +11256,7 @@ mod tests {
         // and the topology is pure, so Tier 1 handles it.
         test_bug53_mixed_post_assert_topology {
             pattern: r"^.{7,8}\B(\b)?a{0,2}$",
-            memory: 1593,
+            memory: 1337,
             min_tier: 1,
             inputs: [
                 ("aaaaaaaa", true),         // .{7} + \B(word→word) + skip \b + a{1} + $
@@ -11157,7 +11295,7 @@ mod tests {
         // Three counters when unroll=0.
         test_bug53_mixed_end_consuming_multi_counter {
             pattern: r"^.{3,5}.{3,5}\b(a{2,3})?$",
-            memory: 1626,
+            memory: 1370,
             min_tier: 1,
             inputs: [
                 ("aaaaaa", true),           // .{3}.{3} + \b(word→eoi) + skip + $
@@ -11176,7 +11314,7 @@ mod tests {
         // path after \b, AND consuming a{2,3} is also reachable.
         test_bug53_mixed_match_consuming_unanchored {
             pattern: r".{3,5}\b(a{2,3})?",
-            memory: 1395,
+            memory: 1139,
             min_tier: 1,
             inputs: [
                 ("abc", true),              // .{3} + \b(c→eoi) + skip
@@ -11192,7 +11330,7 @@ mod tests {
         // Counter break → \B → Split → (CI(a{2,3}) | $ → Match).
         test_bug53_mixed_end_consuming_non_word_boundary {
             pattern: r"^.{3,5}\B(a{2,3})?$",
-            memory: 1461,
+            memory: 1205,
             min_tier: 1,
             inputs: [
                 ("aaaaa", true),            // .{3} + \B(a→a)=yes + a{2} + $
@@ -11212,7 +11350,7 @@ mod tests {
         // without the fix, `\B`-gated seeds fire incorrectly.
         test_tier3_pending_break_seed_non_word_boundary {
             pattern: r"^(a?.{2,2}\Bx{2,2})?$",
-            memory: 1395,
+            memory: 1139,
             min_tier: 1,
             inputs: [
                 ("xxxx", true),                 // \B between x and x (same word class)
@@ -11235,7 +11373,7 @@ mod tests {
         // c1 was never seeded and the match was missed.
         test_tier3_break_seed_ungated_or_path {
             pattern: r"^a{1,2}(\b)?.{4,16}$",
-            memory: 1791,
+            memory: 1535,
             min_tier: 1,
             inputs: [
                 ("aaaaa", true),               // a{1} + skip \b + .{4} = 5 bytes
@@ -11287,7 +11425,7 @@ mod tests {
         // filtered because they have no break_seeds fallback.
         test_tier3_contaminated_counter_free_seeds {
             pattern: r"^((a{8,13}d*)?.?a?.{6,6}a?)?$",
-            memory: 2088,
+            memory: 1832,
             min_tier: 1,
             inputs: [
                 ("aaaaaaaaa", true),                                     // 9 'a's: matches (a{8}+.?=a → 9)
@@ -11388,7 +11526,7 @@ mod tests {
         // properly handles the downstream \B chain.
         test_tier3_chained_assert_target_deferred {
             pattern: r"^.{7,7}(.\b\Ba?(a?a?)?)?$",
-            memory: 1725,
+            memory: 1469,
             min_tier: 1,
             inputs: [
                 ("cy1aacc", true),              // 7 chars, optional group empty, $ matches
@@ -11416,7 +11554,7 @@ mod tests {
         // Increment arm when value >= min, so the DFA selects `with_break`.
         test_tier3_tail_cinc_handoff_break {
             pattern: r"^(.{1,3}.{0,0} )+$",
-            memory: 1296,
+            memory: 1040,
             min_tier: 1,
             inputs: [
                 ("ax a ", true),            // Bug 36 minimal crash case: 2-char body + space, 1-char body + space
@@ -11504,7 +11642,7 @@ mod tests {
         // even with no consuming states downstream.
         test_tier3_dead_target_byte_table_mae {
             pattern: r"^(.{6,36}a{0,4}e*c)?$",
-            memory: 1528,
+            memory: 1272,
             min_tier: 2,
             inputs: [
                 ("xxxcbd ccac", true),          // Bug 39 crash case
@@ -11520,7 +11658,7 @@ mod tests {
 
         // -- Bug 40 regression: assertion-gated counter seeding false positive --
         // The {3,3} outer repetition is unrolled into three counter copies.
-        // Each has structure: ByteClass → Split(optional '1') → Assert(\B)
+        // Each has structure: byte-class → Split(optional '1') → Assert(\B)
         // → CI(counter) → body → CInc.  The with_break DFA state has \B
         // as a deferred assertion; when resolved, it produces seeds for
         // downstream counters (c1, c2).  These resolved seeds were merged
@@ -11535,7 +11673,7 @@ mod tests {
         // correct byte timing.
         test_tier3_assert_gated_counter_seeding {
             pattern: r"^((.1?\B.{3,28}){3,3}|(a?a?)?)$",
-            memory: 4497,
+            memory: 4241,
             min_tier: 1,
             unroll_limit: 96,
             inputs: [
@@ -11561,7 +11699,7 @@ mod tests {
         // emitted as PendingEffect Match atoms via origin_effects.
         test_tier3_contaminated_deferred_assert {
             pattern: r"^.{0,44}1{3,38}f\ba?$",
-            memory: 1496,
+            memory: 1240,
             min_tier: 3,
             inputs: [
                 ("111f", true),                 // c1=3 ≥ min, break, 'f' consumed, \b passes at EOI
@@ -11610,7 +11748,7 @@ mod tests {
         // via a Split.
         test_tier3_break_match_at_end_with_sibling_deferred {
             pattern: r"^.{2,5}(\b|$)",
-            memory: 1362,
+            memory: 1106,
             min_tier: 1,
             inputs: [
                 ("ab", true),                   // 2 chars, $ matches at EOI
@@ -11636,7 +11774,7 @@ mod tests {
         // states cannot contribute to match_at_end at end-of-input.
         test_tier3_eoi_tail_false_positive {
             pattern: r"a{1,2}(.|\b|\b|a)c$",
-            memory: 1362,
+            memory: 1106,
             min_tier: 1,
             inputs: [
                 ("a", false),                   // 8E regression: \b(a,EOI) passes but c never consumed
@@ -11685,7 +11823,7 @@ mod tests {
         // blocks the path.
         test_tier3_chained_contradictory_asserts {
             pattern: r"^.{2,26}\b\B(a?)?$",
-            memory: 2121,
+            memory: 1865,
             min_tier: 1,
             inputs: [
                 ("cc", false),              // \b passes at EOI but \B fails → never matches
@@ -11715,7 +11853,7 @@ mod tests {
         // always false for consuming states).
         test_tier3_pending_tail_consume {
             pattern: r"^.{2,13}\Ba?((a?a?)?(a?a?)?)?$",
-            memory: 2022,
+            memory: 1766,
             min_tier: 1,
             inputs: [
                 ("yxaayca", true),       // original fuzz input
@@ -11740,7 +11878,7 @@ mod tests {
         // of firing unconditionally.
         test_tier3_pure_break_mae_with_sibling_deferred {
             pattern: r"^.{1,11}((\B|a?))?$",
-            memory: 1659,
+            memory: 1403,
             min_tier: 1,
             inputs: [
                 ("aa", true),           // original minimal: .{1,} → skip group → $
@@ -11788,7 +11926,7 @@ mod tests {
         // deferred assertions so each tail is gated individually.
         test_tier3_per_tail_deferred_assert_gate {
             pattern: r"^.{2,10}\by?(\B ?(a?a?)?(a?a?)?)?$",
-            memory: 2022,
+            memory: 1766,
             min_tier: 1,
             inputs: [
                 ("xa1  y ", false),    // Bug 46: \b passes but \B fails for ' ' tail → false positive
@@ -11808,12 +11946,12 @@ mod tests {
         // post-break tail state 8 (ByteTable: a→10, c→11, x→12).
         // On byte 'x', state 8 consumes 'x' → state 12 (Match).
         // Root cause: target_is_match was computed only for Byte/ByteCI/
-        // ByteClass states, skipping ByteTable.  The Advance action
+        // byte-class states, skipping ByteTable.  The Advance action
         // lacked an is_match flag, so ByteTable tails whose byte-specific
         // target reached Match directly were never detected.
         test_tier3_byte_table_tail_direct_match {
             pattern: r"c{0,32}.{6,36}a?c?x",
-            memory: 2487,
+            memory: 2231,
             min_tier: 3,
             inputs: [
                 ("aaaaaax", true),      // Bug 47: ByteTable tail 'x' → Match
@@ -11840,7 +11978,7 @@ mod tests {
         // Fix: guard pre_seeds against contamination (mirror Bug 32).
         test_tier3_contaminated_pre_seeds_false_mae {
             pattern: r"^.{0,26}\B((x{7,7}a?)?(a?a?)?)?$",
-            memory: 2583,
+            memory: 2327,
             min_tier: 1,
             inputs: [
                 ("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", false),  // Bug 48: 50 x's, false positive
@@ -11870,7 +12008,7 @@ mod tests {
         // a shorter path is found.
         test_tier3_deferred_path_shortcut {
             pattern: r"^.{7,36}\B(\ba{0,0})?((a?a?)?(a?a?)?)?$",
-            memory: 1693,
+            memory: 1437,
             min_tier: 2,
             inputs: [
                 ("aaaaaaaa", true),         // Bug 49: 8 a's, false negative
@@ -11921,7 +12059,7 @@ mod tests {
         // so value=0 >= min → immediate break → break_is_match_at_end.
         test_tier3_cov_pending_break_seed_eoi {
             pattern: r"^c{3,5}\b.{0,3}$",
-            memory: 1461,
+            memory: 1205,
             min_tier: 1,
             inputs: [
                 ("ccc", true),           // c0=3, \b pending at EOI, passes (word→end), c1 seed value=0 ≥ min=0
@@ -11942,7 +12080,7 @@ mod tests {
         // value 0→1 < min 3.  Instance continues counting (no immediate break).
         test_tier3_cov_tail_cinc_handoff_continue {
             pattern: r"^.{2,5}bc{3,6}$",
-            memory: 1527,
+            memory: 1271,
             min_tier: 1,
             inputs: [
                 ("aabccc", true),        // c0=2, tail 'b', handoff to c1, c1 counts to 3
@@ -11962,7 +12100,7 @@ mod tests {
         // breaks.  The break path has \b as a deferred assert.
         test_tier3_cov_tail_cinc_handoff_break_deferred {
             pattern: r"^a{3,5}b.{1,4}\b$",
-            memory: 1494,
+            memory: 1238,
             min_tier: 1,
             inputs: [
                 ("aaabx", true),         // c0=3, tail 'b', handoff c1=1, break, \b at EOI passes
@@ -11983,7 +12121,7 @@ mod tests {
         // new post-break tails that must advance through 'c' then 'd'.
         test_tier3_cov_multi_hop_tail_chain {
             pattern: r"^a{3,5}b.{1,3}cd$",
-            memory: 1494,
+            memory: 1238,
             min_tier: 1,
             inputs: [
                 ("aaabxcd", true),       // c0=3, tail 'b', c1 handoff, c1=1 breaks, tails 'c','d'
@@ -12001,7 +12139,7 @@ mod tests {
         // Advance deposits \b, resolved on NEXT byte (' ') mid-input.
         test_tier3_cov_advance_tail_deferred_mid_input {
             pattern: r"^.{2,5}.{2,5}c\b x",
-            memory: 1560,
+            memory: 1304,
             min_tier: 1,
             inputs: [
                 ("aaaac x", true),       // c0=2,c1=2, tail 'c', \b(c,' ') passes, ' ' consumed, 'x' consumed
@@ -12034,7 +12172,7 @@ mod tests {
         // \B at EOI fails (word→end = boundary, \B requires non-boundary).
         test_tier3_cov_none_target_deferred_fail {
             pattern: r"^.{2,30}c{9,48}y\B$",
-            memory: 2287,
+            memory: 2031,
             min_tier: 2,
             inputs: [
                 ("aaccccccccccy", false),    // c0=2, c1=10, tail 'y', \B at EOI fails
@@ -12051,7 +12189,7 @@ mod tests {
         // should return true.
         test_tier3_cov_contaminated_clean_nb_deferred_pass {
             pattern: r"^(.{3,10}.{3,10}|x+)\b$",
-            memory: 1890,
+            memory: 1634,
             min_tier: 1,
             inputs: [
                 ("xxx", true),           // x+ path, \b at EOI, counter-free
@@ -12068,7 +12206,7 @@ mod tests {
         // where contamination is present and the match is legitimate.
         test_tier3_cov_contamination_true_match {
             pattern: r"^.{3,5}.{3,5}a?$",
-            memory: 1527,
+            memory: 1271,
             min_tier: 1,
             inputs: [
                 ("aaaaaa", true),        // 3+3=6, both complete, a? skips
@@ -12086,7 +12224,7 @@ mod tests {
         // At EOI, \B(word, end) fails — word→end is a boundary.
         test_tier3_cov_verified_deferred_fail_eoi {
             pattern: r"^.{3,5}b\B$",
-            memory: 1362,
+            memory: 1106,
             min_tier: 1,
             inputs: [
                 ("aaab", false),         // \B at word(b)→EOI fails
@@ -12102,7 +12240,7 @@ mod tests {
         // Tests that cf_mae uses clean_nb_cf_mae correctly.
          test_tier3_cov_fast_path_contaminated {
             pattern: r"^(.{3,5}.{3,5})?$",
-            memory: 1494,
+            memory: 1238,
             min_tier: 1,
             inputs: [
                 ("aaaaaa", true),        // 3+3, ? matches, $
@@ -12134,7 +12272,7 @@ mod tests {
         }
         test_dense_unroll_byteclass_not_slash {
             pattern: "[^/]{1,20}",
-            memory: 1725,
+            memory: 1501,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -12145,7 +12283,7 @@ mod tests {
         }
         test_dense_unroll_digit_3_5 {
             pattern: r"\d{3,5}",
-            memory: 1230,
+            memory: 974,
             min_tier: 1,
             inputs: [
                 ("123", true),
@@ -12172,7 +12310,7 @@ mod tests {
         }
         test_dense_unroll_not_slash_1_4 {
             pattern: "^[^/]{1,4}$",
-            memory: 1263,
+            memory: 1039,
             min_tier: 1,
             inputs: [
                 ("a", true),
@@ -12202,7 +12340,7 @@ mod tests {
         // {1,10} uses a single counter → Tier 3 (not Tier 4).
         test_dense_unroll_motivating_path_pattern {
             pattern: "(?i)file[^/]{1,20}(/[^/]{1,20}){1,10}",
-            memory: 2617,
+            memory: 2393,
             min_tier: 3,
             inputs: [
                 ("fileA/B", true),
@@ -12217,7 +12355,7 @@ mod tests {
         // body with out_exit feeds CInc correctly.
         test_dense_unroll_inside_counter {
             pattern: "(.{1,5}){1,100}z",
-            memory: 1330,
+            memory: 1074,
             min_tier: 3,
             inputs: [
                 ("az", true),
@@ -12300,15 +12438,13 @@ mod tests {
         );
     }
 
-    /// `\d\d` — two identical predefined classes share one lookup table.
-    ///
-    /// Without dedup this would allocate two 256-byte tables; with dedup
-    /// the memory is the same as `\d` plus one extra `ByteClass` state.
+    /// `\d\d` — two identical predefined classes use ByteClassStatic
+    /// with shared static tables.  No entries in `classes`.
     #[test]
     fn test_dedup_same_class() {
         let one = build_regex_unchecked(r"^\d$");
         let two = build_regex_unchecked(r"^\d\d$");
-        // The second \`\d\` adds one ByteClass state and one Catenate
+        // The second \`\d\` adds one byte-class state and one Catenate
         // join — so the difference is exactly one State plus one bool
         // in state_can_reach_match.
         let state_size = std::mem::size_of::<State>();
@@ -12318,8 +12454,9 @@ mod tests {
             state_size + reach_entry,
             "second \\d should add one state, no extra class table",
         );
-        assert_eq!(one.classes.len(), 1);
-        assert_eq!(two.classes.len(), 1);
+        // Predefined classes use ByteClassStatic — no entries in classes.
+        assert_eq!(one.classes.len(), 0);
+        assert_eq!(two.classes.len(), 0);
     }
 
     /// `[0-9]` and `\d` produce the same 256-byte lookup table.  When
@@ -12333,7 +12470,7 @@ mod tests {
             mixed.memory_size(),
             "[0-9]\\d should be the same size as \\d\\d (same table, deduped)",
         );
-        assert_eq!(mixed.classes.len(), 1);
+        assert_eq!(mixed.classes.len(), 0);
         // Also verify correctness.
         assert_matches_regex_crate(r"^[0-9]\d$", &mixed, "42");
         assert_matches_regex_crate(r"^[0-9]\d$", &mixed, "00");
@@ -12354,7 +12491,7 @@ mod tests {
             explicit.memory_size(),
             "[0-9A-Za-z_]\\w should dedup to same table as \\w\\w",
         );
-        assert_eq!(explicit.classes.len(), 1);
+        assert_eq!(explicit.classes.len(), 0);
         assert_matches_regex_crate(r"^[0-9A-Za-z_]\w$", &explicit, "aZ");
         assert_matches_regex_crate(r"^[0-9A-Za-z_]\w$", &explicit, "_0");
         assert_matches_regex_crate(r"^[0-9A-Za-z_]\w$", &explicit, "!a");
@@ -12370,13 +12507,12 @@ mod tests {
             explicit.memory_size(),
             "explicit whitespace class should dedup with \\s",
         );
-        assert_eq!(explicit.classes.len(), 1);
+        assert_eq!(explicit.classes.len(), 0);
         assert_matches_regex_crate(r"^[\t\n\x0B\x0C\r ]\s$", &explicit, " \t");
         assert_matches_regex_crate(r"^[\t\n\x0B\x0C\r ]\s$", &explicit, "a ");
     }
 
-    /// `.*.*` — two wildcards produce the same `[true; 256]` table and
-    /// should be deduplicated to a single class.
+    /// `.*.*` — two wildcards use State::Wildcard (no class table entry).
     #[test]
     fn test_dedup_wildcard() {
         let one_wild = build_regex_unchecked("^.$");
@@ -12388,44 +12524,46 @@ mod tests {
             state_size + reach_entry,
             "second `.` should add one state, no extra class table",
         );
-        assert_eq!(one_wild.classes.len(), 1);
-        assert_eq!(two_wild.classes.len(), 1);
+        // Wildcards use State::Wildcard — no entries in classes.
+        assert_eq!(one_wild.classes.len(), 0);
+        assert_eq!(two_wild.classes.len(), 0);
     }
 
-    /// `\d\D` — complementary classes are *not* the same table, so both
-    /// must be stored.  This is a negative dedup test.
+    /// `\d\D` — complementary predefined classes both use
+    /// ByteClassStatic with distinct static tables.  No entries in
+    /// `classes` (both are predefined).
     #[test]
     fn test_no_dedup_complementary() {
         let same = build_regex_unchecked(r"^\d\d$");
         let comp = build_regex_unchecked(r"^\d\D$");
-        // \d\D has two distinct tables; \d\d has one.
-        let class_size = std::mem::size_of::<ByteClass>();
+        // Both \d and \D use ByteClassStatic — no classes entries.
+        // Memory difference is only the state variant itself (same size).
+        assert_eq!(same.classes.len(), 0);
+        assert_eq!(comp.classes.len(), 0);
+        // Memory should be equal since both use static tables.
         assert_eq!(
-            comp.memory_size() - same.memory_size(),
-            class_size,
-            "\\d\\D should have one more class table than \\d\\d",
+            same.memory_size(),
+            comp.memory_size(),
+            "\\d\\D and \\d\\d should have same size (both use static tables)",
         );
-        assert_eq!(same.classes.len(), 1);
-        assert_eq!(comp.classes.len(), 2);
     }
 
-    /// `\d{3,5}` — counted repetition unrolls multiple ByteClass states
+    /// `\d{3,5}` — counted repetition unrolls multiple byte-class states
     /// that all refer to the same class.  Only one table is stored.
     #[test]
     fn test_dedup_counted_repetition() {
         let single = build_regex_unchecked(r"^\d$");
         let counted = build_regex_unchecked(r"^\d{3,5}$");
-        // The counted version has more states (counter machinery) but
-        // should still have exactly one class table, same as the single.
+        // Both use ByteClassStatic — no entries in classes.
         assert_eq!(
             single.classes.len(),
-            1,
-            "\\d should have exactly 1 class table",
+            0,
+            "\\d should use ByteClassStatic, no class table",
         );
         assert_eq!(
             counted.classes.len(),
-            1,
-            "\\d{{3,5}} should still have exactly 1 class table (deduped)",
+            0,
+            "\\d{{3,5}} should use ByteClassStatic, no class table",
         );
     }
 
@@ -12990,7 +13128,7 @@ mod tests {
             ("(ab)*", 3), // 2 + 1 Split
             // One-or-more
             ("a+", 1),     // single-atom self-loop (no Split)
-            ("[a-z]+", 1), // single-atom self-loop (ByteClass)
+            ("[a-z]+", 1), // single-atom self-loop (byte-class)
             ("(ab)+", 3),  // 2 + 1 Split (generic)
             // Fixed repetition
             ("a{5}", 5),    // 5 copies

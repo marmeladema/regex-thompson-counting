@@ -382,7 +382,9 @@ impl DfaMemory {
                 }
                 State::Byte { .. }
                 | State::ByteCI { .. }
-                | State::ByteClass { .. }
+                | State::Wildcard { .. }
+                | State::ByteClassStatic { .. }
+                | State::ByteClassCustom { .. }
                 | State::ByteTable { .. } => {
                     self.closure_result.push(idx);
                 }

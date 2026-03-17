@@ -388,7 +388,9 @@ pub(crate) fn compute_tier2_analysis(
                     }
                     State::Byte { out, out_exit, .. }
                     | State::ByteCI { out, out_exit, .. }
-                    | State::ByteClass { out, out_exit, .. } => {
+                    | State::Wildcard { out, out_exit }
+                    | State::ByteClassStatic { out, out_exit, .. }
+                    | State::ByteClassCustom { out, out_exit, .. } => {
                         all_body_consuming.push(idx.0);
                         // Follow through the successor to find more body states.
                         stack.push(out);
@@ -534,7 +536,9 @@ fn collect_break_consuming(start: StateIdx, states: &[State]) -> Vec<StateIdx> {
             State::CounterInstance { out, .. } => stack.push(out),
             State::Byte { .. }
             | State::ByteCI { .. }
-            | State::ByteClass { .. }
+            | State::Wildcard { .. }
+            | State::ByteClassStatic { .. }
+            | State::ByteClassCustom { .. }
             | State::ByteTable { .. } => {
                 result.push(idx);
             }
@@ -1317,11 +1321,17 @@ fn consume_byte(idx: StateIdx, byte: u8, regex: &Regex) -> Option<(StateIdx, Sta
             out,
             out_exit,
         } if byte_match_ci(byte, b) => Some((out, out_exit)),
-        State::ByteClass {
+        State::Wildcard { out, out_exit } => Some((out, out_exit)),
+        State::ByteClassStatic {
+            table,
+            out,
+            out_exit,
+        } if table[byte as usize] => Some((out, out_exit)),
+        State::ByteClassCustom {
             class,
             out,
             out_exit,
-        } if regex.classes[class][byte] => Some((out, out_exit)),
+        } if regex.classes[class.idx()].contains(byte) => Some((out, out_exit)),
         State::ByteTable { table } => {
             let t = regex.byte_tables[table][byte];
             if t != StateIdx::NONE {
@@ -1372,7 +1382,9 @@ fn consuming_states_walk(
             State::CounterInstance { out, .. } => stack.push(out),
             State::Byte { .. }
             | State::ByteCI { .. }
-            | State::ByteClass { .. }
+            | State::Wildcard { .. }
+            | State::ByteClassStatic { .. }
+            | State::ByteClassCustom { .. }
             | State::ByteTable { .. } => {
                 result.push(idx);
             }

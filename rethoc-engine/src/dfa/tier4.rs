@@ -647,7 +647,9 @@ impl Tier4DfaCache {
                         }
                         State::Byte { .. }
                         | State::ByteCI { .. }
-                        | State::ByteClass { .. }
+                        | State::Wildcard { .. }
+                        | State::ByteClassStatic { .. }
+                        | State::ByteClassCustom { .. }
                         | State::ByteTable { .. } => {
                             self.closure_result.push(idx);
                             self.closure_ops
@@ -941,11 +943,27 @@ impl Tier4DfaCache {
                             origin_targets.push((idx, out_exit));
                         }
                     }
-                    State::ByteClass {
+                    State::Wildcard { out, out_exit } => {
+                        origin_targets.push((idx, out));
+                        if out_exit != StateIdx::NONE {
+                            origin_targets.push((idx, out_exit));
+                        }
+                    }
+                    State::ByteClassStatic {
+                        table,
+                        out,
+                        out_exit,
+                    } if table[byte as usize] => {
+                        origin_targets.push((idx, out));
+                        if out_exit != StateIdx::NONE {
+                            origin_targets.push((idx, out_exit));
+                        }
+                    }
+                    State::ByteClassCustom {
                         class,
                         out,
                         out_exit,
-                    } if regex.classes[class][byte] => {
+                    } if regex.classes[class.idx()].contains(byte) => {
                         origin_targets.push((idx, out));
                         if out_exit != StateIdx::NONE {
                             origin_targets.push((idx, out_exit));

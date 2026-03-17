@@ -99,7 +99,7 @@ struct SubsetClosure {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn tier2_overlap_probe(
     states: &[State],
-    classes: &[crate::ByteClass],
+    classes: &[crate::ByteClassBits],
     byte_tables: &[ByteMap],
     byte_classes: &[u8; 256],
     num_byte_classes: usize,
@@ -322,7 +322,9 @@ fn epsilon_closure_with_break_subset(
             }
             State::Byte { .. }
             | State::ByteCI { .. }
-            | State::ByteClass { .. }
+            | State::Wildcard { .. }
+            | State::ByteClassStatic { .. }
+            | State::ByteClassCustom { .. }
             | State::ByteTable { .. } => {
                 nfa_states.push(idx);
             }
@@ -383,7 +385,9 @@ fn epsilon_consuming_closure(
             }
             State::Byte { .. }
             | State::ByteCI { .. }
-            | State::ByteClass { .. }
+            | State::Wildcard { .. }
+            | State::ByteClassStatic { .. }
+            | State::ByteClassCustom { .. }
             | State::ByteTable { .. } => {
                 result.push(idx);
             }
@@ -404,7 +408,7 @@ fn consume_all(
     nfa_set: &[StateIdx],
     byte: u8,
     states: &[State],
-    classes: &[crate::ByteClass],
+    classes: &[crate::ByteClassBits],
     byte_tables: &[ByteMap],
 ) -> Vec<StateIdx> {
     let mut targets = Vec::new();
@@ -421,7 +425,7 @@ fn add_start_targets(
     start: StateIdx,
     byte: u8,
     states: &[State],
-    classes: &[crate::ByteClass],
+    classes: &[crate::ByteClassBits],
     byte_tables: &[ByteMap],
 ) {
     let start_consuming = epsilon_consuming_closure(&[start], states, false);
@@ -438,13 +442,17 @@ fn consume_byte_at(
     idx: StateIdx,
     byte: u8,
     states: &[State],
-    classes: &[crate::ByteClass],
+    classes: &[crate::ByteClassBits],
     byte_tables: &[ByteMap],
 ) -> Option<StateIdx> {
     match states[idx.idx()] {
         State::Byte { byte: b, out, .. } if byte == b => Some(out),
         State::ByteCI { byte: b, out, .. } if crate::byte_match_ci(byte, b) => Some(out),
-        State::ByteClass { class, out, .. } if classes[class.idx()][byte] => Some(out),
+        State::Wildcard { out, .. } => Some(out),
+        State::ByteClassStatic { table, out, .. } if table[byte as usize] => Some(out),
+        State::ByteClassCustom { class, out, .. } if classes[class.idx()].contains(byte) => {
+            Some(out)
+        }
         State::ByteTable { table } => {
             let t = byte_tables[table][byte];
             if t != StateIdx::NONE { Some(t) } else { None }
@@ -616,7 +624,7 @@ mod tests {
     }
 
     fn eligibility(regex: &crate::Regex) -> crate::dfa::tier2::eligibility::Tier2Eligibility {
-        let classes_set: indexmap::IndexSet<crate::ByteClass> =
+        let classes_set: indexmap::IndexSet<crate::ByteClassBits> =
             regex.classes.iter().copied().collect();
         crate::dfa::tier2::eligibility::compute_tier2_eligibility(
             &regex.states.0,

@@ -322,7 +322,9 @@ pub(crate) fn compute_tier3_analysis(
         match *state {
             State::Byte { out, out_exit, .. }
             | State::ByteCI { out, out_exit, .. }
-            | State::ByteClass { out, out_exit, .. } => {
+            | State::Wildcard { out, out_exit }
+            | State::ByteClassStatic { out, out_exit, .. }
+            | State::ByteClassCustom { out, out_exit, .. } => {
                 if out != StateIdx::NONE {
                     is_target[out.idx()] = true;
                 }
@@ -519,7 +521,9 @@ pub(crate) fn compute_tier3_analysis(
                 }
                 State::Byte { .. }
                 | State::ByteCI { .. }
-                | State::ByteClass { .. }
+                | State::Wildcard { .. }
+                | State::ByteClassStatic { .. }
+                | State::ByteClassCustom { .. }
                 | State::ByteTable { .. } => {
                     break_consuming.push(idx);
                 }
@@ -625,7 +629,9 @@ pub(crate) fn compute_tier3_analysis(
                     }
                     State::Byte { out, out_exit, .. }
                     | State::ByteCI { out, out_exit, .. }
-                    | State::ByteClass { out, out_exit, .. } => {
+                    | State::Wildcard { out, out_exit }
+                    | State::ByteClassStatic { out, out_exit, .. }
+                    | State::ByteClassCustom { out, out_exit, .. } => {
                         count += 1;
                         stack.push(out);
                         if out_exit != StateIdx::NONE {
@@ -665,7 +671,9 @@ pub(crate) fn compute_tier3_analysis(
         match *state {
             State::Byte { out, out_exit, .. }
             | State::ByteCI { out, out_exit, .. }
-            | State::ByteClass { out, out_exit, .. } => {
+            | State::Wildcard { out, out_exit }
+            | State::ByteClassStatic { out, out_exit, .. }
+            | State::ByteClassCustom { out, out_exit, .. } => {
                 if out != StateIdx::NONE {
                     targets_buf[0] = Some(out);
                 }
@@ -716,7 +724,9 @@ pub(crate) fn compute_tier3_analysis(
         match *state {
             State::Byte { out, out_exit, .. }
             | State::ByteCI { out, out_exit, .. }
-            | State::ByteClass { out, out_exit, .. } => {
+            | State::Wildcard { out, out_exit }
+            | State::ByteClassStatic { out, out_exit, .. }
+            | State::ByteClassCustom { out, out_exit, .. } => {
                 if out != StateIdx::NONE {
                     targets_buf[0] = Some(out);
                 }
@@ -780,7 +790,9 @@ pub(crate) fn compute_tier3_analysis(
         match *state {
             State::Byte { out, out_exit, .. }
             | State::ByteCI { out, out_exit, .. }
-            | State::ByteClass { out, out_exit, .. } => {
+            | State::Wildcard { out, out_exit }
+            | State::ByteClassStatic { out, out_exit, .. }
+            | State::ByteClassCustom { out, out_exit, .. } => {
                 if out != StateIdx::NONE {
                     targets_buf[0] = Some(out);
                 }
@@ -876,7 +888,9 @@ pub(crate) fn compute_tier3_analysis(
                 }
                 State::Byte { out, out_exit, .. }
                 | State::ByteCI { out, out_exit, .. }
-                | State::ByteClass { out, out_exit, .. } => {
+                | State::Wildcard { out, out_exit }
+                | State::ByteClassStatic { out, out_exit, .. }
+                | State::ByteClassCustom { out, out_exit, .. } => {
                     rwb[i] = true;
                     // Follow .out to reach consuming states deeper in the
                     // NFA graph (e.g. unrolled repetition chains).
@@ -2055,7 +2069,9 @@ impl Tier3DfaCache {
                                 regex.states[to],
                                 State::Byte { .. }
                                     | State::ByteCI { .. }
-                                    | State::ByteClass { .. }
+                                    | State::Wildcard { .. }
+                                    | State::ByteClassStatic { .. }
+                                    | State::ByteClassCustom { .. }
                                     | State::ByteTable { .. }
                             )
                         })
@@ -2151,7 +2167,9 @@ impl Tier3DfaCache {
                             regex.states[to],
                             State::Byte { .. }
                                 | State::ByteCI { .. }
-                                | State::ByteClass { .. }
+                                | State::Wildcard { .. }
+                                | State::ByteClassStatic { .. }
+                                | State::ByteClassCustom { .. }
                                 | State::ByteTable { .. }
                         )
                     })
@@ -2361,11 +2379,17 @@ fn consume_byte(idx: StateIdx, byte: u8, regex: &Regex) -> Option<(StateIdx, Sta
             out,
             out_exit,
         } if byte_match_ci(byte, b) => Some((out, out_exit)),
-        State::ByteClass {
+        State::Wildcard { out, out_exit } => Some((out, out_exit)),
+        State::ByteClassStatic {
+            table,
+            out,
+            out_exit,
+        } if table[byte as usize] => Some((out, out_exit)),
+        State::ByteClassCustom {
             class,
             out,
             out_exit,
-        } if regex.classes[class][byte] => Some((out, out_exit)),
+        } if regex.classes[class.idx()].contains(byte) => Some((out, out_exit)),
         State::ByteTable { table } => {
             let t = regex.byte_tables[table][byte];
             if t != StateIdx::NONE {
@@ -2399,7 +2423,9 @@ fn consuming_states_from(start: StateIdx, states: &[State]) -> Vec<StateIdx> {
             State::CounterInstance { out, .. } => stack.push(out),
             State::Byte { .. }
             | State::ByteCI { .. }
-            | State::ByteClass { .. }
+            | State::Wildcard { .. }
+            | State::ByteClassStatic { .. }
+            | State::ByteClassCustom { .. }
             | State::ByteTable { .. } => {
                 result.push(idx);
             }
@@ -2460,7 +2486,9 @@ fn analyze_target(
             }
             State::Byte { .. }
             | State::ByteCI { .. }
-            | State::ByteClass { .. }
+            | State::Wildcard { .. }
+            | State::ByteClassStatic { .. }
+            | State::ByteClassCustom { .. }
             | State::ByteTable { .. } => {
                 advance_origins.push(idx);
             }
@@ -2814,7 +2842,9 @@ fn break_consuming_tails(
             State::CounterInstance { out, .. } => stack.push((out, deferred)),
             State::Byte { out, out_exit, .. }
             | State::ByteCI { out, out_exit, .. }
-            | State::ByteClass { out, out_exit, .. } => {
+            | State::Wildcard { out, out_exit }
+            | State::ByteClassStatic { out, out_exit, .. }
+            | State::ByteClassCustom { out, out_exit, .. } => {
                 // Only include if at least one target's analysis is NOT
                 // Increment.  Increment targets are handled by counter
                 // seeding.

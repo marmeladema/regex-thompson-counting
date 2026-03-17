@@ -33,11 +33,27 @@ fn push_consume_targets(state: &State, byte: u8, regex: &Regex, targets: &mut Ve
                 targets.push(out_exit);
             }
         }
-        State::ByteClass {
+        State::Wildcard { out, out_exit } => {
+            targets.push(out);
+            if out_exit != StateIdx::NONE {
+                targets.push(out_exit);
+            }
+        }
+        State::ByteClassStatic {
+            table,
+            out,
+            out_exit,
+        } if table[byte as usize] => {
+            targets.push(out);
+            if out_exit != StateIdx::NONE {
+                targets.push(out_exit);
+            }
+        }
+        State::ByteClassCustom {
             class,
             out,
             out_exit,
-        } if regex.classes[class][byte] => {
+        } if regex.classes[class.idx()].contains(byte) => {
             targets.push(out);
             if out_exit != StateIdx::NONE {
                 targets.push(out_exit);

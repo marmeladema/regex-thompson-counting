@@ -1075,7 +1075,9 @@ fn classify_post_assert(start: StateIdx, states: &[crate::State]) -> PostAssertT
             // Consuming states and CInc break paths: stop.
             crate::State::Byte { .. }
             | crate::State::ByteCI { .. }
-            | crate::State::ByteClass { .. }
+            | crate::State::Wildcard { .. }
+            | crate::State::ByteClassStatic { .. }
+            | crate::State::ByteClassCustom { .. }
             | crate::State::ByteTable { .. }
             | crate::State::CounterIncrement { .. } => {
                 has_consuming = true;
@@ -1363,7 +1365,9 @@ pub(crate) fn compile_all_target_effects(
                         states[s.idx()],
                         crate::State::Byte { .. }
                             | crate::State::ByteCI { .. }
-                            | crate::State::ByteClass { .. }
+                            | crate::State::Wildcard { .. }
+                            | crate::State::ByteClassStatic { .. }
+                            | crate::State::ByteClassCustom { .. }
                             | crate::State::ByteTable { .. }
                     )
                 });
