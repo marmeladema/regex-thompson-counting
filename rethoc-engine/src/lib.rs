@@ -66,6 +66,7 @@ mod hir_optimize;
 mod info;
 pub mod memclass;
 mod memrange;
+mod prefilter;
 
 use dfa::{
     DfaMatcher, DfaMemory, Tier1DfaCache, Tier2Analysis, Tier2DfaCache, Tier2DfaMatcher,
@@ -323,31 +324,7 @@ pub(crate) fn byte_match_ci(input: u8, target: u8) -> bool {
 
 /// Prefilter for skipping bytes that can never start a match.
 ///
-/// Derived from [`Regex::start_closure`]: the set of consuming NFA states
-/// reachable from the start state determines which input bytes can
-/// possibly begin a match.  When the DFA is in the DEAD state, `memchr`
-/// is used to jump directly to the next candidate byte, skipping over
-/// large runs of irrelevant input at SIMD speed.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) enum Prefilter {
-    /// No prefilter — all bytes are potentially interesting (e.g. dot-star,
-    /// empty pattern, or too many distinct start bytes).
-    #[default]
-    None,
-    /// Exactly one byte can start a match.
-    Memchr1(u8),
-    /// Exactly two distinct bytes can start a match.
-    Memchr2(u8, u8),
-    /// Exactly three distinct bytes can start a match.
-    Memchr3(u8, u8, u8),
-    /// Four to eight distinct start bytes, searched via SIMD shuffle
-    /// lookup tables.
-    Memclass(memclass::MemclassTable),
-    /// All start bytes fall in a contiguous range `[lo, hi]` (inclusive).
-    /// Used when there are more than 3 distinct start bytes but they fit
-    /// within a range of at most 16 values.
-    Range(u8, u8),
-}
+pub(crate) use prefilter::Prefilter;
 
 impl AssertKind {
     /// Evaluate this assertion.
@@ -1120,31 +1097,7 @@ impl Regex {
         };
 
         // -- Prefilter --
-        let prefilter_desc = match &self.prefilter {
-            Prefilter::None => "none".to_string(),
-            Prefilter::Memchr1(b) => format!("memchr1({:?})", *b as char),
-            Prefilter::Memchr2(a, b) => format!("memchr2({:?}, {:?})", *a as char, *b as char),
-            Prefilter::Memchr3(a, b, c) => {
-                format!(
-                    "memchr3({:?}, {:?}, {:?})",
-                    *a as char, *b as char, *c as char
-                )
-            }
-            Prefilter::Memclass(t) => {
-                let bytes: Vec<String> = (0..=255u8)
-                    .filter(|&b| t.contains(b))
-                    .map(|b| {
-                        if b.is_ascii_graphic() {
-                            format!("{:?}", b as char)
-                        } else {
-                            format!("0x{:02X}", b)
-                        }
-                    })
-                    .collect();
-                format!("memclass({})", bytes.join(", "))
-            }
-            Prefilter::Range(lo, hi) => format!("range(0x{:02X}..=0x{:02X})", lo, hi),
-        };
+        let prefilter_desc = self.prefilter.to_string();
 
         RegexInfo {
             memory: MemoryInfo {
@@ -2786,13 +2739,18 @@ impl RegexBuilder {
                 (identity, 256)
             };
 
-        let prefilter = Self::compute_prefilter(
-            &start_closure,
-            start_closure_matches,
-            self.states.as_slice(),
-            &classes_slice,
-            &byte_tables_slice,
-        );
+        // If the pattern can match empty, every byte is "interesting"
+        // — prefilter can't help.
+        let prefilter = if start_closure_matches {
+            Prefilter::None
+        } else {
+            prefilter::compute_prefilter(
+                start,
+                self.states.as_slice(),
+                &classes_slice,
+                &byte_tables_slice,
+            )
+        };
 
         // Precompute can-reach-match for every NFA state.
         let state_can_reach_match = Self::compute_can_reach_match(self.states.as_slice());
@@ -3039,77 +2997,6 @@ impl RegexBuilder {
 
     /// Derive a [`Prefilter`] from the precomputed start closure.
     ///
-    /// Examines which bytes each consuming state in `start_closure` can accept
-    /// and picks the tightest `memchr` variant (1, 2, or 3 bytes).  Falls back
-    /// to `Prefilter::None` when the set is too large or `start_closure` is
-    /// empty (runtime will use full epsilon closure).
-    fn compute_prefilter(
-        start_closure: &[StateIdx],
-        start_closure_matches: bool,
-        states: &[State],
-        classes: &[ByteClass],
-        byte_tables: &[ByteMap],
-    ) -> Prefilter {
-        // If the pattern can match empty, every byte is "interesting"
-        // (we already matched, so prefilter doesn't help).
-        if start_closure_matches {
-            return Prefilter::None;
-        }
-        // Empty closure means runtime falls back to full epsilon-closure;
-        // we can't prefilter.
-        if start_closure.is_empty() {
-            return Prefilter::None;
-        }
-        // Collect the set of bytes that ANY start-closure state accepts.
-        let mut start_bytes = [false; 256];
-        for &idx in start_closure {
-            match states[idx] {
-                State::Byte { byte, .. } => {
-                    start_bytes[byte as usize] = true;
-                }
-                State::ByteCI { byte, .. } => {
-                    // byte is lowercase; also mark uppercase
-                    start_bytes[byte as usize] = true;
-                    start_bytes[(byte ^ 0x20) as usize] = true;
-                }
-                State::ByteClass { class, .. } => {
-                    for b in 0..=255u8 {
-                        if classes[class.idx()][b] {
-                            start_bytes[b as usize] = true;
-                        }
-                    }
-                }
-                State::ByteTable { table, .. } => {
-                    for b in 0..=255u8 {
-                        if byte_tables[table.idx()].0[b as usize] != StateIdx::NONE {
-                            start_bytes[b as usize] = true;
-                        }
-                    }
-                }
-                _ => return Prefilter::None, // unexpected state type
-            }
-        }
-
-        let bytes: Vec<u8> = (0..=255u8).filter(|&b| start_bytes[b as usize]).collect();
-        match bytes.len() {
-            0 => Prefilter::None, // shouldn't happen, but be safe
-            1 => Prefilter::Memchr1(bytes[0]),
-            2 => Prefilter::Memchr2(bytes[0], bytes[1]),
-            3 => Prefilter::Memchr3(bytes[0], bytes[1], bytes[2]),
-            4..=8 => Prefilter::Memclass(memclass::MemclassTable::new(&bytes)),
-            _ => {
-                // Check if all start bytes fit in a range of at most 16 values.
-                let lo = bytes[0]; // bytes is sorted (from 0..=255 filter)
-                let hi = bytes[bytes.len() - 1];
-                if hi - lo < 16 {
-                    Prefilter::Range(lo, hi)
-                } else {
-                    Prefilter::None
-                }
-            }
-        }
-    }
-
     fn compute_start_closure(&self, start: StateIdx) -> (Box<[StateIdx]>, bool) {
         let mut leaves = Vec::new();
         let mut has_match = false;
