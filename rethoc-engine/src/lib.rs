@@ -59,6 +59,7 @@ use ahash::HashMap;
 /// Global counter for assigning unique IDs to compiled regexes.
 static NEXT_REGEX_ID: AtomicU64 = AtomicU64::new(1);
 
+mod bounded_gap;
 mod dfa;
 mod dump;
 pub mod fuzz_gen;
@@ -1965,54 +1966,27 @@ impl RegexBuilder {
                 }
                 Ok(())
             }
-            HirKind::Class(hir::Class::Bytes(class)) => {
+            HirKind::Class(class) => {
                 // Detect case-insensitive ASCII letter pair: exactly two
                 // single-byte ranges like [C-C][c-c].
-                if let Some(lower) = Self::detect_ci_letter_bytes(class.ranges()) {
-                    self.postfix.push(RegexHirNode::ByteCI(lower));
-                    return Ok(());
-                }
-                let mut table = ByteClass::NONE;
-                for range in class.ranges() {
-                    for b in range.start()..=range.end() {
-                        table.0[b as usize] = true;
+                match class {
+                    hir::Class::Bytes(bc) => {
+                        if let Some(lower) = Self::detect_ci_letter_bytes(bc.ranges()) {
+                            self.postfix.push(RegexHirNode::ByteCI(lower));
+                            return Ok(());
+                        }
+                    }
+                    hir::Class::Unicode(uc) => {
+                        if let Some(lower) = Self::detect_ci_letter_unicode(uc.ranges()) {
+                            self.postfix.push(RegexHirNode::ByteCI(lower));
+                            return Ok(());
+                        }
                     }
                 }
-                if table.is_all() {
-                    self.postfix.push(RegexHirNode::Wildcard);
-                } else if let Some(static_table) = static_classes::detect(&table.0) {
-                    self.postfix
-                        .push(RegexHirNode::ByteClassStatic(static_table));
-                } else {
-                    let idx = self.intern_class(table);
-                    self.postfix.push(RegexHirNode::ByteClassCustom(idx));
-                }
-                Ok(())
-            }
-            HirKind::Class(hir::Class::Unicode(class)) => {
-                // regex-syntax may produce Unicode classes for ASCII-only
-                // patterns like `(a|b)` �� `[ab]`.  If all ranges fit in a
-                // single byte (0x00..=0xFF), lower them to a ByteClass;
-                // otherwise reject.
-                let ranges = class.ranges();
-                let all_single_byte = ranges
-                    .iter()
-                    .all(|r| (r.start() as u32) <= 0xFF && (r.end() as u32) <= 0xFF);
-                if !all_single_byte {
-                    return Err(Error::UnsupportedClass(hir::Class::Unicode(class.clone())));
-                }
-                // Detect case-insensitive ASCII letter pair: exactly two
-                // single-char ranges like [C-C][c-c].
-                if let Some(lower) = Self::detect_ci_letter_unicode(ranges) {
-                    self.postfix.push(RegexHirNode::ByteCI(lower));
-                    return Ok(());
-                }
-                let mut table = ByteClass::NONE;
-                for range in ranges {
-                    for b in (range.start() as u8)..=(range.end() as u8) {
-                        table.0[b as usize] = true;
-                    }
-                }
+                // General path: build boolean table from HIR class.
+                // For Unicode classes this rejects codepoints above 0xFF.
+                let table = ByteClass::from_hir_class(class)
+                    .ok_or_else(|| Error::UnsupportedClass(class.clone()))?;
                 if table.is_all() {
                     self.postfix.push(RegexHirNode::Wildcard);
                 } else if let Some(static_table) = static_classes::detect(&table.0) {

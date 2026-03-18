@@ -15,6 +15,8 @@
 
 use std::ops::Index;
 
+use regex_syntax::hir;
+
 /// Compact bit-packed byte-class for custom character classes.
 ///
 /// Stores 256 membership bits in 4 × u64 = 32 bytes (8× smaller than
@@ -59,6 +61,46 @@ impl ByteClass {
     /// Test whether this class matches every byte (wildcard).
     pub(crate) fn is_all(&self) -> bool {
         self.0.iter().all(|&b| b)
+    }
+
+    /// Build from a `regex-syntax` HIR character class.
+    ///
+    /// Handles both `Class::Bytes` (infallible) and `Class::Unicode`
+    /// (fallible — returns `None` if any codepoint exceeds 0xFF).
+    ///
+    /// `regex-syntax` may produce `Class::Unicode` for ASCII-only
+    /// patterns like `(a|b)` or `[ab]`.  If all ranges fit in a
+    /// single byte (0x00..=0xFF), they are lowered to a byte table;
+    /// otherwise the class is rejected.
+    pub(crate) fn from_hir_class(class: &hir::Class) -> Option<Self> {
+        match class {
+            hir::Class::Bytes(bc) => {
+                let mut table = Self::NONE;
+                for range in bc.ranges() {
+                    for b in range.start()..=range.end() {
+                        table.0[b as usize] = true;
+                    }
+                }
+                Some(table)
+            }
+            hir::Class::Unicode(uc) => {
+                let ranges = uc.ranges();
+                // Reject multi-byte Unicode classes (codepoints > 0xFF).
+                if !ranges
+                    .iter()
+                    .all(|r| (r.start() as u32) <= 0xFF && (r.end() as u32) <= 0xFF)
+                {
+                    return None;
+                }
+                let mut table = Self::NONE;
+                for range in ranges {
+                    for b in (range.start() as u8)..=(range.end() as u8) {
+                        table.0[b as usize] = true;
+                    }
+                }
+                Some(table)
+            }
+        }
     }
 }
 
