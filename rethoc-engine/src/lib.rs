@@ -948,7 +948,7 @@ pub(crate) fn parse_hir(pattern: &str) -> Result<Hir, Error> {
         .build()
         .translate(pattern, &ast)
         .map_err(|e| Error::Translate(e.to_string()))?;
-    Ok(hir_optimize::optimize(hir))
+    Ok(hir_optimize::optimize(hir, false))
 }
 
 impl Regex {
@@ -2034,57 +2034,13 @@ impl RegexBuilder {
             }
             HirKind::Capture(cap) => self.hir2postfix(&cap.sub),
             HirKind::Concat(children) => {
+                // Repetition merging (`.{0,10}.{0,10}` → `.{0,20}`) is now
+                // handled by hir_optimize::optimize(hir, merge_repetitions=true)
+                // before hir2postfix is called.
                 let mut count = 0;
-                let mut i = 0;
-                while i < children.len() {
-                    // Merge consecutive bounded repetitions with identical
-                    // bodies.  E.g. `.{0,1000}.{0,1000}.{0,1000}` → `.{0,3000}`.
-                    //
-                    // Only merge genuine bounded counters (max > 1, finite)
-                    // — not `?` (0,1), `*` (0,∞), or `+` (1,∞).
-                    if self.config.merge_repetitions
-                        && let HirKind::Repetition(rep) = children[i].kind()
-                        && let Some(rep_max) = rep.max
-                        && rep_max > 1
-                        && rep.min < rep_max
-                    {
-                        {
-                            let mut merged_min = rep.min as usize;
-                            let mut merged_max = rep_max as usize;
-                            let mut j = i + 1;
-                            while j < children.len() {
-                                if let HirKind::Repetition(rep2) = children[j].kind()
-                                    && let Some(rep2_max) = rep2.max
-                                    && rep2_max > 1
-                                    && rep2.min < rep2_max
-                                    && rep2.sub == rep.sub
-                                {
-                                    merged_min = merged_min.saturating_add(rep2.min as usize);
-                                    merged_max = merged_max.saturating_add(rep2_max as usize);
-                                    j += 1;
-                                    continue;
-                                }
-                                break;
-                            }
-                            if j > i + 1 {
-                                // Merged run of j - i repetitions into one.
-                                // Bypass max_repetition: individual reps were
-                                // already validated by regex-syntax.
-                                let before = self.postfix.len();
-                                self.emit_bounded_repetition(&rep.sub, merged_min, merged_max)?;
-                                if self.postfix.len() > before {
-                                    count += 1;
-                                    if count > 1 {
-                                        self.postfix.push(RegexHirNode::Catenate);
-                                    }
-                                }
-                                i = j;
-                                continue;
-                            }
-                        }
-                    }
+                for child in children {
                     let before = self.postfix.len();
-                    self.hir2postfix(&children[i])?;
+                    self.hir2postfix(child)?;
                     // Only emit Catenate if the child actually produced
                     // output (Empty produces nothing).
                     if self.postfix.len() > before {
@@ -2093,7 +2049,6 @@ impl RegexBuilder {
                             self.postfix.push(RegexHirNode::Catenate);
                         }
                     }
-                    i += 1;
                 }
                 Ok(())
             }
@@ -2483,13 +2438,24 @@ impl RegexBuilder {
             return Err(Error::PatternTooComplex { estimated, limit });
         }
 
+        // Re-optimize HIR with repetition merging when configured.
+        // The first optimize() in parse_hir() runs without merging;
+        // this pass adds same-body repetition merging when enabled.
+        let merged_hir;
+        let compile_hir = if self.config.merge_repetitions {
+            merged_hir = hir_optimize::optimize(hir.clone(), true);
+            &merged_hir
+        } else {
+            hir
+        };
+
         self.states.clear();
         self.frags.clear();
         self.postfix.clear();
         self.counters.clear();
         self.classes.clear();
         self.byte_tables.clear();
-        self.hir2postfix(hir)?;
+        self.hir2postfix(compile_hir)?;
 
         let mut postfix = std::mem::take(&mut self.postfix);
         for node in postfix.drain(..) {
@@ -2908,8 +2874,15 @@ impl RegexBuilder {
             prefilter,
             state_can_reach_match,
             counter_break_can_match,
-            // Phase 2 will populate this via try_build_bounded_gap_plan().
-            bounded_gap_plan: None,
+            // Bounded-gap probe: always merge repetitions for widest
+            // recognition, even when config.merge_repetitions is false.
+            bounded_gap_plan: if self.config.merge_repetitions {
+                // compile_hir already has repetitions merged.
+                bounded_gap::try_build_bounded_gap_plan(compile_hir)
+            } else {
+                let probe_hir = hir_optimize::optimize(hir.clone(), true);
+                bounded_gap::try_build_bounded_gap_plan(&probe_hir)
+            },
         })
     }
     // -----------------------------------------------------------------------
@@ -6411,7 +6384,7 @@ mod tests {
         }
         test_wildcard_fixed_unrolled {
             pattern: "^a.{3}b$",
-            memory: 1128,
+            memory: 1248,
             min_tier: 1,
             inputs: [
                 ("a123b", true),
@@ -9383,7 +9356,7 @@ mod tests {
         }
         test_partial_ci_counted_group {
             pattern: "^a(?i:b){2,4}c$",
-            memory: 1161,
+            memory: 1281,
             min_tier: 1,
             inputs: [
                 ("abbc", true),
@@ -9520,7 +9493,7 @@ mod tests {
         }
         test_partial_ci_optional_group {
             pattern: "^a(?i:b)?c$",
-            memory: 1095,
+            memory: 1215,
             min_tier: 1,
             inputs: [
                 ("ac", true),
@@ -9718,7 +9691,7 @@ mod tests {
         }
         test_multi_counter_with_literal_prefix {
             pattern: "^ID-[A-Z]{4}-[0-9]{6}$",
-            memory: 1425,
+            memory: 1593,
             min_tier: 1,
             inputs: [
                 ("ID-ABCD-123456", true),
@@ -10409,7 +10382,7 @@ mod tests {
         // tracker detects this when counter 0 breaks.
         test_tier3_post_break_tail_literal {
             pattern: "^a.{3}b$",
-            memory: 1128,
+            memory: 1248,
             min_tier: 1,
             inputs: [
                 ("a123b", true),

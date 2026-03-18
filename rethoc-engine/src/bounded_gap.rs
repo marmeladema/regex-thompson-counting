@@ -207,6 +207,178 @@ impl BoundedGapPlan {
 }
 
 // ---------------------------------------------------------------------------
+// Compile-Time Specialisation Probe
+// ---------------------------------------------------------------------------
+
+/// Attempt to detect a Version 1 bounded-gap chain in the given HIR.
+///
+/// Returns `Some(plan)` if the pattern matches the chain shape
+/// `Anchor (Gap Anchor)* Gap?` with Version 1 restrictions:
+///
+/// - Fixed-length, assertion-free anchors
+/// - One-byte finite gap predicates
+/// - No leading gap
+/// - No internal assertions (whole-pattern `^`/`$` are hoisted)
+///
+/// Returns `None` for any pattern that does not qualify — the caller
+/// should continue with normal compilation.
+pub(crate) fn try_build_bounded_gap_plan(hir: &Hir) -> Option<BoundedGapPlan> {
+    // Step 1: Flatten top-level concat.
+    let pieces = flatten_top_level_concat(hir);
+    if pieces.is_empty() {
+        return None;
+    }
+
+    // Step 2: Hoist whole-pattern ^ / $.
+    let mut start_anchor = StartAnchorKind::None;
+    let mut end_anchor = EndAnchorKind::None;
+    let mut start = 0;
+    let mut end = pieces.len();
+
+    // Leading ^
+    if let Some(HirKind::Look(look)) = pieces.first().map(|h| h.kind()) {
+        match look {
+            regex_syntax::hir::Look::Start => {
+                start_anchor = StartAnchorKind::StartOfInput;
+                start = 1;
+            }
+            // StartLF / StartCRLF → reject in V1.
+            regex_syntax::hir::Look::StartLF | regex_syntax::hir::Look::StartCRLF => {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    // Trailing $
+    if end > start
+        && let Some(HirKind::Look(look)) = pieces.get(end - 1).map(|h| h.kind())
+    {
+        match look {
+            regex_syntax::hir::Look::End => {
+                end_anchor = EndAnchorKind::EndOfInput;
+                end -= 1;
+            }
+            // EndLF / EndCRLF → reject in V1.
+            regex_syntax::hir::Look::EndLF | regex_syntax::hir::Look::EndCRLF => {
+                return None;
+            }
+            _ => {}
+        }
+    }
+
+    let pieces = &pieces[start..end];
+    if pieces.is_empty() {
+        return None;
+    }
+
+    // Step 3: Partition into alternating anchor/gap segments.
+    //
+    // Each piece that classify_gap() recognises is a gap.  Everything
+    // else is anchor material.  Consecutive anchor-material pieces
+    // concatenate into a single anchor.
+    let mut anchor_pieces: Vec<Vec<&Hir>> = Vec::new();
+    let mut gaps: Vec<GapPlan> = Vec::new();
+    let mut current_anchor: Vec<&Hir> = Vec::new();
+    let mut last_was_gap = false;
+
+    for piece in pieces {
+        if let Some((min, max, pred)) = classify_gap(piece) {
+            // Normalise {0,0} → skip (merge adjacent anchors).
+            if min == 0 && max == 0 {
+                continue;
+            }
+            if current_anchor.is_empty() && anchor_pieces.is_empty() {
+                // Leading gap → reject in V1.
+                return None;
+            }
+            if last_was_gap {
+                // Adjacent gaps — the HIR should already have same-body
+                // repetitions merged by optimize(hir, merge_repetitions=true)
+                // before the probe runs.  If we still see adjacent gaps,
+                // they have different predicates and can't be merged.
+                return None;
+            }
+            // Close the current anchor.
+            anchor_pieces.push(std::mem::take(&mut current_anchor));
+            gaps.push(GapPlan {
+                min_gap: min,
+                max_gap: max,
+                predicate: pred,
+            });
+            last_was_gap = true;
+        } else {
+            // Anchor material.
+            if let HirKind::Empty = piece.kind() {
+                // Skip empty nodes that survived optimisation.
+                continue;
+            }
+            current_anchor.push(piece);
+            last_was_gap = false;
+        }
+    }
+
+    // Close trailing anchor (if any).
+    if !current_anchor.is_empty() {
+        anchor_pieces.push(std::mem::take(&mut current_anchor));
+    }
+
+    // Determine chain shape.
+    let (interior_gaps, tail_gap) = if anchor_pieces.len() == gaps.len() + 1 {
+        // Anchor-terminated: A (G A)*
+        (gaps, None)
+    } else if anchor_pieces.len() == gaps.len() && !gaps.is_empty() {
+        // Tail-gap: A (G A)* G
+        let tail = gaps.pop().unwrap();
+        (gaps, Some(tail))
+    } else {
+        // Invalid shape.
+        return None;
+    };
+
+    // Must have at least one gap (otherwise no point in the specialisation).
+    if interior_gaps.is_empty() && tail_gap.is_none() {
+        return None;
+    }
+
+    // Step 4: Validate Version 1 anchor restrictions and build anchor plans.
+    let mut anchor_plans: Vec<AnchorPlan> = Vec::with_capacity(anchor_pieces.len());
+    for pieces in &anchor_pieces {
+        // Compute aggregate fixed length.
+        let mut total_len: u16 = 0;
+        for piece in pieces {
+            let fl = compute_fixed_length(piece)?;
+            total_len = total_len.checked_add(fl.len)?;
+        }
+        if total_len == 0 {
+            return None; // Empty anchor.
+        }
+
+        // All pieces must be assertion-free.
+        for piece in pieces {
+            if !is_assertion_free(piece) {
+                return None;
+            }
+        }
+
+        anchor_plans.push(AnchorPlan {
+            program: AnchorProgram {
+                engine: AnchorEngine::Tier0(AnchorNfaProgram { _placeholder: () }),
+                prefilter: Prefilter::None,
+            },
+            length_info: AnchorLengthInfo::Fixed(total_len),
+        });
+    }
+
+    Some(BoundedGapPlan {
+        anchors: anchor_plans.into_boxed_slice(),
+        interior_gaps: interior_gaps.into_boxed_slice(),
+        tail_gap,
+        start_anchor,
+        end_anchor,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // HIR Flattening
 // ---------------------------------------------------------------------------
 
@@ -350,9 +522,17 @@ mod tests {
     use super::*;
     use crate::parse_hir;
 
-    /// Helper: parse a pattern to HIR using the same settings as the engine.
+    /// Helper: parse a pattern to HIR using the same settings as the engine
+    /// (without repetition merging, matching `parse_hir` behavior).
     fn hir(pattern: &str) -> Hir {
         parse_hir(pattern).expect("test pattern should parse")
+    }
+
+    /// Helper: parse a pattern to HIR with repetition merging enabled,
+    /// matching what the bounded-gap probe sees in `build()`.
+    fn hir_merged(pattern: &str) -> Hir {
+        let h = parse_hir(pattern).expect("test pattern should parse");
+        crate::hir_optimize::optimize(h, true)
     }
 
     // -- flatten_top_level_concat -------------------------------------------
@@ -688,5 +868,270 @@ mod tests {
     fn test_not_assertion_free_word_boundary_negated() {
         let h = hir(r"foo\B");
         assert!(!is_assertion_free(&h));
+    }
+
+    // -- try_build_bounded_gap_plan: recognition ----------------------------
+
+    #[test]
+    fn test_probe_simple_two_anchor() {
+        // foo.{0,10}bar → 2 anchors, 1 interior gap, no tail gap
+        let h = hir(r"foo.{0,10}bar");
+        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        assert_eq!(plan.anchors.len(), 2);
+        assert_eq!(plan.interior_gaps.len(), 1);
+        assert!(plan.tail_gap.is_none());
+        assert_eq!(plan.interior_gaps[0].min_gap, 0);
+        assert_eq!(plan.interior_gaps[0].max_gap, 10);
+        assert_eq!(plan.interior_gaps[0].predicate, GapPredicate::Any);
+        assert_eq!(plan.anchors[0].length_info, AnchorLengthInfo::Fixed(3));
+        assert_eq!(plan.anchors[1].length_info, AnchorLengthInfo::Fixed(3));
+    }
+
+    #[test]
+    fn test_probe_three_anchor_chain() {
+        // foo.{0,10}bar.{0,20}baz → 3 anchors, 2 interior gaps
+        let h = hir(r"foo.{0,10}bar.{0,20}baz");
+        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        assert_eq!(plan.anchors.len(), 3);
+        assert_eq!(plan.interior_gaps.len(), 2);
+        assert!(plan.tail_gap.is_none());
+        assert_eq!(plan.interior_gaps[1].max_gap, 20);
+    }
+
+    #[test]
+    fn test_probe_trailing_gap() {
+        // CWS.{254} → 1 anchor, 0 interior gaps, 1 tail gap
+        let h = hir(r"CWS.{254}");
+        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        assert_eq!(plan.anchors.len(), 1);
+        assert_eq!(plan.interior_gaps.len(), 0);
+        let tail = plan.tail_gap.as_ref().expect("should have tail gap");
+        assert_eq!(tail.min_gap, 254);
+        assert_eq!(tail.max_gap, 254);
+        assert_eq!(tail.predicate, GapPredicate::Any);
+        assert_eq!(plan.anchors[0].length_info, AnchorLengthInfo::Fixed(3));
+    }
+
+    #[test]
+    fn test_probe_constrained_trailing_gap() {
+        // token[^/]{0,20} → 1 anchor, 0 interior gaps, 1 constrained tail gap
+        let h = hir(r"token[^/]{0,20}");
+        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        assert_eq!(plan.anchors.len(), 1);
+        assert_eq!(plan.interior_gaps.len(), 0);
+        let tail = plan.tail_gap.as_ref().expect("should have tail gap");
+        assert_eq!(tail.min_gap, 0);
+        assert_eq!(tail.max_gap, 20);
+        match tail.predicate {
+            GapPredicate::ByteClass(bits) => {
+                assert!(!bits.contains(b'/'));
+                assert!(bits.contains(b'a'));
+            }
+            _ => panic!("expected constrained predicate"),
+        }
+    }
+
+    #[test]
+    fn test_probe_hoisted_start_anchor() {
+        // ^foo.{0,10}bar → StartOfInput hoisted
+        let h = hir(r"^foo.{0,10}bar");
+        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        assert_eq!(plan.start_anchor, StartAnchorKind::StartOfInput);
+        assert_eq!(plan.end_anchor, EndAnchorKind::None);
+        assert_eq!(plan.anchors.len(), 2);
+    }
+
+    #[test]
+    fn test_probe_hoisted_end_anchor() {
+        // foo.{0,10}bar$ → EndOfInput hoisted
+        let h = hir(r"foo.{0,10}bar$");
+        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        assert_eq!(plan.start_anchor, StartAnchorKind::None);
+        assert_eq!(plan.end_anchor, EndAnchorKind::EndOfInput);
+    }
+
+    #[test]
+    fn test_probe_both_anchors_hoisted() {
+        // ^foo.{0,10}bar$ → both hoisted
+        let h = hir(r"^foo.{0,10}bar$");
+        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        assert_eq!(plan.start_anchor, StartAnchorKind::StartOfInput);
+        assert_eq!(plan.end_anchor, EndAnchorKind::EndOfInput);
+    }
+
+    #[test]
+    fn test_probe_exact_gap() {
+        // foo.{5}bar → exact gap of 5
+        let h = hir(r"foo.{5}bar");
+        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        assert_eq!(plan.interior_gaps[0].min_gap, 5);
+        assert_eq!(plan.interior_gaps[0].max_gap, 5);
+    }
+
+    #[test]
+    fn test_probe_case_insensitive_anchor() {
+        // (?i)file.{0,10}path → case-insensitive anchors
+        let h = hir(r"(?i)file.{0,10}path");
+        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        assert_eq!(plan.anchors[0].length_info, AnchorLengthInfo::Fixed(4));
+        assert_eq!(plan.anchors[1].length_info, AnchorLengthInfo::Fixed(4));
+    }
+
+    // -- try_build_bounded_gap_plan: rejection ------------------------------
+
+    #[test]
+    fn test_probe_reject_no_gap() {
+        // "foobar" → no gaps, specialisation does not apply
+        let h = hir(r"foobar");
+        assert!(try_build_bounded_gap_plan(&h).is_none());
+    }
+
+    #[test]
+    fn test_probe_reject_leading_gap() {
+        // .{0,20}foo → leading gap, rejected
+        let h = hir(r".{0,20}foo");
+        assert!(try_build_bounded_gap_plan(&h).is_none());
+    }
+
+    #[test]
+    fn test_probe_reject_unbounded_gap() {
+        // foo.*bar → unbounded gap
+        let h = hir(r"foo.*bar");
+        assert!(try_build_bounded_gap_plan(&h).is_none());
+    }
+
+    #[test]
+    fn test_probe_reject_variable_length_anchor() {
+        // foo.{0,10}ba+r → "ba+r" contains unbounded a+ which is
+        // anchor material with variable length → rejected
+        let h = hir(r"foo.{0,10}ba+r");
+        assert!(try_build_bounded_gap_plan(&h).is_none());
+    }
+
+    #[test]
+    fn test_probe_reject_assertion_in_anchor() {
+        // \bfoo.{0,10}bar → \b in anchor
+        let h = hir(r"\bfoo.{0,10}bar");
+        assert!(try_build_bounded_gap_plan(&h).is_none());
+    }
+
+    #[test]
+    fn test_probe_reject_startlf() {
+        // (?m:^)foo.{0,10}bar → StartLF, rejected in V1
+        let h = hir(r"(?m:^)foo.{0,10}bar");
+        assert!(try_build_bounded_gap_plan(&h).is_none());
+    }
+
+    #[test]
+    fn test_probe_reject_endlf() {
+        // foo.{0,10}bar(?m:$) → EndLF, rejected in V1
+        let h = hir(r"foo.{0,10}bar(?m:$)");
+        assert!(try_build_bounded_gap_plan(&h).is_none());
+    }
+
+    #[test]
+    fn test_probe_reject_alternation_whole_chain() {
+        // (foo|bar).{0,10}baz → top level is alternation, not concat
+        // Actually this IS a concat: (foo|bar) then .{0,10} then baz
+        // The first anchor (foo|bar) has fixed length 3, no assertions → OK
+        let h = hir(r"(foo|bar).{0,10}baz");
+        let plan = try_build_bounded_gap_plan(&h);
+        // This should actually be recognised if (foo|bar) has fixed length 3
+        assert!(plan.is_some());
+    }
+
+    #[test]
+    fn test_probe_reject_top_level_alternation() {
+        // foo|bar — alternation at top level, not a concat chain
+        let h = hir(r"foo|bar");
+        assert!(try_build_bounded_gap_plan(&h).is_none());
+    }
+
+    #[test]
+    fn test_probe_reject_multi_byte_gap_body() {
+        // foo(ab){0,10}bar → gap body is multi-byte
+        let h = hir(r"foo(ab){0,10}bar");
+        assert!(try_build_bounded_gap_plan(&h).is_none());
+    }
+
+    #[test]
+    fn test_probe_adjacent_same_predicate_gaps_merged() {
+        // .{0,10}.{0,20} → optimize(merge=true) merges to .{0,30}
+        let h = hir_merged(r"foo.{0,10}.{0,20}bar");
+        let plan = try_build_bounded_gap_plan(&h).expect("should recognise merged gaps");
+        assert_eq!(plan.interior_gaps.len(), 1);
+        assert_eq!(plan.interior_gaps[0].min_gap, 0);
+        assert_eq!(plan.interior_gaps[0].max_gap, 30);
+        assert_eq!(plan.interior_gaps[0].predicate, GapPredicate::Any);
+    }
+
+    #[test]
+    fn test_probe_adjacent_different_predicate_gaps_rejected() {
+        // foo.{0,10}[^/]{0,20}bar → different predicates, can't merge
+        let h = hir_merged(r"foo.{0,10}[^/]{0,20}bar");
+        assert!(try_build_bounded_gap_plan(&h).is_none());
+    }
+
+    #[test]
+    fn test_probe_trailing_adjacent_gaps_merged() {
+        // foo.{0,10}.{0,20} → optimize(merge=true) merges to .{0,30}
+        let h = hir_merged(r"foo.{0,10}.{0,20}");
+        let plan = try_build_bounded_gap_plan(&h).expect("should recognise merged trailing gaps");
+        assert_eq!(plan.anchors.len(), 1);
+        assert_eq!(plan.interior_gaps.len(), 0);
+        let tail = plan.tail_gap.as_ref().expect("should have merged tail gap");
+        assert_eq!(tail.min_gap, 0);
+        assert_eq!(tail.max_gap, 30);
+    }
+
+    #[test]
+    fn test_probe_three_adjacent_gaps_merged() {
+        // foo.{0,10}.{0,20}.{0,30}bar → optimize(merge=true) merges to .{0,60}
+        let h = hir_merged(r"foo.{0,10}.{0,20}.{0,30}bar");
+        let plan = try_build_bounded_gap_plan(&h).expect("should recognise three merged gaps");
+        assert_eq!(plan.interior_gaps.len(), 1);
+        assert_eq!(plan.interior_gaps[0].max_gap, 60);
+    }
+
+    #[test]
+    fn test_probe_zero_zero_gap_normalised_away() {
+        // foo.{0,0}bar.{0,10}baz → {0,0} gap merged, becomes foo+bar anchor
+        // The HIR optimizer should already collapse .{0,0} to Empty,
+        // so foo and bar concatenate into one literal.
+        let h = hir(r"foo.{0,0}bar.{0,10}baz");
+        let plan = try_build_bounded_gap_plan(&h).expect("should recognise after normalisation");
+        // foobar is one anchor (6 bytes), then gap, then baz
+        assert_eq!(plan.anchors.len(), 2);
+        assert_eq!(plan.anchors[0].length_info, AnchorLengthInfo::Fixed(6));
+        assert_eq!(plan.interior_gaps.len(), 1);
+    }
+
+    #[test]
+    fn test_probe_trailing_zero_gap_dropped() {
+        // foo.{0,10}bar.{0,0} → trailing {0,0} dropped by HIR optimizer
+        let h = hir(r"foo.{0,10}bar.{0,0}");
+        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        // No tail gap since {0,0} was optimised away
+        assert!(plan.tail_gap.is_none());
+        assert_eq!(plan.anchors.len(), 2);
+    }
+
+    #[test]
+    fn test_probe_all_gaps_normalised_away_rejects() {
+        // foo.{0,0}bar → becomes "foobar", no gaps → rejected
+        let h = hir(r"foo.{0,0}bar");
+        assert!(try_build_bounded_gap_plan(&h).is_none());
+    }
+
+    #[test]
+    fn test_probe_end_anchor_with_trailing_gap() {
+        // foo.{0,3}$ → anchor "foo", tail gap {0,3}, EndOfInput
+        let h = hir(r"foo.{0,3}$");
+        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        assert_eq!(plan.anchors.len(), 1);
+        assert_eq!(plan.end_anchor, EndAnchorKind::EndOfInput);
+        let tail = plan.tail_gap.as_ref().expect("should have tail gap");
+        assert_eq!(tail.min_gap, 0);
+        assert_eq!(tail.max_gap, 3);
     }
 }

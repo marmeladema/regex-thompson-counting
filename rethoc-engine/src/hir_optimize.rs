@@ -40,7 +40,11 @@ use regex_syntax::hir::{Hir, HirKind, Repetition};
 
 /// Optimize an HIR tree by stripping captures, collapsing nested
 /// quantifiers, and deduplicating alternation branches.
-pub(crate) fn optimize(hir: Hir) -> Hir {
+///
+/// When `merge_repetitions` is `true`, adjacent bounded repetitions
+/// with identical bodies in a `Concat` are merged into one.
+/// E.g. `.{0,10}.{0,20}` → `.{0,30}`.
+pub(crate) fn optimize(hir: Hir, merge_repetitions: bool) -> Hir {
     match hir.into_kind() {
         // Leaf nodes — pass through unchanged.
         HirKind::Empty => Hir::empty(),
@@ -49,19 +53,22 @@ pub(crate) fn optimize(hir: Hir) -> Hir {
         HirKind::Look(look) => Hir::look(look),
 
         // Strip captures — our engine ignores capture groups.
-        HirKind::Capture(cap) => optimize(*cap.sub),
+        HirKind::Capture(cap) => optimize(*cap.sub, merge_repetitions),
 
-        // Concatenation — optimize children in place, let smart
-        // constructor flatten/merge.
+        // Concatenation — optimize children in place, optionally merge
+        // adjacent repetitions, let smart constructor flatten/merge.
         HirKind::Concat(mut subs) => {
-            optimize_children(&mut subs);
+            optimize_children(&mut subs, merge_repetitions);
+            if merge_repetitions {
+                merge_adjacent_repetitions(&mut subs);
+            }
             Hir::concat(subs)
         }
 
         // Alternation — optimize children in place, deduplicate,
         // reconstruct.
         HirKind::Alternation(mut subs) => {
-            optimize_children(&mut subs);
+            optimize_children(&mut subs, merge_repetitions);
             dedup_branches(&mut subs);
             Hir::alternation(subs)
         }
@@ -69,17 +76,77 @@ pub(crate) fn optimize(hir: Hir) -> Hir {
         // Repetition — optimize sub, then try to collapse nested
         // quantifiers.
         HirKind::Repetition(rep) => {
-            let sub = optimize(*rep.sub);
+            let sub = optimize(*rep.sub, merge_repetitions);
             collapse_repetition(rep.min, rep.max, rep.greedy, sub)
         }
     }
 }
 
 /// Optimize each child in `subs` in place, reusing the Vec allocation.
-fn optimize_children(subs: &mut [Hir]) {
+fn optimize_children(subs: &mut [Hir], merge_repetitions: bool) {
     for sub in subs.iter_mut() {
         let owned = mem::replace(sub, Hir::empty());
-        *sub = optimize(owned);
+        *sub = optimize(owned, merge_repetitions);
+    }
+}
+
+/// Merge adjacent bounded repetitions with identical bodies in a
+/// `Concat` child list.
+///
+/// E.g. `.{0,1000}.{0,1000}.{0,1000}` → `.{0,3000}`.
+///
+/// Only merges genuine bounded ranges (finite `max`, `max > 1`,
+/// `min < max`) — not `?` `(0,1)`, `*` `(0,∞)`, or `+` `(1,∞)`.
+/// Replaces consumed siblings with `Hir::empty()` so the caller can
+/// rely on the `Hir::concat` smart constructor to strip them.
+fn merge_adjacent_repetitions(subs: &mut [Hir]) {
+    let mut i = 0;
+    while i < subs.len() {
+        let dominated = if let HirKind::Repetition(rep) = subs[i].kind()
+            && let Some(rep_max) = rep.max
+            && rep_max > 1
+            && rep.min < rep_max
+        {
+            // Scan forward for mergeable siblings.
+            let mut merged_min = rep.min;
+            let mut merged_max = rep_max;
+            let body = rep.sub.clone();
+            let greedy = rep.greedy;
+            let mut j = i + 1;
+            while j < subs.len() {
+                if let HirKind::Repetition(rep2) = subs[j].kind()
+                    && let Some(rep2_max) = rep2.max
+                    && rep2_max > 1
+                    && rep2.min < rep2_max
+                    && *rep2.sub == *body
+                {
+                    merged_min = merged_min.saturating_add(rep2.min);
+                    merged_max = merged_max.saturating_add(rep2_max);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if j > i + 1 {
+                // Replace the first repetition with the merged one.
+                subs[i] = Hir::repetition(Repetition {
+                    min: merged_min,
+                    max: Some(merged_max),
+                    greedy,
+                    sub: body,
+                });
+                // Blank out the consumed siblings.
+                for s in &mut subs[i + 1..j] {
+                    *s = Hir::empty();
+                }
+                Some(j)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        i = dominated.unwrap_or(i + 1);
     }
 }
 
@@ -178,7 +245,7 @@ mod tests {
             .build()
             .translate(pattern, &ast)
             .unwrap();
-        optimize(hir)
+        optimize(hir, false)
     }
 
     /// Helper: parse a pattern to HIR without optimization (raw).
