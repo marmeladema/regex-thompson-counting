@@ -38,7 +38,7 @@ pub(crate) use tier3::{
 };
 pub(crate) use tier4::{Tier4DfaCache, Tier4DfaMatcher};
 
-use crate::{AssertEval, AssertKind, CounterIdx, Regex, State, StateIdx};
+use crate::{AssertEval, AssertKind, CounterIdx, NfaProgram, State, StateIdx};
 
 /// Maximum number of DFA states before the flat transition table stops
 /// growing.  2048 states × stride entries × 4 bytes.
@@ -114,14 +114,14 @@ impl DfaState {
     ///
     /// `prev_was_word` is the word-ness of the byte that *entered* `from_state`.
     #[inline]
-    fn resolve_deferred(&self, byte: u8, regex: &Regex) -> Vec<StateIdx> {
+    fn resolve_deferred(&self, byte: u8, nfa: &NfaProgram) -> Vec<StateIdx> {
         let mut extra = Vec::new();
         if self.deferred_asserts.is_empty() {
             return extra;
         }
         let prev = self.prev_byte_representative();
         for &assert_idx in self.deferred_asserts.iter() {
-            if let State::Assert { kind, out } = regex.nfa.states[assert_idx]
+            if let State::Assert { kind, out } = nfa.states[assert_idx]
                 && kind.eval(false, false, prev, Some(byte)) == AssertEval::Pass
             {
                 extra.push(out);
@@ -133,15 +133,15 @@ impl DfaState {
     /// Resolve deferred assertions at end-of-input.  Returns true if any
     /// deferred assertion passes and `Match` is reachable from its `out`.
     #[inline]
-    fn resolve_deferred_at_end(&self, regex: &Regex, scratch: &mut ReachScratch) -> bool {
+    fn resolve_deferred_at_end(&self, nfa: &NfaProgram, scratch: &mut ReachScratch) -> bool {
         if self.deferred_asserts.is_empty() {
             return false;
         }
         let prev = self.prev_byte_representative();
         for &assert_idx in self.deferred_asserts.iter() {
-            if let State::Assert { kind, out } = regex.nfa.states[assert_idx]
+            if let State::Assert { kind, out } = nfa.states[assert_idx]
                 && kind.eval(false, true, prev, None) == AssertEval::Pass
-                && Self::can_reach_match_at_end(out, prev, regex, scratch)
+                && Self::can_reach_match_at_end(out, prev, nfa, scratch)
             {
                 return true;
             }
@@ -159,15 +159,15 @@ impl DfaState {
     pub(super) fn can_reach_match_at_end(
         start: StateIdx,
         prev: Option<u8>,
-        regex: &Regex,
+        nfa: &NfaProgram,
         scratch: &mut ReachScratch,
     ) -> bool {
-        let states = &regex.nfa.states;
+        let states = &nfa.states;
         let num_states = states.len();
         scratch.prepare(num_states, start);
         while let Some(idx) = scratch.stack.pop() {
             let i = idx.idx();
-            if i >= num_states || scratch.is_visited(i) || !regex.nfa.state_can_reach_match[i] {
+            if i >= num_states || scratch.is_visited(i) || !nfa.state_can_reach_match[i] {
                 continue;
             }
             scratch.mark_visited(i);
@@ -318,7 +318,7 @@ impl DfaMemory {
     fn epsilon_closure(
         &mut self,
         seeds: impl Iterator<Item = StateIdx>,
-        regex: &Regex,
+        nfa: &NfaProgram,
         at_start: bool,
         at_end: bool,
         prev_byte: Option<u8>,
@@ -346,7 +346,7 @@ impl DfaMemory {
             }
             self.closure_visited[i] = true;
 
-            match regex.nfa.states[idx] {
+            match nfa.states[idx] {
                 State::Split { out, out1 } => {
                     self.closure_stack.push(out1);
                     self.closure_stack.push(out);
@@ -358,7 +358,7 @@ impl DfaMemory {
                     if kind == AssertKind::End {
                         if at_end {
                             self.closure_stack.push(out);
-                        } else if regex.nfa.state_can_reach_match[out.idx()] {
+                        } else if nfa.state_can_reach_match[out.idx()] {
                             is_match_at_end = true;
                         }
                         continue;

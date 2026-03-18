@@ -828,8 +828,6 @@ mod tests {
     #[test]
     #[ignore] // slow: ~30 seconds
     fn test_exhaustive_overlap_mini_model() {
-        use crate::MatcherMemory;
-
         // Alphabet subsets to combine.
         let sets: &[(&str, &str)] = &[
             ("[ab]", "ab"),

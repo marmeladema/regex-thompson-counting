@@ -12,8 +12,9 @@
 use regex_syntax::hir::{Hir, HirKind};
 
 use crate::classes::{ByteClass, ByteClassBits};
+use crate::dfa::{DfaMemory, DfaStateId, Tier1DfaCache};
 use crate::prefilter::Prefilter;
-use crate::{ByteMap, RegexConfig, State, StateIdx};
+use crate::{NfaProgram, RegexConfig, State, StateIdx};
 
 // ---------------------------------------------------------------------------
 // Analysis Types
@@ -96,10 +97,11 @@ pub(crate) struct AnchorPlan {
 /// matcher dispatch.
 #[derive(Debug)]
 pub(crate) struct AnchorProgram {
-    /// Tier-specific execution data.
+    /// Tier-specific execution strategy.
     pub(crate) engine: AnchorEngine,
-    /// Optional prefilter for skipping non-candidate bytes.
-    pub(crate) prefilter: Prefilter,
+    /// The compiled NFA data for this anchor.  Used directly by the
+    /// NFA runner and as the source for lazy DFA `populate()`.
+    pub(crate) nfa: crate::NfaProgram,
 }
 
 /// Tier-specific anchor execution data.
@@ -107,53 +109,20 @@ pub(crate) struct AnchorProgram {
 /// Each variant stores only the compiled state that the corresponding
 /// tier's anchor scanner needs to emit end-position events.  The exact
 /// fields will be refined during Phase 3 (anchor runner implementation).
+/// Tier-specific anchor execution strategy.
+///
+/// Each variant determines how the anchor's per-byte stepping is
+/// performed.  The anchor's [`NfaProgram`](crate::NfaProgram) is
+/// stored directly in [`AnchorProgram`] — no recursive `Regex`
+/// embedding needed.
 #[derive(Debug)]
-#[allow(dead_code)] // Tier1/Tier2 variants reserved for future phases
 pub(crate) enum AnchorEngine {
-    /// NFA simulation (Tier 0).
-    Tier0(AnchorNfaProgram),
-    /// Lazy DFA (Tier 1).
-    Tier1(AnchorDfaProgram),
-    /// Differential-counter DFA (Tier 2).
-    Tier2(AnchorTier2Program),
-}
-
-/// Anchor execution data for Tier 0 (NFA simulation).
-///
-/// Contains a self-contained NFA compiled from the anchor HIR fragment,
-/// including its own state array, byte-class tables, and precomputed
-/// start closure.  Counter-free in Version 1.
-#[derive(Debug)]
-pub(crate) struct AnchorNfaProgram {
-    /// NFA state array for this anchor.
-    pub(crate) states: Box<[State]>,
-    /// Byte-class lookup tables for [`State::ByteClassCustom`].
-    pub(crate) classes: Box<[ByteClassBits]>,
-    /// Byte dispatch tables for [`State::ByteTable`].
-    pub(crate) byte_tables: Box<[ByteMap]>,
-    /// NFA start state index.
-    pub(crate) start: StateIdx,
-    /// Precomputed consuming leaves from the start state.
-    pub(crate) start_closure: Box<[StateIdx]>,
-    /// Whether the empty string matches (start closure reaches Match).
-    #[allow(dead_code)] // reserved for future use (variable-length anchors)
-    pub(crate) start_closure_matches: bool,
-}
-
-/// Anchor execution data for Tier 1 (lazy DFA).
-///
-/// Placeholder — will be populated in a future phase.
-#[derive(Debug)]
-pub(crate) struct AnchorDfaProgram {
-    pub(crate) _placeholder: (),
-}
-
-/// Anchor execution data for Tier 2 (differential-counter DFA).
-///
-/// Placeholder — will be populated in a future phase.
-#[derive(Debug)]
-pub(crate) struct AnchorTier2Program {
-    pub(crate) _placeholder: (),
+    /// Pure NFA simulation (Tier 0).  Stepping is done by
+    /// [`RunnerScratch`] using the `NfaProgram` fields directly.
+    Nfa,
+    /// Lazy DFA (Tier 1).  Stepping uses a [`Tier1DfaCache`] that
+    /// lazily populates DFA states from the `NfaProgram`.
+    Dfa,
 }
 
 /// Anchor length information.
@@ -258,7 +227,7 @@ fn compile_anchor_program(pieces: &[&Hir], config: &RegexConfig) -> Option<Ancho
 /// simpler API with owned scratch.
 #[cfg(test)]
 pub(crate) struct AnchorRunner<'a> {
-    program: &'a AnchorNfaProgram,
+    program: &'a NfaProgram,
     scratch: RunnerScratch,
 }
 
@@ -267,8 +236,8 @@ impl<'a> AnchorRunner<'a> {
     /// Create a new runner from an [`AnchorPlan`].
     pub(crate) fn new(plan: &'a AnchorPlan) -> Self {
         let program = match &plan.program.engine {
-            AnchorEngine::Tier0(p) => p,
-            _ => unimplemented!("only Tier 0 anchor runners in Version 1"),
+            AnchorEngine::Nfa => &plan.program.nfa,
+            AnchorEngine::Dfa => &plan.program.nfa, // NFA used for runner test convenience
         };
         let mut scratch = RunnerScratch::new(program.states.len());
         scratch.seed_start(program);
@@ -292,11 +261,6 @@ impl<'a> AnchorRunner<'a> {
 
     /// Signal end-of-input (no-op for V1 assertion-free anchors).
     pub(crate) fn finish_scan(&mut self, _emit: &mut dyn FnMut(u64)) {}
-
-    /// Process one byte (for direct testing).
-    fn step(&mut self, byte: u8) -> bool {
-        self.scratch.step(self.program, byte)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +320,7 @@ impl RunnerScratch {
     }
 
     /// Seed clist from the program's start closure.
-    fn seed_start(&mut self, program: &AnchorNfaProgram) {
+    fn seed_start(&mut self, program: &NfaProgram) {
         if !program.start_closure.is_empty() {
             for &s in &*program.start_closure {
                 self.clist.push(s);
@@ -370,7 +334,7 @@ impl RunnerScratch {
 
     /// Process one input byte against the anchor NFA.
     /// Returns `true` if the anchor matched ending at this byte.
-    fn step(&mut self, program: &AnchorNfaProgram, byte: u8) -> bool {
+    fn step(&mut self, program: &NfaProgram, byte: u8) -> bool {
         self.nlist.clear();
         self.listid += 1;
         let mut matched = false;
@@ -485,7 +449,7 @@ impl RunnerScratch {
         matched
     }
 
-    fn drain_addstack_into_clist(&mut self, program: &AnchorNfaProgram) {
+    fn drain_addstack_into_clist(&mut self, program: &NfaProgram) {
         while let Some(idx) = self.addstack.pop() {
             if idx == StateIdx::NONE {
                 continue;
@@ -508,7 +472,7 @@ impl RunnerScratch {
         }
     }
 
-    fn drain_addstack_into_nlist(&mut self, program: &AnchorNfaProgram) {
+    fn drain_addstack_into_nlist(&mut self, program: &NfaProgram) {
         while let Some(idx) = self.addstack.pop() {
             if idx == StateIdx::NONE {
                 continue;
@@ -533,6 +497,32 @@ impl RunnerScratch {
 }
 
 // ---------------------------------------------------------------------------
+// DFA Anchor State
+// ---------------------------------------------------------------------------
+
+/// Per-anchor lazy DFA state: cache, scratch memory, and current state ID.
+#[derive(Debug)]
+struct DfaAnchorState {
+    cache: Tier1DfaCache,
+    memory: DfaMemory,
+    current: DfaStateId,
+}
+
+impl DfaAnchorState {
+    fn new(nfa: &NfaProgram) -> Self {
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier1DfaCache::new();
+        cache.prepare(&mut memory, nfa);
+        let current = cache.start_id();
+        DfaAnchorState {
+            cache,
+            memory,
+            current,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bounded-Gap Cache
 // ---------------------------------------------------------------------------
 
@@ -544,6 +534,8 @@ impl RunnerScratch {
 #[derive(Debug)]
 pub(crate) struct BoundedGapCache {
     runner_scratch: Vec<RunnerScratch>,
+    /// Per-anchor DFA state (None for NFA-only anchors).
+    dfa_caches: Vec<Option<DfaAnchorState>>,
     gap_stages: Vec<GapStageState>,
     tail_state: Option<TailGapState>,
     anchor_active: Vec<bool>,
@@ -553,6 +545,7 @@ impl BoundedGapCache {
     pub(crate) fn new() -> Self {
         BoundedGapCache {
             runner_scratch: Vec::new(),
+            dfa_caches: Vec::new(),
             gap_stages: Vec::new(),
             tail_state: None,
             anchor_active: Vec::new(),
@@ -565,13 +558,14 @@ impl BoundedGapCache {
     pub(crate) fn prepare(&mut self, plan: &BoundedGapPlan) {
         let n = plan.anchors.len();
 
-        // Resize runner scratch.
+        // Resize and prepare per-anchor runner caches.
         self.runner_scratch.truncate(n);
+        self.dfa_caches.truncate(n);
         for (i, anchor) in plan.anchors.iter().enumerate() {
-            let num_states = match &anchor.program.engine {
-                AnchorEngine::Tier0(p) => p.states.len(),
-                _ => 16, // placeholder
-            };
+            let nfa = &anchor.program.nfa;
+            let num_states = nfa.states.len();
+
+            // NFA scratch (always needed, even for DFA anchors as fallback).
             if i < self.runner_scratch.len() {
                 let scratch = &mut self.runner_scratch[i];
                 scratch.reset();
@@ -579,15 +573,37 @@ impl BoundedGapCache {
             } else {
                 self.runner_scratch.push(RunnerScratch::new(num_states));
             }
-        }
 
-        // Seed start closures.
-        for (i, anchor) in plan.anchors.iter().enumerate() {
-            let program = match &anchor.program.engine {
-                AnchorEngine::Tier0(p) => p,
-                _ => continue,
-            };
-            self.runner_scratch[i].seed_start(program);
+            // DFA cache (only for DFA-eligible anchors).
+            match anchor.program.engine {
+                AnchorEngine::Dfa => {
+                    if i < self.dfa_caches.len() {
+                        if let Some(ref mut dc) = self.dfa_caches[i] {
+                            dc.cache.prepare(&mut dc.memory, nfa);
+                            dc.current = dc.cache.start_id();
+                        } else {
+                            self.dfa_caches[i] = Some(DfaAnchorState::new(nfa));
+                        }
+                    } else {
+                        while self.dfa_caches.len() < i {
+                            self.dfa_caches.push(None);
+                        }
+                        self.dfa_caches.push(Some(DfaAnchorState::new(nfa)));
+                    }
+                }
+                AnchorEngine::Nfa => {
+                    if i < self.dfa_caches.len() {
+                        self.dfa_caches[i] = None;
+                    } else {
+                        self.dfa_caches.push(None);
+                    }
+                }
+            }
+
+            // Seed NFA start closure (only for NFA engine).
+            if matches!(anchor.program.engine, AnchorEngine::Nfa) {
+                self.runner_scratch[i].seed_start(nfa);
+            }
         }
 
         // Resize gap stage queues.
@@ -664,7 +680,7 @@ impl<'a> BoundedGapMatcher<'a> {
 
     /// Process a chunk of input.
     pub(crate) fn chunk(&mut self, input: &[u8]) {
-        match self.plan.anchors[0].program.prefilter {
+        match self.plan.anchors[0].program.nfa.prefilter {
             Prefilter::None => self.chunk_no_prefilter(input),
             Prefilter::Memchr1(b1) => {
                 self.chunk_prefilter(input, |hay| memchr::memchr(b1, hay));
@@ -724,15 +740,26 @@ impl<'a> BoundedGapMatcher<'a> {
     /// is at start configuration.  In this state, anchor[0]'s prefilter
     /// can safely skip non-candidate bytes.
     fn is_quiescent(&self) -> bool {
-        // Anchor[0]'s NFA must be at start config (no partial match
+        // Anchor[0]'s runner must be at start config (no partial match
         // in progress).
-        let program = match &self.plan.anchors[0].program.engine {
-            AnchorEngine::Tier0(p) => p,
-            _ => return false,
-        };
-        let scratch = &self.cache.runner_scratch[0];
-        if scratch.clist.len() != program.start_closure.len() {
-            return false;
+        match self.plan.anchors[0].program.engine {
+            AnchorEngine::Nfa => {
+                let nfa = &self.plan.anchors[0].program.nfa;
+                let scratch = &self.cache.runner_scratch[0];
+                if scratch.clist.len() != nfa.start_closure.len() {
+                    return false;
+                }
+            }
+            AnchorEngine::Dfa => {
+                if let Some(ref dfa) = self.cache.dfa_caches[0] {
+                    // DFA is quiescent at start or dead state.
+                    let at_start =
+                        dfa.current == dfa.cache.start_id() || dfa.current == DfaStateId::DEAD;
+                    if !at_start {
+                        return false;
+                    }
+                }
+            }
         }
         // Any gap stage has accepted ends → not quiescent.
         for stage in &self.cache.gap_stages {
@@ -775,14 +802,20 @@ impl<'a> BoundedGapMatcher<'a> {
         let n = self.plan.anchors.len();
         let mut anchor_matched = [false; 16]; // V1 chains are small
         debug_assert!(n <= 16, "chain too long for fixed buffer");
-        #[allow(clippy::needless_range_loop)] // indexes into 4 parallel arrays
+        #[allow(clippy::needless_range_loop)] // indexes into parallel arrays
         for i in 0..n {
             if self.cache.anchor_active[i] {
-                let program = match &self.plan.anchors[i].program.engine {
-                    AnchorEngine::Tier0(p) => p,
-                    _ => unimplemented!("only Tier 0 anchor runners in V1"),
+                let nfa = &self.plan.anchors[i].program.nfa;
+                anchor_matched[i] = match self.plan.anchors[i].program.engine {
+                    AnchorEngine::Nfa => self.cache.runner_scratch[i].step(nfa, byte),
+                    AnchorEngine::Dfa => {
+                        let dfa = self.cache.dfa_caches[i]
+                            .as_mut()
+                            .expect("DFA cache must exist for DFA anchor");
+                        dfa.cache
+                            .step_byte(&mut dfa.memory, nfa, &mut dfa.current, byte)
+                    }
                 };
-                anchor_matched[i] = self.cache.runner_scratch[i].step(program, byte);
             }
         }
 
@@ -1738,12 +1771,6 @@ mod tests {
     /// Helper: run the probe with default config.
     fn probe(h: &Hir) -> Option<BoundedGapPlan> {
         try_build_bounded_gap_plan(h, &default_config())
-    }
-
-    /// Helper: run the probe with merged HIR and default config.
-    fn probe_merged(h: &Hir) -> Option<BoundedGapPlan> {
-        let merged = crate::hir_optimize::optimize(h.clone(), true);
-        try_build_bounded_gap_plan(&merged, &default_config())
     }
 
     // -- try_build_bounded_gap_plan: recognition ----------------------------

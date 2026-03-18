@@ -71,7 +71,7 @@
 
 use std::fmt;
 
-use crate::{AssertEval, CounterIdx, Regex, State, StateIdx};
+use crate::{AssertEval, CounterIdx, NfaProgram, State, StateIdx};
 
 // ---------------------------------------------------------------------------
 // Break mask (reserved for future provenance tracking)
@@ -811,7 +811,7 @@ pub(crate) fn eval_assert_chain(
     at_end: bool,
     prev: Option<u8>,
     next: Option<u8>,
-    regex: &Regex,
+    nfa: &NfaProgram,
     check_reachability: bool,
     scratch: &mut super::super::ReachScratch,
 ) -> bool {
@@ -820,11 +820,11 @@ pub(crate) fn eval_assert_chain(
     }
     let chain = arena.get(chain_id);
     for &assert_idx in chain {
-        let State::Assert { kind, out } = regex.nfa.states.0[assert_idx] else {
+        let State::Assert { kind, out } = nfa.states.0[assert_idx] else {
             debug_assert!(
                 false,
                 "assert chain entry {} is not an Assert state: {:?}",
-                assert_idx, regex.nfa.states.0[assert_idx]
+                assert_idx, nfa.states.0[assert_idx]
             );
             return false;
         };
@@ -835,16 +835,15 @@ pub(crate) fn eval_assert_chain(
                     // `out` can still reach a match.  This handles chained
                     // assertions (e.g. `\b → \B → $ → Match`).
                     if at_end {
-                        if !super::super::DfaState::can_reach_match_at_end(
-                            out, prev, regex, scratch,
-                        ) {
+                        if !super::super::DfaState::can_reach_match_at_end(out, prev, nfa, scratch)
+                        {
                             return false;
                         }
                     } else {
                         // Mid-input: check if can_reach_match_mid from the
                         // assertion's out.
                         if !super::Tier3DfaMatcher::can_reach_match_mid(
-                            out, prev, next, regex, scratch,
+                            out, prev, next, nfa, scratch,
                         ) {
                             return false;
                         }
@@ -891,7 +890,7 @@ pub(crate) fn resolve_pending(
     arena: &AssertChainArena,
     at_end: bool,
     next: Option<u8>,
-    regex: &Regex,
+    nfa: &NfaProgram,
     scratch: &mut super::super::ReachScratch,
     actions: &mut ResolvedActions,
 ) {
@@ -922,7 +921,7 @@ pub(crate) fn resolve_pending(
             at_end,
             prev,
             next,
-            regex,
+            nfa,
             has_match_atom,
             scratch,
         ) {
@@ -1627,7 +1626,7 @@ mod tests {
             &arena,
             false,
             Some(b'x'),
-            &regex,
+            &regex.nfa,
             &mut ReachScratch::new(),
             &mut actions,
         );
@@ -1666,7 +1665,7 @@ mod tests {
             &arena,
             false,
             Some(b' '),
-            &regex,
+            &regex.nfa,
             &mut ReachScratch::new(),
             &mut actions,
         );
@@ -1702,7 +1701,7 @@ mod tests {
             &arena,
             false,
             Some(b'a'),
-            &regex,
+            &regex.nfa,
             &mut ReachScratch::new(),
             &mut actions,
         );
@@ -1760,7 +1759,7 @@ mod tests {
             &arena,
             false,
             Some(b' '),
-            &regex,
+            &regex.nfa,
             &mut ReachScratch::new(),
             &mut actions,
         );
@@ -1782,7 +1781,7 @@ mod tests {
             &arena,
             false,
             Some(b'a'),
-            &regex,
+            &regex.nfa,
             &mut ReachScratch::new(),
             &mut actions2,
         );
@@ -1828,7 +1827,7 @@ mod tests {
             &arena,
             false,
             Some(b' '),
-            &regex,
+            &regex.nfa,
             &mut ReachScratch::new(),
             &mut actions,
         );
@@ -1845,7 +1844,7 @@ mod tests {
             &arena,
             false,
             Some(b'a'),
-            &regex,
+            &regex.nfa,
             &mut ReachScratch::new(),
             &mut actions2,
         );
@@ -1874,7 +1873,7 @@ mod tests {
             &arena,
             false,
             Some(b'x'),
-            &regex,
+            &regex.nfa,
             &mut ReachScratch::new(),
             &mut actions,
         );
@@ -1903,7 +1902,7 @@ mod tests {
             &arena,
             false,
             Some(b'x'),
-            &regex,
+            &regex.nfa,
             &mut ReachScratch::new(),
             &mut actions,
         );
@@ -1930,7 +1929,7 @@ mod tests {
             &arena,
             false,
             Some(b'x'),
-            &regex,
+            &regex.nfa,
             &mut ReachScratch::new(),
             &mut actions,
         );
@@ -1985,7 +1984,7 @@ mod tests {
             &arena,
             true, // at_end
             None, // no next byte
-            &regex,
+            &regex.nfa,
             &mut ReachScratch::new(),
             &mut actions,
         );
@@ -2029,7 +2028,7 @@ mod tests {
             &arena,
             false,       // not at_end
             Some(b'\n'), // next byte is newline
-            &regex,
+            &regex.nfa,
             &mut ReachScratch::new(),
             &mut actions,
         );
@@ -2073,7 +2072,7 @@ mod tests {
             &arena,
             false,      // not at_end
             Some(b'x'), // next byte is not newline
-            &regex,
+            &regex.nfa,
             &mut ReachScratch::new(),
             &mut actions,
         );
@@ -2127,7 +2126,7 @@ mod tests {
             &arena,
             false,
             Some(b'x'),
-            &regex,
+            &regex.nfa,
             &mut ReachScratch::new(),
             &mut actions,
         );
@@ -2195,7 +2194,7 @@ mod tests {
             &arena,
             false,
             Some(b'a'), // word char → word→word, \b fails
-            &regex,
+            &regex.nfa,
             &mut ReachScratch::new(),
             &mut actions,
         );

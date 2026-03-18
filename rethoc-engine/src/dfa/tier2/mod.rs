@@ -19,8 +19,8 @@ pub(crate) mod overlap;
 use std::fmt;
 
 use crate::{
-    AssertEval, AssertKind, CounterIdx, Prefilter, Regex, State, StateIdx, byte_match_ci,
-    is_word_byte,
+    AssertEval, AssertKind, CounterIdx, NfaProgram, Prefilter, Regex, State, StateIdx,
+    byte_match_ci, is_word_byte,
 };
 
 use super::{DfaCache, DfaMemory, DfaStateId};
@@ -781,7 +781,7 @@ impl Tier2DfaCache {
         &mut self,
         memory: &mut DfaMemory,
         seeds: impl Iterator<Item = StateIdx>,
-        regex: &Regex,
+        nfa: &NfaProgram,
         analysis: &Tier2Analysis,
         at_start: bool,
         prev_byte: Option<u8>,
@@ -793,7 +793,7 @@ impl Tier2DfaCache {
 
         let (is_match, is_match_at_end) = memory.epsilon_closure(
             seeds,
-            regex,
+            nfa,
             at_start,
             false,
             prev_byte,
@@ -841,7 +841,8 @@ impl Tier2DfaCache {
         memory: &mut DfaMemory,
         from: DfaStateId,
         byte: u8,
-        regex: &Regex,
+        nfa: &NfaProgram,
+        tier2_overlap_proven: bool,
         analysis: &Tier2Analysis,
     ) -> Transition {
         let mut targets: Vec<StateIdx> = Vec::new();
@@ -873,7 +874,7 @@ impl Tier2DfaCache {
         if from != DfaStateId::DEAD {
             let from_state = &self.inner.states[from.idx()];
             // Phase 1: resolve deferred assertions.
-            let extra = from_state.resolve_deferred(byte, regex);
+            let extra = from_state.resolve_deferred(byte, nfa);
             if !extra.is_empty() {
                 let resolved_prev = from_state.prev_byte_representative();
                 // Use follow_break=false: the CInc break path should NOT
@@ -883,7 +884,7 @@ impl Tier2DfaCache {
                 let cr = self.epsilon_closure(
                     memory,
                     extra.into_iter(),
-                    regex,
+                    nfa,
                     analysis,
                     false,
                     resolved_prev,
@@ -913,9 +914,7 @@ impl Tier2DfaCache {
 
                         // Check direct (epsilon-only) match from break
                         // target — precomputed at analysis time.
-                        if regex.nfa.counter_break_can_match[ci]
-                            && analysis.break_has_direct_match(ci)
-                        {
+                        if nfa.counter_break_can_match[ci] && analysis.break_has_direct_match(ci) {
                             resolved_break_match = true;
                         }
 
@@ -924,7 +923,7 @@ impl Tier2DfaCache {
                         // These are only reachable when the counter
                         // breaks AND the deferred assertion passed.
                         for &bc in analysis.break_consuming(ci) {
-                            if let Some((t, te)) = consume_byte(bc, byte, regex) {
+                            if let Some((t, te)) = consume_byte(bc, byte, nfa) {
                                 resolved_break_targets.push(t);
                                 if te != StateIdx::NONE {
                                     resolved_break_targets.push(te);
@@ -934,7 +933,7 @@ impl Tier2DfaCache {
                     }
                 }
                 for &idx in cr.nfa_states.iter() {
-                    if let Some((t, te)) = consume_byte(idx, byte, regex) {
+                    if let Some((t, te)) = consume_byte(idx, byte, nfa) {
                         targets.push(t);
                         if te != StateIdx::NONE {
                             targets.push(te);
@@ -946,7 +945,7 @@ impl Tier2DfaCache {
 
             // Phase 2: consuming states consume `byte`.
             for &idx in &self.inner.states[from.idx()].nfa_states {
-                if let Some((t, te)) = consume_byte(idx, byte, regex) {
+                if let Some((t, te)) = consume_byte(idx, byte, nfa) {
                     targets.push(t);
                     if te != StateIdx::NONE {
                         targets.push(te);
@@ -958,11 +957,8 @@ impl Tier2DfaCache {
         // Probe: full "both" closure to detect CInc and collect seeds.
         let probe = self.epsilon_closure(
             memory,
-            targets
-                .iter()
-                .copied()
-                .chain(std::iter::once(regex.nfa.start)),
-            regex,
+            targets.iter().copied().chain(std::iter::once(nfa.start)),
+            nfa,
             analysis,
             false,
             Some(byte),
@@ -991,7 +987,7 @@ impl Tier2DfaCache {
         // For overlap-proven patterns, multi-CInc is expected and was
         // validated by the binary-exactness proof at compile time.
         debug_assert!(
-            regex.tier2_overlap_proven || counting_mask.count_ones() <= 1,
+            tier2_overlap_proven || counting_mask.count_ones() <= 1,
             "Tier 2 disjoint-body pattern has counting_mask with {} bits set \
              on DFA state {:?} byte {}: this violates the disjoint-bytes \
              invariant (the overlap proof was not used for this pattern)",
@@ -1016,11 +1012,8 @@ impl Tier2DfaCache {
         if counting_mask != 0 {
             let cr_nb = self.epsilon_closure(
                 memory,
-                targets
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(regex.nfa.start)),
-                regex,
+                targets.iter().copied().chain(std::iter::once(nfa.start)),
+                nfa,
                 analysis,
                 false,
                 Some(byte),
@@ -1042,8 +1035,8 @@ impl Tier2DfaCache {
                         .iter()
                         .copied()
                         .chain(resolved_break_targets.iter().copied())
-                        .chain(std::iter::once(regex.nfa.start)),
-                    regex,
+                        .chain(std::iter::once(nfa.start)),
+                    nfa,
                     analysis,
                     false,
                     Some(byte),
@@ -1134,7 +1127,7 @@ impl Tier2DfaCache {
                 .deferred_asserts
                 .iter()
                 .fold(0u64, |acc, &assert_idx| {
-                    if let State::Assert { out, .. } = regex.nfa.states[assert_idx] {
+                    if let State::Assert { out, .. } = nfa.states[assert_idx] {
                         acc | analysis.cinc_reachable_from(out)
                     } else {
                         acc
@@ -1256,20 +1249,20 @@ impl Tier2DfaCache {
     pub(crate) fn prepare(
         &mut self,
         memory: &mut DfaMemory,
-        regex: &Regex,
+        nfa: &NfaProgram,
         analysis: &Tier2Analysis,
     ) {
-        let id = regex.nfa.id;
+        let id = nfa.id;
         if self.inner.regex_id == id && self.inner.start_id != DfaStateId::DEAD {
             return;
         }
-        self.clear(memory, regex.nfa.states.len(), regex.nfa.num_byte_classes);
+        self.clear(memory, nfa.states.len(), nfa.num_byte_classes);
         self.inner.regex_id = id;
 
         let cr = self.epsilon_closure(
             memory,
-            std::iter::once(regex.nfa.start),
-            regex,
+            std::iter::once(nfa.start),
+            nfa,
             analysis,
             true,
             None,
@@ -1291,7 +1284,7 @@ impl Tier2DfaCache {
         self.start_seeds = cr.seed_instances.iter().map(|&(c, _s)| (c, 0u32)).collect();
 
         // Initialize counter state (phases + metadata).
-        self.counters.populate(&regex.nfa.counter_info);
+        self.counters.populate(&nfa.counter_info);
     }
 }
 
@@ -1316,8 +1309,8 @@ struct ClosureResult {
 
 /// Consume `byte` at NFA state `idx`.  Returns `(out, out_exit)` where
 /// `out_exit` is `StateIdx::NONE` when there is no exit branch.
-fn consume_byte(idx: StateIdx, byte: u8, regex: &Regex) -> Option<(StateIdx, StateIdx)> {
-    match regex.nfa.states[idx] {
+fn consume_byte(idx: StateIdx, byte: u8, nfa: &NfaProgram) -> Option<(StateIdx, StateIdx)> {
+    match nfa.states[idx] {
         State::Byte {
             byte: b,
             out,
@@ -1338,9 +1331,9 @@ fn consume_byte(idx: StateIdx, byte: u8, regex: &Regex) -> Option<(StateIdx, Sta
             class,
             out,
             out_exit,
-        } if regex.nfa.classes[class.idx()].contains(byte) => Some((out, out_exit)),
+        } if nfa.classes[class.idx()].contains(byte) => Some((out, out_exit)),
         State::ByteTable { table } => {
-            let t = regex.nfa.byte_tables[table][byte];
+            let t = nfa.byte_tables[table][byte];
             if t != StateIdx::NONE {
                 Some((t, StateIdx::NONE))
             } else {
@@ -1481,14 +1474,14 @@ pub struct Tier2DfaMatcher<'a> {
 fn resolve_deferred_cinc_at_end(
     deferred: &[StateIdx],
     prev: Option<u8>,
-    regex: &crate::Regex,
+    nfa: &NfaProgram,
     counters: &CounterState,
     memory: &mut DfaMemory,
 ) -> bool {
     if deferred.is_empty() {
         return false;
     }
-    let states = &regex.nfa.states;
+    let states = &nfa.states;
 
     for v in memory.closure_visited.iter_mut() {
         *v = false;
@@ -1511,7 +1504,7 @@ fn resolve_deferred_cinc_at_end(
         match states[idx] {
             State::CounterIncrement { counter, min, .. } => {
                 let ci = counter.idx();
-                if !regex.nfa.counter_break_can_match[ci] {
+                if !nfa.counter_break_can_match[ci] {
                     continue;
                 }
                 if ci < counters.meta.len() {
@@ -1584,9 +1577,14 @@ impl<'a> Tier2DfaMatcher<'a> {
         let class = self.regex.nfa.byte_classes[byte as usize] as usize;
         let slot = self.current.idx() * self.cache.stride + class;
         if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
-            let trans =
-                self.cache
-                    .populate(self.memory, self.current, byte, self.regex, self.analysis);
+            let trans = self.cache.populate(
+                self.memory,
+                self.current,
+                byte,
+                &self.regex.nfa,
+                self.regex.tier2_overlap_proven,
+                self.analysis,
+            );
             self.cache.transitions[slot] = trans;
         }
         slot
@@ -1597,9 +1595,14 @@ impl<'a> Tier2DfaMatcher<'a> {
     fn ensure_transition_direct(&mut self, byte: u8) -> usize {
         let slot = self.current.idx() * 256 + byte as usize;
         if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
-            let trans =
-                self.cache
-                    .populate(self.memory, self.current, byte, self.regex, self.analysis);
+            let trans = self.cache.populate(
+                self.memory,
+                self.current,
+                byte,
+                &self.regex.nfa,
+                self.regex.tier2_overlap_proven,
+                self.analysis,
+            );
             self.cache.transitions[slot] = trans;
         }
         slot
@@ -1719,7 +1722,8 @@ impl<'a> Tier2DfaMatcher<'a> {
             self.memory,
             DfaStateId::DEAD,
             byte,
-            self.regex,
+            &self.regex.nfa,
+            self.regex.tier2_overlap_proven,
             self.analysis,
         );
         self.current = trans.no_break;
@@ -1857,7 +1861,7 @@ impl<'a> Tier2DfaMatcher<'a> {
             // Standard deferred resolution: handles assertions outside
             // counter bodies (deferred assert -> Match path).
             let mut scratch = super::ReachScratch::new();
-            if state.resolve_deferred_at_end(self.regex, &mut scratch) {
+            if state.resolve_deferred_at_end(&self.regex.nfa, &mut scratch) {
                 return true;
             }
             // Tier 2 specific: handle deferred assertions inside counter
@@ -1867,7 +1871,7 @@ impl<'a> Tier2DfaMatcher<'a> {
             if resolve_deferred_cinc_at_end(
                 &state.deferred_asserts,
                 state.prev_byte_representative(),
-                self.regex,
+                &self.regex.nfa,
                 &self.cache.counters,
                 self.memory,
             ) {

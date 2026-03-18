@@ -10,8 +10,8 @@ use indexmap::IndexSet;
 use std::fmt;
 
 use crate::{
-    AssertKind, CounterCtx, CounterIdx, CounterPool, CtxDedupTable, Regex, State, StateIdx,
-    byte_match_ci,
+    AssertKind, CounterCtx, CounterIdx, CounterPool, CtxDedupTable, NfaProgram, Regex, State,
+    StateIdx, byte_match_ci,
 };
 
 use super::{DfaState, DfaStateId, DfaStateRef};
@@ -869,17 +869,17 @@ impl Tier4DfaCache {
     /// Compute a counting transition for `(from_state, byte)`, using
     /// byte-class compression (stride < 256).
     #[inline(always)]
-    fn transition(&mut self, from: DfaStateId, byte: u8, regex: &Regex) -> CountingTransition {
+    fn transition(&mut self, from: DfaStateId, byte: u8, nfa: &NfaProgram) -> CountingTransition {
         if from == DfaStateId::DEAD {
-            let t = self.populate(from, byte, regex);
+            let t = self.populate(from, byte, nfa);
             return t;
         }
-        let slot = from.0 as usize * self.stride + regex.nfa.byte_classes[byte as usize] as usize;
+        let slot = from.0 as usize * self.stride + nfa.byte_classes[byte as usize] as usize;
         let t = self.transitions[slot];
         if !t.is_unpopulated() {
             return t;
         }
-        let t = self.populate(from, byte, regex);
+        let t = self.populate(from, byte, nfa);
         self.transitions[slot] = t;
         t
     }
@@ -891,10 +891,10 @@ impl Tier4DfaCache {
         &mut self,
         from: DfaStateId,
         byte: u8,
-        regex: &Regex,
+        nfa: &NfaProgram,
     ) -> CountingTransition {
         if from == DfaStateId::DEAD {
-            let t = self.populate(from, byte, regex);
+            let t = self.populate(from, byte, nfa);
             return t;
         }
         let slot = from.0 as usize * 256 + byte as usize;
@@ -902,7 +902,7 @@ impl Tier4DfaCache {
         if !t.is_unpopulated() {
             return t;
         }
-        let t = self.populate(from, byte, regex);
+        let t = self.populate(from, byte, nfa);
         self.transitions[slot] = t;
         t
     }
@@ -915,14 +915,14 @@ impl Tier4DfaCache {
     /// closure to get the counter program for that origin.  This ensures
     /// that contexts at different NFA positions receive only their own
     /// counter ops.
-    fn populate(&mut self, from: DfaStateId, byte: u8, regex: &Regex) -> CountingTransition {
+    fn populate(&mut self, from: DfaStateId, byte: u8, nfa: &NfaProgram) -> CountingTransition {
         // Collect (origin_nfa_state, nfa_target) pairs.
         let mut origin_targets: Vec<(StateIdx, StateIdx)> = Vec::new();
 
         if from != DfaStateId::DEAD {
             let nfa_states = self.states[from.idx()].nfa_states.clone();
             for &idx in nfa_states.iter() {
-                match regex.nfa.states[idx] {
+                match nfa.states[idx] {
                     State::Byte {
                         byte: b2,
                         out,
@@ -963,14 +963,14 @@ impl Tier4DfaCache {
                         class,
                         out,
                         out_exit,
-                    } if regex.nfa.classes[class.idx()].contains(byte) => {
+                    } if nfa.classes[class.idx()].contains(byte) => {
                         origin_targets.push((idx, out));
                         if out_exit != StateIdx::NONE {
                             origin_targets.push((idx, out_exit));
                         }
                     }
                     State::ByteTable { table } => {
-                        let t = regex.nfa.byte_tables[table][byte];
+                        let t = nfa.byte_tables[table][byte];
                         if t != StateIdx::NONE {
                             origin_targets.push((idx, t));
                         }
@@ -987,15 +987,15 @@ impl Tier4DfaCache {
 
         // Per-origin closures.
         for (origin, target) in &origin_targets {
-            let (nfa, m, mae, ops) = self.epsilon_closure_with_program(
+            let (nfa_set, m, mae, ops) = self.epsilon_closure_with_program(
                 std::iter::once(*target),
-                &regex.nfa.states,
+                &nfa.states,
                 false,
                 Some(byte),
             );
             is_match = is_match || m;
             is_match_at_end = is_match_at_end || mae;
-            merged.extend_from_slice(&nfa);
+            merged.extend_from_slice(&nfa_set);
             let prog_idx = self.intern_program(ops);
             origin_table.push((*origin, prog_idx));
         }
@@ -1003,8 +1003,8 @@ impl Tier4DfaCache {
         // Seed closure (from regex.nfa.start, at_start=false for re-seed).
         let (seed_nfa, seed_match, seed_match_at_end, seed_ops) = self
             .epsilon_closure_with_program(
-                std::iter::once(regex.nfa.start),
-                &regex.nfa.states,
+                std::iter::once(nfa.start),
+                &nfa.states,
                 false,
                 Some(byte),
             );
@@ -1063,20 +1063,16 @@ impl Tier4DfaCache {
     }
 
     /// Prepare the cache for `regex`.
-    pub(crate) fn prepare(&mut self, regex: &Regex) {
-        let id = regex.nfa.id;
+    pub(crate) fn prepare(&mut self, nfa: &NfaProgram) {
+        let id = nfa.id;
         if self.regex_id == id && self.start_id != DfaStateId::DEAD {
             return;
         }
-        self.clear(regex.nfa.states.len(), regex.nfa.num_byte_classes);
+        self.clear(nfa.states.len(), nfa.num_byte_classes);
         self.regex_id = id;
 
-        let (nfa_set, is_match, is_match_at_end, ops) = self.epsilon_closure_with_program(
-            std::iter::once(regex.nfa.start),
-            &regex.nfa.states,
-            true,
-            None,
-        );
+        let (nfa_set, is_match, is_match_at_end, ops) =
+            self.epsilon_closure_with_program(std::iter::once(nfa.start), &nfa.states, true, None);
         self.start_id = self.intern_state(&nfa_set, is_match, is_match_at_end);
         self.start_program = self.intern_program(ops);
         self.start_is_match = is_match;
@@ -1211,9 +1207,10 @@ impl<'a> Tier4DfaMatcher<'a> {
     #[inline]
     fn step(&mut self, byte: u8) {
         let trans = if self.cache.stride == 256 {
-            self.cache.transition_direct(self.current, byte, self.regex)
+            self.cache
+                .transition_direct(self.current, byte, &self.regex.nfa)
         } else {
-            self.cache.transition(self.current, byte, self.regex)
+            self.cache.transition(self.current, byte, &self.regex.nfa)
         };
         self.current = trans.next;
 

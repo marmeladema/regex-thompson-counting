@@ -504,14 +504,13 @@ fn fmt_bounded_gap_plan(plan: &BoundedGapPlan, f: &mut fmt::Formatter<'_>) -> fm
     for (i, anchor) in plan.anchors.iter().enumerate() {
         let AnchorLengthInfo::Fixed(len) = anchor.length_info;
         let engine = match &anchor.program.engine {
-            AnchorEngine::Tier0(_) => "NFA",
-            AnchorEngine::Tier1(_) => "Tier1",
-            AnchorEngine::Tier2(_) => "Tier2",
+            AnchorEngine::Nfa => "NFA",
+            AnchorEngine::Dfa => "Tier1 DFA",
         };
         writeln!(
             f,
             "  anchor[{i}]: fixed_len={len}, engine={engine}, prefilter={:?}",
-            anchor.program.prefilter
+            anchor.program.nfa.prefilter
         )?;
 
         // Interior gap after this anchor (if any).
