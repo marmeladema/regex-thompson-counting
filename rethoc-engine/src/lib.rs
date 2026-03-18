@@ -3448,6 +3448,10 @@ impl MatcherMemory {
     /// lazy DFA (for DFA-eligible patterns) or the NFA simulator.
     #[inline]
     pub fn matcher<'a>(&'a mut self, regex: &'a Regex) -> AnyMatcher<'a> {
+        // Prefer bounded-gap specialisation when available.
+        if let Some(plan) = &regex.bounded_gap_plan {
+            return AnyMatcher::BoundedGap(bounded_gap::BoundedGapMatcher::new(plan));
+        }
         if regex.dfa_eligible {
             // Tier 1: pure DFA (no counters, simple assertions).
             let cache = self.dfa_cache.get_or_insert_with(Tier1DfaCache::new);
@@ -3615,6 +3619,9 @@ pub enum AnyMatcher<'a> {
     Tier4Dfa(Tier4DfaMatcher<'a>),
     /// NFA simulator path (general case).
     Nfa(NfaMatcher<'a>),
+    /// Bounded-gap specialisation (fixed-length anchor chains with
+    /// bounded gaps between them).
+    BoundedGap(bounded_gap::BoundedGapMatcher<'a>),
 }
 
 impl<'a> AnyMatcher<'a> {
@@ -3627,6 +3634,7 @@ impl<'a> AnyMatcher<'a> {
             Self::Tier3Dfa(d) => d.chunk(input),
             Self::Tier4Dfa(d) => d.chunk(input),
             Self::Nfa(n) => n.chunk(input),
+            Self::BoundedGap(bg) => bg.chunk(input),
         }
     }
 
@@ -3639,6 +3647,7 @@ impl<'a> AnyMatcher<'a> {
             Self::Tier3Dfa(d) => d.finish(),
             Self::Tier4Dfa(d) => d.finish(),
             Self::Nfa(n) => n.finish(),
+            Self::BoundedGap(bg) => bg.finish(),
         }
     }
 
@@ -3651,6 +3660,7 @@ impl<'a> AnyMatcher<'a> {
             Self::Tier3Dfa(d) => d.ismatch(),
             Self::Tier4Dfa(d) => d.ismatch(),
             Self::Nfa(n) => n.ismatch(),
+            Self::BoundedGap(bg) => bg.ismatch(),
         }
     }
 }
@@ -3663,6 +3673,7 @@ impl<'a> fmt::Debug for AnyMatcher<'a> {
             Self::Tier3Dfa(d) => f.debug_tuple("AnyMatcher::Tier3Dfa").field(d).finish(),
             Self::Tier4Dfa(d) => f.debug_tuple("AnyMatcher::Tier4Dfa").field(d).finish(),
             Self::Nfa(n) => f.debug_tuple("AnyMatcher::Nfa").field(n).finish(),
+            Self::BoundedGap(bg) => f.debug_tuple("AnyMatcher::BoundedGap").field(bg).finish(),
         }
     }
 }
@@ -3674,6 +3685,7 @@ impl<'a> fmt::Display for AnyMatcher<'a> {
             Self::Tier2Dfa(d) => fmt::Display::fmt(d, f),
             Self::Tier3Dfa(d) => fmt::Display::fmt(d, f),
             Self::Tier4Dfa(d) => fmt::Display::fmt(d, f),
+            Self::BoundedGap(bg) => fmt::Display::fmt(bg, f),
             Self::Nfa(n) => fmt::Display::fmt(n, f),
         }
     }

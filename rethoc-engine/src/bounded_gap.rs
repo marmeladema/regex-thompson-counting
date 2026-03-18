@@ -924,6 +924,29 @@ impl<'a> BoundedGapMatcher<'a> {
     }
 }
 
+impl std::fmt::Debug for BoundedGapMatcher<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundedGapMatcher")
+            .field("position", &self.position)
+            .field("matched", &self.matched)
+            .field("matched_here", &self.matched_here)
+            .field("anchors", &self.plan.anchors.len())
+            .field("interior_gaps", &self.plan.interior_gaps.len())
+            .field("tail_gap", &self.plan.tail_gap.is_some())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for BoundedGapMatcher<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "BoundedGap(pos={}, matched={}, here={})",
+            self.position, self.matched, self.matched_here
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Compile-Time Specialisation Probe
 // ---------------------------------------------------------------------------
