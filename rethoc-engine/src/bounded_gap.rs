@@ -13,6 +13,7 @@ use regex_syntax::hir::{Hir, HirKind};
 
 use crate::classes::{ByteClass, ByteClassBits};
 use crate::prefilter::Prefilter;
+use crate::{ByteMap, RegexConfig, State, StateIdx};
 
 // ---------------------------------------------------------------------------
 // Analysis Types
@@ -118,28 +119,38 @@ pub(crate) enum AnchorEngine {
 
 /// Anchor execution data for Tier 0 (NFA simulation).
 ///
-/// Fields will be populated in Phase 3.
+/// Contains a self-contained NFA compiled from the anchor HIR fragment,
+/// including its own state array, byte-class tables, and precomputed
+/// start closure.  Counter-free in Version 1.
 #[derive(Debug)]
 pub(crate) struct AnchorNfaProgram {
-    // Placeholder — populated in Phase 3.
-    pub(crate) _placeholder: (),
+    /// NFA state array for this anchor.
+    pub(crate) states: Box<[State]>,
+    /// Byte-class lookup tables for [`State::ByteClassCustom`].
+    pub(crate) classes: Box<[ByteClassBits]>,
+    /// Byte dispatch tables for [`State::ByteTable`].
+    pub(crate) byte_tables: Box<[ByteMap]>,
+    /// NFA start state index.
+    pub(crate) start: StateIdx,
+    /// Precomputed consuming leaves from the start state.
+    pub(crate) start_closure: Box<[StateIdx]>,
+    /// Whether the empty string matches (start closure reaches Match).
+    pub(crate) start_closure_matches: bool,
 }
 
 /// Anchor execution data for Tier 1 (lazy DFA).
 ///
-/// Fields will be populated in Phase 3.
+/// Placeholder — will be populated in a future phase.
 #[derive(Debug)]
 pub(crate) struct AnchorDfaProgram {
-    // Placeholder — populated in Phase 3.
     pub(crate) _placeholder: (),
 }
 
 /// Anchor execution data for Tier 2 (differential-counter DFA).
 ///
-/// Fields will be populated in Phase 3.
+/// Placeholder — will be populated in a future phase.
 #[derive(Debug)]
 pub(crate) struct AnchorTier2Program {
-    // Placeholder — populated in Phase 3.
     pub(crate) _placeholder: (),
 }
 
@@ -207,6 +218,334 @@ impl BoundedGapPlan {
 }
 
 // ---------------------------------------------------------------------------
+// Anchor Compilation
+// ---------------------------------------------------------------------------
+
+/// Compile anchor HIR pieces into an [`AnchorProgram`].
+///
+/// Reconstructs a single HIR from the given pieces (concatenating if
+/// necessary), compiles it through the standard [`RegexBuilder`] pipeline,
+/// and extracts the NFA data.  The temporary [`Regex`] is consumed.
+///
+/// Returns `None` if compilation fails (e.g. unsupported constructs).
+fn compile_anchor_program(pieces: &[&Hir], config: &RegexConfig) -> Option<AnchorProgram> {
+    let anchor_hir = if pieces.len() == 1 {
+        pieces[0].clone()
+    } else {
+        Hir::concat(pieces.iter().map(|h| (*h).clone()).collect())
+    };
+    let mut builder = crate::RegexBuilder::with_config(config.clone());
+    match builder.build(&anchor_hir) {
+        Ok(regex) => Some(regex.into_anchor_program()),
+        Err(e) => {
+            // Anchor compilation failed — fall back to normal engine.
+            debug_assert!(false, "anchor compilation failed: {e}");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Anchor Runner
+// ---------------------------------------------------------------------------
+
+/// Runtime state for a single anchor NFA runner.
+///
+/// Processes input bytes and emits end-position events (absolute byte
+/// positions where the anchor pattern matches).  Uses a simplified NFA
+/// simulation: no counter contexts (Version 1 anchors are counter-free),
+/// no assertion resolution (Version 1 anchors are assertion-free).
+pub(crate) struct AnchorRunner<'a> {
+    /// Compiled NFA data.
+    program: &'a AnchorNfaProgram,
+    /// Byte-class lookup tables (borrowed from program).
+    classes: &'a [ByteClassBits],
+    /// Byte dispatch tables (borrowed from program).
+    byte_tables: &'a [ByteMap],
+    /// Per-state dedup stamp.
+    lastlist: Vec<usize>,
+    /// Monotonically increasing step ID.
+    listid: usize,
+    /// Current active state list (consuming states awaiting a byte).
+    clist: Vec<StateIdx>,
+    /// Next active state list (built during step).
+    nlist: Vec<StateIdx>,
+    /// Work stack for iterative epsilon-closure.
+    addstack: Vec<StateIdx>,
+    /// True when `clist` is the unmodified start closure (enables prefilter).
+    at_start_state: bool,
+    /// Prefilter for skipping non-candidate bytes.
+    prefilter: Prefilter,
+}
+
+impl<'a> AnchorRunner<'a> {
+    /// Create a new runner from an [`AnchorPlan`].
+    pub(crate) fn new(plan: &'a AnchorPlan) -> Self {
+        let program = match &plan.program.engine {
+            AnchorEngine::Tier0(p) => p,
+            _ => unimplemented!("only Tier 0 anchor runners in Version 1"),
+        };
+        let num_states = program.states.len();
+        let mut runner = AnchorRunner {
+            program,
+            classes: &program.classes,
+            byte_tables: &program.byte_tables,
+            lastlist: vec![0; num_states],
+            listid: 1,
+            clist: Vec::with_capacity(num_states),
+            nlist: Vec::with_capacity(num_states),
+            addstack: Vec::with_capacity(num_states),
+            at_start_state: true,
+            prefilter: plan.program.prefilter,
+        };
+        // Populate initial clist from start closure.
+        runner.seed_start();
+        runner
+    }
+
+    /// Reset the runner for a new match (same anchor program).
+    pub(crate) fn reset(&mut self) {
+        self.clist.clear();
+        self.nlist.clear();
+        self.addstack.clear();
+        self.listid = 1;
+        for slot in self.lastlist.iter_mut() {
+            *slot = 0;
+        }
+        self.at_start_state = true;
+        self.seed_start();
+    }
+
+    /// Seed `clist` from the precomputed start closure.
+    fn seed_start(&mut self) {
+        if !self.program.start_closure.is_empty() {
+            for &s in &*self.program.start_closure {
+                self.clist.push(s);
+                self.lastlist[s.idx()] = self.listid;
+            }
+        } else {
+            // Fall back to epsilon-closure from the start state.
+            self.addstack.push(self.program.start);
+            self.drain_addstack_into_clist();
+        }
+    }
+
+    /// Process a chunk of input, emitting end-position events.
+    ///
+    /// `base_pos` is the absolute byte position of `input[0]`.
+    /// For each position where the anchor matches, `emit` is called
+    /// with the absolute end position.
+    ///
+    /// Events are emitted in monotonically increasing position order.
+    pub(crate) fn scan_chunk(
+        &mut self,
+        input: &[u8],
+        base_pos: u64,
+        emit: &mut dyn FnMut(u64),
+    ) {
+        for (offset, &byte) in input.iter().enumerate() {
+            let matched = self.step(byte);
+            if matched {
+                emit(base_pos + offset as u64);
+            }
+        }
+    }
+
+    /// Signal end-of-input.  For Version 1 (assertion-free) anchors this
+    /// is a no-op, but the signature is retained for future phases.
+    pub(crate) fn finish_scan(&mut self, _emit: &mut dyn FnMut(u64)) {
+        // Version 1: no end-of-input assertions to resolve.
+    }
+
+    /// Process one input byte.  Returns `true` if the anchor matched
+    /// ending at this byte position.
+    fn step(&mut self, byte: u8) -> bool {
+        // Prepare nlist for building the next state set.
+        self.nlist.clear();
+        self.listid += 1;
+
+        let mut matched = false;
+
+        // Phase 1: consume the byte from each state in clist.
+        for i in 0..self.clist.len() {
+            let state_idx = self.clist[i];
+            let state = &self.program.states[state_idx.idx()];
+            match *state {
+                State::Byte {
+                    byte: b,
+                    out,
+                    out_exit,
+                } => {
+                    if b == byte {
+                        self.addstack.push(out);
+                        if out_exit != StateIdx::NONE {
+                            self.addstack.push(out_exit);
+                        }
+                    }
+                }
+                State::ByteCI {
+                    byte: lower,
+                    out,
+                    out_exit,
+                } => {
+                    if byte == lower || byte == (lower ^ 0x20) {
+                        self.addstack.push(out);
+                        if out_exit != StateIdx::NONE {
+                            self.addstack.push(out_exit);
+                        }
+                    }
+                }
+                State::Wildcard { out, out_exit } => {
+                    self.addstack.push(out);
+                    if out_exit != StateIdx::NONE {
+                        self.addstack.push(out_exit);
+                    }
+                }
+                State::ByteClassStatic {
+                    table,
+                    out,
+                    out_exit,
+                } => {
+                    if table[byte as usize] {
+                        self.addstack.push(out);
+                        if out_exit != StateIdx::NONE {
+                            self.addstack.push(out_exit);
+                        }
+                    }
+                }
+                State::ByteClassCustom {
+                    class,
+                    out,
+                    out_exit,
+                } => {
+                    if self.classes[class.idx()].contains(byte) {
+                        self.addstack.push(out);
+                        if out_exit != StateIdx::NONE {
+                            self.addstack.push(out_exit);
+                        }
+                    }
+                }
+                State::ByteTable { table } => {
+                    let target = self.byte_tables[table.idx()][byte];
+                    if target != StateIdx::NONE {
+                        self.addstack.push(target);
+                    }
+                }
+                // Split, Assert, Counter*, Match should not be in clist
+                // (clist contains only consuming states).
+                _ => {}
+            }
+        }
+
+        // Phase 2: drain addstack — follow epsilon chains into nlist.
+        while let Some(idx) = self.addstack.pop() {
+            if idx == StateIdx::NONE {
+                continue;
+            }
+            let i = idx.idx();
+            if self.lastlist[i] == self.listid {
+                continue; // already visited
+            }
+            self.lastlist[i] = self.listid;
+
+            match self.program.states[i] {
+                State::Split { out, out1 } => {
+                    self.addstack.push(out1);
+                    self.addstack.push(out);
+                }
+                State::Match => {
+                    matched = true;
+                }
+                // Any consuming state → park in nlist.
+                _ => {
+                    self.nlist.push(idx);
+                }
+            }
+        }
+
+        // Phase 3: re-seed from start closure.
+        if !self.program.start_closure.is_empty() {
+            for &s in &*self.program.start_closure {
+                if self.lastlist[s.idx()] != self.listid {
+                    self.lastlist[s.idx()] = self.listid;
+                    self.nlist.push(s);
+                }
+            }
+        } else {
+            self.addstack.push(self.program.start);
+            self.drain_addstack_into_nlist();
+        }
+
+        // nlist is the new clist for the next step.
+        std::mem::swap(&mut self.clist, &mut self.nlist);
+
+        // Update start-state flag for prefilter eligibility.
+        self.at_start_state = !matched && self.is_at_start_config();
+
+        matched
+    }
+
+    /// Check whether clist is exactly the start closure (eligible for prefilter skip).
+    fn is_at_start_config(&self) -> bool {
+        if self.clist.len() != self.program.start_closure.len() {
+            return false;
+        }
+        // Since both are deduped and inserted in the same order, a
+        // length check is a strong signal.  We could compare elements
+        // but for V1 the length check suffices.
+        true
+    }
+
+    /// Drain addstack into clist (used during initialisation).
+    fn drain_addstack_into_clist(&mut self) {
+        while let Some(idx) = self.addstack.pop() {
+            if idx == StateIdx::NONE {
+                continue;
+            }
+            let i = idx.idx();
+            if self.lastlist[i] == self.listid {
+                continue;
+            }
+            self.lastlist[i] = self.listid;
+            match self.program.states[i] {
+                State::Split { out, out1 } => {
+                    self.addstack.push(out1);
+                    self.addstack.push(out);
+                }
+                State::Match => { /* start_closure_matches handles this */ }
+                _ => {
+                    self.clist.push(idx);
+                }
+            }
+        }
+    }
+
+    /// Drain addstack into nlist (used during re-seeding fallback).
+    fn drain_addstack_into_nlist(&mut self) {
+        while let Some(idx) = self.addstack.pop() {
+            if idx == StateIdx::NONE {
+                continue;
+            }
+            let i = idx.idx();
+            if self.lastlist[i] == self.listid {
+                continue;
+            }
+            self.lastlist[i] = self.listid;
+            match self.program.states[i] {
+                State::Split { out, out1 } => {
+                    self.addstack.push(out1);
+                    self.addstack.push(out);
+                }
+                State::Match => {}
+                _ => {
+                    self.nlist.push(idx);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Compile-Time Specialisation Probe
 // ---------------------------------------------------------------------------
 
@@ -222,7 +561,10 @@ impl BoundedGapPlan {
 ///
 /// Returns `None` for any pattern that does not qualify — the caller
 /// should continue with normal compilation.
-pub(crate) fn try_build_bounded_gap_plan(hir: &Hir) -> Option<BoundedGapPlan> {
+pub(crate) fn try_build_bounded_gap_plan(
+    hir: &Hir,
+    config: &RegexConfig,
+) -> Option<BoundedGapPlan> {
     // Step 1: Flatten top-level concat.
     let pieces = flatten_top_level_concat(hir);
     if pieces.is_empty() {
@@ -360,11 +702,11 @@ pub(crate) fn try_build_bounded_gap_plan(hir: &Hir) -> Option<BoundedGapPlan> {
             }
         }
 
+        // Compile the anchor fragment into a real NFA program.
+        let program = compile_anchor_program(pieces, config)?;
+
         anchor_plans.push(AnchorPlan {
-            program: AnchorProgram {
-                engine: AnchorEngine::Tier0(AnchorNfaProgram { _placeholder: () }),
-                prefilter: Prefilter::None,
-            },
+            program,
             length_info: AnchorLengthInfo::Fixed(total_len),
         });
     }
@@ -870,13 +1212,29 @@ mod tests {
         assert!(!is_assertion_free(&h));
     }
 
+    /// Default config for probe tests.
+    fn default_config() -> RegexConfig {
+        RegexConfig::default()
+    }
+
+    /// Helper: run the probe with default config.
+    fn probe(h: &Hir) -> Option<BoundedGapPlan> {
+        try_build_bounded_gap_plan(h, &default_config())
+    }
+
+    /// Helper: run the probe with merged HIR and default config.
+    fn probe_merged(h: &Hir) -> Option<BoundedGapPlan> {
+        let merged = crate::hir_optimize::optimize(h.clone(), true);
+        try_build_bounded_gap_plan(&merged, &default_config())
+    }
+
     // -- try_build_bounded_gap_plan: recognition ----------------------------
 
     #[test]
     fn test_probe_simple_two_anchor() {
         // foo.{0,10}bar → 2 anchors, 1 interior gap, no tail gap
         let h = hir(r"foo.{0,10}bar");
-        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        let plan = probe(&h).expect("should recognise");
         assert_eq!(plan.anchors.len(), 2);
         assert_eq!(plan.interior_gaps.len(), 1);
         assert!(plan.tail_gap.is_none());
@@ -891,7 +1249,7 @@ mod tests {
     fn test_probe_three_anchor_chain() {
         // foo.{0,10}bar.{0,20}baz → 3 anchors, 2 interior gaps
         let h = hir(r"foo.{0,10}bar.{0,20}baz");
-        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        let plan = probe(&h).expect("should recognise");
         assert_eq!(plan.anchors.len(), 3);
         assert_eq!(plan.interior_gaps.len(), 2);
         assert!(plan.tail_gap.is_none());
@@ -902,7 +1260,7 @@ mod tests {
     fn test_probe_trailing_gap() {
         // CWS.{254} → 1 anchor, 0 interior gaps, 1 tail gap
         let h = hir(r"CWS.{254}");
-        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        let plan = probe(&h).expect("should recognise");
         assert_eq!(plan.anchors.len(), 1);
         assert_eq!(plan.interior_gaps.len(), 0);
         let tail = plan.tail_gap.as_ref().expect("should have tail gap");
@@ -916,7 +1274,7 @@ mod tests {
     fn test_probe_constrained_trailing_gap() {
         // token[^/]{0,20} → 1 anchor, 0 interior gaps, 1 constrained tail gap
         let h = hir(r"token[^/]{0,20}");
-        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        let plan = probe(&h).expect("should recognise");
         assert_eq!(plan.anchors.len(), 1);
         assert_eq!(plan.interior_gaps.len(), 0);
         let tail = plan.tail_gap.as_ref().expect("should have tail gap");
@@ -935,7 +1293,7 @@ mod tests {
     fn test_probe_hoisted_start_anchor() {
         // ^foo.{0,10}bar → StartOfInput hoisted
         let h = hir(r"^foo.{0,10}bar");
-        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        let plan = probe(&h).expect("should recognise");
         assert_eq!(plan.start_anchor, StartAnchorKind::StartOfInput);
         assert_eq!(plan.end_anchor, EndAnchorKind::None);
         assert_eq!(plan.anchors.len(), 2);
@@ -945,7 +1303,7 @@ mod tests {
     fn test_probe_hoisted_end_anchor() {
         // foo.{0,10}bar$ → EndOfInput hoisted
         let h = hir(r"foo.{0,10}bar$");
-        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        let plan = probe(&h).expect("should recognise");
         assert_eq!(plan.start_anchor, StartAnchorKind::None);
         assert_eq!(plan.end_anchor, EndAnchorKind::EndOfInput);
     }
@@ -954,7 +1312,7 @@ mod tests {
     fn test_probe_both_anchors_hoisted() {
         // ^foo.{0,10}bar$ → both hoisted
         let h = hir(r"^foo.{0,10}bar$");
-        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        let plan = probe(&h).expect("should recognise");
         assert_eq!(plan.start_anchor, StartAnchorKind::StartOfInput);
         assert_eq!(plan.end_anchor, EndAnchorKind::EndOfInput);
     }
@@ -963,7 +1321,7 @@ mod tests {
     fn test_probe_exact_gap() {
         // foo.{5}bar → exact gap of 5
         let h = hir(r"foo.{5}bar");
-        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        let plan = probe(&h).expect("should recognise");
         assert_eq!(plan.interior_gaps[0].min_gap, 5);
         assert_eq!(plan.interior_gaps[0].max_gap, 5);
     }
@@ -972,7 +1330,7 @@ mod tests {
     fn test_probe_case_insensitive_anchor() {
         // (?i)file.{0,10}path → case-insensitive anchors
         let h = hir(r"(?i)file.{0,10}path");
-        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        let plan = probe(&h).expect("should recognise");
         assert_eq!(plan.anchors[0].length_info, AnchorLengthInfo::Fixed(4));
         assert_eq!(plan.anchors[1].length_info, AnchorLengthInfo::Fixed(4));
     }
@@ -983,21 +1341,21 @@ mod tests {
     fn test_probe_reject_no_gap() {
         // "foobar" → no gaps, specialisation does not apply
         let h = hir(r"foobar");
-        assert!(try_build_bounded_gap_plan(&h).is_none());
+        assert!(probe(&h).is_none());
     }
 
     #[test]
     fn test_probe_reject_leading_gap() {
         // .{0,20}foo → leading gap, rejected
         let h = hir(r".{0,20}foo");
-        assert!(try_build_bounded_gap_plan(&h).is_none());
+        assert!(probe(&h).is_none());
     }
 
     #[test]
     fn test_probe_reject_unbounded_gap() {
         // foo.*bar → unbounded gap
         let h = hir(r"foo.*bar");
-        assert!(try_build_bounded_gap_plan(&h).is_none());
+        assert!(probe(&h).is_none());
     }
 
     #[test]
@@ -1005,28 +1363,28 @@ mod tests {
         // foo.{0,10}ba+r → "ba+r" contains unbounded a+ which is
         // anchor material with variable length → rejected
         let h = hir(r"foo.{0,10}ba+r");
-        assert!(try_build_bounded_gap_plan(&h).is_none());
+        assert!(probe(&h).is_none());
     }
 
     #[test]
     fn test_probe_reject_assertion_in_anchor() {
         // \bfoo.{0,10}bar → \b in anchor
         let h = hir(r"\bfoo.{0,10}bar");
-        assert!(try_build_bounded_gap_plan(&h).is_none());
+        assert!(probe(&h).is_none());
     }
 
     #[test]
     fn test_probe_reject_startlf() {
         // (?m:^)foo.{0,10}bar → StartLF, rejected in V1
         let h = hir(r"(?m:^)foo.{0,10}bar");
-        assert!(try_build_bounded_gap_plan(&h).is_none());
+        assert!(probe(&h).is_none());
     }
 
     #[test]
     fn test_probe_reject_endlf() {
         // foo.{0,10}bar(?m:$) → EndLF, rejected in V1
         let h = hir(r"foo.{0,10}bar(?m:$)");
-        assert!(try_build_bounded_gap_plan(&h).is_none());
+        assert!(probe(&h).is_none());
     }
 
     #[test]
@@ -1035,7 +1393,7 @@ mod tests {
         // Actually this IS a concat: (foo|bar) then .{0,10} then baz
         // The first anchor (foo|bar) has fixed length 3, no assertions → OK
         let h = hir(r"(foo|bar).{0,10}baz");
-        let plan = try_build_bounded_gap_plan(&h);
+        let plan = probe(&h);
         // This should actually be recognised if (foo|bar) has fixed length 3
         assert!(plan.is_some());
     }
@@ -1044,21 +1402,21 @@ mod tests {
     fn test_probe_reject_top_level_alternation() {
         // foo|bar — alternation at top level, not a concat chain
         let h = hir(r"foo|bar");
-        assert!(try_build_bounded_gap_plan(&h).is_none());
+        assert!(probe(&h).is_none());
     }
 
     #[test]
     fn test_probe_reject_multi_byte_gap_body() {
         // foo(ab){0,10}bar → gap body is multi-byte
         let h = hir(r"foo(ab){0,10}bar");
-        assert!(try_build_bounded_gap_plan(&h).is_none());
+        assert!(probe(&h).is_none());
     }
 
     #[test]
     fn test_probe_adjacent_same_predicate_gaps_merged() {
         // .{0,10}.{0,20} → optimize(merge=true) merges to .{0,30}
         let h = hir_merged(r"foo.{0,10}.{0,20}bar");
-        let plan = try_build_bounded_gap_plan(&h).expect("should recognise merged gaps");
+        let plan = probe(&h).expect("should recognise merged gaps");
         assert_eq!(plan.interior_gaps.len(), 1);
         assert_eq!(plan.interior_gaps[0].min_gap, 0);
         assert_eq!(plan.interior_gaps[0].max_gap, 30);
@@ -1069,14 +1427,14 @@ mod tests {
     fn test_probe_adjacent_different_predicate_gaps_rejected() {
         // foo.{0,10}[^/]{0,20}bar → different predicates, can't merge
         let h = hir_merged(r"foo.{0,10}[^/]{0,20}bar");
-        assert!(try_build_bounded_gap_plan(&h).is_none());
+        assert!(probe(&h).is_none());
     }
 
     #[test]
     fn test_probe_trailing_adjacent_gaps_merged() {
         // foo.{0,10}.{0,20} → optimize(merge=true) merges to .{0,30}
         let h = hir_merged(r"foo.{0,10}.{0,20}");
-        let plan = try_build_bounded_gap_plan(&h).expect("should recognise merged trailing gaps");
+        let plan = probe(&h).expect("should recognise merged trailing gaps");
         assert_eq!(plan.anchors.len(), 1);
         assert_eq!(plan.interior_gaps.len(), 0);
         let tail = plan.tail_gap.as_ref().expect("should have merged tail gap");
@@ -1088,7 +1446,7 @@ mod tests {
     fn test_probe_three_adjacent_gaps_merged() {
         // foo.{0,10}.{0,20}.{0,30}bar → optimize(merge=true) merges to .{0,60}
         let h = hir_merged(r"foo.{0,10}.{0,20}.{0,30}bar");
-        let plan = try_build_bounded_gap_plan(&h).expect("should recognise three merged gaps");
+        let plan = probe(&h).expect("should recognise three merged gaps");
         assert_eq!(plan.interior_gaps.len(), 1);
         assert_eq!(plan.interior_gaps[0].max_gap, 60);
     }
@@ -1099,7 +1457,7 @@ mod tests {
         // The HIR optimizer should already collapse .{0,0} to Empty,
         // so foo and bar concatenate into one literal.
         let h = hir(r"foo.{0,0}bar.{0,10}baz");
-        let plan = try_build_bounded_gap_plan(&h).expect("should recognise after normalisation");
+        let plan = probe(&h).expect("should recognise after normalisation");
         // foobar is one anchor (6 bytes), then gap, then baz
         assert_eq!(plan.anchors.len(), 2);
         assert_eq!(plan.anchors[0].length_info, AnchorLengthInfo::Fixed(6));
@@ -1110,7 +1468,7 @@ mod tests {
     fn test_probe_trailing_zero_gap_dropped() {
         // foo.{0,10}bar.{0,0} → trailing {0,0} dropped by HIR optimizer
         let h = hir(r"foo.{0,10}bar.{0,0}");
-        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        let plan = probe(&h).expect("should recognise");
         // No tail gap since {0,0} was optimised away
         assert!(plan.tail_gap.is_none());
         assert_eq!(plan.anchors.len(), 2);
@@ -1120,18 +1478,152 @@ mod tests {
     fn test_probe_all_gaps_normalised_away_rejects() {
         // foo.{0,0}bar → becomes "foobar", no gaps → rejected
         let h = hir(r"foo.{0,0}bar");
-        assert!(try_build_bounded_gap_plan(&h).is_none());
+        assert!(probe(&h).is_none());
     }
 
     #[test]
     fn test_probe_end_anchor_with_trailing_gap() {
         // foo.{0,3}$ → anchor "foo", tail gap {0,3}, EndOfInput
         let h = hir(r"foo.{0,3}$");
-        let plan = try_build_bounded_gap_plan(&h).expect("should recognise");
+        let plan = probe(&h).expect("should recognise");
         assert_eq!(plan.anchors.len(), 1);
         assert_eq!(plan.end_anchor, EndAnchorKind::EndOfInput);
         let tail = plan.tail_gap.as_ref().expect("should have tail gap");
         assert_eq!(tail.min_gap, 0);
         assert_eq!(tail.max_gap, 3);
+    }
+
+    // -- AnchorRunner -------------------------------------------------------
+
+    /// Helper: compile an anchor plan for a simple pattern.
+    fn anchor_plan(pattern: &str) -> AnchorPlan {
+        let h = hir(pattern);
+        let pieces = vec![&h];
+        let program = compile_anchor_program(&pieces, &default_config())
+            .unwrap_or_else(|| panic!("anchor should compile for pattern: {pattern}"));
+        AnchorPlan {
+            program,
+            length_info: AnchorLengthInfo::Fixed(
+                compute_fixed_length(&h).unwrap().len,
+            ),
+        }
+    }
+
+    /// Collect all events emitted by scanning the input.
+    fn scan_events(plan: &AnchorPlan, input: &[u8]) -> Vec<u64> {
+        let mut runner = AnchorRunner::new(plan);
+        let mut events = Vec::new();
+        runner.scan_chunk(input, 0, &mut |pos| events.push(pos));
+        runner.finish_scan(&mut |pos| events.push(pos));
+        events
+    }
+
+    #[test]
+    fn test_runner_literal_match() {
+        let plan = anchor_plan("foo");
+        // "xxfooxx" → match ending at position 4 (0-indexed: f=2, o=3, o=4)
+        let events = scan_events(&plan, b"xxfooxx");
+        assert_eq!(events, vec![4]);
+    }
+
+    #[test]
+    fn test_runner_literal_multiple_matches() {
+        let plan = anchor_plan("ab");
+        // "ababab" → matches ending at 1, 3, 5
+        let events = scan_events(&plan, b"ababab");
+        assert_eq!(events, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn test_runner_literal_no_match() {
+        let plan = anchor_plan("xyz");
+        let events = scan_events(&plan, b"abc");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_runner_overlapping_matches() {
+        let plan = anchor_plan("aa");
+        // "aaa" → "aa" ends at position 1, then again at position 2
+        let events = scan_events(&plan, b"aaa");
+        assert_eq!(events, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_runner_class_match() {
+        let plan = anchor_plan(r"\d\d");
+        // "a12b34c" → "12" ends at 2, "34" ends at 5
+        let events = scan_events(&plan, b"a12b34c");
+        assert_eq!(events, vec![2, 5]);
+    }
+
+    #[test]
+    fn test_runner_case_insensitive() {
+        let plan = anchor_plan(r"(?i)file");
+        // "FILE_file" → matches ending at 3, 8
+        let events = scan_events(&plan, b"FILE_file");
+        assert_eq!(events, vec![3, 8]);
+    }
+
+    #[test]
+    fn test_runner_alternation_anchor() {
+        let plan = anchor_plan(r"GET|PUT");
+        // "GET_PUT" → GET ends at 2, PUT ends at 6
+        let events = scan_events(&plan, b"GET_PUT");
+        assert_eq!(events, vec![2, 6]);
+    }
+
+    #[test]
+    fn test_runner_cross_chunk() {
+        let plan = anchor_plan("foo");
+        let mut runner = AnchorRunner::new(&plan);
+        let mut events = Vec::new();
+        // "fo" in chunk 0, "obar" in chunk 1 → "foo" ends at position 2
+        runner.scan_chunk(b"fo", 0, &mut |pos| events.push(pos));
+        runner.scan_chunk(b"obar", 2, &mut |pos| events.push(pos));
+        runner.finish_scan(&mut |pos| events.push(pos));
+        assert_eq!(events, vec![2]);
+    }
+
+    #[test]
+    fn test_runner_cross_chunk_split_inside_match() {
+        let plan = anchor_plan("abc");
+        let mut runner = AnchorRunner::new(&plan);
+        let mut events = Vec::new();
+        // "a" then "b" then "cxx"
+        runner.scan_chunk(b"a", 0, &mut |pos| events.push(pos));
+        runner.scan_chunk(b"b", 1, &mut |pos| events.push(pos));
+        runner.scan_chunk(b"cxx", 2, &mut |pos| events.push(pos));
+        runner.finish_scan(&mut |pos| events.push(pos));
+        assert_eq!(events, vec![2]);
+    }
+
+    #[test]
+    fn test_runner_events_monotone() {
+        let plan = anchor_plan(r"a|b");
+        let events = scan_events(&plan, b"abba");
+        // "a" ends at 0, "b" ends at 1, "b" ends at 2, "a" ends at 3
+        assert_eq!(events, vec![0, 1, 2, 3]);
+        // Verify monotone ordering.
+        for w in events.windows(2) {
+            assert!(w[0] <= w[1], "events must be monotone");
+        }
+    }
+
+    #[test]
+    fn test_runner_reset() {
+        let plan = anchor_plan("ab");
+        let mut runner = AnchorRunner::new(&plan);
+
+        // First match.
+        let mut events = Vec::new();
+        runner.scan_chunk(b"xabx", 0, &mut |pos| events.push(pos));
+        assert_eq!(events, vec![2]);
+
+        // Reset and match again.
+        runner.reset();
+        events.clear();
+        runner.scan_chunk(b"yaby", 0, &mut |pos| events.push(pos));
+        assert_eq!(events, vec![2]);
     }
 }

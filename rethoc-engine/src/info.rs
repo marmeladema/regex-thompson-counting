@@ -273,7 +273,12 @@ impl fmt::Display for RegexInfo {
 
         // Execution tier
         writeln!(f)?;
-        writeln!(f, "Execution: {}", self.execution.tier_name)?;
+        if let Some(spec) = &self.execution.specialization {
+            writeln!(f, "Execution: {} specialization", spec)?;
+            writeln!(f, "  fallback: {}", self.execution.tier_name)?;
+        } else {
+            writeln!(f, "Execution: {}", self.execution.tier_name)?;
+        }
 
         // Start closure
         writeln!(f)?;

@@ -977,6 +977,28 @@ impl Regex {
         builder.build(&hir)
     }
 
+    /// Consume this `Regex` and extract the NFA data needed for an
+    /// anchor program in the bounded-gap engine.
+    ///
+    /// This avoids storing a full `Regex` inside the plan (which would
+    /// create a recursive type graph) while reusing the existing
+    /// compilation pipeline.
+    pub(crate) fn into_anchor_program(self) -> bounded_gap::AnchorProgram {
+        use bounded_gap::{AnchorEngine, AnchorNfaProgram, AnchorProgram};
+        let program = AnchorNfaProgram {
+            states: self.states.0,
+            classes: self.classes,
+            byte_tables: self.byte_tables,
+            start: self.start,
+            start_closure: self.start_closure,
+            start_closure_matches: self.start_closure_matches,
+        };
+        AnchorProgram {
+            engine: AnchorEngine::Tier0(program),
+            prefilter: self.prefilter,
+        }
+    }
+
     /// Return the total memory footprint (in bytes) of this compiled
     /// regex, including the struct itself and all heap-allocated data
     /// (state tables, character class tables, byte dispatch tables).
@@ -2878,10 +2900,10 @@ impl RegexBuilder {
             // recognition, even when config.merge_repetitions is false.
             bounded_gap_plan: if self.config.merge_repetitions {
                 // compile_hir already has repetitions merged.
-                bounded_gap::try_build_bounded_gap_plan(compile_hir)
+                bounded_gap::try_build_bounded_gap_plan(compile_hir, &self.config)
             } else {
                 let probe_hir = hir_optimize::optimize(hir.clone(), true);
-                bounded_gap::try_build_bounded_gap_plan(&probe_hir)
+                bounded_gap::try_build_bounded_gap_plan(&probe_hir, &self.config)
             },
         })
     }
@@ -6384,7 +6406,7 @@ mod tests {
         }
         test_wildcard_fixed_unrolled {
             pattern: "^a.{3}b$",
-            memory: 1248,
+            memory: 1416,
             min_tier: 1,
             inputs: [
                 ("a123b", true),
@@ -9356,7 +9378,7 @@ mod tests {
         }
         test_partial_ci_counted_group {
             pattern: "^a(?i:b){2,4}c$",
-            memory: 1281,
+            memory: 1449,
             min_tier: 1,
             inputs: [
                 ("abbc", true),
@@ -9493,7 +9515,7 @@ mod tests {
         }
         test_partial_ci_optional_group {
             pattern: "^a(?i:b)?c$",
-            memory: 1215,
+            memory: 1383,
             min_tier: 1,
             inputs: [
                 ("ac", true),
@@ -9691,7 +9713,7 @@ mod tests {
         }
         test_multi_counter_with_literal_prefix {
             pattern: "^ID-[A-Z]{4}-[0-9]{6}$",
-            memory: 1593,
+            memory: 1761,
             min_tier: 1,
             inputs: [
                 ("ID-ABCD-123456", true),
@@ -10382,7 +10404,7 @@ mod tests {
         // tracker detects this when counter 0 breaks.
         test_tier3_post_break_tail_literal {
             pattern: "^a.{3}b$",
-            memory: 1248,
+            memory: 1416,
             min_tier: 1,
             inputs: [
                 ("a123b", true),
