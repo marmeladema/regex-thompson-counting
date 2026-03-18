@@ -659,12 +659,89 @@ impl<'a> BoundedGapMatcher<'a> {
 
     /// Process a chunk of input.
     pub(crate) fn chunk(&mut self, input: &[u8]) {
+        match self.plan.anchors[0].program.prefilter {
+            Prefilter::None => self.chunk_no_prefilter(input),
+            Prefilter::Memchr1(b1) => {
+                self.chunk_prefilter(input, |hay| memchr::memchr(b1, hay));
+            }
+            Prefilter::Memchr2(b1, b2) => {
+                self.chunk_prefilter(input, |hay| memchr::memchr2(b1, b2, hay));
+            }
+            Prefilter::Memchr3(b1, b2, b3) => {
+                self.chunk_prefilter(input, |hay| memchr::memchr3(b1, b2, b3, hay));
+            }
+            Prefilter::Memclass(t) => {
+                self.chunk_prefilter(input, |hay| crate::memclass::memclass(&t, hay));
+            }
+            Prefilter::Range(lo, hi) => {
+                self.chunk_prefilter(input, |hay| crate::memrange::memrange(lo, hi, hay));
+            }
+        }
+    }
+
+    /// No prefilter: process every byte.
+    fn chunk_no_prefilter(&mut self, input: &[u8]) {
         for &byte in input {
             if self.matched {
                 return;
             }
             self.step(byte);
         }
+    }
+
+    /// Prefilter path: when the matcher is quiescent (all gap stage
+    /// queues empty, only anchor[0] active), use the prefilter to skip
+    /// non-candidate bytes at SIMD speed.
+    fn chunk_prefilter(&mut self, input: &[u8], finder: impl Fn(&[u8]) -> Option<usize>) {
+        let mut i = 0;
+        while i < input.len() {
+            if self.matched {
+                return;
+            }
+            if self.is_quiescent() {
+                if let Some(offset) = finder(&input[i..]) {
+                    // Advance position past the skipped bytes.
+                    self.position += offset as u64;
+                    i += offset;
+                } else {
+                    // No candidate in remaining input.
+                    self.position += (input.len() - i) as u64;
+                    return;
+                }
+            }
+            self.step(input[i]);
+            i += 1;
+        }
+    }
+
+    /// Check whether the matcher is in quiescent state: all gap stage
+    /// queues are empty, only anchor[0] is active, and anchor[0]'s NFA
+    /// is at start configuration.  In this state, anchor[0]'s prefilter
+    /// can safely skip non-candidate bytes.
+    fn is_quiescent(&self) -> bool {
+        // Anchor[0]'s NFA must be at start config (no partial match
+        // in progress).
+        let program = match &self.plan.anchors[0].program.engine {
+            AnchorEngine::Tier0(p) => p,
+            _ => return false,
+        };
+        let scratch = &self.cache.runner_scratch[0];
+        if scratch.clist.len() != program.start_closure.len() {
+            return false;
+        }
+        // Any gap stage has accepted ends → not quiescent.
+        for stage in &self.cache.gap_stages {
+            if !stage.accepted_prev_ends.is_empty() {
+                return false;
+            }
+        }
+        // Tail state has accepted ends → not quiescent.
+        if let Some(ref ts) = self.cache.tail_state
+            && !ts.accepted_final_anchor_ends.is_empty()
+        {
+            return false;
+        }
+        true
     }
 
     /// Signal end-of-input.  Resolves `EndOfInput` candidates.
@@ -2219,5 +2296,113 @@ mod tests {
         assert!(m.ismatch());
         m.chunk(b"xxxxxxxxxxxxxxxx"); // should be skipped
         assert!(m.finish());
+    }
+
+    // -- Prefilter integration tests ----------------------------------------
+
+    #[test]
+    fn test_prefilter_skips_non_candidate_bytes() {
+        // "foo" has prefilter Memchr1('f').  Large input with match
+        // near the end — the prefilter should skip most of the input.
+        let input: Vec<u8> = {
+            let mut v = vec![b'x'; 10_000];
+            v.extend_from_slice(b"foo___bar");
+            v
+        };
+        assert!(gap_match(r"foo.{0,10}bar", &input));
+    }
+
+    #[test]
+    fn test_prefilter_no_match_in_large_input() {
+        // No 'f' anywhere → prefilter skips entire input.
+        let input = vec![b'x'; 10_000];
+        assert!(!gap_match(r"foo.{0,10}bar", &input));
+    }
+
+    #[test]
+    fn test_prefilter_position_tracking_across_skip() {
+        // Verify gap length is computed correctly when prefilter skips
+        // bytes.  Anchor "ab" prefilter skips to 'a'.
+        // Input: 1000 x's, then "ab___cd".  Gap must be ≤5.
+        let input: Vec<u8> = {
+            let mut v = vec![b'x'; 1000];
+            v.extend_from_slice(b"ab___cd");
+            v
+        };
+        assert!(gap_match(r"ab.{0,5}cd", &input));
+    }
+
+    #[test]
+    fn test_prefilter_gap_too_large_after_skip() {
+        // After prefilter skip, gap exceeds max.
+        // "ab" at position 1000, "cd" needs to be within 5 bytes.
+        // Put "cd" 10 bytes after "ab" → gap=8 > 5 → no match.
+        let input: Vec<u8> = {
+            let mut v = vec![b'x'; 1000];
+            v.extend_from_slice(b"ab");
+            v.extend_from_slice(b"xxxxxxxx");
+            v.extend_from_slice(b"cd");
+            v
+        };
+        assert!(!gap_match(r"ab.{0,5}cd", &input));
+    }
+
+    #[test]
+    fn test_prefilter_multiple_candidates() {
+        // Multiple 'f' bytes — prefilter finds first, fails match,
+        // re-enters quiescent, skips to next 'f', matches.
+        assert!(gap_match(r"foo.{0,5}bar", b"xxxfxxxxxxxxxxfoo__barxxx"));
+    }
+
+    #[test]
+    fn test_prefilter_with_constrained_gap() {
+        // ab[^/]{0,10}cd — prefilter for 'a', gap rejects '/'.
+        let input: Vec<u8> = {
+            let mut v = vec![b'x'; 500];
+            v.extend_from_slice(b"ab___cd");
+            v
+        };
+        assert!(gap_match(r"ab[^/]{0,10}cd", &input));
+    }
+
+    #[test]
+    fn test_prefilter_with_trailing_gap() {
+        // foo.{3,10} with prefilter for 'f'.
+        let input: Vec<u8> = {
+            let mut v = vec![b'x'; 500];
+            v.extend_from_slice(b"fooXXX");
+            v
+        };
+        assert!(gap_match(r"foo.{3,10}", &input));
+    }
+
+    #[test]
+    fn test_prefilter_multi_chunk_with_skip() {
+        // Prefilter skip across chunk boundaries.
+        let h = hir(r"foo.{0,5}bar");
+        let plan = probe(&h).expect("should recognise");
+        let mut cache = BoundedGapCache::new();
+        let mut m = BoundedGapMatcher::new(&plan, &mut cache);
+        // First chunk: no 'f' — entirely skipped by prefilter.
+        m.chunk(&[b'x'; 5000]);
+        // Second chunk: contains the match.
+        m.chunk(b"foo__bar");
+        assert!(m.finish());
+    }
+
+    #[test]
+    fn test_prefilter_quiescence_after_failed_anchor() {
+        // After anchor[0] partially matches then fails, the matcher
+        // should return to quiescent and resume prefilter skipping.
+        // "fo" starts anchor[0] but "fx" fails → back to quiescent.
+        assert!(gap_match(r"foo.{0,5}bar", b"fxxxxxxxxxxxxxfoo_barxxx"));
+    }
+
+    #[test]
+    fn test_prefilter_end_anchor_with_skip() {
+        // ^foo.{0,5}bar$ with large padding before — ^foo requires
+        // start at 0, so prefilter doesn't help (first byte must be 'f').
+        assert!(!gap_match(r"^foo.{0,5}bar$", b"xxxfoo_bar"));
+        assert!(gap_match(r"^foo.{0,5}bar$", b"foo_bar"));
     }
 }
