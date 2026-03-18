@@ -1,19 +1,21 @@
-//! Bounded-gap analysis helpers for detecting `Anchor (Gap Anchor)* Gap?`
-//! patterns in `regex-syntax` HIR.
+//! Bounded-gap engine types and HIR analysis helpers.
 //!
-//! These helpers operate on HIR before NFA construction.  They detect
-//! whether a pattern can be compiled as a bounded-gap chain and extract
-//! the structural parameters needed for plan construction.
+//! This module contains:
 //!
-//! Phase 0 of the bounded-gap engine: analysis scaffolding only, no
-//! runtime types or matching logic.
+//! - **Plan types**: [`BoundedGapPlan`], [`GapPlan`], [`AnchorPlan`],
+//!   [`AnchorProgram`], and supporting enums that define the compile-time
+//!   representation of a bounded-gap chain.
+//! - **Analysis helpers**: functions that operate on `regex-syntax` HIR
+//!   to detect whether a pattern can be compiled as a bounded-gap chain
+//!   and extract the structural parameters needed for plan construction.
 
 use regex_syntax::hir::{Hir, HirKind};
 
 use crate::classes::{ByteClass, ByteClassBits};
+use crate::prefilter::Prefilter;
 
 // ---------------------------------------------------------------------------
-// Types
+// Analysis Types
 // ---------------------------------------------------------------------------
 
 /// Classification of a gap body predicate.
@@ -21,8 +23,11 @@ use crate::classes::{ByteClass, ByteClassBits};
 /// Version 1 gap predicates are always single-byte.  `Any` is kept
 /// separate to enable a meaningful runtime fast path where bad-byte
 /// tracking is skipped entirely for `.{0,K}` / `[\s\S]{0,K}` style gaps.
+///
+/// Used both during HIR analysis ([`classify_gap_body`]) and as the
+/// predicate stored in [`GapPlan`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GapBodyClass {
+pub(crate) enum GapPredicate {
     /// Matches any single byte (wildcard).
     Any,
     /// Matches a specific set of bytes, stored as a 256-bit inline set.
@@ -35,6 +40,170 @@ pub(crate) enum GapBodyClass {
 pub(crate) struct FixedLengthInfo {
     /// The exact byte length consumed by this anchor.
     pub(crate) len: u16,
+}
+
+// ---------------------------------------------------------------------------
+// Plan Types
+// ---------------------------------------------------------------------------
+
+/// Compiled plan for a bounded-gap chain.
+///
+/// Represents a pattern of the form `Anchor0 (Gap0 Anchor1)* GapTail?`
+/// where each gap is a bounded repetition of a single-byte predicate
+/// and each anchor is a separately compiled fixed-length regex fragment.
+///
+/// Invariant: `anchors.len() == interior_gaps.len() + 1`.
+#[derive(Debug)]
+pub(crate) struct BoundedGapPlan {
+    /// The anchor programs, in chain order.
+    pub(crate) anchors: Box<[AnchorPlan]>,
+    /// Interior gap constraints between consecutive anchors.
+    pub(crate) interior_gaps: Box<[GapPlan]>,
+    /// Optional terminal gap after the final anchor.
+    pub(crate) tail_gap: Option<GapPlan>,
+    /// Whole-pattern start anchoring (`^`).
+    pub(crate) start_anchor: StartAnchorKind,
+    /// Whole-pattern end anchoring (`$`).
+    pub(crate) end_anchor: EndAnchorKind,
+}
+
+/// A gap constraint between two anchors (or after the final anchor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GapPlan {
+    /// Minimum gap length in bytes.
+    pub(crate) min_gap: u32,
+    /// Maximum gap length in bytes.
+    pub(crate) max_gap: u32,
+    /// Per-byte predicate for bytes in the gap.
+    pub(crate) predicate: GapPredicate,
+}
+
+/// Compiled anchor within a bounded-gap chain.
+#[derive(Debug)]
+pub(crate) struct AnchorPlan {
+    /// The compiled execution program for this anchor.
+    pub(crate) program: AnchorProgram,
+    /// Length information (fixed in Version 1).
+    pub(crate) length_info: AnchorLengthInfo,
+}
+
+/// Compiled execution data for an anchor submatcher.
+///
+/// This is deliberately **not** a [`Regex`](crate::Regex).  It stores
+/// only the data needed for event-producing anchor runners, without
+/// nested specialisation probes, public diagnostics, or top-level
+/// matcher dispatch.
+#[derive(Debug)]
+pub(crate) struct AnchorProgram {
+    /// Tier-specific execution data.
+    pub(crate) engine: AnchorEngine,
+    /// Optional prefilter for skipping non-candidate bytes.
+    pub(crate) prefilter: Prefilter,
+}
+
+/// Tier-specific anchor execution data.
+///
+/// Each variant stores only the compiled state that the corresponding
+/// tier's anchor scanner needs to emit end-position events.  The exact
+/// fields will be refined during Phase 3 (anchor runner implementation).
+#[derive(Debug)]
+pub(crate) enum AnchorEngine {
+    /// NFA simulation (Tier 0).
+    Tier0(AnchorNfaProgram),
+    /// Lazy DFA (Tier 1).
+    Tier1(AnchorDfaProgram),
+    /// Differential-counter DFA (Tier 2).
+    Tier2(AnchorTier2Program),
+}
+
+/// Anchor execution data for Tier 0 (NFA simulation).
+///
+/// Fields will be populated in Phase 3.
+#[derive(Debug)]
+pub(crate) struct AnchorNfaProgram {
+    // Placeholder — populated in Phase 3.
+    pub(crate) _placeholder: (),
+}
+
+/// Anchor execution data for Tier 1 (lazy DFA).
+///
+/// Fields will be populated in Phase 3.
+#[derive(Debug)]
+pub(crate) struct AnchorDfaProgram {
+    // Placeholder — populated in Phase 3.
+    pub(crate) _placeholder: (),
+}
+
+/// Anchor execution data for Tier 2 (differential-counter DFA).
+///
+/// Fields will be populated in Phase 3.
+#[derive(Debug)]
+pub(crate) struct AnchorTier2Program {
+    // Placeholder — populated in Phase 3.
+    pub(crate) _placeholder: (),
+}
+
+/// Anchor length information.
+///
+/// Version 1 supports only fixed-length anchors.  Phase 2 will add
+/// `ExactSmallSet` and `ExactSparse` variants for bounded
+/// variable-length anchors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AnchorLengthInfo {
+    /// Anchor consumes exactly this many bytes.
+    Fixed(u16),
+}
+
+/// Whole-pattern start anchoring.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum StartAnchorKind {
+    /// No start anchoring — the chain can begin at any input position.
+    #[default]
+    None,
+    /// `^` — the first anchor must start at position 0.
+    StartOfInput,
+}
+
+/// Whole-pattern end anchoring.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum EndAnchorKind {
+    /// No end anchoring — the chain can end at any input position.
+    #[default]
+    None,
+    /// `$` — the match must end at the final input position.
+    EndOfInput,
+}
+
+/// Controls how a pattern is compiled.
+///
+/// Anchors are compiled in `Anchor` mode, which disables bounded-gap
+/// detection and other top-level-only specialisations.  This prevents
+/// recursive specialisation trees and keeps the ownership graph flat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompileMode {
+    /// Normal top-level compilation (specialisation probes enabled).
+    TopLevel,
+    /// Anchor sub-compilation (specialisation probes disabled).
+    Anchor,
+}
+
+// ---------------------------------------------------------------------------
+// Plan memory accounting
+// ---------------------------------------------------------------------------
+
+impl BoundedGapPlan {
+    /// Estimated heap size of the plan (excluding the inline `Option` on
+    /// `Regex`).  Used by [`Regex::memory_size`](crate::Regex::memory_size).
+    pub(crate) fn heap_size(&self) -> usize {
+        let anchors = self.anchors.len() * std::mem::size_of::<AnchorPlan>();
+        let gaps = self.interior_gaps.len() * std::mem::size_of::<GapPlan>();
+        let tail = if self.tail_gap.is_some() {
+            std::mem::size_of::<GapPlan>()
+        } else {
+            0
+        };
+        anchors + gaps + tail
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -77,7 +246,7 @@ pub(crate) fn flatten_top_level_concat(hir: &Hir) -> Vec<&Hir> {
 /// Recognize whether an HIR fragment is a Version 1 gap body: a single
 /// byte-consuming predicate atom.
 ///
-/// Returns `Some(GapBodyClass)` if the body qualifies, `None` otherwise.
+/// Returns `Some(GapPredicate)` if the body qualifies, `None` otherwise.
 ///
 /// Qualifying bodies:
 /// - `.` (wildcard)
@@ -89,21 +258,21 @@ pub(crate) fn flatten_top_level_concat(hir: &Hir) -> Vec<&Hir> {
 /// - Multi-byte literals (`ab`)
 /// - Bodies containing assertions (`\b`)
 /// - Alternations, repetitions, or other compound structures
-pub(crate) fn classify_gap_body(hir: &Hir) -> Option<GapBodyClass> {
+pub(crate) fn classify_gap_body(hir: &Hir) -> Option<GapPredicate> {
     match hir.kind() {
         // Single-byte literal → byte class with one byte set.
         HirKind::Literal(lit) if lit.0.len() == 1 => {
             let mut table = ByteClass::NONE;
             table.0[lit.0[0] as usize] = true;
-            Some(GapBodyClass::ByteClass(table.to_bits()))
+            Some(GapPredicate::ByteClass(table.to_bits()))
         }
         // Byte or Unicode class → check for wildcard or specific class.
         HirKind::Class(class) => {
             let table = ByteClass::from_hir_class(class)?;
             if table.is_all() {
-                Some(GapBodyClass::Any)
+                Some(GapPredicate::Any)
             } else {
-                Some(GapBodyClass::ByteClass(table.to_bits()))
+                Some(GapPredicate::ByteClass(table.to_bits()))
             }
         }
         // Capture is just a wrapper — recurse.
@@ -122,7 +291,7 @@ pub(crate) fn classify_gap_body(hir: &Hir) -> Option<GapBodyClass> {
 /// Requires:
 /// - `Repetition` with finite `max`
 /// - Body qualifies under [`classify_gap_body`]
-pub(crate) fn classify_gap(hir: &Hir) -> Option<(u32, u32, GapBodyClass)> {
+pub(crate) fn classify_gap(hir: &Hir) -> Option<(u32, u32, GapPredicate)> {
     let hir = strip_wrappers(hir);
     match hir.kind() {
         HirKind::Repetition(rep) => {
@@ -239,14 +408,14 @@ mod tests {
     fn test_gap_body_wildcard() {
         // "." with dot_matches_new_line(true) → Any
         let h = hir(r".");
-        assert_eq!(classify_gap_body(&h), Some(GapBodyClass::Any));
+        assert_eq!(classify_gap_body(&h), Some(GapPredicate::Any));
     }
 
     #[test]
     fn test_gap_body_all_bytes_class() {
         // [\s\S] should match all bytes → Any
         let h = hir(r"[\s\S]");
-        assert_eq!(classify_gap_body(&h), Some(GapBodyClass::Any));
+        assert_eq!(classify_gap_body(&h), Some(GapPredicate::Any));
     }
 
     #[test]
@@ -254,7 +423,7 @@ mod tests {
         // [^/] → ByteClass with '/' excluded
         let h = hir(r"[^/]");
         match classify_gap_body(&h) {
-            Some(GapBodyClass::ByteClass(bits)) => {
+            Some(GapPredicate::ByteClass(bits)) => {
                 assert!(!bits.contains(b'/'), "'/' should not be in [^/] class");
                 assert!(bits.contains(b'a'), "'a' should be in [^/] class");
             }
@@ -267,7 +436,7 @@ mod tests {
         // \s → ByteClass with whitespace bytes
         let h = hir(r"\s");
         match classify_gap_body(&h) {
-            Some(GapBodyClass::ByteClass(bits)) => {
+            Some(GapPredicate::ByteClass(bits)) => {
                 assert!(bits.contains(b' '), "space should be in \\s class");
                 assert!(bits.contains(b'\t'), "tab should be in \\s class");
                 assert!(!bits.contains(b'a'), "'a' should not be in \\s class");
@@ -281,7 +450,7 @@ mod tests {
         // "a" → ByteClass with just 'a'
         let h = hir(r"a");
         match classify_gap_body(&h) {
-            Some(GapBodyClass::ByteClass(bits)) => {
+            Some(GapPredicate::ByteClass(bits)) => {
                 assert!(bits.contains(b'a'), "'a' should be set");
                 assert!(!bits.contains(b'b'), "'b' should not be set");
             }
@@ -308,7 +477,7 @@ mod tests {
         // a|b → regex-syntax normalizes to [ab] → ByteClass
         let h = hir(r"a|b");
         match classify_gap_body(&h) {
-            Some(GapBodyClass::ByteClass(bits)) => {
+            Some(GapPredicate::ByteClass(bits)) => {
                 assert!(bits.contains(b'a'));
                 assert!(bits.contains(b'b'));
                 assert!(!bits.contains(b'c'));
@@ -329,7 +498,7 @@ mod tests {
         // \w → ByteClass
         let h = hir(r"\w");
         match classify_gap_body(&h) {
-            Some(GapBodyClass::ByteClass(bits)) => {
+            Some(GapPredicate::ByteClass(bits)) => {
                 assert!(bits.contains(b'a'));
                 assert!(bits.contains(b'Z'));
                 assert!(bits.contains(b'0'));
@@ -346,14 +515,14 @@ mod tests {
     fn test_classify_gap_bounded_wildcard() {
         // .{0,100} → (0, 100, Any)
         let h = hir(r".{0,100}");
-        assert_eq!(classify_gap(&h), Some((0, 100, GapBodyClass::Any)));
+        assert_eq!(classify_gap(&h), Some((0, 100, GapPredicate::Any)));
     }
 
     #[test]
     fn test_classify_gap_exact_count() {
         // .{254} → (254, 254, Any)
         let h = hir(r".{254}");
-        assert_eq!(classify_gap(&h), Some((254, 254, GapBodyClass::Any)));
+        assert_eq!(classify_gap(&h), Some((254, 254, GapPredicate::Any)));
     }
 
     #[test]
@@ -361,7 +530,7 @@ mod tests {
         // [^/]{0,20} → (0, 20, ByteClass(...))
         let h = hir(r"[^/]{0,20}");
         match classify_gap(&h) {
-            Some((0, 20, GapBodyClass::ByteClass(bits))) => {
+            Some((0, 20, GapPredicate::ByteClass(bits))) => {
                 assert!(!bits.contains(b'/'));
                 assert!(bits.contains(b'a'));
             }

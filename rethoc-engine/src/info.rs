@@ -94,9 +94,18 @@ pub struct NfaStateBreakdown {
 #[derive(Debug, Clone, Serialize)]
 pub struct ExecutionInfo {
     /// Numeric tier: 0 = NFA only, 1–4 = DFA tiers.
+    ///
+    /// When a specialisation is active, this reports the tier that
+    /// would have been selected without the specialisation.
     pub tier: u8,
     /// Human-readable description of the selected tier.
     pub tier_name: String,
+    /// Optional specialisation override (e.g. `"BoundedGap"`).
+    ///
+    /// When present, the pattern is executed by a specialised engine
+    /// rather than the generic tier indicated by [`tier`](Self::tier).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub specialization: Option<String>,
 }
 
 /// Start-closure diagnostics.
