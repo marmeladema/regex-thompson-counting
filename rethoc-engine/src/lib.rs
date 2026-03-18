@@ -809,9 +809,16 @@ impl std::ops::Deref for StateList {
     }
 }
 
-/// A compiled NFA ready for matching.
+/// Core NFA program data used by all execution tiers.
+///
+/// This struct contains the compiled NFA state array, byte-class tables,
+/// prefilter, and auxiliary data that both the main regex engine and
+/// bounded-gap anchor programs need.  By factoring these fields into a
+/// shared type, anchor programs can hold an `NfaProgram` directly
+/// without embedding a full [`Regex`] (which would create a recursive
+/// type through [`BoundedGapPlan`]).
 #[derive(Debug)]
-pub struct Regex {
+pub(crate) struct NfaProgram {
     /// Unique identity for this compiled regex, used by [] to
     /// detect when its cached DFA states are stale (built for a different
     /// regex).  Assigned from a global atomic counter at build time.
@@ -839,43 +846,17 @@ pub struct Regex {
     /// Empty if the closure contains `CounterInstance`, `Assert`, or
     /// `CounterIncrement` states (which require context manipulation);
     /// the runtime falls back to full epsilon-closure via `addstate()`.
-    start_closure: Box<[StateIdx]>,
+    pub(crate) start_closure: Box<[StateIdx]>,
     /// `true` if `Match` is reachable from the start state through
     /// the precomputed start closure (i.e. the pattern can match the
     /// empty string without consuming any input).  Used to initialise
     /// `Matcher::ever_matched` so that `chunk()` can short-circuit
     /// immediately.
-    start_closure_matches: bool,
-    /// `true` when this pattern can be matched using the lazy DFA
-    /// (Tier 1: no counters, no CRLF assertion types like
-    /// EndCRLF/StartCRLF).  Deferred assertions (`\b`, `\B`, `EndLF`)
-    /// are handled natively by Tier 1.
-    dfa_eligible: bool,
-    /// `true` when this pattern has non-nested counters with fixed-length
-    /// bodies and can use the Tier 2 differential-counter DFA.
-    tier2_eligible: bool,
-    /// True when Tier 2 eligibility was granted through the overlap
-    /// proof path (not the disjoint fast path).  Used for debug
-    /// assertions in `populate()`.
-    tier2_overlap_proven: bool,
-    /// Precomputed NFA analysis for Tier 2 (body interior data for
-    /// differential counters).  `None` when the pattern is not tier 2
-    /// eligible.
-    pub(crate) tier2_analysis: Option<Tier2Analysis>,
-    /// `true` when this pattern has non-nested counters and can use the
-    /// Tier 3 conditional-transition DFA.
-    tier3_eligible: bool,
-    /// Precomputed NFA analysis for Tier 3 (per-target actions, CI seed
-    /// origins, break-path seeds).  `None` when the pattern is not tier 3
-    /// eligible.
-    pub(crate) tier3_analysis: Option<Tier3Analysis>,
-    /// `true` when this pattern has counters but can use the counting DFA
-    /// (Tier 4: no complex assertions).
-    tier4_eligible: bool,
+    pub(crate) start_closure_matches: bool,
     /// Per-counter info: `(min, max, body_byte_length)`.
     /// Per-counter compile-time info.  Empty if the pattern has no
     /// counters.
-    counter_info: Box<[CounterInfo]>,
+    pub(crate) counter_info: Box<[CounterInfo]>,
     /// Byte equivalence classes for DFA transition table compression.
     ///
     /// Maps each input byte (0..255) to a small equivalence class index.
@@ -920,6 +901,39 @@ pub struct Regex {
     /// counter `ci` can reach the `Match` state through epsilon transitions.
     /// Avoids scanning all NFA states at DFA populate time.
     pub(crate) counter_break_can_match: Box<[bool]>,
+}
+
+/// A compiled NFA ready for matching.
+#[derive(Debug)]
+pub struct Regex {
+    /// Core NFA program data (states, classes, byte tables, prefilter, etc.).
+    pub(crate) nfa: NfaProgram,
+    /// `true` when this pattern can be matched using the lazy DFA
+    /// (Tier 1: no counters, no CRLF assertion types like
+    /// EndCRLF/StartCRLF).  Deferred assertions (`\b`, `\B`, `EndLF`)
+    /// are handled natively by Tier 1.
+    dfa_eligible: bool,
+    /// `true` when this pattern has non-nested counters with fixed-length
+    /// bodies and can use the Tier 2 differential-counter DFA.
+    tier2_eligible: bool,
+    /// True when Tier 2 eligibility was granted through the overlap
+    /// proof path (not the disjoint fast path).  Used for debug
+    /// assertions in `populate()`.
+    tier2_overlap_proven: bool,
+    /// Precomputed NFA analysis for Tier 2 (body interior data for
+    /// differential counters).  `None` when the pattern is not tier 2
+    /// eligible.
+    pub(crate) tier2_analysis: Option<Tier2Analysis>,
+    /// `true` when this pattern has non-nested counters and can use the
+    /// Tier 3 conditional-transition DFA.
+    tier3_eligible: bool,
+    /// Precomputed NFA analysis for Tier 3 (per-target actions, CI seed
+    /// origins, break-path seeds).  `None` when the pattern is not tier 3
+    /// eligible.
+    pub(crate) tier3_analysis: Option<Tier3Analysis>,
+    /// `true` when this pattern has counters but can use the counting DFA
+    /// (Tier 4: no complex assertions).
+    tier4_eligible: bool,
     /// Optional bounded-gap execution plan.
     ///
     /// Present when the pattern was recognised as a bounded-gap chain
@@ -986,16 +1000,16 @@ impl Regex {
     pub(crate) fn into_anchor_program(self) -> bounded_gap::AnchorProgram {
         use bounded_gap::{AnchorEngine, AnchorNfaProgram, AnchorProgram};
         let program = AnchorNfaProgram {
-            states: self.states.0,
-            classes: self.classes,
-            byte_tables: self.byte_tables,
-            start: self.start,
-            start_closure: self.start_closure,
-            start_closure_matches: self.start_closure_matches,
+            states: self.nfa.states.0,
+            classes: self.nfa.classes,
+            byte_tables: self.nfa.byte_tables,
+            start: self.nfa.start,
+            start_closure: self.nfa.start_closure,
+            start_closure_matches: self.nfa.start_closure_matches,
         };
         AnchorProgram {
             engine: AnchorEngine::Tier0(program),
-            prefilter: self.prefilter,
+            prefilter: self.nfa.prefilter,
         }
     }
 
@@ -1004,11 +1018,12 @@ impl Regex {
     /// (state tables, character class tables, byte dispatch tables).
     pub fn memory_size(&self) -> usize {
         let inline = std::mem::size_of::<Self>();
-        let states_alloc = self.states.len() * std::mem::size_of::<State>();
-        let classes_alloc = self.classes.len() * std::mem::size_of::<ByteClassBits>();
-        let byte_tables_alloc = self.byte_tables.len() * std::mem::size_of::<ByteMap>();
-        let reach_match_alloc = self.state_can_reach_match.len() * std::mem::size_of::<bool>();
-        let break_match_alloc = self.counter_break_can_match.len() * std::mem::size_of::<bool>();
+        let states_alloc = self.nfa.states.len() * std::mem::size_of::<State>();
+        let classes_alloc = self.nfa.classes.len() * std::mem::size_of::<ByteClassBits>();
+        let byte_tables_alloc = self.nfa.byte_tables.len() * std::mem::size_of::<ByteMap>();
+        let reach_match_alloc = self.nfa.state_can_reach_match.len() * std::mem::size_of::<bool>();
+        let break_match_alloc =
+            self.nfa.counter_break_can_match.len() * std::mem::size_of::<bool>();
         let bounded_gap_alloc = self
             .bounded_gap_plan
             .as_ref()
@@ -1023,7 +1038,7 @@ impl Regex {
     }
     /// Return per-counter compile-time information.
     pub fn counter_info(&self, counter_idx: usize) -> CounterInfo {
-        self.counter_info[counter_idx]
+        self.nfa.counter_info[counter_idx]
     }
     /// Return the minimum DFA tier that can handle this regex.
     ///
@@ -1062,7 +1077,7 @@ impl Regex {
         let mut n_counter_instance = 0usize;
         let mut n_counter_increment = 0usize;
         let mut n_match = 0usize;
-        for s in self.states.iter() {
+        for s in self.nfa.states.iter() {
             match s {
                 State::Split { .. } => n_split += 1,
                 State::Byte { .. } => n_byte += 1,
@@ -1079,11 +1094,11 @@ impl Regex {
         }
 
         // -- Counters (directly from compile-time counter_info) --
-        let counters: Vec<CounterInfo> = self.counter_info.to_vec();
+        let counters: Vec<CounterInfo> = self.nfa.counter_info.to_vec();
 
         // -- Assertions --
         let mut assert_kinds = std::collections::BTreeSet::new();
-        for s in self.states.iter() {
+        for s in self.nfa.states.iter() {
             if let State::Assert { kind, .. } = s {
                 assert_kinds.insert(format!("{:?}", kind));
             }
@@ -1091,6 +1106,7 @@ impl Regex {
 
         // -- Deferred assertions --
         let n_deferred = self
+            .nfa
             .states
             .iter()
             .filter(|s| {
@@ -1128,19 +1144,19 @@ impl Regex {
         };
 
         // -- Prefilter --
-        let prefilter_desc = self.prefilter.to_string();
+        let prefilter_desc = self.nfa.prefilter.to_string();
 
         RegexInfo {
             memory: MemoryInfo {
                 total: self.memory_size(),
-                states: self.states.len() * std::mem::size_of::<State>(),
-                classes: self.classes.len() * std::mem::size_of::<ByteClassBits>(),
-                byte_tables: self.byte_tables.len() * std::mem::size_of::<ByteMap>(),
-                num_states: self.states.len(),
+                states: self.nfa.states.len() * std::mem::size_of::<State>(),
+                classes: self.nfa.classes.len() * std::mem::size_of::<ByteClassBits>(),
+                byte_tables: self.nfa.byte_tables.len() * std::mem::size_of::<ByteMap>(),
+                num_states: self.nfa.states.len(),
                 state_size: std::mem::size_of::<State>(),
-                num_classes: self.classes.len(),
+                num_classes: self.nfa.classes.len(),
                 class_size: std::mem::size_of::<ByteClassBits>(),
-                num_byte_tables: self.byte_tables.len(),
+                num_byte_tables: self.nfa.byte_tables.len(),
                 byte_table_size: std::mem::size_of::<ByteMap>(),
             },
             nfa_states: NfaStateBreakdown {
@@ -1157,7 +1173,7 @@ impl Regex {
             counters,
             assert_kinds: assert_kinds.into_iter().collect(),
             deferred_assertions: n_deferred,
-            byte_classes: self.num_byte_classes,
+            byte_classes: self.nfa.num_byte_classes,
             execution: ExecutionInfo {
                 tier: self.min_tier(),
                 tier_name: execution_tier.to_string(),
@@ -1168,8 +1184,8 @@ impl Regex {
                 },
             },
             start_closure: StartClosureInfo {
-                len: self.start_closure.len(),
-                matches_empty: self.start_closure_matches,
+                len: self.nfa.start_closure.len(),
+                matches_empty: self.nfa.start_closure_matches,
             },
             prefilter: prefilter_desc,
         }
@@ -1177,15 +1193,15 @@ impl Regex {
 
     /// Emit a Graphviz DOT representation of the NFA.
     pub fn to_dot(&self, mut buffer: impl Write) {
-        let mut visited = vec![false; self.states.len()];
+        let mut visited = vec![false; self.nfa.states.len()];
         writeln!(buffer, "digraph graphname {{").unwrap();
         writeln!(buffer, "\trankdir=LR;").unwrap();
-        writeln!(&mut buffer, "\t{} [shape=box];", self.start).unwrap();
-        let mut stack = vec![self.start];
+        writeln!(&mut buffer, "\t{} [shape=box];", self.nfa.start).unwrap();
+        let mut stack = vec![self.nfa.start];
         while let Some(s) = stack.pop() {
             let i = s.idx();
             if !visited[i] {
-                writeln!(buffer, "\t// [{}] {:?}", s, self.states[s]).unwrap();
+                writeln!(buffer, "\t// [{}] {:?}", s, self.nfa.states[s]).unwrap();
                 self.write_dot_state(s, &mut buffer, &mut stack);
                 visited[i] = true;
             }
@@ -1194,7 +1210,7 @@ impl Regex {
     }
 
     fn write_dot_state(&self, idx: StateIdx, buffer: &mut impl Write, stack: &mut Vec<StateIdx>) {
-        match self.states[idx] {
+        match self.nfa.states[idx] {
             State::Split { out, out1 } => {
                 self.write_dot_state(out, buffer, stack);
                 self.write_dot_state(out1, buffer, stack);
@@ -1281,7 +1297,7 @@ impl Regex {
                 out_exit,
             } => {
                 stack.push(out);
-                let count: u32 = self.classes[class.idx()]
+                let count: u32 = self.nfa.classes[class.idx()]
                     .0
                     .iter()
                     .map(|w| w.count_ones())
@@ -1300,7 +1316,7 @@ impl Regex {
                 writeln!(buffer, "\t{} -> {} [label=\"{}\"];", idx, out, kind.label()).unwrap();
             }
             State::ByteTable { table } => {
-                let t = &self.byte_tables[table];
+                let t = &self.nfa.byte_tables[table];
                 for (b, &target) in t.0.iter().enumerate() {
                     if target != StateIdx::NONE {
                         stack.push(target);
@@ -2835,14 +2851,22 @@ impl RegexBuilder {
         };
 
         Ok(Regex {
-            id: NEXT_REGEX_ID.fetch_add(1, Ordering::Relaxed),
-            states: StateList(self.states.to_vec().into_boxed_slice()),
-            start,
-            num_counters: self.counters.len(),
-            classes: classes_slice.into_boxed_slice(),
-            byte_tables: byte_tables_slice.into_boxed_slice(),
-            start_closure,
-            start_closure_matches,
+            nfa: NfaProgram {
+                id: NEXT_REGEX_ID.fetch_add(1, Ordering::Relaxed),
+                states: StateList(self.states.to_vec().into_boxed_slice()),
+                start,
+                num_counters: self.counters.len(),
+                classes: classes_slice.into_boxed_slice(),
+                byte_tables: byte_tables_slice.into_boxed_slice(),
+                start_closure,
+                start_closure_matches,
+                counter_info,
+                byte_classes,
+                num_byte_classes,
+                prefilter,
+                state_can_reach_match,
+                counter_break_can_match,
+            },
             dfa_eligible,
             tier2_eligible,
             tier2_overlap_proven,
@@ -2850,12 +2874,6 @@ impl RegexBuilder {
             tier3_eligible,
             tier3_analysis,
             tier4_eligible,
-            counter_info,
-            byte_classes,
-            num_byte_classes,
-            prefilter,
-            state_can_reach_match,
-            counter_break_can_match,
             // Bounded-gap probe: always merge repetitions for widest
             // recognition, even when config.merge_repetitions is false.
             bounded_gap_plan: if self.config.merge_repetitions {
@@ -3447,7 +3465,7 @@ impl MatcherMemory {
             // Tier 4: DFA + explicit counter contexts.
             let cache = self
                 .tier4_cache
-                .get_or_insert_with(|| Tier4DfaCache::new(regex.states.len()));
+                .get_or_insert_with(|| Tier4DfaCache::new(regex.nfa.states.len()));
             cache.prepare(regex);
             let dfa = Tier4DfaMatcher::new(cache, regex, &mut self.counting_pool);
             AnyMatcher::Tier4Dfa(dfa)
@@ -3532,7 +3550,7 @@ impl MatcherMemory {
                 }
                 let cache = self
                     .tier4_cache
-                    .get_or_insert_with(|| Tier4DfaCache::new(regex.states.len()));
+                    .get_or_insert_with(|| Tier4DfaCache::new(regex.nfa.states.len()));
                 cache.prepare(regex);
                 let dfa = Tier4DfaMatcher::new(cache, regex, &mut self.counting_pool);
                 Ok(AnyMatcher::Tier4Dfa(dfa))
@@ -3544,19 +3562,19 @@ impl MatcherMemory {
     /// Create an NFA matcher (always available, used as fallback).
     fn nfa_matcher<'a>(&'a mut self, regex: &'a Regex) -> NfaMatcher<'a> {
         self.lastlist.clear();
-        self.lastlist.resize(regex.states.len(), usize::MAX);
+        self.lastlist.resize(regex.nfa.states.len(), usize::MAX);
         self.clist.clear();
         self.nlist.clear();
         self.addstack.clear();
         self.ctx_visited.clear();
         self.ctx_visited_map.clear();
         self.counter_pool.clear();
-        self.counter_pool.num_counters = regex.num_counters;
+        self.counter_pool.num_counters = regex.nfa.num_counters;
 
         let mut m = NfaMatcher {
-            states: &regex.states,
-            classes: &regex.classes,
-            byte_tables: &regex.byte_tables,
+            states: &regex.nfa.states,
+            classes: &regex.nfa.classes,
+            byte_tables: &regex.nfa.byte_tables,
             lastlist: &mut self.lastlist,
             listid: 0,
             clist: &mut self.clist,
@@ -3564,16 +3582,16 @@ impl MatcherMemory {
             addstack: &mut self.addstack,
             ctx_visited: &mut self.ctx_visited,
             ctx_visited_map: &mut self.ctx_visited_map,
-            start: regex.start,
-            start_closure: &regex.start_closure,
+            start: regex.nfa.start,
+            start_closure: &regex.nfa.start_closure,
             at_start: true,
             at_end: false,
             prev_byte: None,
-            ever_matched: regex.start_closure_matches,
+            ever_matched: regex.nfa.start_closure_matches,
             has_assert: false,
             nlist_has_assert: false,
             counter_pool: &mut self.counter_pool,
-            prefilter: regex.prefilter,
+            prefilter: regex.nfa.prefilter,
             at_start_state: false,
         };
 
@@ -4420,6 +4438,7 @@ mod tests {
     /// Helper: count how many states in the NFA are `ByteTable`.
     fn count_byte_tables(regex: &Regex) -> usize {
         regex
+            .nfa
             .states
             .iter()
             .filter(|s| matches!(s, State::ByteTable { .. }))
@@ -4444,7 +4463,7 @@ mod tests {
         // (ab|cd|ef) — 3 branches with distinct first bytes.
         let re = build_regex_unchecked("^(ab|cd|ef)$");
         assert!(count_byte_tables(&re) > 0);
-        assert_eq!(re.byte_tables.len(), count_byte_tables(&re));
+        assert_eq!(re.nfa.byte_tables.len(), count_byte_tables(&re));
     }
 
     #[test]
@@ -5036,12 +5055,12 @@ mod tests {
     /// Test a pattern+input via Tier 4 DFA (full-chunk + byte-at-a-time).
     fn test_tier4(pattern: &str, re: &Regex, input: &str, expected: bool, unroll: usize) {
         use crate::dfa::{Tier4DfaCache, Tier4DfaMatcher};
-        let mut cache = Tier4DfaCache::new(re.states.len());
+        let mut cache = Tier4DfaCache::new(re.nfa.states.len());
         cache.prepare(re);
         let mut pool = CounterPool {
             arena: Vec::new(),
             free: Vec::new(),
-            num_counters: re.num_counters,
+            num_counters: re.nfa.num_counters,
         };
         let mut d = Tier4DfaMatcher::new(&mut cache, re, &mut pool);
         d.chunk(input.as_bytes());
@@ -5052,7 +5071,7 @@ mod tests {
             pattern, input, unroll, actual, expected
         );
         pool.clear();
-        pool.num_counters = re.num_counters;
+        pool.num_counters = re.nfa.num_counters;
         let mut d = Tier4DfaMatcher::new(&mut cache, re, &mut pool);
         for &b in input.as_bytes() {
             d.chunk(&[b]);
@@ -5169,7 +5188,7 @@ mod tests {
             let hir = super::parse_hir(pattern)
                 .expect("parse_hir should succeed for a compilable pattern");
             let estimated = RegexBuilder::estimate_nfa_states(&hir);
-            let actual_states = re.states.len() - 1; // exclude Match
+            let actual_states = re.nfa.states.len() - 1; // exclude Match
             assert_eq!(
                 estimated, actual_states,
                 "estimate_nfa_states mismatch for tier-1 pattern `{}` (unroll={}): \
@@ -5229,6 +5248,7 @@ mod tests {
     fn generate_nfa_inputs(regex: &Regex, max_inputs: usize) -> Vec<Vec<u8>> {
         // Build boundary values for each counter.
         let boundary_values: Vec<Vec<usize>> = regex
+            .nfa
             .counter_info
             .iter()
             .map(|c| {
@@ -5298,11 +5318,11 @@ mod tests {
     /// exists with this schedule.
     fn gen_walk_nfa(regex: &Regex, schedule: &[usize]) -> Option<Vec<u8>> {
         let mut out = Vec::new();
-        let mut counter_counts = vec![0usize; regex.num_counters];
+        let mut counter_counts = vec![0usize; regex.nfa.num_counters];
         let mut steps = 0u32;
         if gen_walk_rec(
             regex,
-            regex.start,
+            regex.nfa.start,
             schedule,
             &mut counter_counts,
             &mut out,
@@ -5342,12 +5362,12 @@ mod tests {
         if *steps > GEN_MAX_STEPS || epsilon_budget == 0 || idx == StateIdx::NONE {
             return false;
         }
-        if idx.idx() >= regex.states.len() {
+        if idx.idx() >= regex.nfa.states.len() {
             return false;
         }
 
         let eb = epsilon_budget - 1; // decremented for epsilon states
-        match regex.states[idx] {
+        match regex.nfa.states[idx] {
             State::Match => true,
 
             State::Split { out: o1, out1: o2 } => {
@@ -5466,7 +5486,7 @@ mod tests {
                 if out.len() >= GEN_MAX_INPUT_LEN {
                     return false;
                 }
-                let bc = &regex.classes[class.idx()];
+                let bc = &regex.nfa.classes[class.idx()];
                 // Prefer 'a' (word char), then '0', ' ', then first match.
                 let byte = [b'a', b'0', b' ']
                     .into_iter()
@@ -5494,7 +5514,7 @@ mod tests {
                 if out.len() >= GEN_MAX_INPUT_LEN {
                     return false;
                 }
-                let bt = &regex.byte_tables[table.idx()];
+                let bt = &regex.nfa.byte_tables[table.idx()];
                 // Try preferred bytes first, then scan.
                 let candidates = [b'a', b'0', b' '];
                 for &byte in &candidates {
@@ -10541,7 +10561,7 @@ mod tests {
             ],
         }
         // Regression: counter_free_nb_mae early-return guard used
-        // `reachable_without_break[regex.start.idx()]` to decide whether
+        // `reachable_without_break[regex.nfa.start.idx()]` to decide whether
         // the re-seeded start state could contribute a counter-free
         // `$ → Match`.  But reachable_without_break only marks *consuming*
         // states; the start state (a Split) was never marked, so the guard
@@ -12470,8 +12490,8 @@ mod tests {
             "second \\d should add one state, no extra class table",
         );
         // Predefined classes use ByteClassStatic — no entries in classes.
-        assert_eq!(one.classes.len(), 0);
-        assert_eq!(two.classes.len(), 0);
+        assert_eq!(one.nfa.classes.len(), 0);
+        assert_eq!(two.nfa.classes.len(), 0);
     }
 
     /// `[0-9]` and `\d` produce the same 256-byte lookup table.  When
@@ -12485,7 +12505,7 @@ mod tests {
             mixed.memory_size(),
             "[0-9]\\d should be the same size as \\d\\d (same table, deduped)",
         );
-        assert_eq!(mixed.classes.len(), 0);
+        assert_eq!(mixed.nfa.classes.len(), 0);
         // Also verify correctness.
         assert_matches_regex_crate(r"^[0-9]\d$", &mixed, "42");
         assert_matches_regex_crate(r"^[0-9]\d$", &mixed, "00");
@@ -12506,7 +12526,7 @@ mod tests {
             explicit.memory_size(),
             "[0-9A-Za-z_]\\w should dedup to same table as \\w\\w",
         );
-        assert_eq!(explicit.classes.len(), 0);
+        assert_eq!(explicit.nfa.classes.len(), 0);
         assert_matches_regex_crate(r"^[0-9A-Za-z_]\w$", &explicit, "aZ");
         assert_matches_regex_crate(r"^[0-9A-Za-z_]\w$", &explicit, "_0");
         assert_matches_regex_crate(r"^[0-9A-Za-z_]\w$", &explicit, "!a");
@@ -12522,7 +12542,7 @@ mod tests {
             explicit.memory_size(),
             "explicit whitespace class should dedup with \\s",
         );
-        assert_eq!(explicit.classes.len(), 0);
+        assert_eq!(explicit.nfa.classes.len(), 0);
         assert_matches_regex_crate(r"^[\t\n\x0B\x0C\r ]\s$", &explicit, " \t");
         assert_matches_regex_crate(r"^[\t\n\x0B\x0C\r ]\s$", &explicit, "a ");
     }
@@ -12540,8 +12560,8 @@ mod tests {
             "second `.` should add one state, no extra class table",
         );
         // Wildcards use State::Wildcard — no entries in classes.
-        assert_eq!(one_wild.classes.len(), 0);
-        assert_eq!(two_wild.classes.len(), 0);
+        assert_eq!(one_wild.nfa.classes.len(), 0);
+        assert_eq!(two_wild.nfa.classes.len(), 0);
     }
 
     /// `\d\D` — complementary predefined classes both use
@@ -12553,8 +12573,8 @@ mod tests {
         let comp = build_regex_unchecked(r"^\d\D$");
         // Both \d and \D use ByteClassStatic — no classes entries.
         // Memory difference is only the state variant itself (same size).
-        assert_eq!(same.classes.len(), 0);
-        assert_eq!(comp.classes.len(), 0);
+        assert_eq!(same.nfa.classes.len(), 0);
+        assert_eq!(comp.nfa.classes.len(), 0);
         // Memory should be equal since both use static tables.
         assert_eq!(
             same.memory_size(),
@@ -12571,12 +12591,12 @@ mod tests {
         let counted = build_regex_unchecked(r"^\d{3,5}$");
         // Both use ByteClassStatic — no entries in classes.
         assert_eq!(
-            single.classes.len(),
+            single.nfa.classes.len(),
             0,
             "\\d should use ByteClassStatic, no class table",
         );
         assert_eq!(
-            counted.classes.len(),
+            counted.nfa.classes.len(),
             0,
             "\\d{{3,5}} should use ByteClassStatic, no class table",
         );
@@ -12680,7 +12700,7 @@ mod tests {
         // Pure alternation of literals: closure should be non-empty
         let re = build_regex_unchecked("(a|b|c)");
         assert!(
-            !re.start_closure.is_empty(),
+            !re.nfa.start_closure.is_empty(),
             "pure alt should have start_closure"
         );
 
@@ -12688,32 +12708,32 @@ mod tests {
         // (disable unrolling so the counter is preserved)
         let re = build_regex_with_unroll("a{2,3}", 0);
         assert!(
-            re.start_closure.is_empty(),
+            re.nfa.start_closure.is_empty(),
             "counter at start should disable start_closure"
         );
 
         // Pattern starting with assertion: closure should be empty
         let re = build_regex_unchecked("^abc");
         assert!(
-            re.start_closure.is_empty(),
+            re.nfa.start_closure.is_empty(),
             "assertion at start should disable start_closure"
         );
 
         // Simple literal: closure should have a single Byte leaf
         let re = build_regex_unchecked("abc");
         assert!(
-            !re.start_closure.is_empty(),
+            !re.nfa.start_closure.is_empty(),
             "simple literal should have start_closure"
         );
-        assert_eq!(re.start_closure.len(), 1, "literal has 1 start leaf");
+        assert_eq!(re.nfa.start_closure.len(), 1, "literal has 1 start leaf");
 
         // aws-keys-like pattern: should have 4 leaves
         let re = build_regex_unchecked("(?:ASIA|AKIA|AROA|AIDA)");
         assert!(
-            !re.start_closure.is_empty(),
+            !re.nfa.start_closure.is_empty(),
             "aws-keys alt should have start_closure"
         );
-        assert_eq!(re.start_closure.len(), 4, "4 branches = 4 leaves");
+        assert_eq!(re.nfa.start_closure.len(), 4, "4 branches = 4 leaves");
     }
 
     // -----------------------------------------------------------------------
@@ -12723,12 +12743,20 @@ mod tests {
     #[test]
     fn test_ci_byteci_state_emitted() {
         let re = build_regex_unchecked("^(?i)a$");
-        let has_byteci = re.states.iter().any(|s| matches!(s, State::ByteCI { .. }));
+        let has_byteci = re
+            .nfa
+            .states
+            .iter()
+            .any(|s| matches!(s, State::ByteCI { .. }));
         assert!(has_byteci, "expected ByteCI state for (?i)a");
 
         // Non-CI pattern should NOT have ByteCI
         let re2 = build_regex_unchecked("^a$");
-        let has_byteci2 = re2.states.iter().any(|s| matches!(s, State::ByteCI { .. }));
+        let has_byteci2 = re2
+            .nfa
+            .states
+            .iter()
+            .any(|s| matches!(s, State::ByteCI { .. }));
         assert!(!has_byteci2, "plain \"a\" should not use ByteCI");
     }
 
@@ -12741,9 +12769,9 @@ mod tests {
         // Small pattern: should use identity mapping (stride=256).
         let small = build_regex_unchecked("^(?i)abc$");
         assert_eq!(
-            small.num_byte_classes, 256,
+            small.nfa.num_byte_classes, 256,
             "small pattern should use identity mapping, got {} classes",
-            small.num_byte_classes
+            small.nfa.num_byte_classes
         );
 
         // Large pattern: use a WAF-style keyword alternation that exceeds
@@ -12755,17 +12783,17 @@ mod tests {
              substring|ascii|benchmark|sleep|waitfor|delay|load_file|outfile)\\b",
         );
         assert!(
-            large.num_byte_classes < 256,
+            large.nfa.num_byte_classes < 256,
             "large pattern should use byte class compression, got {} classes",
-            large.num_byte_classes
+            large.nfa.num_byte_classes
         );
         // Verify a and A map to the same class in the compressed pattern
         assert_eq!(
-            large.byte_classes[b'a' as usize], large.byte_classes[b'A' as usize],
+            large.nfa.byte_classes[b'a' as usize], large.nfa.byte_classes[b'A' as usize],
             "a and A should be in the same byte equivalence class"
         );
         assert_eq!(
-            large.byte_classes[b'b' as usize], large.byte_classes[b'B' as usize],
+            large.nfa.byte_classes[b'b' as usize], large.nfa.byte_classes[b'B' as usize],
             "b and B should be in the same byte equivalence class"
         );
     }
@@ -12778,11 +12806,13 @@ mod tests {
         // a(?i:b)c ��� only b should be ByteCI, a and c should be Byte
         let re = build_regex_unchecked("^a(?i:b)c$");
         let byte_count = re
+            .nfa
             .states
             .iter()
             .filter(|s| matches!(s, State::Byte { .. }))
             .count();
         let byteci_count = re
+            .nfa
             .states
             .iter()
             .filter(|s| matches!(s, State::ByteCI { .. }))
@@ -12807,19 +12837,19 @@ mod tests {
              nnn|ooo|ppp|qqq|rrr|sss|ttt|uuu|vvv|www|xxx|yyy|zzz)(?-i)def",
         );
         assert!(
-            re.num_byte_classes < 256,
+            re.nfa.num_byte_classes < 256,
             "pattern should use byte class compression, got {} classes",
-            re.num_byte_classes
+            re.nfa.num_byte_classes
         );
         // In the CI region: a/A should share a class
         assert_eq!(
-            re.byte_classes[b'a' as usize], re.byte_classes[b'A' as usize],
+            re.nfa.byte_classes[b'a' as usize], re.nfa.byte_classes[b'A' as usize],
             "a and A should be in the same byte equivalence class (CI region)"
         );
         // In the non-CI region: d/D should be in different classes because
         // d matches a consuming state that D does not.
         assert_ne!(
-            re.byte_classes[b'd' as usize], re.byte_classes[b'D' as usize],
+            re.nfa.byte_classes[b'd' as usize], re.nfa.byte_classes[b'D' as usize],
             "d and D should be in different byte equivalence classes (non-CI region)"
         );
     }
@@ -12921,11 +12951,11 @@ mod tests {
     #[test]
     #[ignore] // TODO: pre-existing Tier 3 bug, investigate separately
     fn test_fuzz_regression_tier3_word_boundary() {
-        use crate::fuzz_gen::{generate_inputs, generate_pattern, FuzzRng};
+        use crate::fuzz_gen::{FuzzRng, generate_inputs, generate_pattern};
 
         let pattern_seed: &[u8] = &[
-            1, 128, 0, 2, 0, 129, 25, 0, 0, 0, 0, 0, 120, 60, 40, 204, 0, 3, 0, 0, 100, 25, 14,
-            0, 75, 0, 17, 0, 63, 0, 6, 0, 108, 74, 111, 0, 121, 0, 0, 115, 64, 42, 0, 36,
+            1, 128, 0, 2, 0, 129, 25, 0, 0, 0, 0, 0, 120, 60, 40, 204, 0, 3, 0, 0, 100, 25, 14, 0,
+            75, 0, 17, 0, 63, 0, 6, 0, 108, 74, 111, 0, 121, 0, 0, 115, 64, 42, 0, 36,
         ];
         let extra_bytes: &[u8] = &[
             27, 141, 227, 121, 40, 43, 134, 6, 23, 124, 167, 51, 106, 244, 104, 88, 158, 64, 239,
@@ -12958,7 +12988,8 @@ mod tests {
             let tier3_result = m.finish();
 
             assert_eq!(
-                tier3_result, nfa_result,
+                tier3_result,
+                nfa_result,
                 "Tier 3 disagrees with NFA for pattern `{pattern}` \
                  on input {:?} (len={}): tier3={tier3_result}, nfa={nfa_result}",
                 &input[..input.len().min(80)],

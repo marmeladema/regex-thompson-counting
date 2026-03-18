@@ -607,30 +607,30 @@ mod tests {
 
     fn probe_result(regex: &crate::Regex) -> Tier2OverlapStats {
         let analysis = crate::dfa::tier2::compute_tier2_analysis(
-            &regex.states.0,
-            &regex.byte_tables,
-            regex.counter_info.len(),
+            &regex.nfa.states.0,
+            &regex.nfa.byte_tables,
+            regex.nfa.counter_info.len(),
         );
         tier2_overlap_probe(
-            &regex.states.0,
-            &regex.classes,
-            &regex.byte_tables,
-            &regex.byte_classes,
-            regex.num_byte_classes,
-            regex.start,
+            &regex.nfa.states.0,
+            &regex.nfa.classes,
+            &regex.nfa.byte_tables,
+            &regex.nfa.byte_classes,
+            regex.nfa.num_byte_classes,
+            regex.nfa.start,
             &analysis,
-            regex.counter_info.len(),
+            regex.nfa.counter_info.len(),
         )
     }
 
     fn eligibility(regex: &crate::Regex) -> crate::dfa::tier2::eligibility::Tier2Eligibility {
         let classes_set: indexmap::IndexSet<crate::ByteClassBits> =
-            regex.classes.iter().copied().collect();
+            regex.nfa.classes.iter().copied().collect();
         crate::dfa::tier2::eligibility::compute_tier2_eligibility(
-            &regex.states.0,
+            &regex.nfa.states.0,
             &classes_set,
-            &regex.byte_tables,
-            regex.counter_info.len(),
+            &regex.nfa.byte_tables,
+            regex.nfa.counter_info.len(),
             false, // has_deferred_in_counter_body
         )
     }
@@ -767,7 +767,7 @@ mod tests {
                 None => continue,
             };
 
-            if regex.counter_info.len() < 2 {
+            if regex.nfa.counter_info.len() < 2 {
                 continue; // only test multi-counter patterns
             }
             tested += 1;

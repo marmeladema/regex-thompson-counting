@@ -53,14 +53,14 @@ fn push_consume_targets(state: &State, byte: u8, regex: &Regex, targets: &mut Ve
             class,
             out,
             out_exit,
-        } if regex.classes[class.idx()].contains(byte) => {
+        } if regex.nfa.classes[class.idx()].contains(byte) => {
             targets.push(out);
             if out_exit != StateIdx::NONE {
                 targets.push(out_exit);
             }
         }
         State::ByteTable { table } => {
-            let t = regex.byte_tables[table][byte];
+            let t = regex.nfa.byte_tables[table][byte];
             if t != StateIdx::NONE {
                 targets.push(t);
             }
@@ -183,7 +183,7 @@ impl Tier1DfaCache {
         if from == DfaStateId::DEAD {
             return self.transition_from_dead(memory, byte, regex);
         }
-        let class = regex.byte_classes[byte as usize] as usize;
+        let class = regex.nfa.byte_classes[byte as usize] as usize;
         let slot = from.idx() * self.stride + class;
         let cached = self.transitions[slot];
         if cached != DfaStateId::UNPOPULATED {
@@ -281,7 +281,7 @@ impl Tier1DfaCache {
                 // previous borrow of from_state may have been invalidated).
                 let from_state = &self.inner.states[from.idx()];
                 for &idx in resolved_consumers.iter() {
-                    push_consume_targets(&regex.states[idx], byte, regex, &mut targets);
+                    push_consume_targets(&regex.nfa.states[idx], byte, regex, &mut targets);
                 }
                 // If the resolved closure itself found a match or
                 // match_at_end, we need to handle it.  But `resolved_match`
@@ -302,7 +302,7 @@ impl Tier1DfaCache {
                 // Phase 2: original consuming states consume `byte`.
                 let nfa_states = from_state.nfa_states.clone();
                 for &idx in nfa_states.iter() {
-                    push_consume_targets(&regex.states[idx], byte, regex, &mut targets);
+                    push_consume_targets(&regex.nfa.states[idx], byte, regex, &mut targets);
                 }
 
                 // Phase 3: epsilon closure of all targets + re-seed.
@@ -323,7 +323,7 @@ impl Tier1DfaCache {
                     // No consuming state produced a target.  Re-seed.
                     let (mut m, mae) = Self::epsilon_closure(
                         memory,
-                        std::iter::once(regex.start),
+                        std::iter::once(regex.nfa.start),
                         regex,
                         false,
                         false,
@@ -348,7 +348,7 @@ impl Tier1DfaCache {
                         .unwrap_or(DfaStateId::DEAD);
                 }
 
-                let seeds = targets.into_iter().chain(std::iter::once(regex.start));
+                let seeds = targets.into_iter().chain(std::iter::once(regex.nfa.start));
                 let (mut m, mae) =
                     Self::epsilon_closure(memory, seeds, regex, false, false, Some(byte), None);
                 m |= resolved_match;
@@ -372,14 +372,14 @@ impl Tier1DfaCache {
             // No deferred assertions to resolve — fast path (Phase 2 only).
             let nfa_states = from_state.nfa_states.clone();
             for &idx in nfa_states.iter() {
-                push_consume_targets(&regex.states[idx], byte, regex, &mut targets);
+                push_consume_targets(&regex.nfa.states[idx], byte, regex, &mut targets);
             }
         }
 
         if targets.is_empty() {
             let (is_match, is_match_at_end) = Self::epsilon_closure(
                 memory,
-                std::iter::once(regex.start),
+                std::iter::once(regex.nfa.start),
                 regex,
                 false,
                 false,
@@ -409,7 +409,7 @@ impl Tier1DfaCache {
                 .unwrap_or(DfaStateId::DEAD);
         }
 
-        let seeds = targets.into_iter().chain(std::iter::once(regex.start));
+        let seeds = targets.into_iter().chain(std::iter::once(regex.nfa.start));
         let (is_match, is_match_at_end) =
             Self::epsilon_closure(memory, seeds, regex, false, false, Some(byte), None);
 
@@ -447,11 +447,11 @@ impl Tier1DfaCache {
     /// Prepare the cache for use with `regex`.
     #[inline]
     pub(crate) fn prepare(&mut self, memory: &mut DfaMemory, regex: &Regex) {
-        let id = regex.id;
+        let id = regex.nfa.id;
         if self.inner.regex_id == id && self.inner.start_id != DfaStateId::DEAD {
             return;
         }
-        self.clear(memory, regex.states.len(), regex.num_byte_classes);
+        self.clear(memory, regex.nfa.states.len(), regex.nfa.num_byte_classes);
         self.inner.regex_id = id;
 
         // Start state: at_start=true, prev_byte=None, at_end=false.
@@ -459,7 +459,7 @@ impl Tier1DfaCache {
         // prev=None → prev_was_word=false.
         let (is_match, is_match_at_end) = Self::epsilon_closure(
             memory,
-            std::iter::once(regex.start),
+            std::iter::once(regex.nfa.start),
             regex,
             true,
             false,
@@ -507,7 +507,7 @@ impl<'a> DfaMatcher<'a> {
             cache,
             memory,
             regex,
-            prefilter: regex.prefilter,
+            prefilter: regex.nfa.prefilter,
         }
     }
 

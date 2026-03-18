@@ -913,7 +913,8 @@ impl Tier2DfaCache {
 
                         // Check direct (epsilon-only) match from break
                         // target — precomputed at analysis time.
-                        if regex.counter_break_can_match[ci] && analysis.break_has_direct_match(ci)
+                        if regex.nfa.counter_break_can_match[ci]
+                            && analysis.break_has_direct_match(ci)
                         {
                             resolved_break_match = true;
                         }
@@ -957,7 +958,10 @@ impl Tier2DfaCache {
         // Probe: full "both" closure to detect CInc and collect seeds.
         let probe = self.epsilon_closure(
             memory,
-            targets.iter().copied().chain(std::iter::once(regex.start)),
+            targets
+                .iter()
+                .copied()
+                .chain(std::iter::once(regex.nfa.start)),
             regex,
             analysis,
             false,
@@ -1012,7 +1016,10 @@ impl Tier2DfaCache {
         if counting_mask != 0 {
             let cr_nb = self.epsilon_closure(
                 memory,
-                targets.iter().copied().chain(std::iter::once(regex.start)),
+                targets
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(regex.nfa.start)),
                 regex,
                 analysis,
                 false,
@@ -1035,7 +1042,7 @@ impl Tier2DfaCache {
                         .iter()
                         .copied()
                         .chain(resolved_break_targets.iter().copied())
-                        .chain(std::iter::once(regex.start)),
+                        .chain(std::iter::once(regex.nfa.start)),
                     regex,
                     analysis,
                     false,
@@ -1127,7 +1134,7 @@ impl Tier2DfaCache {
                 .deferred_asserts
                 .iter()
                 .fold(0u64, |acc, &assert_idx| {
-                    if let State::Assert { out, .. } = regex.states[assert_idx] {
+                    if let State::Assert { out, .. } = regex.nfa.states[assert_idx] {
                         acc | analysis.cinc_reachable_from(out)
                     } else {
                         acc
@@ -1252,16 +1259,16 @@ impl Tier2DfaCache {
         regex: &Regex,
         analysis: &Tier2Analysis,
     ) {
-        let id = regex.id;
+        let id = regex.nfa.id;
         if self.inner.regex_id == id && self.inner.start_id != DfaStateId::DEAD {
             return;
         }
-        self.clear(memory, regex.states.len(), regex.num_byte_classes);
+        self.clear(memory, regex.nfa.states.len(), regex.nfa.num_byte_classes);
         self.inner.regex_id = id;
 
         let cr = self.epsilon_closure(
             memory,
-            std::iter::once(regex.start),
+            std::iter::once(regex.nfa.start),
             regex,
             analysis,
             true,
@@ -1284,7 +1291,7 @@ impl Tier2DfaCache {
         self.start_seeds = cr.seed_instances.iter().map(|&(c, _s)| (c, 0u32)).collect();
 
         // Initialize counter state (phases + metadata).
-        self.counters.populate(&regex.counter_info);
+        self.counters.populate(&regex.nfa.counter_info);
     }
 }
 
@@ -1310,7 +1317,7 @@ struct ClosureResult {
 /// Consume `byte` at NFA state `idx`.  Returns `(out, out_exit)` where
 /// `out_exit` is `StateIdx::NONE` when there is no exit branch.
 fn consume_byte(idx: StateIdx, byte: u8, regex: &Regex) -> Option<(StateIdx, StateIdx)> {
-    match regex.states[idx] {
+    match regex.nfa.states[idx] {
         State::Byte {
             byte: b,
             out,
@@ -1331,9 +1338,9 @@ fn consume_byte(idx: StateIdx, byte: u8, regex: &Regex) -> Option<(StateIdx, Sta
             class,
             out,
             out_exit,
-        } if regex.classes[class.idx()].contains(byte) => Some((out, out_exit)),
+        } if regex.nfa.classes[class.idx()].contains(byte) => Some((out, out_exit)),
         State::ByteTable { table } => {
-            let t = regex.byte_tables[table][byte];
+            let t = regex.nfa.byte_tables[table][byte];
             if t != StateIdx::NONE {
                 Some((t, StateIdx::NONE))
             } else {
@@ -1481,7 +1488,7 @@ fn resolve_deferred_cinc_at_end(
     if deferred.is_empty() {
         return false;
     }
-    let states = &regex.states;
+    let states = &regex.nfa.states;
 
     for v in memory.closure_visited.iter_mut() {
         *v = false;
@@ -1504,7 +1511,7 @@ fn resolve_deferred_cinc_at_end(
         match states[idx] {
             State::CounterIncrement { counter, min, .. } => {
                 let ci = counter.idx();
-                if !regex.counter_break_can_match[ci] {
+                if !regex.nfa.counter_break_can_match[ci] {
                     continue;
                 }
                 if ci < counters.meta.len() {
@@ -1567,14 +1574,14 @@ impl<'a> Tier2DfaMatcher<'a> {
             memory,
             regex,
             analysis,
-            prefilter: regex.prefilter,
+            prefilter: regex.nfa.prefilter,
         }
     }
 
     /// Slot lookup using byte-class compression (stride < 256).
     #[inline(always)]
     fn ensure_transition(&mut self, byte: u8) -> usize {
-        let class = self.regex.byte_classes[byte as usize] as usize;
+        let class = self.regex.nfa.byte_classes[byte as usize] as usize;
         let slot = self.current.idx() * self.cache.stride + class;
         if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
             let trans =

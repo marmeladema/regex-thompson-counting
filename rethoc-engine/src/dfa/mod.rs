@@ -121,7 +121,7 @@ impl DfaState {
         }
         let prev = self.prev_byte_representative();
         for &assert_idx in self.deferred_asserts.iter() {
-            if let State::Assert { kind, out } = regex.states[assert_idx]
+            if let State::Assert { kind, out } = regex.nfa.states[assert_idx]
                 && kind.eval(false, false, prev, Some(byte)) == AssertEval::Pass
             {
                 extra.push(out);
@@ -139,7 +139,7 @@ impl DfaState {
         }
         let prev = self.prev_byte_representative();
         for &assert_idx in self.deferred_asserts.iter() {
-            if let State::Assert { kind, out } = regex.states[assert_idx]
+            if let State::Assert { kind, out } = regex.nfa.states[assert_idx]
                 && kind.eval(false, true, prev, None) == AssertEval::Pass
                 && Self::can_reach_match_at_end(out, prev, regex, scratch)
             {
@@ -162,12 +162,12 @@ impl DfaState {
         regex: &Regex,
         scratch: &mut ReachScratch,
     ) -> bool {
-        let states = &regex.states;
+        let states = &regex.nfa.states;
         let num_states = states.len();
         scratch.prepare(num_states, start);
         while let Some(idx) = scratch.stack.pop() {
             let i = idx.idx();
-            if i >= num_states || scratch.is_visited(i) || !regex.state_can_reach_match[i] {
+            if i >= num_states || scratch.is_visited(i) || !regex.nfa.state_can_reach_match[i] {
                 continue;
             }
             scratch.mark_visited(i);
@@ -346,7 +346,7 @@ impl DfaMemory {
             }
             self.closure_visited[i] = true;
 
-            match regex.states[idx] {
+            match regex.nfa.states[idx] {
                 State::Split { out, out1 } => {
                     self.closure_stack.push(out1);
                     self.closure_stack.push(out);
@@ -358,7 +358,7 @@ impl DfaMemory {
                     if kind == AssertKind::End {
                         if at_end {
                             self.closure_stack.push(out);
-                        } else if regex.state_can_reach_match[out.idx()] {
+                        } else if regex.nfa.state_can_reach_match[out.idx()] {
                             is_match_at_end = true;
                         }
                         continue;

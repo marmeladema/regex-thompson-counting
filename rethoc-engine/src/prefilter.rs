@@ -201,7 +201,7 @@ mod tests {
             },
         )
         .unwrap();
-        re.prefilter
+        re.nfa.prefilter
     }
 
     /// Helper: compile with unrolling disabled (forces counters).
@@ -215,7 +215,7 @@ mod tests {
             },
         )
         .unwrap();
-        re.prefilter
+        re.nfa.prefilter
     }
 
     // ── Basic variant selection ──

@@ -10,8 +10,8 @@ use std::fmt;
 use crate::bounded_gap::{
     AnchorEngine, AnchorLengthInfo, BoundedGapPlan, EndAnchorKind, GapPredicate, StartAnchorKind,
 };
-use crate::dfa::tier3::effects::{AssertChainArena, CompiledOriginEffects, CompiledTargetEffects};
 use crate::dfa::Tier3OriginKind;
+use crate::dfa::tier3::effects::{AssertChainArena, CompiledOriginEffects, CompiledTargetEffects};
 use crate::{AssertKind, ByteClass, ByteMap, Regex, State, StateIdx};
 
 // ---------------------------------------------------------------------------
@@ -348,7 +348,7 @@ impl<'a> DumpRegex<'a> {
 impl fmt::Display for DumpRegex<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let r = self.regex;
-        let states = &r.states.0;
+        let states = &r.nfa.states.0;
         let width = if states.len() <= 1 {
             1
         } else {
@@ -360,16 +360,16 @@ impl fmt::Display for DumpRegex<'_> {
         for (i, state) in states.iter().enumerate() {
             let ds = DumpState {
                 state,
-                byte_tables: &r.byte_tables,
+                byte_tables: &r.nfa.byte_tables,
             };
             writeln!(f, "  {i:>width$}: {ds}")?;
         }
         writeln!(f)?;
 
         // -- Byte Classes -----------------------------------------------------
-        if !r.classes.is_empty() {
-            writeln!(f, "Byte Classes ({}):", r.classes.len())?;
-            for (i, class) in r.classes.iter().enumerate() {
+        if !r.nfa.classes.is_empty() {
+            writeln!(f, "Byte Classes ({}):", r.nfa.classes.len())?;
+            for (i, class) in r.nfa.classes.iter().enumerate() {
                 write!(f, "  cls:{i}: ")?;
                 format_byte_class_bits(class, f)?;
                 writeln!(f)?;
@@ -378,9 +378,9 @@ impl fmt::Display for DumpRegex<'_> {
         }
 
         // -- Byte Tables (summary) --------------------------------------------
-        if !r.byte_tables.is_empty() {
-            writeln!(f, "Byte Tables ({}):", r.byte_tables.len())?;
-            for (i, map) in r.byte_tables.iter().enumerate() {
+        if !r.nfa.byte_tables.is_empty() {
+            writeln!(f, "Byte Tables ({}):", r.nfa.byte_tables.len())?;
+            for (i, map) in r.nfa.byte_tables.iter().enumerate() {
                 let count = (0..=255u8).filter(|&b| map[b] != StateIdx::NONE).count();
                 writeln!(f, "  tbl:{i}: {count} entries")?;
             }
@@ -388,9 +388,9 @@ impl fmt::Display for DumpRegex<'_> {
         }
 
         // -- Counters ---------------------------------------------------------
-        if r.num_counters > 0 {
-            writeln!(f, "Counters ({}):", r.num_counters)?;
-            for c in r.counter_info.iter() {
+        if r.nfa.num_counters > 0 {
+            writeln!(f, "Counters ({}):", r.nfa.num_counters)?;
+            for c in r.nfa.counter_info.iter() {
                 let i = c.index;
                 if c.body_byte_length == 0 {
                     writeln!(f, "  c{i}: {{{},{}}}, body_len=variable", c.min, c.max)?;
@@ -407,23 +407,24 @@ impl fmt::Display for DumpRegex<'_> {
 
         // -- Basic Info -------------------------------------------------------
         writeln!(f, "Basic Info:")?;
-        writeln!(f, "  start: {}", r.start)?;
+        writeln!(f, "  start: {}", r.nfa.start)?;
         writeln!(
             f,
             "  start_closure: [{}]",
-            r.start_closure
+            r.nfa
+                .start_closure
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         )?;
-        writeln!(f, "  matches_empty: {}", r.start_closure_matches)?;
-        writeln!(f, "  prefilter: {:?}", r.prefilter)?;
+        writeln!(f, "  matches_empty: {}", r.nfa.start_closure_matches)?;
+        writeln!(f, "  prefilter: {:?}", r.nfa.prefilter)?;
         writeln!(
             f,
             "  byte_classes: {} classes (compression: {})",
-            r.num_byte_classes,
-            if r.num_byte_classes < 256 {
+            r.nfa.num_byte_classes,
+            if r.nfa.num_byte_classes < 256 {
                 "on"
             } else {
                 "off"
@@ -442,7 +443,7 @@ impl fmt::Display for DumpRegex<'_> {
         // -- Auxiliary Arrays --------------------------------------------------
         writeln!(f, "Auxiliary Arrays:")?;
         write!(f, "  state_can_reach_match: [")?;
-        for (i, &v) in r.state_can_reach_match.iter().enumerate() {
+        for (i, &v) in r.nfa.state_can_reach_match.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
@@ -453,9 +454,9 @@ impl fmt::Display for DumpRegex<'_> {
             }
         }
         writeln!(f, "]")?;
-        if !r.counter_break_can_match.is_empty() {
+        if !r.nfa.counter_break_can_match.is_empty() {
             write!(f, "  counter_break_can_match: [")?;
-            for (i, &v) in r.counter_break_can_match.iter().enumerate() {
+            for (i, &v) in r.nfa.counter_break_can_match.iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
@@ -565,7 +566,7 @@ impl DumpRegex<'_> {
         if let Some(ref t2) = r.tier2_analysis {
             writeln!(f)?;
             writeln!(f, "Tier 2 Analysis:")?;
-            for ci in 0..r.num_counters {
+            for ci in 0..r.nfa.num_counters {
                 let interior = t2.interior(ci);
                 if interior.is_empty() {
                     writeln!(f, "  c{ci}: body_interior: (none — L=1)")?;
@@ -667,7 +668,7 @@ impl DumpRegex<'_> {
                     let labels: Vec<String> = asserts
                         .iter()
                         .map(|&da| {
-                            if let State::Assert { kind, .. } = r.states.0[da] {
+                            if let State::Assert { kind, .. } = r.nfa.states.0[da] {
                                 format!("{}@{}", kind.label(), da)
                             } else {
                                 format!("?@{da}")
@@ -693,7 +694,7 @@ impl DumpRegex<'_> {
                             .deferred_asserts
                             .iter()
                             .map(|&da| {
-                                if let State::Assert { kind, .. } = r.states.0[da] {
+                                if let State::Assert { kind, .. } = r.nfa.states.0[da] {
                                     format!("{}@{}", kind.label(), da)
                                 } else {
                                     format!("?@{da}")
@@ -846,8 +847,13 @@ impl DumpRegex<'_> {
             // Typed effects compiled from target analysis.
             writeln!(f)?;
             writeln!(f, "  --- Typed Effects ---")?;
-            fmt_target_effects(f, &t3.target_effects, &t3.assert_chain_arena, &r.states.0)?;
-            fmt_origin_effects(f, &t3.origin_effects, &r.states.0)?;
+            fmt_target_effects(
+                f,
+                &t3.target_effects,
+                &t3.assert_chain_arena,
+                &r.nfa.states.0,
+            )?;
+            fmt_origin_effects(f, &t3.origin_effects, &r.nfa.states.0)?;
         }
 
         Ok(())

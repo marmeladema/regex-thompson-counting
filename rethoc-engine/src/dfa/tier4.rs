@@ -304,7 +304,7 @@ struct CountingTransition {
     /// the `from` DFA state, the counter program to apply to contexts at
     /// that origin.
     origin_table: OriginTableIdx,
-    /// Counter program for the re-seed context (from regex.start).
+    /// Counter program for the re-seed context (from regex.nfa.start).
     seed_program: CounterProgramIdx,
 }
 
@@ -874,7 +874,7 @@ impl Tier4DfaCache {
             let t = self.populate(from, byte, regex);
             return t;
         }
-        let slot = from.0 as usize * self.stride + regex.byte_classes[byte as usize] as usize;
+        let slot = from.0 as usize * self.stride + regex.nfa.byte_classes[byte as usize] as usize;
         let t = self.transitions[slot];
         if !t.is_unpopulated() {
             return t;
@@ -922,7 +922,7 @@ impl Tier4DfaCache {
         if from != DfaStateId::DEAD {
             let nfa_states = self.states[from.idx()].nfa_states.clone();
             for &idx in nfa_states.iter() {
-                match regex.states[idx] {
+                match regex.nfa.states[idx] {
                     State::Byte {
                         byte: b2,
                         out,
@@ -963,14 +963,14 @@ impl Tier4DfaCache {
                         class,
                         out,
                         out_exit,
-                    } if regex.classes[class.idx()].contains(byte) => {
+                    } if regex.nfa.classes[class.idx()].contains(byte) => {
                         origin_targets.push((idx, out));
                         if out_exit != StateIdx::NONE {
                             origin_targets.push((idx, out_exit));
                         }
                     }
                     State::ByteTable { table } => {
-                        let t = regex.byte_tables[table][byte];
+                        let t = regex.nfa.byte_tables[table][byte];
                         if t != StateIdx::NONE {
                             origin_targets.push((idx, t));
                         }
@@ -989,7 +989,7 @@ impl Tier4DfaCache {
         for (origin, target) in &origin_targets {
             let (nfa, m, mae, ops) = self.epsilon_closure_with_program(
                 std::iter::once(*target),
-                &regex.states,
+                &regex.nfa.states,
                 false,
                 Some(byte),
             );
@@ -1000,11 +1000,11 @@ impl Tier4DfaCache {
             origin_table.push((*origin, prog_idx));
         }
 
-        // Seed closure (from regex.start, at_start=false for re-seed).
+        // Seed closure (from regex.nfa.start, at_start=false for re-seed).
         let (seed_nfa, seed_match, seed_match_at_end, seed_ops) = self
             .epsilon_closure_with_program(
-                std::iter::once(regex.start),
-                &regex.states,
+                std::iter::once(regex.nfa.start),
+                &regex.nfa.states,
                 false,
                 Some(byte),
             );
@@ -1064,16 +1064,16 @@ impl Tier4DfaCache {
 
     /// Prepare the cache for `regex`.
     pub(crate) fn prepare(&mut self, regex: &Regex) {
-        let id = regex.id;
+        let id = regex.nfa.id;
         if self.regex_id == id && self.start_id != DfaStateId::DEAD {
             return;
         }
-        self.clear(regex.states.len(), regex.num_byte_classes);
+        self.clear(regex.nfa.states.len(), regex.nfa.num_byte_classes);
         self.regex_id = id;
 
         let (nfa_set, is_match, is_match_at_end, ops) = self.epsilon_closure_with_program(
-            std::iter::once(regex.start),
-            &regex.states,
+            std::iter::once(regex.nfa.start),
+            &regex.nfa.states,
             true,
             None,
         );
@@ -1156,7 +1156,7 @@ impl<'a> Tier4DfaMatcher<'a> {
         pool: &'a mut CounterPool,
     ) -> Self {
         pool.clear();
-        pool.num_counters = regex.num_counters;
+        pool.num_counters = regex.nfa.num_counters;
 
         // Apply the start program to a fresh context to get initial contexts.
         let mut contexts = Vec::new();

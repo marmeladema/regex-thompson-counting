@@ -1405,7 +1405,7 @@ impl CounterStorage for InstanceCounters {
 /// ## When range compression is sound (contiguity proof)
 ///
 /// Range compression is sound when **every `CounterInstance` node is
-/// epsilon-reachable from `regex.start`** — i.e. reachable via only
+/// epsilon-reachable from `regex.nfa.start`** — i.e. reachable via only
 /// `Split` and `CounterInstance` edges, with no consuming states, no
 /// `Assert` nodes, and no `CounterIncrement` nodes on the path.  When
 /// this holds, the unanchored `.*` loop at the start injects a fresh
@@ -1446,7 +1446,7 @@ impl CounterStorage for InstanceCounters {
 /// ## When range compression is unsound
 ///
 /// The proof breaks down when a `CounterInstance` node is **not**
-/// epsilon-reachable from `regex.start`.  In that case, value-0 seeds
+/// epsilon-reachable from `regex.nfa.start`.  In that case, value-0 seeds
 /// are not injected on every byte, so ranges need not be anchored at 0
 /// and can fragment.  Merging disjoint ranges via min/max creates
 /// "phantom" values that do not correspond to any real NFA thread,
@@ -1851,7 +1851,7 @@ impl Tier3DfaCache {
             all_targets
                 .iter()
                 .copied()
-                .chain(std::iter::once(regex.start)),
+                .chain(std::iter::once(regex.nfa.start)),
             regex,
             analysis,
             false,
@@ -1916,7 +1916,7 @@ impl Tier3DfaCache {
                 all_targets
                     .iter()
                     .copied()
-                    .chain(std::iter::once(regex.start)),
+                    .chain(std::iter::once(regex.nfa.start)),
                 regex,
                 analysis,
                 false,
@@ -1996,7 +1996,7 @@ impl Tier3DfaCache {
                     cf_targets
                         .iter()
                         .copied()
-                        .chain(std::iter::once(regex.start)),
+                        .chain(std::iter::once(regex.nfa.start)),
                     regex,
                     analysis,
                     false,
@@ -2066,7 +2066,7 @@ impl Tier3DfaCache {
                         .find(|&&(from, _)| from == s.1)
                         .filter(|&&(_, to)| {
                             matches!(
-                                regex.states[to],
+                                regex.nfa.states[to],
                                 State::Byte { .. }
                                     | State::ByteCI { .. }
                                     | State::Wildcard { .. }
@@ -2164,7 +2164,7 @@ impl Tier3DfaCache {
                     .find(|&&(from, _)| from == s.1)
                     .filter(|&&(_, to)| {
                         matches!(
-                            regex.states[to],
+                            regex.nfa.states[to],
                             State::Byte { .. }
                                 | State::ByteCI { .. }
                                 | State::Wildcard { .. }
@@ -2232,11 +2232,11 @@ impl Tier3DfaCache {
             .flat_map(|(_, ts)| ts.iter().copied())
             .collect();
         // Note: we intentionally do NOT bail out when cf_targets is empty.
-        // The re-seeded `regex.start` is always counter-free (it represents
+        // The re-seeded `regex.nfa.start` is always counter-free (it represents
         // the unanchored match restart, not a counter break), so its epsilon
         // closure may contribute `$ → Match` even when no counter-free
         // consuming origins exist.  The previous guard checked
-        // `reachable_without_break[regex.start.idx()]`, but that array only
+        // `reachable_without_break[regex.nfa.start.idx()]`, but that array only
         // marks *consuming* states; the start state (typically a Split) is
         // never marked, causing false negatives for patterns like
         // `([b-ed-ie-f].{4,43})?$` where the `?`-skip to `$` is the only
@@ -2246,7 +2246,7 @@ impl Tier3DfaCache {
             cf_targets
                 .iter()
                 .copied()
-                .chain(std::iter::once(regex.start)),
+                .chain(std::iter::once(regex.nfa.start)),
             regex,
             analysis,
             false,
@@ -2311,16 +2311,16 @@ impl Tier3DfaCache {
         regex: &Regex,
         analysis: &Tier3Analysis,
     ) {
-        let id = regex.id;
+        let id = regex.nfa.id;
         if self.inner.regex_id == id && self.inner.start_id != DfaStateId::DEAD {
             return;
         }
-        self.clear(memory, regex.states.len(), regex.num_byte_classes);
+        self.clear(memory, regex.nfa.states.len(), regex.nfa.num_byte_classes);
         self.inner.regex_id = id;
 
         let cr = self.epsilon_closure(
             memory,
-            std::iter::once(regex.start),
+            std::iter::once(regex.nfa.start),
             regex,
             analysis,
             true,
@@ -2368,7 +2368,7 @@ struct ClosureResult {
 /// Try to consume `byte` at NFA state `idx`.  Returns `(out, out_exit)`
 /// where `out_exit` is `StateIdx::NONE` when there is no exit branch.
 fn consume_byte(idx: StateIdx, byte: u8, regex: &Regex) -> Option<(StateIdx, StateIdx)> {
-    match regex.states[idx] {
+    match regex.nfa.states[idx] {
         State::Byte {
             byte: b,
             out,
@@ -2389,9 +2389,9 @@ fn consume_byte(idx: StateIdx, byte: u8, regex: &Regex) -> Option<(StateIdx, Sta
             class,
             out,
             out_exit,
-        } if regex.classes[class.idx()].contains(byte) => Some((out, out_exit)),
+        } if regex.nfa.classes[class.idx()].contains(byte) => Some((out, out_exit)),
         State::ByteTable { table } => {
-            let t = regex.byte_tables[table][byte];
+            let t = regex.nfa.byte_tables[table][byte];
             if t != StateIdx::NONE {
                 Some((t, StateIdx::NONE))
             } else {
@@ -3235,7 +3235,7 @@ macro_rules! step_slow_impl {
             // that also appear in the clean chain are truly
             // counter-free.
             let pre_seed_contaminated =
-                self.current_has_break_extras && self.regex.num_counters > 1;
+                self.current_has_break_extras && self.regex.nfa.num_counters > 1;
             for &(counter, origin, value) in &t.pre_seeds {
                 if pre_seed_contaminated {
                     if let Some(cn_slot) = self.clean_nb_trans_slot {
@@ -3354,7 +3354,8 @@ macro_rules! step_slow_impl {
             // be in the DFA state before those downstream counters have
             // actually reached their minimums.
             self.no_break_current = t.no_break;
-            let from_contaminated = self.current_has_break_extras && self.regex.num_counters > 1;
+            let from_contaminated =
+                self.current_has_break_extras && self.regex.nfa.num_counters > 1;
             self.last_nb_counter_free_mae = if from_contaminated {
                 self.clean_nb_cf_mae
             } else {
@@ -3502,7 +3503,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         regex: &'a Regex,
         analysis: &'a Tier3Analysis,
     ) -> Self {
-        let nc = regex.num_counters;
+        let nc = regex.nfa.num_counters;
         let stride = analysis.max_body_origins;
         let use_ranges = analysis.all_counters_rangeable;
 
@@ -3551,13 +3552,13 @@ impl<'a> Tier3DfaMatcher<'a> {
             next_ranged,
             inst_counters,
             next_instances,
-            prefilter: regex.prefilter,
+            prefilter: regex.nfa.prefilter,
             pending_effects_current: Vec::new(),
             pending_effects_next: Vec::new(),
             reach_scratch: super::ReachScratch::new(),
             resolved_tails: Vec::new(),
             resolved_actions: tier3_effects::ResolvedActions::default(),
-            tail_seen: vec![0; regex.states.len()],
+            tail_seen: vec![0; regex.nfa.states.len()],
             tail_epoch: 0,
         }
     }
@@ -3732,7 +3733,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             let class = if stride == 256 {
                 b as usize
             } else {
-                self.regex.byte_classes[b as usize] as usize
+                self.regex.nfa.byte_classes[b as usize] as usize
             };
             let slot = self.current.idx() * stride + class;
             if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
@@ -3751,7 +3752,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             // Bug 32: save the clean_nb transition slot so step_slow can
             // filter unconditional seeds on counting transitions against
             // the clean chain's seeds.
-            if self.current_has_break_extras && self.regex.num_counters > 1 {
+            if self.current_has_break_extras && self.regex.nfa.num_counters > 1 {
                 if self.clean_nb != DfaStateId::DEAD {
                     let cn_slot = self.clean_nb.idx() * stride + class;
                     if self.cache.transitions[cn_slot].no_break == DfaStateId::UNPOPULATED {
@@ -3781,7 +3782,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             let t = &self.cache.transitions[slot];
 
             // When not contaminated, clean_nb simply tracks no_break.
-            if !(self.current_has_break_extras && self.regex.num_counters > 1) {
+            if !(self.current_has_break_extras && self.regex.nfa.num_counters > 1) {
                 self.clean_nb = t.no_break;
                 self.clean_nb_cf_mae = t.nb_counter_free_mae;
                 self.clean_nb_is_match = t.no_break_is_match;
@@ -3794,7 +3795,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                 && self.post_break_tails.is_empty()
             {
                 let from_contaminated =
-                    self.current_has_break_extras && self.regex.num_counters > 1;
+                    self.current_has_break_extras && self.regex.nfa.num_counters > 1;
                 self.current = t.no_break;
                 self.no_break_current = t.no_break;
                 let cf_mae = if from_contaminated {
@@ -3880,12 +3881,12 @@ impl<'a> Tier3DfaMatcher<'a> {
         regex: &Regex,
         scratch: &mut super::ReachScratch,
     ) -> bool {
-        let states = &regex.states;
+        let states = &regex.nfa.states;
         let num_states = states.len();
         scratch.prepare(num_states, start);
         while let Some(idx) = scratch.stack.pop() {
             let i = idx.idx();
-            if i >= num_states || scratch.is_visited(i) || !regex.state_can_reach_match[i] {
+            if i >= num_states || scratch.is_visited(i) || !regex.nfa.state_can_reach_match[i] {
                 continue;
             }
             scratch.mark_visited(i);
@@ -4158,7 +4159,7 @@ impl<'a> Tier3DfaMatcher<'a> {
         // as PendingEffect entries with Match atoms and resolved
         // via the pending-effect path below.
         // Non-contaminated deferred asserts from `clean_nb` are handled below.
-        let from_contaminated = self.current_has_break_extras && self.regex.num_counters > 1;
+        let from_contaminated = self.current_has_break_extras && self.regex.nfa.num_counters > 1;
         if self.no_break_current != DfaStateId::DEAD && !from_contaminated {
             let nb_state = &self.cache.inner.states[self.no_break_current.idx()];
             if nb_state.resolve_deferred_at_end(self.regex, &mut self.reach_scratch) {
@@ -4320,7 +4321,7 @@ impl fmt::Display for Tier3DfaMatcher<'_> {
         }
         // Clean chain state (always shown when multi-counter pattern has
         // break extras; shown as "n/a" otherwise so absence is explicit).
-        if self.current_has_break_extras && self.regex.num_counters > 1 {
+        if self.current_has_break_extras && self.regex.nfa.num_counters > 1 {
             if self.clean_nb == DfaStateId::DEAD {
                 write!(f, " clean_nb=DEAD")?;
             } else {

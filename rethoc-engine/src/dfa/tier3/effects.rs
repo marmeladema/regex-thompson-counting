@@ -820,11 +820,11 @@ pub(crate) fn eval_assert_chain(
     }
     let chain = arena.get(chain_id);
     for &assert_idx in chain {
-        let State::Assert { kind, out } = regex.states.0[assert_idx] else {
+        let State::Assert { kind, out } = regex.nfa.states.0[assert_idx] else {
             debug_assert!(
                 false,
                 "assert chain entry {} is not an Assert state: {:?}",
-                assert_idx, regex.states.0[assert_idx]
+                assert_idx, regex.nfa.states.0[assert_idx]
             );
             return false;
         };
@@ -1599,7 +1599,7 @@ mod tests {
     /// Find the first NFA state index with `State::Assert { kind, .. }`
     /// matching the given `AssertKind`.
     fn find_assert_state(regex: &crate::Regex, target_kind: crate::AssertKind) -> StateIdx {
-        for (i, state) in regex.states.0.iter().enumerate() {
+        for (i, state) in regex.nfa.states.0.iter().enumerate() {
             if let crate::State::Assert { kind, .. } = state {
                 if *kind == target_kind {
                     return StateIdx(i as u32);
@@ -1954,6 +1954,7 @@ mod tests {
         let mut arena = AssertChainArena::new();
         // Find the EndLF assert state.
         let endlf_idx = regex
+            .nfa
             .states
             .iter()
             .position(|s| {
@@ -1997,6 +1998,7 @@ mod tests {
         let regex = build_regex(r"(?m:a$)");
         let mut arena = AssertChainArena::new();
         let endlf_idx = regex
+            .nfa
             .states
             .iter()
             .position(|s| {
@@ -2040,6 +2042,7 @@ mod tests {
         let regex = build_regex(r"(?m:a$)");
         let mut arena = AssertChainArena::new();
         let endlf_idx = regex
+            .nfa
             .states
             .iter()
             .position(|s| {
@@ -2145,6 +2148,7 @@ mod tests {
         let regex = build_regex(r"\ba");
         let mut arena = AssertChainArena::new();
         let wb_idx = regex
+            .nfa
             .states
             .iter()
             .position(|s| {
@@ -2212,6 +2216,7 @@ mod tests {
         let regex = build_regex(r"\b");
         // \b → Match: the assert output goes to Match.
         let assert_idx = regex
+            .nfa
             .states
             .iter()
             .position(|s| {
@@ -2224,11 +2229,11 @@ mod tests {
                 )
             })
             .expect("should have \\b");
-        let out = match regex.states.0[assert_idx] {
+        let out = match regex.nfa.states.0[assert_idx] {
             crate::State::Assert { out, .. } => out,
             _ => unreachable!(),
         };
-        let topo = classify_post_assert(out, &regex.states.0);
+        let topo = classify_post_assert(out, &regex.nfa.states.0);
         // \b's output leads to Match directly.
         assert_eq!(topo, PostAssertTopology::DirectMatch);
         assert!(topo.is_tier3_sound());
@@ -2240,6 +2245,7 @@ mod tests {
         // reachable only through End assertion.
         let regex = build_regex(r"a$");
         let end_idx = regex
+            .nfa
             .states
             .iter()
             .position(|s| {
@@ -2252,13 +2258,13 @@ mod tests {
                 )
             })
             .expect("should have $");
-        let out = match regex.states.0[end_idx] {
+        let out = match regex.nfa.states.0[end_idx] {
             crate::State::Assert { out, .. } => out,
             _ => unreachable!(),
         };
         // From $'s output: directly Match (through_end was already set
         // by the caller, so from this point it's DirectMatch).
-        let topo = classify_post_assert(out, &regex.states.0);
+        let topo = classify_post_assert(out, &regex.nfa.states.0);
         assert_eq!(topo, PostAssertTopology::DirectMatch);
     }
 
@@ -2268,6 +2274,7 @@ mod tests {
         // `\ba` — \b output → Byte('a') (consuming).
         let regex = build_regex(r"\ba");
         let assert_idx = regex
+            .nfa
             .states
             .iter()
             .position(|s| {
@@ -2280,11 +2287,11 @@ mod tests {
                 )
             })
             .expect("should have \\b");
-        let out = match regex.states.0[assert_idx] {
+        let out = match regex.nfa.states.0[assert_idx] {
             crate::State::Assert { out, .. } => out,
             _ => unreachable!(),
         };
-        let topo = classify_post_assert(out, &regex.states.0);
+        let topo = classify_post_assert(out, &regex.nfa.states.0);
         assert_eq!(topo, PostAssertTopology::ConsumingOnly);
         assert!(topo.is_tier3_sound());
     }
@@ -2295,6 +2302,7 @@ mod tests {
         // This is a mixed topology: consuming + end-match.
         let regex = build_regex(r"\B(a|$)");
         let assert_idx = regex
+            .nfa
             .states
             .iter()
             .position(|s| {
@@ -2307,11 +2315,11 @@ mod tests {
                 )
             })
             .expect("should have \\B");
-        let out = match regex.states.0[assert_idx] {
+        let out = match regex.nfa.states.0[assert_idx] {
             crate::State::Assert { out, .. } => out,
             _ => unreachable!(),
         };
-        let topo = classify_post_assert(out, &regex.states.0);
+        let topo = classify_post_assert(out, &regex.nfa.states.0);
         assert_eq!(topo, PostAssertTopology::MixedEndAndConsuming);
         assert!(!topo.is_tier3_sound());
     }
@@ -2326,7 +2334,7 @@ mod tests {
             .tier3_analysis
             .as_ref()
             .expect("tier3_analysis should be computed even if rejected");
-        let sound = check_break_deferred_soundness(analysis, &regex.states.0);
+        let sound = check_break_deferred_soundness(analysis, &regex.nfa.states.0);
         assert!(!sound, "Bug 53 pattern should be rejected");
     }
 
@@ -2339,7 +2347,7 @@ mod tests {
             .tier3_analysis
             .as_ref()
             .expect("tier3_analysis should be computed");
-        let sound = check_break_deferred_soundness(analysis, &regex.states.0);
+        let sound = check_break_deferred_soundness(analysis, &regex.nfa.states.0);
         assert!(sound, "pure \\b$ pattern should be accepted");
     }
 }
