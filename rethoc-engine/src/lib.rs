@@ -12945,6 +12945,69 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Fuzz regression tests
+    // -----------------------------------------------------------------------
+
+    /// Regression: Tier 3 disagrees with NFA on this pattern found by
+    /// `test_fuzz_differential_tiers`.  Captured proptest seeds:
+    ///   pattern_seed = [1,128,0,2,0,129,25,0,0,0,0,0,120,60,40,204,
+    ///                   0,3,0,0,100,25,14,0,75,0,17,0,63,0,6,0,
+    ///                   108,74,111,0,121,0,0,115,64,42,0,36]
+    ///   extra_bytes  = [27,141,227,121,40,43,134,6,23,124,167,51,
+    ///                   106,244,104,88,158,64,239,194,212,164,198,
+    ///                   115,242,253,71,223,224,69,164,65,226,70,178,
+    ///                   37,10,170,30,204,183,254,134,123,180,242,141,
+    ///                   59,177,37,74,31,246,63,108]
+    #[test]
+    #[ignore] // TODO: pre-existing Tier 3 bug, investigate separately
+    fn test_fuzz_regression_tier3_word_boundary() {
+        use crate::fuzz_gen::{generate_inputs, generate_pattern, FuzzRng};
+
+        let pattern_seed: &[u8] = &[
+            1, 128, 0, 2, 0, 129, 25, 0, 0, 0, 0, 0, 120, 60, 40, 204, 0, 3, 0, 0, 100, 25, 14,
+            0, 75, 0, 17, 0, 63, 0, 6, 0, 108, 74, 111, 0, 121, 0, 0, 115, 64, 42, 0, 36,
+        ];
+        let extra_bytes: &[u8] = &[
+            27, 141, 227, 121, 40, 43, 134, 6, 23, 124, 167, 51, 106, 244, 104, 88, 158, 64, 239,
+            194, 212, 164, 198, 115, 242, 253, 71, 223, 224, 69, 164, 65, 226, 70, 178, 37, 10,
+            170, 30, 204, 183, 254, 134, 123, 180, 242, 141, 59, 177, 37, 74, 31, 246, 63, 108,
+        ];
+
+        let (pattern, ast) = generate_pattern(&mut FuzzRng::new(pattern_seed));
+        let inputs = generate_inputs(&mut FuzzRng::new(extra_bytes), &ast);
+
+        let hir = parse_hir_bytes_fallible(&pattern).expect("pattern should parse");
+        let mut builder = RegexBuilder::default();
+        let re = builder.build(&hir).expect("pattern should compile");
+
+        assert!(
+            re.tier3_eligible,
+            "pattern should be tier 3 eligible: {pattern}"
+        );
+
+        let mut memory = MatcherMemory::default();
+        for input in &inputs {
+            let mut m = memory.nfa_matcher(&re);
+            m.chunk(input);
+            let nfa_result = m.finish();
+
+            let mut m = memory
+                .matcher_for_tier(&re, 3)
+                .expect("tier 3 should be available");
+            m.chunk(input);
+            let tier3_result = m.finish();
+
+            assert_eq!(
+                tier3_result, nfa_result,
+                "Tier 3 disagrees with NFA for pattern `{pattern}` \
+                 on input {:?} (len={}): tier3={tier3_result}, nfa={nfa_result}",
+                &input[..input.len().min(80)],
+                input.len()
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Proptest: fuzz-style property-based tests
     // -----------------------------------------------------------------------
 
@@ -13025,6 +13088,23 @@ mod tests {
                         expected
                     );
                 }
+            }
+
+            // Test bounded-gap engine if eligible.
+            if let Some(mut m) = memory.bounded_gap_matcher(&re) {
+                m.chunk(input);
+                let bg_result = m.finish();
+                assert_eq!(
+                    bg_result,
+                    expected,
+                    "BoundedGap mismatch for pattern `{}` on input {:?} (len={}): \
+                     bg={}, oracle={}",
+                    pattern,
+                    &input[..input.len().min(80)],
+                    input.len(),
+                    bg_result,
+                    expected
+                );
             }
         }
 
@@ -13155,6 +13235,18 @@ mod tests {
                             &input[..input.len().min(80)], input.len()
                         );
                     }
+                }
+
+                // Test bounded-gap engine if eligible.
+                if let Some(mut m) = memory.bounded_gap_matcher(&re) {
+                    m.chunk(input);
+                    let bg_result = m.finish();
+                    assert_eq!(
+                        bg_result, nfa_result,
+                        "BoundedGap disagrees with NFA for pattern `{pattern}` \
+                         on input {:?} (len={}): bg={bg_result}, nfa={nfa_result}",
+                        &input[..input.len().min(80)], input.len()
+                    );
                 }
             }
         }
