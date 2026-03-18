@@ -39,6 +39,7 @@ Options:
   --bounded-gap        Force the bounded-gap engine (error if not eligible)
   --unroll-limit <N>   Max NFA states for repetition unrolling (0=disable, default: 32)
   --max-states <N>     Max estimated fully-unrolled states (default: 2048)
+  --max-repetition <N> Max bounded repetition count (default: 1000)
   --no-merge           Disable merging of consecutive same-body repetitions
   --dfa                Include tier-specific DFA analysis in dump output
   --debug              Print matcher state after each step
@@ -92,6 +93,7 @@ fn parse_args() -> Command {
     let mut force_bounded_gap = false;
     let mut unroll_limit: Option<usize> = None;
     let mut max_estimated_states: Option<usize> = None;
+    let mut max_repetition: Option<usize> = None;
     let mut format = Format::Text;
     let mut debug = false;
     let mut dfa = false;
@@ -162,6 +164,17 @@ fn parse_args() -> Command {
                     process::exit(1);
                 }));
             }
+            "--max-repetition" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --max-repetition requires a value");
+                    process::exit(1);
+                }
+                max_repetition = Some(args[i].parse::<usize>().unwrap_or_else(|_| {
+                    eprintln!("error: --max-repetition must be a non-negative integer");
+                    process::exit(1);
+                }));
+            }
             "--no-merge" => {
                 merge = false;
             }
@@ -216,6 +229,9 @@ fn parse_args() -> Command {
     }
     if let Some(m) = max_estimated_states {
         config.max_estimated_states = m;
+    }
+    if let Some(r) = max_repetition {
+        config.max_repetition = r;
     }
     config.merge_repetitions = merge;
 
