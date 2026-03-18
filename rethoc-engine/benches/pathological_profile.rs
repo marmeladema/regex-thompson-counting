@@ -35,8 +35,8 @@ fn parse_hir(pattern: &str) -> regex_syntax::hir::Hir {
 fn setup_no_match() -> (Regex, Vec<u8>) {
     let hir = parse_hir(PATTERN);
     let re = RegexBuilder::default()
-        .merge_repetitions(false)
-        .build(&hir)
+        .optimize_hir(false)
+        .build(hir)
         .unwrap();
     let haystack = vec![b'x'; HAYSTACK_SIZE];
     (re, haystack)
@@ -45,8 +45,8 @@ fn setup_no_match() -> (Regex, Vec<u8>) {
 fn setup_match_at_end() -> (Regex, Vec<u8>) {
     let hir = parse_hir(PATTERN);
     let re = RegexBuilder::default()
-        .merge_repetitions(false)
-        .build(&hir)
+        .optimize_hir(false)
+        .build(hir)
         .unwrap();
     let mut haystack = vec![b'x'; HAYSTACK_SIZE];
     *haystack.last_mut().unwrap() = b'a';

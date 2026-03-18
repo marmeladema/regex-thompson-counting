@@ -207,7 +207,7 @@ fn compile_anchor_program(pieces: &[&Hir], config: &RegexConfig) -> Option<Ancho
         Hir::concat(pieces.iter().map(|h| (*h).clone()).collect())
     };
     let mut builder = crate::RegexBuilder::with_config(config.clone());
-    match builder.build(&anchor_hir) {
+    match builder.build(anchor_hir) {
         Ok(regex) => Some(regex.into_anchor_program()),
         Err(e) => {
             // Anchor compilation failed — fall back to normal engine.

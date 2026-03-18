@@ -962,7 +962,7 @@ pub(crate) fn parse_hir(pattern: &str) -> Result<Hir, Error> {
         .build()
         .translate(pattern, &ast)
         .map_err(|e| Error::Translate(e.to_string()))?;
-    Ok(hir_optimize::normalize(hir))
+    Ok(hir)
 }
 
 impl Regex {
@@ -988,7 +988,7 @@ impl Regex {
     pub fn with_config(pattern: &str, config: RegexConfig) -> Result<Regex, Error> {
         let hir = parse_hir(pattern)?;
         let mut builder = RegexBuilder::with_config(config);
-        builder.build(&hir)
+        builder.build(hir)
     }
 
     /// Consume this `Regex` and extract the NFA data needed for an
@@ -1432,7 +1432,7 @@ impl Default for RegexConfig {
 ///
 /// let hir: Hir = regex_syntax::parse(r"hello|world").unwrap();
 /// let mut builder = RegexBuilder::with_config(RegexConfig::default());
-/// let re = builder.build(&hir).unwrap();
+/// let re = builder.build(hir).unwrap();
 /// ```
 #[derive(Debug)]
 pub struct RegexBuilder {
@@ -1512,7 +1512,7 @@ impl RegexBuilder {
     /// [`build`](Self::build) on the result.
     pub fn compile(&mut self, pattern: &str) -> Result<Regex, Error> {
         let hir = parse_hir(pattern)?;
-        self.build(&hir)
+        self.build(hir)
     }
 
     /// Allocate a fresh counter index.
@@ -2428,27 +2428,23 @@ impl RegexBuilder {
     const BYTE_CLASSES_NFA_THRESHOLD: usize = 128;
 
     /// Compile a `regex-syntax` HIR into a ready-to-match [`Regex`].
-    pub fn build(&mut self, hir: &Hir) -> Result<Regex, Error> {
-        // Complexity check: reject patterns whose fully-unrolled cost
-        // exceeds the configured limit.
-        let estimated = Self::estimate_nfa_states(hir);
+    pub fn build(&mut self, hir: Hir) -> Result<Regex, Error> {
+        // Optimize first: strip captures, collapse quantifiers, dedup
+        // alternation branches, merge adjacent repetitions, strip
+        // irrelevant boundary gaps.  Skipped when optimize_hir=false
+        // to preserve multi-counter structure for testing.
+        let compile_hir = if self.config.optimize_hir {
+            hir_optimize::optimize(hir)
+        } else {
+            hir
+        };
+
+        // Complexity check on the (possibly optimised) HIR.
+        let estimated = Self::estimate_nfa_states(&compile_hir);
         let limit = self.config.max_estimated_states;
         if estimated > limit {
             return Err(Error::PatternTooComplex { estimated, limit });
         }
-
-        // Full HIR optimization when configured: merge adjacent
-        // repetitions, strip irrelevant leading/trailing gaps.
-        // parse_hir() only did normalization (capture strip, collapse,
-        // dedup).  This pass is skipped when optimize_hir=false to
-        // preserve multi-counter structure for testing.
-        let optimized_hir;
-        let compile_hir = if self.config.optimize_hir {
-            optimized_hir = hir_optimize::optimize(hir.clone());
-            &optimized_hir
-        } else {
-            hir
-        };
 
         self.states.clear();
         self.frags.clear();
@@ -2456,7 +2452,7 @@ impl RegexBuilder {
         self.counters.clear();
         self.classes.clear();
         self.byte_tables.clear();
-        self.hir2postfix(compile_hir)?;
+        self.hir2postfix(&compile_hir)?;
 
         let mut postfix = std::mem::take(&mut self.postfix);
         for node in postfix.drain(..) {
@@ -2880,9 +2876,9 @@ impl RegexBuilder {
             // Bounded-gap probe: always optimize for widest recognition,
             // even when config.optimize_hir is false.
             bounded_gap_plan: if self.config.optimize_hir {
-                bounded_gap::try_build_bounded_gap_plan(compile_hir, &self.config)
+                bounded_gap::try_build_bounded_gap_plan(&compile_hir, &self.config)
             } else {
-                let probe_hir = hir_optimize::optimize(hir.clone());
+                let probe_hir = hir_optimize::optimize(compile_hir);
                 bounded_gap::try_build_bounded_gap_plan(&probe_hir, &self.config)
             },
         })
@@ -12872,7 +12868,7 @@ mod tests {
         builder.max_unroll_states(0);
         builder.optimize_hir(false);
         let hir = super::parse_hir(&pattern).unwrap();
-        let result = builder.build(&hir);
+        let result = builder.build(hir);
         assert!(
             matches!(result, Err(Error::TooManyCounters)),
             "expected TooManyCounters error, got {result:?}"
@@ -12892,7 +12888,7 @@ mod tests {
         builder.max_unroll_states(0);
         builder.optimize_hir(false);
         let hir = super::parse_hir(&pattern).unwrap();
-        let result = builder.build(&hir);
+        let result = builder.build(hir);
         assert!(
             result.is_ok(),
             "256 counters should succeed, got {result:?}"
@@ -12972,7 +12968,7 @@ mod tests {
 
         let hir = parse_hir_bytes_fallible(&pattern).expect("pattern should parse");
         let mut builder = RegexBuilder::default();
-        let re = builder.build(&hir).expect("pattern should compile");
+        let re = builder.build(hir).expect("pattern should compile");
 
         assert!(
             re.tier3_eligible,
@@ -13015,7 +13011,7 @@ mod tests {
             Err(_) => return,
         };
         let mut builder = RegexBuilder::default();
-        let re = match builder.build(&hir) {
+        let re = match builder.build(hir.clone()) {
             Ok(r) => r,
             Err(_) => return,
         };
@@ -13108,7 +13104,7 @@ mod tests {
         // multi-counter patterns retain their counter structure.
         builder.max_unroll_states(0);
         builder.optimize_hir(false);
-        if let Ok(re_no_unroll) = builder.build(&hir) {
+        if let Ok(re_no_unroll) = builder.build(hir) {
             for input in inputs {
                 let expected = oracle.is_match(input);
 
@@ -13206,7 +13202,7 @@ mod tests {
                 None => return Ok(()),
             };
             let mut builder = RegexBuilder::default();
-            let re = match builder.build(&hir) {
+            let re = match builder.build(hir) {
                 Ok(r) => r,
                 Err(_) => return Ok(()),
             };
@@ -13312,16 +13308,16 @@ mod tests {
             ("a{1,1}{1,1}", 1), // stacked: 1 × (1 × 1)
             // Zero-min = optional
             ("a{0,1}", 2), // same as a?: 1 + 1
-            // Nested quantifiers (optimized: HIR pass collapses these)
-            ("(a?)?", 2),    // collapsed to a? → 2
-            ("((a?)?)?", 2), // collapsed to a? → 2
-            ("(a+)+", 1),    // collapsed to a+ (self-loop) → 1
-            ("(a*)*", 2),    // collapsed to a* → 2
-            ("(a+)*", 2),    // collapsed to a* → 2
+            // Nested quantifiers (raw HIR — parse_hir no longer optimizes)
+            ("(a?)?", 3),    // inner a? = 2, outer ? = +1 Split
+            ("((a?)?)?", 4), // innermost a? = 2, middle ? = +1, outer ? = +1
+            ("(a+)+", 2),    // inner a+ = 1, outer + = +1 Split
+            ("(a*)*", 3),    // inner a* = 2, outer * = +1 Split
+            ("(a+)*", 2),    // inner a+ = 1, outer * = +1 Split
             // Alternation with empty branch
             ("(a|)", 2),  // alt: 1+0 + 1 Split
             ("(|a)", 2),  // same
-            ("(||a)", 2), // deduped to (|a) → 2
+            ("(||a)", 3), // raw: 3 branches (||a) → 2 Splits + 1 atom
             // Concat with zero-count segment
             ("a{0,0}b", 1), // 0 + 1
             // HIR merges alternation to class

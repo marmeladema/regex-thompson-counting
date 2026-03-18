@@ -77,7 +77,7 @@ fn for_each_line(haystack: &[u8], mut f: impl FnMut(&[u8])) {
 fn bench_aws_keys_quick() {
     let haystack = aws_haystack();
     let hir = parse_hir(AWS_PATTERN);
-    let re = RegexBuilder::default().build(&hir).unwrap();
+    let re = RegexBuilder::default().build(hir).unwrap();
     let mut mem = MatcherMemory::default();
     let mut matcher = mem.matcher(&re);
     matcher.chunk(black_box(&haystack));
@@ -91,7 +91,7 @@ fn bench_aws_keys_quick() {
 fn bench_aws_keys_grep() {
     let haystack = aws_haystack();
     let hir = parse_hir(AWS_PATTERN);
-    let re = RegexBuilder::default().build(&hir).unwrap();
+    let re = RegexBuilder::default().build(hir).unwrap();
     let mut mem = MatcherMemory::default();
     let mut count = 0usize;
     for_each_line(&haystack, |line| {
@@ -110,7 +110,7 @@ fn bench_aws_keys_grep() {
 fn bench_grep_every_line() {
     let haystack = grep_haystack();
     let hir = parse_hir(GREP_EVERY_LINE_PATTERN);
-    let re = RegexBuilder::default().build(&hir).unwrap();
+    let re = RegexBuilder::default().build(hir).unwrap();
     let mut mem = MatcherMemory::default();
     let mut count = 0usize;
     for_each_line(&haystack, |line| {
@@ -134,7 +134,7 @@ const AWS_PREFIX_PATTERN: &str = r"(?:ASIA|AKIA|AROA|AIDA)[A-Z0-7][A-Z0-7][A-Z0-
 fn bench_aws_prefix_tier1() {
     let haystack = aws_haystack();
     let hir = parse_hir(AWS_PREFIX_PATTERN);
-    let re = RegexBuilder::default().build(&hir).unwrap();
+    let re = RegexBuilder::default().build(hir).unwrap();
     let mut mem = MatcherMemory::default();
     let mut matcher = mem.matcher(&re);
     matcher.chunk(black_box(&haystack));

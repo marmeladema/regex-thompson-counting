@@ -26,11 +26,11 @@
 use std::hint::black_box;
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use rethoc_engine::{MatcherMemory, RegexBuilder};
 
-const PATTERN: &str = r".{0,1000}.{0,1000}.{0,1000}a";
+const PATTERN: &str = r"x.{0,1000}.{0,1000}.{0,1000}a";
 
 fn parse_hir(pattern: &str) -> rethoc_engine::Hir {
     use regex_syntax::ast::parse::ParserBuilder;
@@ -54,9 +54,19 @@ fn bench_compile(c: &mut Criterion) {
 
     group.bench_function("rethoc", |b| {
         let hir = parse_hir(PATTERN);
-        b.iter(|| {
-            black_box(RegexBuilder::default().build(black_box(&hir)).unwrap());
-        })
+        b.iter_batched(
+            || hir.clone(),
+            |hir| {
+                black_box(
+                    RegexBuilder::default()
+                        .max_estimated_states(4096)
+                        .max_repetition(3000)
+                        .build(black_box(hir))
+                        .unwrap(),
+                );
+            },
+            BatchSize::SmallInput,
+        )
     });
 
     group.bench_function("regex", |b| {
@@ -95,15 +105,17 @@ fn bench_no_match(c: &mut Criterion) {
     // (single counter, Tier 2).
     let rethoc_merged = RegexBuilder::default()
         .max_estimated_states(4096)
-        .build(&hir)
+        .max_repetition(3000)
+        .build(hir.clone())
         .unwrap();
     assert_eq!(rethoc_merged.min_tier(), 2);
     // No-merge compilation: preserves 3 separate counters for tier3/tier4/nfa
     // benchmarks that need the multi-counter structure.
     let rethoc_re = RegexBuilder::default()
-        .merge_repetitions(false)
+        .optimize_hir(false)
         .max_estimated_states(4096)
-        .build(&hir)
+        .max_repetition(3000)
+        .build(hir)
         .unwrap();
     let regex_re = regex::bytes::RegexBuilder::new(PATTERN)
         .unicode(false)
@@ -204,13 +216,13 @@ fn bench_match_at_end(c: &mut Criterion) {
     let hir = parse_hir(PATTERN);
     let rethoc_merged = RegexBuilder::default()
         .max_estimated_states(4096)
-        .build(&hir)
+        .build(hir.clone())
         .unwrap();
     assert_eq!(rethoc_merged.min_tier(), 2);
     let rethoc_re = RegexBuilder::default()
-        .merge_repetitions(false)
+        .optimize_hir(false)
         .max_estimated_states(4096)
-        .build(&hir)
+        .build(hir)
         .unwrap();
     let regex_re = regex::bytes::RegexBuilder::new(PATTERN)
         .unicode(false)
@@ -320,7 +332,7 @@ fn bench_nested_match_at_end(c: &mut Criterion) {
     let hir = parse_hir(NESTED_PATTERN);
     let rethoc_re = RegexBuilder::default()
         .max_estimated_states(4096)
-        .build(&hir)
+        .build(hir)
         .unwrap();
 
     // The regex crate cannot compile this nested pattern within its default
