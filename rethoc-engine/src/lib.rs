@@ -3492,6 +3492,18 @@ impl MatcherMemory {
         }
     }
 
+    /// Create a matcher using the bounded-gap specialisation.
+    ///
+    /// Returns `None` if the pattern was not recognised as a bounded-gap
+    /// chain.  The returned matcher is independent of `MatcherMemory`'s
+    /// tier-specific caches (the bounded-gap matcher owns its own scratch).
+    pub fn bounded_gap_matcher<'a>(&'a mut self, regex: &'a Regex) -> Option<AnyMatcher<'a>> {
+        let plan = regex.bounded_gap_plan.as_ref()?;
+        Some(AnyMatcher::BoundedGap(bounded_gap::BoundedGapMatcher::new(
+            plan,
+        )))
+    }
+
     /// Create a matcher forced to a specific execution tier.
     ///
     /// Tier 0 = NFA simulator (always available), tiers 1–4 = DFA tiers.
@@ -5085,6 +5097,34 @@ mod tests {
         );
     }
 
+    /// Test a pattern+input via the bounded-gap engine (full-chunk + byte-at-a-time).
+    fn test_bounded_gap(pattern: &str, re: &Regex, input: &str, expected: bool, unroll: usize) {
+        let plan = re
+            .bounded_gap_plan
+            .as_ref()
+            .expect("bounded_gap_plan must be present for bounded-gap test");
+        // Full-chunk test.
+        let mut m = bounded_gap::BoundedGapMatcher::new(plan);
+        m.chunk(input.as_bytes());
+        let actual = m.finish();
+        assert_eq!(
+            actual, expected,
+            "BoundedGap chunk mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
+            pattern, input, unroll, actual, expected
+        );
+        // Byte-at-a-time test.
+        let mut m = bounded_gap::BoundedGapMatcher::new(plan);
+        for &b in input.as_bytes() {
+            m.chunk(&[b]);
+        }
+        let actual = m.finish();
+        assert_eq!(
+            actual, expected,
+            "BoundedGap single-byte mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
+            pattern, input, unroll, actual, expected
+        );
+    }
+
     /// Test a single compiled regex against the oracle on all inputs,
     /// exercising NFA and every eligible DFA tier.
     fn test_all_tiers(
@@ -5119,6 +5159,9 @@ mod tests {
             }
             if re.tier4_eligible {
                 test_tier4(pattern, re, input, expected, unroll);
+            }
+            if re.bounded_gap_plan.is_some() {
+                test_bounded_gap(pattern, re, input, expected, unroll);
             }
         }
     }
@@ -5585,6 +5628,9 @@ mod tests {
             }
             if re.tier4_eligible {
                 test_tier4(pattern, re, input, expected, unroll);
+            }
+            if re.bounded_gap_plan.is_some() {
+                test_bounded_gap(pattern, re, input, expected, unroll);
             }
         }
     }

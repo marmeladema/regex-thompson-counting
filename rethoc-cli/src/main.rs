@@ -36,6 +36,7 @@ Options:
   --format <text|json|debug>  Output format (default: text; debug uses Rust {{:#?}})
   --chunk-size <N>     Feed input in chunks of N bytes (default: entire input at once)
   --tier <0|1|2|3|4>   Force a specific execution tier (0=NFA, 1-4=DFA tiers)
+  --bounded-gap        Force the bounded-gap engine (error if not eligible)
   --unroll-limit <N>   Max NFA states for repetition unrolling (0=disable, default: 32)
   --max-states <N>     Max estimated fully-unrolled states (default: 2048)
   --no-merge           Disable merging of consecutive same-body repetitions
@@ -61,6 +62,7 @@ enum Command {
         inputs: Vec<String>,
         chunk_size: Option<usize>,
         tier: Option<u8>,
+        force_bounded_gap: bool,
         config: RegexConfig,
         debug: bool,
     },
@@ -87,6 +89,7 @@ fn parse_args() -> Command {
 
     let mut chunk_size: Option<usize> = None;
     let mut tier: Option<u8> = None;
+    let mut force_bounded_gap = false;
     let mut unroll_limit: Option<usize> = None;
     let mut max_estimated_states: Option<usize> = None;
     let mut format = Format::Text;
@@ -133,6 +136,9 @@ fn parse_args() -> Command {
                     process::exit(1);
                 }
                 tier = Some(t);
+            }
+            "--bounded-gap" => {
+                force_bounded_gap = true;
             }
             "--unroll-limit" => {
                 i += 1;
@@ -245,6 +251,7 @@ fn parse_args() -> Command {
                 inputs: positional[2..].to_vec(),
                 chunk_size,
                 tier,
+                force_bounded_gap,
                 config,
                 debug,
             }
@@ -331,6 +338,7 @@ fn run_match(
     inputs: &[String],
     chunk_size: Option<usize>,
     tier: Option<u8>,
+    force_bounded_gap: bool,
     config: RegexConfig,
     debug: bool,
 ) {
@@ -342,20 +350,34 @@ fn run_match(
     if let Some(cs) = chunk_size {
         eprintln!("chunk_size: {cs}");
     }
+    if tier.is_some() && force_bounded_gap {
+        eprintln!("error: --tier and --bounded-gap are mutually exclusive");
+        process::exit(1);
+    }
     if let Some(t) = tier {
         eprintln!("tier: {t} (forced)");
+    }
+    if force_bounded_gap {
+        eprintln!("engine: bounded-gap (forced)");
     }
     eprintln!();
 
     let mut any_failed = false;
     for input in inputs {
         let bytes = input.as_bytes();
-        let mut matcher = match tier {
-            Some(t) => memory.matcher_for_tier(&regex, t).unwrap_or_else(|e| {
-                eprintln!("error: {e}");
+        let mut matcher = if force_bounded_gap {
+            memory.bounded_gap_matcher(&regex).unwrap_or_else(|| {
+                eprintln!("error: pattern is not eligible for bounded-gap engine");
                 process::exit(1);
-            }),
-            None => memory.matcher(&regex),
+            })
+        } else {
+            match tier {
+                Some(t) => memory.matcher_for_tier(&regex, t).unwrap_or_else(|e| {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }),
+                None => memory.matcher(&regex),
+            }
         };
 
         if debug {
@@ -460,9 +482,18 @@ fn main() {
             inputs,
             chunk_size,
             tier,
+            force_bounded_gap,
             config,
             debug,
-        } => run_match(&pattern, &inputs, chunk_size, tier, config, debug),
+        } => run_match(
+            &pattern,
+            &inputs,
+            chunk_size,
+            tier,
+            force_bounded_gap,
+            config,
+            debug,
+        ),
         Command::Grep {
             pattern,
             file,

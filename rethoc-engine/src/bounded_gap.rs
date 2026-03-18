@@ -568,7 +568,7 @@ struct TailGapState {
 /// determine whether an `Anchor (Gap Anchor)* Gap?` chain matches
 /// anywhere in the input.  Produces an existence-only result (no
 /// match positions or captures).
-pub(crate) struct BoundedGapMatcher<'a> {
+pub struct BoundedGapMatcher<'a> {
     /// The compiled plan.
     plan: &'a BoundedGapPlan,
     /// Anchor runners (one per anchor in the chain).
