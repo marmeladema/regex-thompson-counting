@@ -7,8 +7,11 @@
 
 use std::fmt;
 
-use crate::dfa::Tier3OriginKind;
+use crate::bounded_gap::{
+    AnchorEngine, AnchorLengthInfo, BoundedGapPlan, EndAnchorKind, GapPredicate, StartAnchorKind,
+};
 use crate::dfa::tier3::effects::{AssertChainArena, CompiledOriginEffects, CompiledTargetEffects};
+use crate::dfa::Tier3OriginKind;
 use crate::{AssertKind, ByteClass, ByteMap, Regex, State, StateIdx};
 
 // ---------------------------------------------------------------------------
@@ -461,12 +464,95 @@ impl fmt::Display for DumpRegex<'_> {
             writeln!(f, "]")?;
         }
 
+        // -- Bounded-Gap Plan -------------------------------------------------
+        if let Some(plan) = &r.bounded_gap_plan {
+            writeln!(f)?;
+            fmt_bounded_gap_plan(plan, f)?;
+        }
+
         // -- DFA Analysis (optional) ------------------------------------------
         if self.dfa {
             self.fmt_dfa_analysis(f)?;
         }
 
         Ok(())
+    }
+}
+
+/// Format a bounded-gap plan for human-readable output.
+fn fmt_bounded_gap_plan(plan: &BoundedGapPlan, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    writeln!(
+        f,
+        "Bounded-Gap Plan ({} anchors, {} interior gaps, tail_gap: {}):",
+        plan.anchors.len(),
+        plan.interior_gaps.len(),
+        plan.tail_gap.is_some()
+    )?;
+
+    // Anchoring.
+    match plan.start_anchor {
+        StartAnchorKind::None => {}
+        StartAnchorKind::StartOfInput => writeln!(f, "  start_anchor: ^")?,
+    }
+    match plan.end_anchor {
+        EndAnchorKind::None => {}
+        EndAnchorKind::EndOfInput => writeln!(f, "  end_anchor: $")?,
+    }
+
+    // Chain: interleave anchors and gaps.
+    for (i, anchor) in plan.anchors.iter().enumerate() {
+        let AnchorLengthInfo::Fixed(len) = anchor.length_info;
+        let engine = match &anchor.program.engine {
+            AnchorEngine::Tier0(_) => "NFA",
+            AnchorEngine::Tier1(_) => "Tier1",
+            AnchorEngine::Tier2(_) => "Tier2",
+        };
+        writeln!(
+            f,
+            "  anchor[{i}]: fixed_len={len}, engine={engine}, prefilter={:?}",
+            anchor.program.prefilter
+        )?;
+
+        // Interior gap after this anchor (if any).
+        if i < plan.interior_gaps.len() {
+            let gap = &plan.interior_gaps[i];
+            writeln!(
+                f,
+                "  gap[{i}]:    {{{},{}}} pred={}",
+                gap.min_gap,
+                gap.max_gap,
+                fmt_predicate(&gap.predicate)
+            )?;
+        }
+    }
+
+    // Tail gap.
+    if let Some(tail) = &plan.tail_gap {
+        writeln!(
+            f,
+            "  tail_gap:  {{{},{}}} pred={}",
+            tail.min_gap,
+            tail.max_gap,
+            fmt_predicate(&tail.predicate)
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Format a gap predicate for display.
+fn fmt_predicate(pred: &GapPredicate) -> String {
+    match pred {
+        GapPredicate::Any => "Any".to_string(),
+        GapPredicate::ByteClass(bits) => {
+            // Count how many bytes match.
+            let count = (0..=255u8).filter(|&b| bits.contains(b)).count();
+            if count <= 256 - count {
+                format!("ByteClass({count}/256 bytes)")
+            } else {
+                format!("ByteClass(NOT {}/256 bytes)", 256 - count)
+            }
+        }
     }
 }
 
