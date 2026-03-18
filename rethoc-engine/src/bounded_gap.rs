@@ -337,12 +337,7 @@ impl<'a> AnchorRunner<'a> {
     /// with the absolute end position.
     ///
     /// Events are emitted in monotonically increasing position order.
-    pub(crate) fn scan_chunk(
-        &mut self,
-        input: &[u8],
-        base_pos: u64,
-        emit: &mut dyn FnMut(u64),
-    ) {
+    pub(crate) fn scan_chunk(&mut self, input: &[u8], base_pos: u64, emit: &mut dyn FnMut(u64)) {
         for (offset, &byte) in input.iter().enumerate() {
             let matched = self.step(byte);
             if matched {
@@ -541,6 +536,390 @@ impl<'a> AnchorRunner<'a> {
                     self.nlist.push(idx);
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded-Gap Matcher
+// ---------------------------------------------------------------------------
+
+use std::collections::VecDeque;
+
+/// Per-interior-gap stage state.
+struct GapStageState {
+    /// Accepted end positions from the preceding anchor, sorted ascending.
+    accepted_prev_ends: VecDeque<u64>,
+    /// Positions where the gap predicate failed, sorted ascending.
+    bad_positions: VecDeque<u64>,
+}
+
+/// Terminal gap state.
+struct TailGapState {
+    /// Accepted end positions from the final anchor, sorted ascending.
+    accepted_final_anchor_ends: VecDeque<u64>,
+    /// Positions where the terminal gap predicate failed, sorted ascending.
+    bad_positions: VecDeque<u64>,
+}
+
+/// Runtime matcher for bounded-gap chains.
+///
+/// Coordinates N anchor runners with queue-based gap validation to
+/// determine whether an `Anchor (Gap Anchor)* Gap?` chain matches
+/// anywhere in the input.  Produces an existence-only result (no
+/// match positions or captures).
+pub(crate) struct BoundedGapMatcher<'a> {
+    /// The compiled plan.
+    plan: &'a BoundedGapPlan,
+    /// Anchor runners (one per anchor in the chain).
+    runners: Vec<AnchorRunner<'a>>,
+    /// Per-interior-gap stage state.
+    gap_stages: Vec<GapStageState>,
+    /// Terminal gap state (if the chain has a trailing gap).
+    tail_state: Option<TailGapState>,
+    /// Whether each anchor runner is active (lazy activation).
+    anchor_active: Vec<bool>,
+    /// Current absolute byte position.
+    position: u64,
+    /// Existence result: set once a full chain match is confirmed.
+    matched: bool,
+    /// Per-position flag: the chain is fully satisfied at the current
+    /// byte.  When `end_anchor == EndOfInput`, this is a candidate
+    /// that becomes `matched` only in `finish()`.
+    matched_here: bool,
+}
+
+impl<'a> BoundedGapMatcher<'a> {
+    /// Create a new matcher from a compiled plan.
+    pub(crate) fn new(plan: &'a BoundedGapPlan) -> Self {
+        let n = plan.anchors.len();
+        let mut runners: Vec<AnchorRunner<'a>> = Vec::with_capacity(n);
+        for anchor in plan.anchors.iter() {
+            runners.push(AnchorRunner::new(anchor));
+        }
+
+        let gap_stages = (0..plan.interior_gaps.len())
+            .map(|_| GapStageState {
+                accepted_prev_ends: VecDeque::new(),
+                bad_positions: VecDeque::new(),
+            })
+            .collect();
+
+        let tail_state = plan.tail_gap.as_ref().map(|_| TailGapState {
+            accepted_final_anchor_ends: VecDeque::new(),
+            bad_positions: VecDeque::new(),
+        });
+
+        let mut anchor_active = vec![false; n];
+        anchor_active[0] = true; // anchor[0] is always active from start
+
+        BoundedGapMatcher {
+            plan,
+            runners,
+            gap_stages,
+            tail_state,
+            anchor_active,
+            position: 0,
+            matched: false,
+            matched_here: false,
+        }
+    }
+
+    /// Process a chunk of input.
+    pub(crate) fn chunk(&mut self, input: &[u8]) {
+        for &byte in input {
+            if self.matched {
+                return;
+            }
+            self.step(byte);
+        }
+    }
+
+    /// Signal end-of-input.  Resolves `EndOfInput` candidates.
+    pub(crate) fn finish(self) -> bool {
+        if self.matched {
+            return true;
+        }
+        if self.plan.end_anchor == EndAnchorKind::EndOfInput {
+            return self.matched_here;
+        }
+        false
+    }
+
+    /// Return whether a match has been found.
+    pub(crate) fn ismatch(&self) -> bool {
+        self.matched
+    }
+
+    /// Process one input byte.
+    fn step(&mut self, byte: u8) {
+        let p = self.position;
+        self.position += 1;
+        self.matched_here = false;
+
+        // -- Step 1: Feed byte to active anchor runners. -----------------
+        // Collect match results into a fixed-size buffer to avoid
+        // borrowing issues with self.
+        let n = self.plan.anchors.len();
+        let mut anchor_matched = [false; 16]; // V1 chains are small
+        debug_assert!(n <= 16, "chain too long for fixed buffer");
+        for (i, (runner, &active)) in self
+            .runners
+            .iter_mut()
+            .zip(self.anchor_active.iter())
+            .enumerate()
+        {
+            if active {
+                anchor_matched[i] = runner.step(byte);
+            }
+        }
+
+        // -- Step 2: Update bad-byte queues. -----------------------------
+        for (i, gap) in self.plan.interior_gaps.iter().enumerate() {
+            if let GapPredicate::ByteClass(bits) = gap.predicate
+                && !bits.contains(byte)
+            {
+                self.gap_stages[i].bad_positions.push_back(p);
+            }
+        }
+        // Terminal gap: current byte IS part of the gap (ordering rule).
+        if let Some(ref mut tail_state) = self.tail_state
+            && let Some(tail_gap) = &self.plan.tail_gap
+            && let GapPredicate::ByteClass(bits) = tail_gap.predicate
+            && !bits.contains(byte)
+        {
+            tail_state.bad_positions.push_back(p);
+        }
+
+        // -- Step 3: Process anchor matches left-to-right. ---------------
+        self.process_anchor_events(p, &anchor_matched[..n]);
+
+        // -- Step 5: Terminal-gap success checks. ------------------------
+        if self.plan.tail_gap.is_some() {
+            self.check_terminal_gap(p);
+        }
+
+        // -- Step 4: Expire dead queue entries. --------------------------
+        self.expire_queues(p);
+
+        // -- Step 6: Update matched flag. --------------------------------
+        if self.matched_here && self.plan.end_anchor == EndAnchorKind::None {
+            self.matched = true;
+        }
+    }
+
+    /// Process anchor match events through the chain.
+    fn process_anchor_events(&mut self, p: u64, anchor_matched: &[bool]) {
+        let n = self.plan.anchors.len();
+
+        // Anchor[0] match.
+        if anchor_matched[0] {
+            // StartOfInput filter: accept only if the anchor starts at 0.
+            let anchor_len = self.anchor_length(0);
+            let start_ok = if self.plan.start_anchor == StartAnchorKind::StartOfInput {
+                p + 1 == anchor_len
+            } else {
+                true
+            };
+
+            if start_ok {
+                if !self.gap_stages.is_empty() {
+                    // Push to first interior gap stage.
+                    self.gap_stages[0].accepted_prev_ends.push_back(p);
+                } else if self.tail_state.is_some() {
+                    // Single anchor + tail gap.
+                    self.tail_state
+                        .as_mut()
+                        .unwrap()
+                        .accepted_final_anchor_ends
+                        .push_back(p);
+                }
+                // Activate anchor[1] if it exists.
+                if n > 1 && !self.anchor_active[1] {
+                    self.anchor_active[1] = true;
+                }
+            }
+        }
+
+        // Subsequent anchors.
+        for i in 0..self.plan.interior_gaps.len() {
+            let anchor_idx = i + 1;
+            if !anchor_matched[anchor_idx] {
+                continue;
+            }
+            let anchor_len = self.anchor_length(anchor_idx);
+            let s = p + 1 - anchor_len; // start position of this anchor
+
+            // Validate the preceding gap stage.
+            let valid = Self::validate_interior_gap(
+                &mut self.gap_stages[i],
+                &self.plan.interior_gaps[i],
+                s,
+            );
+
+            if valid {
+                let next_stage = i + 1;
+                if next_stage < self.gap_stages.len() {
+                    // Push to next interior gap stage.
+                    self.gap_stages[next_stage].accepted_prev_ends.push_back(p);
+                } else if self.tail_state.is_some() {
+                    // Final anchor before tail gap.
+                    self.tail_state
+                        .as_mut()
+                        .unwrap()
+                        .accepted_final_anchor_ends
+                        .push_back(p);
+                } else {
+                    // Final anchor, no tail gap → chain complete.
+                    self.matched_here = true;
+                }
+                // Activate the next anchor if it exists.
+                let next_anchor = anchor_idx + 1;
+                if next_anchor < n && !self.anchor_active[next_anchor] {
+                    self.anchor_active[next_anchor] = true;
+                }
+            }
+        }
+    }
+
+    /// Validate an interior gap stage: check if any accepted prior end
+    /// satisfies the gap constraints for a next-anchor start at `s`.
+    ///
+    /// Uses the destructive-pop strategy: expired and bad-byte-invalidated
+    /// entries are permanently removed (correct due to monotonicity).
+    fn validate_interior_gap(stage: &mut GapStageState, gap: &GapPlan, s: u64) -> bool {
+        // 1. Pop expired entries (gap too large for max_gap).
+        let min_valid_e = s.saturating_sub(1 + gap.max_gap as u64);
+        while let Some(&front) = stage.accepted_prev_ends.front() {
+            if front < min_valid_e {
+                stage.accepted_prev_ends.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // 2. Find most recent bad position before s.
+        let bad_before_s = stage.bad_positions.iter().rev().find(|&&b| b < s).copied();
+
+        // 3. Pop entries invalidated by bad bytes.
+        if let Some(bad) = bad_before_s {
+            while let Some(&front) = stage.accepted_prev_ends.front() {
+                if front < bad {
+                    stage.accepted_prev_ends.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // 4. Check if front satisfies min_gap.
+        if let Some(&e) = stage.accepted_prev_ends.front() {
+            if let Some(gap_len) = s.checked_sub(e + 1) {
+                gap_len >= gap.min_gap as u64
+            } else {
+                false // s <= e, anchors overlap
+            }
+        } else {
+            false // no valid entries
+        }
+    }
+
+    /// Check terminal gap validity at position `p`.
+    fn check_terminal_gap(&mut self, p: u64) {
+        let tail_gap = match &self.plan.tail_gap {
+            Some(g) => g,
+            None => return,
+        };
+        let tail_state = match &mut self.tail_state {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Expire entries where tail_len > max_gap.
+        while let Some(&e) = tail_state.accepted_final_anchor_ends.front() {
+            if p.saturating_sub(e) > tail_gap.max_gap as u64 {
+                tail_state.accepted_final_anchor_ends.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // Expire bad positions older than the oldest accepted end.
+        if let Some(&oldest_e) = tail_state.accepted_final_anchor_ends.front() {
+            while let Some(&front_b) = tail_state.bad_positions.front() {
+                if front_b <= oldest_e {
+                    tail_state.bad_positions.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Pop entries invalidated by bad bytes.
+        // After expiry, front of bad_positions (if any) is the earliest
+        // bad byte > oldest_e.  Pop accepted ends where e < front_b.
+        if let Some(&front_b) = tail_state.bad_positions.front() {
+            while let Some(&e) = tail_state.accepted_final_anchor_ends.front() {
+                if e < front_b {
+                    tail_state.accepted_final_anchor_ends.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Check if the front entry satisfies min_gap.
+        if let Some(&e) = tail_state.accepted_final_anchor_ends.front() {
+            let tail_len = p - e;
+            if tail_len >= tail_gap.min_gap as u64 {
+                self.matched_here = true;
+            }
+        }
+    }
+
+    /// Expire stale entries from interior gap stage queues.
+    fn expire_queues(&mut self, p: u64) {
+        for (i, gap) in self.plan.interior_gaps.iter().enumerate() {
+            // Compute expiry threshold before borrowing the stage mutably.
+            let next_anchor_len = match self.plan.anchors[i + 1].length_info {
+                AnchorLengthInfo::Fixed(len) => len as u64,
+            };
+            let stage = &mut self.gap_stages[i];
+
+            // Expire accepted ends that are too old.
+            // An entry `e` is stale when no future anchor start can
+            // form a gap within max_gap: e < p - max_gap - max_anchor_len.
+            let expiry = p
+                .saturating_sub(gap.max_gap as u64)
+                .saturating_sub(next_anchor_len);
+            while let Some(&front) = stage.accepted_prev_ends.front() {
+                if front < expiry {
+                    stage.accepted_prev_ends.pop_front();
+                } else {
+                    break;
+                }
+            }
+
+            // Expire bad positions older than the oldest accepted end.
+            if let Some(&oldest_e) = stage.accepted_prev_ends.front() {
+                while let Some(&front_b) = stage.bad_positions.front() {
+                    if front_b <= oldest_e {
+                        stage.bad_positions.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                // No accepted ends → all bad positions are irrelevant.
+                stage.bad_positions.clear();
+            }
+        }
+    }
+
+    /// Get the fixed byte length of anchor `i`.
+    fn anchor_length(&self, i: usize) -> u64 {
+        match self.plan.anchors[i].length_info {
+            AnchorLengthInfo::Fixed(len) => len as u64,
         }
     }
 }
@@ -1503,9 +1882,7 @@ mod tests {
             .unwrap_or_else(|| panic!("anchor should compile for pattern: {pattern}"));
         AnchorPlan {
             program,
-            length_info: AnchorLengthInfo::Fixed(
-                compute_fixed_length(&h).unwrap().len,
-            ),
+            length_info: AnchorLengthInfo::Fixed(compute_fixed_length(&h).unwrap().len),
         }
     }
 
@@ -1625,5 +2002,161 @@ mod tests {
         events.clear();
         runner.scan_chunk(b"yaby", 0, &mut |pos| events.push(pos));
         assert_eq!(events, vec![2]);
+    }
+
+    // -- BoundedGapMatcher --------------------------------------------------
+
+    /// Helper: build a plan and run the matcher, returning match result.
+    fn gap_match(pattern: &str, input: &[u8]) -> bool {
+        let h = hir(pattern);
+        let plan = probe(&h)
+            .unwrap_or_else(|| panic!("pattern should be recognized as bounded-gap: {pattern}"));
+        let mut m = BoundedGapMatcher::new(&plan);
+        m.chunk(input);
+        m.finish()
+    }
+
+    /// Helper: build a plan from merged HIR and run the matcher.
+    fn gap_match_merged(pattern: &str, input: &[u8]) -> bool {
+        let h = hir_merged(pattern);
+        let plan = probe(&h)
+            .unwrap_or_else(|| panic!("pattern should be recognized as bounded-gap: {pattern}"));
+        let mut m = BoundedGapMatcher::new(&plan);
+        m.chunk(input);
+        m.finish()
+    }
+
+    #[test]
+    fn test_matcher_simple_two_anchor() {
+        // abc.{0,10}xyz
+        assert!(gap_match(r"abc.{0,10}xyz", b"abc___xyz"));
+        assert!(gap_match(r"abc.{0,10}xyz", b"abcxyz")); // gap=0
+        assert!(!gap_match(r"abc.{0,10}xyz", b"abc"));
+        assert!(!gap_match(r"abc.{0,10}xyz", b"xyz"));
+        assert!(!gap_match(r"abc.{0,10}xyz", b"abc____________xyz")); // gap=12 > 10
+    }
+
+    #[test]
+    fn test_matcher_exact_gap() {
+        // ab.{3}cd → gap must be exactly 3
+        assert!(gap_match(r"ab.{3}cd", b"ab123cd"));
+        assert!(!gap_match(r"ab.{3}cd", b"ab12cd")); // gap=2
+        assert!(!gap_match(r"ab.{3}cd", b"ab1234cd")); // gap=4
+    }
+
+    #[test]
+    fn test_matcher_trailing_gap() {
+        // abc.{0,5} → match once "abc" found (min_gap=0)
+        assert!(gap_match(r"abc.{0,5}", b"abc"));
+        assert!(gap_match(r"abc.{0,5}", b"abcXXX"));
+        assert!(!gap_match(r"abc.{0,5}", b"xyz"));
+    }
+
+    #[test]
+    fn test_matcher_trailing_gap_min_nonzero() {
+        // abc.{3,5} → need at least 3 bytes after "abc"
+        assert!(!gap_match(r"abc.{3,5}", b"abc"));
+        assert!(!gap_match(r"abc.{3,5}", b"abcXX"));
+        assert!(gap_match(r"abc.{3,5}", b"abcXXX"));
+        assert!(gap_match(r"abc.{3,5}", b"abcXXXXX"));
+        assert!(gap_match(r"abc.{3,5}", b"abcXXXXXXXX")); // gap=8 > 5, but min=3 satisfied at some point
+    }
+
+    #[test]
+    fn test_matcher_constrained_gap() {
+        // ab[^/]{0,10}cd → gap bytes must not be '/'
+        assert!(gap_match(r"ab[^/]{0,10}cd", b"ab___cd"));
+        assert!(!gap_match(r"ab[^/]{0,10}cd", b"ab/cd")); // '/' in gap
+        assert!(gap_match(r"ab[^/]{0,10}cd", b"abcd")); // gap=0
+    }
+
+    #[test]
+    fn test_matcher_constrained_trailing_gap() {
+        // ab[^/]{0,10} → trailing gap rejects '/'
+        assert!(gap_match(r"ab[^/]{0,10}", b"ab"));
+        assert!(gap_match(r"ab[^/]{0,10}", b"abxyz"));
+        // Once a '/' is seen, the tail gap is invalidated for entries
+        // before the '/', but "ab" at a later position could still work.
+        assert!(gap_match(r"ab[^/]{0,10}", b"ab/ab"));
+    }
+
+    #[test]
+    fn test_matcher_three_anchor_chain() {
+        // ab.{0,5}cd.{0,5}ef
+        assert!(gap_match(r"ab.{0,5}cd.{0,5}ef", b"abcdef"));
+        assert!(gap_match(r"ab.{0,5}cd.{0,5}ef", b"ab__cd__ef"));
+        assert!(!gap_match(r"ab.{0,5}cd.{0,5}ef", b"abef"));
+    }
+
+    #[test]
+    fn test_matcher_start_anchor() {
+        // ^abc.{0,10}xyz → must start at position 0
+        assert!(gap_match(r"^abc.{0,10}xyz", b"abc___xyz"));
+        assert!(!gap_match(r"^abc.{0,10}xyz", b"_abc___xyz"));
+    }
+
+    #[test]
+    fn test_matcher_end_anchor() {
+        // abc.{0,10}xyz$ → must end at end-of-input
+        assert!(gap_match(r"abc.{0,10}xyz$", b"abc___xyz"));
+        assert!(!gap_match(r"abc.{0,10}xyz$", b"abc___xyz_"));
+    }
+
+    #[test]
+    fn test_matcher_both_anchors() {
+        // ^abc.{0,10}xyz$ → anchored both ends
+        assert!(gap_match(r"^abc.{0,10}xyz$", b"abc___xyz"));
+        assert!(!gap_match(r"^abc.{0,10}xyz$", b"_abc___xyz"));
+        assert!(!gap_match(r"^abc.{0,10}xyz$", b"abc___xyz_"));
+    }
+
+    #[test]
+    fn test_matcher_end_anchor_trailing_gap() {
+        // abc.{0,5}$ → must end at EOI
+        assert!(gap_match(r"abc.{0,5}$", b"abc"));
+        assert!(gap_match(r"abc.{0,5}$", b"abcXXX"));
+        assert!(!gap_match(r"abc.{0,5}$", b"abc______")); // 6 > 5
+        assert!(gap_match(r"abc.{0,5}$", b"__abc__"));
+    }
+
+    #[test]
+    fn test_matcher_multi_chunk() {
+        let h = hir(r"abc.{0,10}xyz");
+        let plan = probe(&h).expect("should recognise");
+        let mut m = BoundedGapMatcher::new(&plan);
+        m.chunk(b"ab");
+        m.chunk(b"c__");
+        m.chunk(b"_xy");
+        m.chunk(b"z");
+        assert!(m.finish());
+    }
+
+    #[test]
+    fn test_matcher_overlapping_matches() {
+        // a.{0,3}a → "aaa" has overlapping matches
+        assert!(gap_match(r"a.{0,3}a", b"aa")); // gap=0
+        assert!(gap_match(r"a.{0,3}a", b"a___a")); // gap=3
+        assert!(!gap_match(r"a.{0,3}a", b"a____a")); // gap=4 > 3
+    }
+
+    #[test]
+    fn test_matcher_merged_gaps() {
+        // abc.{0,10}.{0,20}xyz → gaps merge to .{0,30}
+        assert!(gap_match_merged(
+            r"abc.{0,10}.{0,20}xyz",
+            b"abc______________________________xyz"
+        )); // gap=30
+    }
+
+    #[test]
+    fn test_matcher_early_exit() {
+        // Once matched, further input doesn't change result.
+        let h = hir(r"ab.{0,5}cd");
+        let plan = probe(&h).expect("should recognise");
+        let mut m = BoundedGapMatcher::new(&plan);
+        m.chunk(b"abcd"); // match immediately
+        assert!(m.ismatch());
+        m.chunk(b"xxxxxxxxxxxxxxxx"); // should be skipped
+        assert!(m.finish());
     }
 }
