@@ -1045,6 +1045,11 @@ impl Regex {
             0
         }
     }
+    /// Return whether this regex has a bounded-gap execution plan.
+    pub fn has_bounded_gap_plan(&self) -> bool {
+        self.bounded_gap_plan.is_some()
+    }
+
     /// Return a [`RegexInfo`] snapshot of compiled regex diagnostics.
     pub fn info(&self) -> RegexInfo {
         // -- NFA state breakdown --
@@ -1922,51 +1927,6 @@ impl RegexBuilder {
             self.hir2postfix(sub)?;
             if i > 0 {
                 self.postfix.push(RegexHirNode::Catenate);
-            }
-        }
-        Ok(())
-    }
-
-    /// Emit postfix for a bounded repetition with the given min/max/sub.
-    ///
-    /// Used by the consecutive-repetition merger in the Concat handler.
-    /// The `max_repetition` check is skipped because the individual
-    /// repetitions were already validated by `regex-syntax`.
-    fn emit_bounded_repetition(&mut self, sub: &Hir, min: usize, max: usize) -> Result<(), Error> {
-        debug_assert!(min <= max);
-        if max == 0 {
-            return Ok(());
-        }
-        // Try to unroll.
-        let body_nfa = Self::estimate_nfa_states(sub);
-        let limit = self.config.max_unroll_states;
-        if min > 0 && self.try_unroll(min, max, body_nfa, limit, sub)? {
-            // Unrolled — no counter needed.
-        } else if min == 0
-            && max != usize::MAX
-            && self.try_unroll(1, max, body_nfa, limit.saturating_sub(1), sub)?
-        {
-            self.postfix.push(RegexHirNode::RepeatZeroOne);
-        } else if min > 0 {
-            let counter = self.next_counter()?;
-            let before = self.postfix.len();
-            self.hir2postfix(sub)?;
-            if self.postfix.len() > before {
-                self.postfix
-                    .push(RegexHirNode::CounterLoop { counter, min, max });
-            }
-        } else {
-            // {0,max}: lower to (body{1,max})?
-            let counter = self.next_counter()?;
-            let before = self.postfix.len();
-            self.hir2postfix(sub)?;
-            if self.postfix.len() > before {
-                self.postfix.push(RegexHirNode::CounterLoop {
-                    counter,
-                    min: 1,
-                    max,
-                });
-                self.postfix.push(RegexHirNode::RepeatZeroOne);
             }
         }
         Ok(())

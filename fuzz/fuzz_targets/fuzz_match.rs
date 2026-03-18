@@ -175,6 +175,22 @@ fuzz_target!(|data: &[u8]| {
                 );
             }
         }
+
+        // Bounded-gap engine (if eligible).
+        if let Some(mut m) = memory.bounded_gap_matcher(&re) {
+            set_phase("match (BoundedGap)");
+            m.chunk(input);
+            let bg_result = m.finish();
+            assert_eq!(
+                bg_result,
+                expected,
+                "BoundedGap mismatch for `{}` on input len={}: bg={}, oracle={}",
+                pattern,
+                input.len(),
+                bg_result,
+                expected
+            );
+        }
     }
 
     // Second pass: recompile without unrolling.
@@ -222,6 +238,22 @@ fuzz_target!(|data: &[u8]| {
                     expected
                 );
             }
+        }
+
+        // Bounded-gap engine (no-unroll, if eligible).
+        if let Some(mut m) = memory.bounded_gap_matcher(&re_no_unroll) {
+            set_phase("match (no-unroll BoundedGap)");
+            m.chunk(input);
+            let bg_result = m.finish();
+            assert_eq!(
+                bg_result,
+                expected,
+                "BoundedGap mismatch (no-unroll) for `{}` on input len={}: bg={}, oracle={}",
+                pattern,
+                input.len(),
+                bg_result,
+                expected
+            );
         }
     }
 });

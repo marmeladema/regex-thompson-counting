@@ -520,6 +520,151 @@ fn gen_matching_input(rng: &mut FuzzRng<'_>, node: &PatternNode, out: &mut Vec<u
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Bounded-gap pattern generation
+// ---------------------------------------------------------------------------
+
+/// Maximum gap bound for generated bounded-gap patterns.
+const BG_MAX_GAP: usize = 100;
+/// Maximum anchor length (sum of literal + exact-repetition pieces).
+const BG_MAX_ANCHOR_PIECES: usize = 4;
+
+/// Generate a pattern guaranteed to be recognised by the bounded-gap
+/// specialisation probe: `Anchor (Gap Anchor)* Gap?` with fixed-length,
+/// assertion-free anchors and single-byte bounded gaps.
+///
+/// Returns `(pattern_string, ast)` where the AST can be used for
+/// targeted input generation via [`generate_inputs`].
+pub fn generate_bounded_gap_pattern(rng: &mut FuzzRng<'_>) -> (String, PatternNode) {
+    // Decide chain shape.
+    let num_anchors = rng.range(1, 4); // 1–4 anchors
+    let has_tail_gap = num_anchors == 1 || rng.chance(40);
+
+    // Decide whole-pattern anchoring.
+    let start_anchored = rng.chance(25);
+    let end_anchored = rng.chance(25);
+
+    let mut pieces: Vec<PatternNode> = Vec::new();
+
+    if start_anchored {
+        pieces.push(PatternNode::AnchorStart);
+    }
+
+    for i in 0..num_anchors {
+        // Generate a fixed-length, assertion-free anchor.
+        pieces.push(gen_bg_anchor(rng));
+
+        // Interior gap between anchors.
+        if i < num_anchors - 1 {
+            pieces.push(gen_bg_gap(rng));
+        }
+    }
+
+    // Optional trailing gap.
+    if has_tail_gap {
+        pieces.push(gen_bg_gap(rng));
+    }
+
+    if end_anchored {
+        pieces.push(PatternNode::AnchorEnd);
+    }
+
+    let ast = if pieces.len() == 1 {
+        pieces.pop().unwrap()
+    } else {
+        PatternNode::Concat(pieces)
+    };
+
+    let mut pattern = String::new();
+    render_node(&ast, &mut pattern);
+    (pattern, ast)
+}
+
+/// Generate a fixed-length, assertion-free anchor fragment.
+///
+/// Produces a concatenation of 1–4 pieces, each being a literal byte
+/// or a fixed-count repetition of a single byte/class (e.g. `a{3}`).
+/// All branches of alternations have equal length.
+fn gen_bg_anchor(rng: &mut FuzzRng<'_>) -> PatternNode {
+    let num_pieces = rng.range(1, BG_MAX_ANCHOR_PIECES);
+    if num_pieces == 1 {
+        gen_bg_anchor_piece(rng)
+    } else {
+        let children: Vec<_> = (0..num_pieces).map(|_| gen_bg_anchor_piece(rng)).collect();
+        PatternNode::Concat(children)
+    }
+}
+
+/// Generate one fixed-length anchor piece: a literal, a byte class,
+/// or a fixed-count repetition.
+fn gen_bg_anchor_piece(rng: &mut FuzzRng<'_>) -> PatternNode {
+    match rng.choose(6) {
+        // Literal byte (3/6 = 50%).
+        0..=2 => {
+            let idx = rng.choose(LITERAL_POOL.len());
+            PatternNode::Literal(LITERAL_POOL[idx])
+        }
+        // Byte class (1/6 ≈ 17%).
+        3 => {
+            let num_ranges = rng.range(1, 3);
+            let mut ranges = Vec::with_capacity(num_ranges);
+            for _ in 0..num_ranges {
+                let lo = LITERAL_POOL[rng.choose(LITERAL_POOL.len())];
+                let hi_offset = rng.range(0, 5) as u8;
+                let hi = lo.saturating_add(hi_offset);
+                ranges.push((lo, hi));
+            }
+            PatternNode::Class(ranges)
+        }
+        // Fixed-count repetition of a byte/class (2/6 ≈ 33%).
+        _ => {
+            let count = rng.range(1, 6);
+            let body = match rng.choose(3) {
+                0 => PatternNode::Dot,
+                1 => {
+                    let idx = rng.choose(LITERAL_POOL.len());
+                    PatternNode::Literal(LITERAL_POOL[idx])
+                }
+                _ => {
+                    let lo = LITERAL_POOL[rng.choose(LITERAL_POOL.len())];
+                    let hi = lo.saturating_add(rng.range(0, 5) as u8);
+                    PatternNode::Class(vec![(lo, hi)])
+                }
+            };
+            PatternNode::Repeat {
+                body: Box::new(body),
+                kind: RepeatKind::Bounded {
+                    min: count,
+                    max: count,
+                },
+            }
+        }
+    }
+}
+
+/// Generate a bounded gap: a single-byte predicate with finite bounds.
+fn gen_bg_gap(rng: &mut FuzzRng<'_>) -> PatternNode {
+    let min = rng.range(0, 20);
+    let max = rng.range(min, BG_MAX_GAP);
+
+    // Gap body: dot (wildcard) or a byte class.
+    let body = match rng.choose(4) {
+        // Dot (75%) — most common in practice.
+        0..=2 => PatternNode::Dot,
+        // Byte class (25%) — e.g. [^/].
+        _ => {
+            let lo = LITERAL_POOL[rng.choose(LITERAL_POOL.len())];
+            let hi = lo.saturating_add(rng.range(0, 10) as u8);
+            PatternNode::Class(vec![(lo, hi)])
+        }
+    };
+
+    PatternNode::Repeat {
+        body: Box::new(body),
+        kind: RepeatKind::Bounded { min, max },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

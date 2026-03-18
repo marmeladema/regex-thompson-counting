@@ -1,19 +1,23 @@
-//! Fuzz target: cross-tier differential.
+//! Fuzz target: bounded-gap differential.
 //!
-//! The NFA simulator is the oracle — all eligible DFA tiers must produce
-//! the same `is_match` result.  This catches tier-specific bugs without
-//! needing an external crate.
+//! Generates patterns that are eligible for the bounded-gap engine,
+//! then compares bounded-gap execution directly against tier 0 (NFA),
+//! tier 1 (lazy DFA), and tier 2 (differential-counter DFA).
+//!
+//! Unlike `fuzz_match` and `fuzz_differential` which exercise all pattern
+//! shapes, this target ensures every iteration produces a bounded-gap
+//! pattern — no wasted iterations on patterns the specialisation rejects.
 //!
 //! Run with:
 //! ```sh
-//! cargo +nightly fuzz run fuzz_differential
+//! cargo +nightly fuzz run fuzz_bounded_gap
 //! ```
 
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
 
-use rethoc_engine::fuzz_gen::{generate_inputs, generate_pattern, FuzzRng};
+use rethoc_engine::fuzz_gen::{generate_bounded_gap_pattern, generate_inputs, FuzzRng};
 use rethoc_engine::{MatcherMemory, RegexBuilder};
 
 use std::cell::RefCell;
@@ -38,7 +42,7 @@ fn install_panic_hook() {
                             let phase = ph.borrow();
                             let input = inp.borrow();
                             eprintln!("\n╔══════════════════════════════════════════════════");
-                            eprintln!("║ FUZZ CRASH");
+                            eprintln!("║ FUZZ CRASH (fuzz_bounded_gap)");
                             eprintln!("║ Pattern: `{}`", *pat);
                             eprintln!("║ Phase:   {}", *phase);
                             if !input.is_empty() {
@@ -76,36 +80,36 @@ fuzz_target!(|data: &[u8]| {
     let mid = data.len() / 2;
     let (pattern_seed, input_seed) = data.split_at(mid);
 
-    let (pattern, ast) = generate_pattern(&mut FuzzRng::new(pattern_seed));
+    // Generate a pattern guaranteed to be bounded-gap eligible.
+    let (pattern, ast) = generate_bounded_gap_pattern(&mut FuzzRng::new(pattern_seed));
     let inputs = generate_inputs(&mut FuzzRng::new(input_seed), &ast);
 
     CURRENT_PATTERN.with(|p| *p.borrow_mut() = pattern.clone());
     CURRENT_INPUT.with(|i| i.borrow_mut().clear());
 
+    // Parse and compile.
     let hir = match parse_hir_bytes(&pattern) {
         Some(h) => h,
         None => return,
     };
 
+    set_phase("compilation");
     let mut builder = RegexBuilder::default();
-    set_phase("compilation (default unroll)");
     let re = match builder.build(&hir) {
         Ok(r) => r,
         Err(_) => return,
     };
 
-    // Computational budget: skip patterns that are too expensive under
-    // ASAN instrumentation.  Patterns with many NFA states (nested
-    // optionals) or large total input volume cause timeouts.
-    let info = re.info();
-    let num_states = info.memory.num_states;
+    // Skip if no bounded-gap plan (some patterns may get optimised
+    // away, e.g. all gaps normalised to {0,0}).
+    if !re.has_bounded_gap_plan() {
+        return;
+    }
+
+    // Computational budget.
     let total_input_bytes: usize = inputs.iter().map(|i| i.len()).sum();
     let max_input_len = inputs.iter().map(|i| i.len()).max().unwrap_or(0);
-    if num_states > 50
-        || total_input_bytes > 1000
-        || max_input_len > 200
-        || num_states * total_input_bytes > 15_000
-    {
+    if total_input_bytes > 2000 || max_input_len > 300 {
         return;
     }
 
@@ -114,7 +118,7 @@ fuzz_target!(|data: &[u8]| {
     for input in &inputs {
         set_input(input);
 
-        // NFA is the ground truth.
+        // NFA (tier 0) is the oracle.
         set_phase("match (NFA)");
         let mut m = match memory.matcher_for_tier(&re, 0) {
             Ok(m) => m,
@@ -123,106 +127,74 @@ fuzz_target!(|data: &[u8]| {
         m.chunk(input);
         let nfa_result = m.finish();
 
-        for tier in 1..=4u8 {
-            if let Ok(mut m) = memory.matcher_for_tier(&re, tier) {
-                set_phase(&format!("match (Tier {})", tier));
-                m.chunk(input);
-                let tier_result = m.finish();
-                assert_eq!(
-                    tier_result,
-                    nfa_result,
-                    "Tier {} disagrees with NFA for `{}` on input len={}: \
-                     tier{}={}, nfa={}",
-                    tier,
-                    pattern,
-                    input.len(),
-                    tier,
-                    tier_result,
-                    nfa_result
-                );
-            }
-        }
+        // Bounded-gap engine: full chunk.
+        set_phase("match (BoundedGap full-chunk)");
+        let mut m = memory
+            .bounded_gap_matcher(&re)
+            .expect("bounded-gap matcher must be available");
+        m.chunk(input);
+        let bg_result = m.finish();
+        assert_eq!(
+            bg_result,
+            nfa_result,
+            "BoundedGap (full-chunk) disagrees with NFA for `{}` on input len={}: \
+             bg={}, nfa={}",
+            pattern,
+            input.len(),
+            bg_result,
+            nfa_result
+        );
 
-        // Bounded-gap engine vs NFA.
-        if let Some(mut m) = memory.bounded_gap_matcher(&re) {
-            set_phase("match (BoundedGap)");
+        // Bounded-gap engine: byte-at-a-time.
+        set_phase("match (BoundedGap byte-at-a-time)");
+        let mut m = memory
+            .bounded_gap_matcher(&re)
+            .expect("bounded-gap matcher must be available");
+        for &b in input.iter() {
+            m.chunk(&[b]);
+        }
+        let bg_byte_result = m.finish();
+        assert_eq!(
+            bg_byte_result,
+            nfa_result,
+            "BoundedGap (byte-at-a-time) disagrees with NFA for `{}` on input len={}: \
+             bg={}, nfa={}",
+            pattern,
+            input.len(),
+            bg_byte_result,
+            nfa_result
+        );
+
+        // Tier 1 (lazy DFA) if eligible.
+        if let Ok(mut m) = memory.matcher_for_tier(&re, 1) {
+            set_phase("match (Tier 1)");
             m.chunk(input);
-            let bg_result = m.finish();
+            let t1_result = m.finish();
             assert_eq!(
-                bg_result,
+                t1_result,
                 nfa_result,
-                "BoundedGap disagrees with NFA for `{}` on input len={}: \
-                 bg={}, nfa={}",
+                "Tier 1 disagrees with NFA for `{}` on input len={}: \
+                 tier1={}, nfa={}",
                 pattern,
                 input.len(),
-                bg_result,
+                t1_result,
                 nfa_result
             );
         }
-    }
 
-    // Second pass: no unrolling.
-    set_phase("compilation (no-unroll)");
-    set_input(&[]);
-    builder.max_unroll_states(0);
-    let re_no_unroll = match builder.build(&hir) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-
-    // Re-check budget: no-unroll compilation may promote patterns to
-    // higher tiers with more expensive matching (e.g. Tier 4 with
-    // nested counter programs).
-    let info_nu = re_no_unroll.info();
-    let num_states_nu = info_nu.memory.num_states;
-    if num_states_nu > 50 || num_states_nu * total_input_bytes > 15_000 {
-        return;
-    }
-
-    for input in &inputs {
-        set_input(input);
-
-        set_phase("match (no-unroll NFA)");
-        let mut m = match memory.matcher_for_tier(&re_no_unroll, 0) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        m.chunk(input);
-        let nfa_result = m.finish();
-
-        for tier in 1..=4u8 {
-            if let Ok(mut m) = memory.matcher_for_tier(&re_no_unroll, tier) {
-                set_phase(&format!("match (no-unroll Tier {})", tier));
-                m.chunk(input);
-                let tier_result = m.finish();
-                assert_eq!(
-                    tier_result,
-                    nfa_result,
-                    "Tier {} disagrees with NFA (no-unroll) for `{}` on input len={}: \
-                     tier{}={}, nfa={}",
-                    tier,
-                    pattern,
-                    input.len(),
-                    tier,
-                    tier_result,
-                    nfa_result
-                );
-            }
-        }
-
-        // Bounded-gap engine vs NFA (no-unroll).
-        if let Some(mut m) = memory.bounded_gap_matcher(&re_no_unroll) {
-            set_phase("match (no-unroll BoundedGap)");
+        // Tier 2 (differential counters) if eligible.
+        if let Ok(mut m) = memory.matcher_for_tier(&re, 2) {
+            set_phase("match (Tier 2)");
             m.chunk(input);
-            let bg_result = m.finish();
+            let t2_result = m.finish();
             assert_eq!(
-                bg_result,
+                t2_result,
                 nfa_result,
-                "BoundedGap disagrees with NFA (no-unroll) for `{}` on input len={}: \
-                 bg={}, nfa={}",
+                "Tier 2 disagrees with NFA for `{}` on input len={}: \
+                 tier2={}, nfa={}",
                 pattern,
                 input.len(),
-                bg_result,
+                t2_result,
                 nfa_result
             );
         }

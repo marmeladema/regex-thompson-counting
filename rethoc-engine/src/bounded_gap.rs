@@ -108,6 +108,7 @@ pub(crate) struct AnchorProgram {
 /// tier's anchor scanner needs to emit end-position events.  The exact
 /// fields will be refined during Phase 3 (anchor runner implementation).
 #[derive(Debug)]
+#[allow(dead_code)] // Tier1/Tier2 variants reserved for future phases
 pub(crate) enum AnchorEngine {
     /// NFA simulation (Tier 0).
     Tier0(AnchorNfaProgram),
@@ -135,6 +136,7 @@ pub(crate) struct AnchorNfaProgram {
     /// Precomputed consuming leaves from the start state.
     pub(crate) start_closure: Box<[StateIdx]>,
     /// Whether the empty string matches (start closure reaches Match).
+    #[allow(dead_code)] // reserved for future use (variable-length anchors)
     pub(crate) start_closure_matches: bool,
 }
 
@@ -191,6 +193,7 @@ pub(crate) enum EndAnchorKind {
 /// detection and other top-level-only specialisations.  This prevents
 /// recursive specialisation trees and keeps the ownership graph flat.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // reserved for explicit CompileMode gating in future phases
 pub(crate) enum CompileMode {
     /// Normal top-level compilation (specialisation probes enabled).
     TopLevel,
@@ -253,11 +256,13 @@ fn compile_anchor_program(pieces: &[&Hir], config: &RegexConfig) -> Option<Ancho
 ///
 /// Delegates NFA stepping to [`RunnerScratch`] while providing a
 /// simpler API with owned scratch.
+#[cfg(test)]
 pub(crate) struct AnchorRunner<'a> {
     program: &'a AnchorNfaProgram,
     scratch: RunnerScratch,
 }
 
+#[cfg(test)]
 impl<'a> AnchorRunner<'a> {
     /// Create a new runner from an [`AnchorPlan`].
     pub(crate) fn new(plan: &'a AnchorPlan) -> Self {

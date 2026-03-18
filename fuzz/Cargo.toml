@@ -33,3 +33,8 @@ doc = false
 name = "fuzz_compile"
 path = "fuzz_targets/fuzz_compile.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_bounded_gap"
+path = "fuzz_targets/fuzz_bounded_gap.rs"
+doc = false
