@@ -598,7 +598,7 @@ mod tests {
             pattern,
             crate::RegexConfig {
                 max_unroll_states: 0,
-                merge_repetitions: false,
+                optimize_hir: false,
                 ..Default::default()
             },
         )
@@ -892,7 +892,7 @@ mod tests {
             pattern,
             crate::RegexConfig {
                 max_unroll_states: 0,
-                merge_repetitions: false,
+                optimize_hir: false,
                 ..Default::default()
             },
         )

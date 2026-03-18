@@ -1186,7 +1186,7 @@ pub(crate) fn try_build_bounded_gap_plan(
             }
             if last_was_gap {
                 // Adjacent gaps — the HIR should already have same-body
-                // repetitions merged by optimize(hir, merge_repetitions=true)
+                // repetitions merged by optimize(hir, optimize_hir=true)
                 // before the probe runs.  If we still see adjacent gaps,
                 // they have different predicates and can't be merged.
                 return None;
@@ -1425,7 +1425,7 @@ mod tests {
     /// matching what the bounded-gap probe sees in `build()`.
     fn hir_merged(pattern: &str) -> Hir {
         let h = parse_hir(pattern).expect("test pattern should parse");
-        crate::hir_optimize::optimize(h, true)
+        crate::hir_optimize::optimize(h)
     }
 
     // -- flatten_top_level_concat -------------------------------------------
@@ -1976,14 +1976,22 @@ mod tests {
     }
 
     #[test]
-    fn test_probe_trailing_adjacent_gaps_merged() {
-        // foo.{0,10}.{0,20} → optimize(merge=true) merges to .{0,30}
+    fn test_probe_trailing_adjacent_gaps_merged_and_stripped() {
+        // foo.{0,10}.{0,20} → optimize(merge=true) merges to foo.{0,30}
+        // → trailing gap stripped (min=0, irrelevant unanchored) → just "foo"
+        // → no gaps → probe rejects (correctly, it's just a literal)
         let h = hir_merged(r"foo.{0,10}.{0,20}");
-        let plan = probe(&h).expect("should recognise merged trailing gaps");
+        assert!(probe(&h).is_none());
+    }
+
+    #[test]
+    fn test_probe_trailing_gap_with_min_survives() {
+        // foo.{3,10}.{3,20} → merges to foo.{6,30} → min=6, NOT stripped
+        let h = hir_merged(r"foo.{3,10}.{3,20}");
+        let plan = probe(&h).expect("should recognise merged trailing gap with min>0");
         assert_eq!(plan.anchors.len(), 1);
-        assert_eq!(plan.interior_gaps.len(), 0);
-        let tail = plan.tail_gap.as_ref().expect("should have merged tail gap");
-        assert_eq!(tail.min_gap, 0);
+        let tail = plan.tail_gap.as_ref().expect("should have tail gap");
+        assert_eq!(tail.min_gap, 6);
         assert_eq!(tail.max_gap, 30);
     }
 

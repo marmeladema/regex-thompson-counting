@@ -232,7 +232,7 @@ execution paths while preserving multi-counter structure.
 
 **Key implication for debugging:** A test entry with `min_tier: 1` and a simple pattern like
 `\b\w{3,5}\b` will be tested on Tier 1 with default unrolling, BUT ALSO on Tier 2/3 when the
-macro re-runs with `unroll_limit=0` + `merge_repetitions=false` (which forces counter-based
+macro re-runs with `unroll_limit=0` + `optimize_hir=false` (which forces counter-based
 execution, promoting the pattern to higher tiers). So a Tier 3 bug can cause failures in tests
 whose `min_tier` is 1. When you see "Tier3 chunk mismatch" in a test failure, it's the
 `unroll_limit=0` re-run that failed.
@@ -261,8 +261,8 @@ cargo run --release -- dot '<pattern>'                  # Graphviz DOT output
 cargo run --release -- match --tier 2 '<pattern>' 'input' # force a specific tier
 cargo run --release -- info --unroll-limit 0 '<pattern>'  # disable unrolling (force counters)
 cargo run --release -- match --unroll-limit 0 '<pattern>' 'input' # match with counters only
-cargo run --release -- info --no-merge '<pattern>'       # disable same-body repetition merging
-cargo run --release -- match --no-merge --unroll-limit 0 '<pattern>' 'input' # no merge + no unroll
+cargo run --release -- info --optimize-hir false '<pattern>'  # disable HIR optimisations
+cargo run --release -- match --optimize-hir false --unroll-limit 0 '<pattern>' 'input' # no opt + no unroll
 cargo run --release -- info --max-states 4096 '<pattern>'  # raise estimated-states limit (default: 2048)
 cargo run --release -- grep '<pattern>' file.txt          # print matching lines from a file
 cat file.txt | cargo run --release -- grep '<pattern>'    # print matching lines from stdin
@@ -360,8 +360,8 @@ When fuzzing discovers bugs, follow this discipline:
     cargo run --release -- match --debug --chunk-size 1 --tier 3 '<pattern>' '<input>'
     # Combine: force tier 3 without unrolling:
     cargo run --release -- match --debug --chunk-size 1 --tier 3 --unroll-limit 0 '<pattern>' '<input>'
-    # Disable repetition merging (prevents .{0,N}.{0,M} → .{0,N+M}):
-    cargo run --release -- match --debug --chunk-size 1 --no-merge --unroll-limit 0 '<pattern>' '<input>'
+    # Disable HIR optimisations (prevents .{0,N}.{0,M} → .{0,N+M}):
+    cargo run --release -- match --debug --chunk-size 1 --optimize-hir false --unroll-limit 0 '<pattern>' '<input>'
    ```
    The `[init]` line prints full `Debug` (struct fields, NFA states, cache
    details).  Each subsequent `[after chunk ...]` line prints compact

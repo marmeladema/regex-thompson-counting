@@ -962,7 +962,7 @@ pub(crate) fn parse_hir(pattern: &str) -> Result<Hir, Error> {
         .build()
         .translate(pattern, &ast)
         .map_err(|e| Error::Translate(e.to_string()))?;
-    Ok(hir_optimize::optimize(hir, false))
+    Ok(hir_optimize::normalize(hir))
 }
 
 impl Regex {
@@ -1377,13 +1377,17 @@ pub struct RegexConfig {
     /// Set to 0 to disable unrolling entirely (all bounded repetitions
     /// use counters).  Default: 32.
     pub max_unroll_states: usize,
-    /// Whether to merge adjacent bounded repetitions with identical
-    /// bodies into a single repetition (e.g. `.{0,1000}.{0,1000}` is
-    /// rewritten to `.{0,2000}`).
+    /// Enable HIR-level optimisations: merge adjacent same-body bounded
+    /// repetitions (e.g. `.{0,1000}.{0,1000}` → `.{0,2000}`), and strip
+    /// semantically irrelevant leading/trailing gaps with `min == 0`
+    /// from unanchored concatenations.
     ///
-    /// Merging reduces the number of counters and often enables a
+    /// These optimisations reduce counter count and often enable a
     /// faster execution tier.  Default: `true`.
-    pub merge_repetitions: bool,
+    ///
+    /// Set to `false` for debugging to force counter-based execution
+    /// paths that would otherwise be optimised away.
+    pub optimize_hir: bool,
     /// Maximum estimated fully-unrolled state count allowed for a
     /// pattern.  Patterns whose estimated cost (as if every bounded
     /// repetition were fully expanded) exceeds this limit are rejected
@@ -1399,7 +1403,7 @@ impl Default for RegexConfig {
         Self {
             max_repetition: 1000,
             max_unroll_states: DEFAULT_MAX_UNROLL_STATES,
-            merge_repetitions: true,
+            optimize_hir: true,
             max_estimated_states: 2048,
         }
     }
@@ -1487,10 +1491,10 @@ impl RegexBuilder {
         self
     }
 
-    /// Enable or disable merging of consecutive bounded repetitions
-    /// with identical bodies.  Default: true.
-    pub fn merge_repetitions(&mut self, enable: bool) -> &mut Self {
-        self.config.merge_repetitions = enable;
+    /// Enable or disable HIR-level optimisations (repetition merging,
+    /// irrelevant gap stripping).  Default: true.
+    pub fn optimize_hir(&mut self, enable: bool) -> &mut Self {
+        self.config.optimize_hir = enable;
         self
     }
 
@@ -2029,9 +2033,9 @@ impl RegexBuilder {
             }
             HirKind::Capture(cap) => self.hir2postfix(&cap.sub),
             HirKind::Concat(children) => {
-                // Repetition merging (`.{0,10}.{0,10}` → `.{0,20}`) is now
-                // handled by hir_optimize::optimize(hir, merge_repetitions=true)
-                // before hir2postfix is called.
+                // Repetition merging (`.{0,10}.{0,10}` → `.{0,20}`) and
+                // boundary gap stripping are handled by
+                // hir_optimize::optimize() before hir2postfix is called.
                 let mut count = 0;
                 for child in children {
                     let before = self.postfix.len();
@@ -2433,13 +2437,15 @@ impl RegexBuilder {
             return Err(Error::PatternTooComplex { estimated, limit });
         }
 
-        // Re-optimize HIR with repetition merging when configured.
-        // The first optimize() in parse_hir() runs without merging;
-        // this pass adds same-body repetition merging when enabled.
-        let merged_hir;
-        let compile_hir = if self.config.merge_repetitions {
-            merged_hir = hir_optimize::optimize(hir.clone(), true);
-            &merged_hir
+        // Full HIR optimization when configured: merge adjacent
+        // repetitions, strip irrelevant leading/trailing gaps.
+        // parse_hir() only did normalization (capture strip, collapse,
+        // dedup).  This pass is skipped when optimize_hir=false to
+        // preserve multi-counter structure for testing.
+        let optimized_hir;
+        let compile_hir = if self.config.optimize_hir {
+            optimized_hir = hir_optimize::optimize(hir.clone());
+            &optimized_hir
         } else {
             hir
         };
@@ -2871,13 +2877,12 @@ impl RegexBuilder {
             tier3_eligible,
             tier3_analysis,
             tier4_eligible,
-            // Bounded-gap probe: always merge repetitions for widest
-            // recognition, even when config.merge_repetitions is false.
-            bounded_gap_plan: if self.config.merge_repetitions {
-                // compile_hir already has repetitions merged.
+            // Bounded-gap probe: always optimize for widest recognition,
+            // even when config.optimize_hir is false.
+            bounded_gap_plan: if self.config.optimize_hir {
                 bounded_gap::try_build_bounded_gap_plan(compile_hir, &self.config)
             } else {
-                let probe_hir = hir_optimize::optimize(hir.clone(), true);
+                let probe_hir = hir_optimize::optimize(hir.clone());
                 bounded_gap::try_build_bounded_gap_plan(&probe_hir, &self.config)
             },
         })
@@ -5180,11 +5185,13 @@ mod tests {
         // For tier-1 patterns, the estimate should exactly predict the
         // compiled state count (minus Match).  Tier 1 means everything
         // was fully unrolled — no counters, so the estimate and reality
-        // should agree.
+        // should agree.  Use the optimised HIR (same as build()) to
+        // account for gap stripping.
         if actual_tier == 1 {
             let hir = super::parse_hir(pattern)
                 .expect("parse_hir should succeed for a compilable pattern");
-            let estimated = RegexBuilder::estimate_nfa_states(&hir);
+            let optimised = super::hir_optimize::optimize(hir);
+            let estimated = RegexBuilder::estimate_nfa_states(&optimised);
             let actual_states = re.nfa.states.len() - 1; // exclude Match
             assert_eq!(
                 estimated, actual_states,
@@ -6947,7 +6954,7 @@ mod tests {
         }
         test_unanchored_star_literal {
             pattern: "a*b",
-            memory: 996,
+            memory: 930,
             min_tier: 1,
             inputs: [
                 ("b", true),
@@ -7895,7 +7902,7 @@ mod tests {
         }
         test_unanchored_question_mark {
             pattern: "a?b",
-            memory: 996,
+            memory: 930,
             min_tier: 1,
             inputs: [
                 ("ab", true),
@@ -10370,8 +10377,8 @@ mod tests {
         // range merge at 10 origins, 1000 max iterations.
         test_tier3_varlen_large_body_high_count {
             pattern: ".{0,1000}(.{1,10}){0,1000}c",
-            memory: 1493,
-            min_tier: 3,
+            memory: 930,
+            min_tier: 1, // was 3 before leading gaps stripped by HIR opt
             inputs: [
                 ("c", true),
                 ("xc", true),
@@ -10567,8 +10574,8 @@ mod tests {
         // was overwritten to false on every byte, causing false negatives.
         test_tier3_counter_free_mae_optional_skip {
             pattern: "([b-ed-ie-f].{4,43})?$",
-            memory: 1128,
-            min_tier: 2,
+            memory: 930,
+            min_tier: 1, // was 2 before leading (){0,1} stripped by HIR opt
             inputs: [
                 ("zzz", true),       // optional group skipped, $ matches at end
                 ("", true),          // empty input, $ matches
@@ -11162,8 +11169,8 @@ mod tests {
         // The `?` makes every input match via the empty-to-`$` path.
         test_tier3_counter_free_mae_optional_group {
             pattern: r"([b-e].+{4,43})?$",
-            memory: 1128,
-            min_tier: 3,
+            memory: 930,
+            min_tier: 1, // was 3 before leading (){0,1} stripped by HIR opt
             inputs: [
                 ("zzz", true),
                 ("", true),
@@ -11346,7 +11353,7 @@ mod tests {
         // path after \b, AND consuming a{2,3} is also reachable.
         test_bug53_mixed_match_consuming_unanchored {
             pattern: r".{3,5}\b(a{2,3})?",
-            memory: 1227,
+            memory: 1095,
             min_tier: 1,
             inputs: [
                 ("abc", true),              // .{3} + \b(c→eoi) + skip
@@ -11427,7 +11434,7 @@ mod tests {
         // match was missed — producing a false negative.
         test_tier3_post_break_tail_advance_match {
             pattern: r"^c{3,5}c{1,5}cee?",
-            memory: 1392,
+            memory: 1326,
             min_tier: 1,
             inputs: [
                 ("ccccce", true),               // ccc + c + c + e (+ empty e?)
@@ -11983,8 +11990,8 @@ mod tests {
         // target reached Match directly were never detected.
         test_tier3_byte_table_tail_direct_match {
             pattern: r"c{0,32}.{6,36}a?c?x",
-            memory: 2319,
-            min_tier: 3,
+            memory: 2186,
+            min_tier: 2, // was 3 before leading c{0,32} stripped by HIR opt
             inputs: [
                 ("aaaaaax", true),      // Bug 47: ByteTable tail 'x' → Match
                 ("aaaaaacx", true),     // tail 'c' → 11, then 'x' → Match
@@ -12863,7 +12870,7 @@ mod tests {
         pattern.push('$');
         let mut builder = RegexBuilder::default();
         builder.max_unroll_states(0);
-        builder.merge_repetitions(false);
+        builder.optimize_hir(false);
         let hir = super::parse_hir(&pattern).unwrap();
         let result = builder.build(&hir);
         assert!(
@@ -12883,7 +12890,7 @@ mod tests {
         pattern.push('$');
         let mut builder = RegexBuilder::default();
         builder.max_unroll_states(0);
-        builder.merge_repetitions(false);
+        builder.optimize_hir(false);
         let hir = super::parse_hir(&pattern).unwrap();
         let result = builder.build(&hir);
         assert!(
@@ -13100,7 +13107,7 @@ mod tests {
         // counter-based code paths.  Also disable merging so that
         // multi-counter patterns retain their counter structure.
         builder.max_unroll_states(0);
-        builder.merge_repetitions(false);
+        builder.optimize_hir(false);
         if let Ok(re_no_unroll) = builder.build(&hir) {
             for input in inputs {
                 let expected = oracle.is_match(input);

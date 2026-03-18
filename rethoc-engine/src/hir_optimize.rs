@@ -38,13 +38,72 @@ use std::mem;
 
 use regex_syntax::hir::{Hir, HirKind, Repetition};
 
-/// Optimize an HIR tree by stripping captures, collapsing nested
-/// quantifiers, and deduplicating alternation branches.
+/// Normalize an HIR tree: strip captures, collapse nested quantifiers,
+/// and deduplicate alternation branches.
 ///
-/// When `merge_repetitions` is `true`, adjacent bounded repetitions
-/// with identical bodies in a `Concat` are merged into one.
-/// E.g. `.{0,10}.{0,20}` → `.{0,30}`.
-pub(crate) fn optimize(hir: Hir, merge_repetitions: bool) -> Hir {
+/// Always safe to call — does not change matching semantics.  Called
+/// by `parse_hir` on every pattern.
+pub(crate) fn normalize(hir: Hir) -> Hir {
+    normalize_inner(hir)
+}
+
+/// Full HIR optimization: everything in [`normalize`] plus merging
+/// adjacent same-body bounded repetitions and stripping semantically
+/// irrelevant leading/trailing `Repetition { min: 0 }` from the
+/// top-level unanchored concatenation.
+///
+/// Gated by [`RegexConfig::optimize_hir`](crate::RegexConfig::optimize_hir).
+pub(crate) fn optimize(hir: Hir) -> Hir {
+    let result = optimize_inner(hir);
+    // Strip irrelevant boundary gaps at the outermost level only.
+    // This is NOT safe inside nested concats (the surrounding
+    // context — groups, alternations, anchors — may make the gap
+    // semantically relevant).
+    if !matches!(result.kind(), HirKind::Concat(_)) {
+        return result;
+    }
+    match result.into_kind() {
+        HirKind::Concat(mut subs) => {
+            strip_leading_gaps(&mut subs);
+            strip_trailing_gaps(&mut subs);
+            Hir::concat(subs)
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Recursive normalization (no merge, no strip).
+fn normalize_inner(hir: Hir) -> Hir {
+    match hir.into_kind() {
+        HirKind::Empty => Hir::empty(),
+        HirKind::Literal(lit) => Hir::literal(lit.0),
+        HirKind::Class(cls) => Hir::class(cls),
+        HirKind::Look(look) => Hir::look(look),
+        HirKind::Capture(cap) => normalize_inner(*cap.sub),
+        HirKind::Concat(mut subs) => {
+            for sub in subs.iter_mut() {
+                let owned = mem::replace(sub, Hir::empty());
+                *sub = normalize_inner(owned);
+            }
+            Hir::concat(subs)
+        }
+        HirKind::Alternation(mut subs) => {
+            for sub in subs.iter_mut() {
+                let owned = mem::replace(sub, Hir::empty());
+                *sub = normalize_inner(owned);
+            }
+            dedup_branches(&mut subs);
+            Hir::alternation(subs)
+        }
+        HirKind::Repetition(rep) => {
+            let sub = normalize_inner(*rep.sub);
+            collapse_repetition(rep.min, rep.max, rep.greedy, sub)
+        }
+    }
+}
+
+/// Recursive optimization (merge + normalize, no top-level strip).
+fn optimize_inner(hir: Hir) -> Hir {
     match hir.into_kind() {
         // Leaf nodes — pass through unchanged.
         HirKind::Empty => Hir::empty(),
@@ -53,22 +112,20 @@ pub(crate) fn optimize(hir: Hir, merge_repetitions: bool) -> Hir {
         HirKind::Look(look) => Hir::look(look),
 
         // Strip captures — our engine ignores capture groups.
-        HirKind::Capture(cap) => optimize(*cap.sub, merge_repetitions),
+        HirKind::Capture(cap) => optimize_inner(*cap.sub),
 
-        // Concatenation — optimize children in place, optionally merge
-        // adjacent repetitions, let smart constructor flatten/merge.
+        // Concatenation — optimize children, merge adjacent repetitions.
+        // Boundary gap stripping is NOT done here — it's only valid at
+        // the outermost concat level, applied by `optimize()`.
         HirKind::Concat(mut subs) => {
-            optimize_children(&mut subs, merge_repetitions);
-            if merge_repetitions {
-                merge_adjacent_repetitions(&mut subs);
-            }
+            optimize_children(&mut subs);
+            merge_adjacent_repetitions(&mut subs);
             Hir::concat(subs)
         }
 
-        // Alternation — optimize children in place, deduplicate,
-        // reconstruct.
+        // Alternation — optimize children, deduplicate.
         HirKind::Alternation(mut subs) => {
-            optimize_children(&mut subs, merge_repetitions);
+            optimize_children(&mut subs);
             dedup_branches(&mut subs);
             Hir::alternation(subs)
         }
@@ -76,17 +133,17 @@ pub(crate) fn optimize(hir: Hir, merge_repetitions: bool) -> Hir {
         // Repetition — optimize sub, then try to collapse nested
         // quantifiers.
         HirKind::Repetition(rep) => {
-            let sub = optimize(*rep.sub, merge_repetitions);
+            let sub = optimize_inner(*rep.sub);
             collapse_repetition(rep.min, rep.max, rep.greedy, sub)
         }
     }
 }
 
 /// Optimize each child in `subs` in place, reusing the Vec allocation.
-fn optimize_children(subs: &mut [Hir], merge_repetitions: bool) {
+fn optimize_children(subs: &mut [Hir]) {
     for sub in subs.iter_mut() {
         let owned = mem::replace(sub, Hir::empty());
-        *sub = optimize(owned, merge_repetitions);
+        *sub = optimize_inner(owned);
     }
 }
 
@@ -147,6 +204,43 @@ fn merge_adjacent_repetitions(subs: &mut [Hir]) {
             None
         };
         i = dominated.unwrap_or(i + 1);
+    }
+}
+
+/// Strip semantically irrelevant leading gaps from a `Concat`.
+///
+/// In an unanchored existence-only engine, a leading `Repetition { min: 0 }`
+/// is irrelevant: the engine tries every position, so allowing 0–K bytes
+/// of anything before the real pattern adds no constraint.
+///
+/// Stops when the first child is not a droppable repetition (including
+/// when it's a `Look::Start` anchor, which makes the gap meaningful).
+fn strip_leading_gaps(subs: &mut Vec<Hir>) {
+    while let Some(first) = subs.first() {
+        if let HirKind::Repetition(rep) = first.kind()
+            && rep.min == 0
+        {
+            subs.remove(0);
+            continue;
+        }
+        break;
+    }
+}
+
+/// Strip semantically irrelevant trailing gaps from a `Concat`.
+///
+/// Same reasoning as [`strip_leading_gaps`]: a trailing
+/// `Repetition { min: 0 }` after the real pattern adds no constraint
+/// for existence matching, unless followed by a `Look::End` anchor.
+fn strip_trailing_gaps(subs: &mut Vec<Hir>) {
+    while let Some(last) = subs.last() {
+        if let HirKind::Repetition(rep) = last.kind()
+            && rep.min == 0
+        {
+            subs.pop();
+            continue;
+        }
+        break;
     }
 }
 
@@ -245,7 +339,7 @@ mod tests {
             .build()
             .translate(pattern, &ast)
             .unwrap();
-        optimize(hir, false)
+        normalize(hir)
     }
 
     /// Helper: parse a pattern to HIR without optimization (raw).
@@ -260,6 +354,12 @@ mod tests {
             .build()
             .translate(pattern, &ast)
             .unwrap()
+    }
+
+    /// Helper: parse + full optimize (normalize + merge + strip).
+    fn opt_full(pattern: &str) -> Hir {
+        let hir = raw(pattern);
+        optimize(hir)
     }
 
     /// Assert that optimizing `input` produces the same HIR as the
@@ -428,5 +528,219 @@ mod tests {
     fn test_deep_capture_and_collapse() {
         // (((a?))?)? → a?
         assert_opt("(((a?)?)?)", "a?");
+    }
+
+    /// Assert that fully optimizing `input` (with merge + strip) produces
+    /// the same HIR as the raw parse of `expected`.
+    fn assert_opt_full(input: &str, expected: &str) {
+        let optimized = opt_full(input);
+        let expected_hir = raw(expected);
+        assert_eq!(
+            optimized, expected_hir,
+            "\noptimize_full({input:?}) produced:\n  {optimized:?}\n\
+             expected (from {expected:?}):\n  {expected_hir:?}"
+        );
+    }
+
+    // ── Leading gap stripping ──
+
+    #[test]
+    fn test_strip_leading_wildcard_gap() {
+        // .{0,10}foo → foo (leading wildcard gap irrelevant unanchored)
+        assert_opt_full(".{0,10}foo", "foo");
+    }
+
+    #[test]
+    fn test_strip_leading_class_gap() {
+        // [^/]{0,20}foo → foo
+        assert_opt_full("[^/]{0,20}foo", "foo");
+    }
+
+    #[test]
+    fn test_strip_leading_star() {
+        // a*foo → foo (a* = a{0,∞}, min=0)
+        assert_opt_full("a*foo", "foo");
+    }
+
+    #[test]
+    fn test_strip_leading_optional() {
+        // a?foo → foo (a? = a{0,1}, min=0)
+        assert_opt_full("a?foo", "foo");
+    }
+
+    #[test]
+    fn test_strip_leading_multi_byte_body() {
+        // (abc){0,5}foo → foo (multi-byte body, still min=0)
+        assert_opt_full("(abc){0,5}foo", "foo");
+    }
+
+    #[test]
+    fn test_strip_leading_chained() {
+        // .{0,5}.{0,10}foo → merged to .{0,15}foo → stripped → foo
+        assert_opt_full(".{0,5}.{0,10}foo", "foo");
+    }
+
+    #[test]
+    fn test_no_strip_leading_min_nonzero() {
+        // .{3,10}foo → NOT stripped (min=3 is meaningful)
+        assert_opt_full(".{3,10}foo", ".{3,10}foo");
+    }
+
+    #[test]
+    fn test_no_strip_leading_plus() {
+        // a+foo → NOT stripped (a+ = a{1,∞}, min=1)
+        assert_opt_full("a+foo", "a+foo");
+    }
+
+    #[test]
+    fn test_no_strip_leading_anchored_start() {
+        // ^.{0,10}foo → NOT stripped (^ makes gap meaningful)
+        assert_opt_full("^.{0,10}foo", "^.{0,10}foo");
+    }
+
+    #[test]
+    fn test_no_strip_leading_anchored_startlf() {
+        // (?m:^).{0,10}foo → NOT stripped
+        assert_opt_full("(?m:^).{0,10}foo", "(?m:^).{0,10}foo");
+    }
+
+    // ── Trailing gap stripping ──
+
+    #[test]
+    fn test_strip_trailing_wildcard_gap() {
+        // foo.{0,10} → foo
+        assert_opt_full("foo.{0,10}", "foo");
+    }
+
+    #[test]
+    fn test_strip_trailing_class_gap() {
+        // foo[^/]{0,20} → foo
+        assert_opt_full("foo[^/]{0,20}", "foo");
+    }
+
+    #[test]
+    fn test_strip_trailing_star() {
+        // fooa* → foo
+        assert_opt_full("fooa*", "foo");
+    }
+
+    #[test]
+    fn test_strip_trailing_optional() {
+        // fooa? → foo
+        assert_opt_full("fooa?", "foo");
+    }
+
+    #[test]
+    fn test_no_strip_trailing_min_nonzero() {
+        // foo.{3,10} → NOT stripped
+        assert_opt_full("foo.{3,10}", "foo.{3,10}");
+    }
+
+    #[test]
+    fn test_no_strip_trailing_anchored_end() {
+        // foo.{0,10}$ → NOT stripped ($ makes gap meaningful)
+        assert_opt_full("foo.{0,10}$", "foo.{0,10}$");
+    }
+
+    #[test]
+    fn test_no_strip_trailing_anchored_endlf() {
+        // foo.{0,10}(?m:$) → NOT stripped
+        assert_opt_full("foo.{0,10}(?m:$)", "foo.{0,10}(?m:$)");
+    }
+
+    // ── Both sides ──
+
+    #[test]
+    fn test_strip_both_sides() {
+        // .{0,5}foo.{0,5} → foo
+        assert_opt_full(".{0,5}foo.{0,5}", "foo");
+    }
+
+    #[test]
+    fn test_strip_leading_only() {
+        // .{0,5}foo.{3,5} → foo.{3,5}
+        assert_opt_full(".{0,5}foo.{3,5}", "foo.{3,5}");
+    }
+
+    #[test]
+    fn test_strip_trailing_only() {
+        // .{3,5}foo.{0,5} → .{3,5}foo
+        assert_opt_full(".{3,5}foo.{0,5}", ".{3,5}foo");
+    }
+
+    // ── Nested anchors / groups ──
+
+    #[test]
+    fn test_no_strip_nested_start_anchor_in_alternation() {
+        // (^.{0,10}foo)|bar → branch 1 has ^, NOT stripped; branch 2 unchanged
+        // The top-level is an Alternation, not a Concat — no stripping at all
+        // Captures stripped by optimize, so expected uses non-capturing syntax.
+        assert_opt_full("(^.{0,10}foo)|bar", "(?:^.{0,10}foo)|bar");
+    }
+
+    #[test]
+    fn test_no_strip_inside_nested_concat() {
+        // Nested a?a? inside a group must NOT be stripped
+        // ^(a?a?)?$ — the a? inside the group is semantically relevant
+        assert_opt_full("^(a?a?)?$", "^(?:a?a?)?$");
+    }
+
+    #[test]
+    fn test_no_strip_inside_alternation_branch() {
+        // (a?x|b?y) — a? and b? inside branches are NOT stripped
+        // (they're in nested concats, not top-level)
+        assert_opt_full("(a?x|b?y)", "(?:a?x|b?y)");
+    }
+
+    #[test]
+    fn test_strip_top_level_optional_group_unanchored() {
+        // (foo){0,3}bar → bar (optional group stripped, capture stripped)
+        assert_opt_full("(foo){0,3}bar", "bar");
+    }
+
+    #[test]
+    fn test_no_strip_top_level_optional_group_anchored() {
+        // ^(foo){0,3}bar → NOT stripped (^ present; capture stripped)
+        assert_opt_full("^(foo){0,3}bar", "^(?:foo){0,3}bar");
+    }
+
+    // ── Edge cases ──
+
+    #[test]
+    fn test_strip_to_single_literal() {
+        // .{0,100}x.{0,100} → x
+        assert_opt_full(".{0,100}x.{0,100}", "x");
+    }
+
+    #[test]
+    fn test_strip_chained_optional_groups() {
+        // (ab){0,5}(cd){0,5}xyz → xyz
+        assert_opt_full("(ab){0,5}(cd){0,5}xyz", "xyz");
+    }
+
+    #[test]
+    fn test_strip_mixed_min_zero() {
+        // .{0,10}.{5,20}foo → .{5,20}foo (only .{0,10} stripped, .{5,20} has min>0)
+        // Note: with merging, .{0,10}.{5,20} does NOT merge (min < max required
+        // for both, and the body is the same, but the merge conditions are
+        // rep_max > 1 && rep.min < rep_max — both satisfy, so they DO merge
+        // to .{5,30}). After merge: .{5,30}foo → NOT stripped (min=5).
+        assert_opt_full(".{0,10}.{5,20}foo", ".{5,30}foo");
+    }
+
+    // ── Interaction: stripping does NOT happen recursively ──
+
+    #[test]
+    fn test_no_recursive_strip_in_repetition_body() {
+        // (.{0,5}foo)+ → the .{0,5} is inside a repetition body,
+        // not at the top-level concat — must NOT be stripped
+        assert_opt_full("(.{0,5}foo)+", "(?:.{0,5}foo)+");
+    }
+
+    #[test]
+    fn test_no_recursive_strip_in_alternation() {
+        // .{0,5}foo|bar → top-level is Alternation (not Concat)
+        // so no stripping at all (stripping only applies to top-level Concat)
+        assert_opt_full(".{0,5}foo|bar", ".{0,5}foo|bar");
     }
 }

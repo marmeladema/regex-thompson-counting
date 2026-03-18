@@ -360,25 +360,24 @@ mod tests {
 
     #[test]
     fn test_star_single_byte() {
-        // a*x → Split(Byte('a'), next), start closure has 'a' and 'x'.
+        // a*x → HIR optimiser strips leading a* (min=0, irrelevant for
+        // unanchored existence matching) → just x → Memchr1('x').
         match prefilter_for("a*x") {
-            Prefilter::Memchr2(a, b) => {
-                assert_eq!(a, b'a');
+            Prefilter::Memchr1(b) => {
                 assert_eq!(b, b'x');
             }
-            other => panic!("expected Memchr2('a','x'), got {:?}", other),
+            other => panic!("expected Memchr1('x'), got {:?}", other),
         }
     }
 
     #[test]
     fn test_optional_single_byte() {
-        // a?x → Split(Byte('a'), Byte('x')), start closure has 'a' and 'x'.
+        // a?x → HIR optimiser strips leading a? (min=0) → just x.
         match prefilter_for("a?x") {
-            Prefilter::Memchr2(a, b) => {
-                assert_eq!(a, b'a');
+            Prefilter::Memchr1(b) => {
                 assert_eq!(b, b'x');
             }
-            other => panic!("expected Memchr2('a','x'), got {:?}", other),
+            other => panic!("expected Memchr1('x'), got {:?}", other),
         }
     }
 
@@ -396,14 +395,12 @@ mod tests {
 
     #[test]
     fn test_star_class() {
-        // [ab]*x → start closure has 'a', 'b', 'x'.
+        // [ab]*x → HIR optimiser strips leading [ab]* (min=0) → just x.
         match prefilter_for("[ab]*x") {
-            Prefilter::Memchr3(a, b, c) => {
-                assert_eq!(a, b'a');
-                assert_eq!(b, b'b');
-                assert_eq!(c, b'x');
+            Prefilter::Memchr1(b) => {
+                assert_eq!(b, b'x');
             }
-            other => panic!("expected Memchr3, got {:?}", other),
+            other => panic!("expected Memchr1('x'), got {:?}", other),
         }
     }
 

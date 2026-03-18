@@ -40,7 +40,7 @@ Options:
   --unroll-limit <N>   Max NFA states for repetition unrolling (0=disable, default: 32)
   --max-states <N>     Max estimated fully-unrolled states (default: 2048)
   --max-repetition <N> Max bounded repetition count (default: 1000)
-  --no-merge           Disable merging of consecutive same-body repetitions
+  --optimize-hir <true|false>  Enable/disable HIR optimisations (default: true)
   --dfa                Include tier-specific DFA analysis in dump output
   --debug              Print matcher state after each step
   -q, --quiet          Suppress output (grep: exit code only)
@@ -97,7 +97,7 @@ fn parse_args() -> Command {
     let mut format = Format::Text;
     let mut debug = false;
     let mut dfa = false;
-    let mut merge = true;
+    let mut optimize_hir_flag: Option<bool> = None;
     let mut quiet = false;
     let mut positional = Vec::new();
 
@@ -175,8 +175,20 @@ fn parse_args() -> Command {
                     process::exit(1);
                 }));
             }
-            "--no-merge" => {
-                merge = false;
+            "--optimize-hir" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --optimize-hir requires a value (true or false)");
+                    process::exit(1);
+                }
+                optimize_hir_flag = Some(match args[i].as_str() {
+                    "true" => true,
+                    "false" => false,
+                    other => {
+                        eprintln!("error: --optimize-hir must be 'true' or 'false', got '{other}'");
+                        process::exit(1);
+                    }
+                });
             }
             "-q" | "--quiet" => {
                 quiet = true;
@@ -233,7 +245,9 @@ fn parse_args() -> Command {
     if let Some(r) = max_repetition {
         config.max_repetition = r;
     }
-    config.merge_repetitions = merge;
+    if let Some(opt) = optimize_hir_flag {
+        config.optimize_hir = opt;
+    }
 
     match positional[0].as_str() {
         "info" => {
