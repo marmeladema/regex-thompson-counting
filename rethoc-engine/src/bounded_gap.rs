@@ -249,33 +249,13 @@ fn compile_anchor_program(pieces: &[&Hir], config: &RegexConfig) -> Option<Ancho
 // Anchor Runner
 // ---------------------------------------------------------------------------
 
-/// Runtime state for a single anchor NFA runner.
+/// Convenience wrapper for standalone anchor runner usage (tests).
 ///
-/// Processes input bytes and emits end-position events (absolute byte
-/// positions where the anchor pattern matches).  Uses a simplified NFA
-/// simulation: no counter contexts (Version 1 anchors are counter-free),
-/// no assertion resolution (Version 1 anchors are assertion-free).
+/// Delegates NFA stepping to [`RunnerScratch`] while providing a
+/// simpler API with owned scratch.
 pub(crate) struct AnchorRunner<'a> {
-    /// Compiled NFA data.
     program: &'a AnchorNfaProgram,
-    /// Byte-class lookup tables (borrowed from program).
-    classes: &'a [ByteClassBits],
-    /// Byte dispatch tables (borrowed from program).
-    byte_tables: &'a [ByteMap],
-    /// Per-state dedup stamp.
-    lastlist: Vec<usize>,
-    /// Monotonically increasing step ID.
-    listid: usize,
-    /// Current active state list (consuming states awaiting a byte).
-    clist: Vec<StateIdx>,
-    /// Next active state list (built during step).
-    nlist: Vec<StateIdx>,
-    /// Work stack for iterative epsilon-closure.
-    addstack: Vec<StateIdx>,
-    /// True when `clist` is the unmodified start closure (enables prefilter).
-    at_start_state: bool,
-    /// Prefilter for skipping non-candidate bytes.
-    prefilter: Prefilter,
+    scratch: RunnerScratch,
 }
 
 impl<'a> AnchorRunner<'a> {
@@ -285,26 +265,82 @@ impl<'a> AnchorRunner<'a> {
             AnchorEngine::Tier0(p) => p,
             _ => unimplemented!("only Tier 0 anchor runners in Version 1"),
         };
-        let num_states = program.states.len();
-        let mut runner = AnchorRunner {
-            program,
-            classes: &program.classes,
-            byte_tables: &program.byte_tables,
+        let mut scratch = RunnerScratch::new(program.states.len());
+        scratch.seed_start(program);
+        AnchorRunner { program, scratch }
+    }
+
+    /// Reset the runner for a new match (same anchor program).
+    pub(crate) fn reset(&mut self) {
+        self.scratch.reset();
+        self.scratch.seed_start(self.program);
+    }
+
+    /// Process a chunk of input, emitting end-position events.
+    pub(crate) fn scan_chunk(&mut self, input: &[u8], base_pos: u64, emit: &mut dyn FnMut(u64)) {
+        for (offset, &byte) in input.iter().enumerate() {
+            if self.scratch.step(self.program, byte) {
+                emit(base_pos + offset as u64);
+            }
+        }
+    }
+
+    /// Signal end-of-input (no-op for V1 assertion-free anchors).
+    pub(crate) fn finish_scan(&mut self, _emit: &mut dyn FnMut(u64)) {}
+
+    /// Process one byte (for direct testing).
+    fn step(&mut self, byte: u8) -> bool {
+        self.scratch.step(self.program, byte)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded-Gap Matcher
+// ---------------------------------------------------------------------------
+
+use std::collections::VecDeque;
+
+/// Per-interior-gap stage queues.
+#[derive(Debug)]
+struct GapStageState {
+    /// Accepted end positions from the preceding anchor, sorted ascending.
+    accepted_prev_ends: VecDeque<u64>,
+    /// Positions where the gap predicate failed, sorted ascending.
+    bad_positions: VecDeque<u64>,
+}
+
+/// Terminal gap queues.
+#[derive(Debug)]
+struct TailGapState {
+    /// Accepted end positions from the final anchor, sorted ascending.
+    accepted_final_anchor_ends: VecDeque<u64>,
+    /// Positions where the terminal gap predicate failed, sorted ascending.
+    bad_positions: VecDeque<u64>,
+}
+
+/// Per-anchor NFA scratch state (reusable across matches).
+#[derive(Debug)]
+struct RunnerScratch {
+    lastlist: Vec<usize>,
+    listid: usize,
+    clist: Vec<StateIdx>,
+    nlist: Vec<StateIdx>,
+    addstack: Vec<StateIdx>,
+}
+
+impl RunnerScratch {
+    fn new(num_states: usize) -> Self {
+        RunnerScratch {
             lastlist: vec![0; num_states],
             listid: 1,
             clist: Vec::with_capacity(num_states),
             nlist: Vec::with_capacity(num_states),
             addstack: Vec::with_capacity(num_states),
-            at_start_state: true,
-            prefilter: plan.program.prefilter,
-        };
-        // Populate initial clist from start closure.
-        runner.seed_start();
-        runner
+        }
     }
 
-    /// Reset the runner for a new match (same anchor program).
-    pub(crate) fn reset(&mut self) {
+    /// Clear state for a new match, retaining allocations.
+    fn reset(&mut self) {
         self.clist.clear();
         self.nlist.clear();
         self.addstack.clear();
@@ -312,59 +348,32 @@ impl<'a> AnchorRunner<'a> {
         for slot in self.lastlist.iter_mut() {
             *slot = 0;
         }
-        self.at_start_state = true;
-        self.seed_start();
     }
 
-    /// Seed `clist` from the precomputed start closure.
-    fn seed_start(&mut self) {
-        if !self.program.start_closure.is_empty() {
-            for &s in &*self.program.start_closure {
+    /// Seed clist from the program's start closure.
+    fn seed_start(&mut self, program: &AnchorNfaProgram) {
+        if !program.start_closure.is_empty() {
+            for &s in &*program.start_closure {
                 self.clist.push(s);
                 self.lastlist[s.idx()] = self.listid;
             }
         } else {
-            // Fall back to epsilon-closure from the start state.
-            self.addstack.push(self.program.start);
-            self.drain_addstack_into_clist();
+            self.addstack.push(program.start);
+            self.drain_addstack_into_clist(program);
         }
     }
 
-    /// Process a chunk of input, emitting end-position events.
-    ///
-    /// `base_pos` is the absolute byte position of `input[0]`.
-    /// For each position where the anchor matches, `emit` is called
-    /// with the absolute end position.
-    ///
-    /// Events are emitted in monotonically increasing position order.
-    pub(crate) fn scan_chunk(&mut self, input: &[u8], base_pos: u64, emit: &mut dyn FnMut(u64)) {
-        for (offset, &byte) in input.iter().enumerate() {
-            let matched = self.step(byte);
-            if matched {
-                emit(base_pos + offset as u64);
-            }
-        }
-    }
-
-    /// Signal end-of-input.  For Version 1 (assertion-free) anchors this
-    /// is a no-op, but the signature is retained for future phases.
-    pub(crate) fn finish_scan(&mut self, _emit: &mut dyn FnMut(u64)) {
-        // Version 1: no end-of-input assertions to resolve.
-    }
-
-    /// Process one input byte.  Returns `true` if the anchor matched
-    /// ending at this byte position.
-    fn step(&mut self, byte: u8) -> bool {
-        // Prepare nlist for building the next state set.
+    /// Process one input byte against the anchor NFA.
+    /// Returns `true` if the anchor matched ending at this byte.
+    fn step(&mut self, program: &AnchorNfaProgram, byte: u8) -> bool {
         self.nlist.clear();
         self.listid += 1;
-
         let mut matched = false;
 
-        // Phase 1: consume the byte from each state in clist.
+        // Phase 1: consume byte from each consuming state in clist.
         for i in 0..self.clist.len() {
             let state_idx = self.clist[i];
-            let state = &self.program.states[state_idx.idx()];
+            let state = &program.states[state_idx.idx()];
             match *state {
                 State::Byte {
                     byte: b,
@@ -413,7 +422,7 @@ impl<'a> AnchorRunner<'a> {
                     out,
                     out_exit,
                 } => {
-                    if self.classes[class.idx()].contains(byte) {
+                    if program.classes[class.idx()].contains(byte) {
                         self.addstack.push(out);
                         if out_exit != StateIdx::NONE {
                             self.addstack.push(out_exit);
@@ -421,13 +430,11 @@ impl<'a> AnchorRunner<'a> {
                     }
                 }
                 State::ByteTable { table } => {
-                    let target = self.byte_tables[table.idx()][byte];
+                    let target = program.byte_tables[table.idx()][byte];
                     if target != StateIdx::NONE {
                         self.addstack.push(target);
                     }
                 }
-                // Split, Assert, Counter*, Match should not be in clist
-                // (clist contains only consuming states).
                 _ => {}
             }
         }
@@ -439,11 +446,10 @@ impl<'a> AnchorRunner<'a> {
             }
             let i = idx.idx();
             if self.lastlist[i] == self.listid {
-                continue; // already visited
+                continue;
             }
             self.lastlist[i] = self.listid;
-
-            match self.program.states[i] {
+            match program.states[i] {
                 State::Split { out, out1 } => {
                     self.addstack.push(out1);
                     self.addstack.push(out);
@@ -451,7 +457,6 @@ impl<'a> AnchorRunner<'a> {
                 State::Match => {
                     matched = true;
                 }
-                // Any consuming state → park in nlist.
                 _ => {
                     self.nlist.push(idx);
                 }
@@ -459,40 +464,23 @@ impl<'a> AnchorRunner<'a> {
         }
 
         // Phase 3: re-seed from start closure.
-        if !self.program.start_closure.is_empty() {
-            for &s in &*self.program.start_closure {
+        if !program.start_closure.is_empty() {
+            for &s in &*program.start_closure {
                 if self.lastlist[s.idx()] != self.listid {
                     self.lastlist[s.idx()] = self.listid;
                     self.nlist.push(s);
                 }
             }
         } else {
-            self.addstack.push(self.program.start);
-            self.drain_addstack_into_nlist();
+            self.addstack.push(program.start);
+            self.drain_addstack_into_nlist(program);
         }
 
-        // nlist is the new clist for the next step.
         std::mem::swap(&mut self.clist, &mut self.nlist);
-
-        // Update start-state flag for prefilter eligibility.
-        self.at_start_state = !matched && self.is_at_start_config();
-
         matched
     }
 
-    /// Check whether clist is exactly the start closure (eligible for prefilter skip).
-    fn is_at_start_config(&self) -> bool {
-        if self.clist.len() != self.program.start_closure.len() {
-            return false;
-        }
-        // Since both are deduped and inserted in the same order, a
-        // length check is a strong signal.  We could compare elements
-        // but for V1 the length check suffices.
-        true
-    }
-
-    /// Drain addstack into clist (used during initialisation).
-    fn drain_addstack_into_clist(&mut self) {
+    fn drain_addstack_into_clist(&mut self, program: &AnchorNfaProgram) {
         while let Some(idx) = self.addstack.pop() {
             if idx == StateIdx::NONE {
                 continue;
@@ -502,12 +490,12 @@ impl<'a> AnchorRunner<'a> {
                 continue;
             }
             self.lastlist[i] = self.listid;
-            match self.program.states[i] {
+            match program.states[i] {
                 State::Split { out, out1 } => {
                     self.addstack.push(out1);
                     self.addstack.push(out);
                 }
-                State::Match => { /* start_closure_matches handles this */ }
+                State::Match => {}
                 _ => {
                     self.clist.push(idx);
                 }
@@ -515,8 +503,7 @@ impl<'a> AnchorRunner<'a> {
         }
     }
 
-    /// Drain addstack into nlist (used during re-seeding fallback).
-    fn drain_addstack_into_nlist(&mut self) {
+    fn drain_addstack_into_nlist(&mut self, program: &AnchorNfaProgram) {
         while let Some(idx) = self.addstack.pop() {
             if idx == StateIdx::NONE {
                 continue;
@@ -526,7 +513,7 @@ impl<'a> AnchorRunner<'a> {
                 continue;
             }
             self.lastlist[i] = self.listid;
-            match self.program.states[i] {
+            match program.states[i] {
                 State::Split { out, out1 } => {
                     self.addstack.push(out1);
                     self.addstack.push(out);
@@ -541,25 +528,96 @@ impl<'a> AnchorRunner<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Bounded-Gap Matcher
+// Bounded-Gap Cache
 // ---------------------------------------------------------------------------
 
-use std::collections::VecDeque;
-
-/// Per-interior-gap stage state.
-struct GapStageState {
-    /// Accepted end positions from the preceding anchor, sorted ascending.
-    accepted_prev_ends: VecDeque<u64>,
-    /// Positions where the gap predicate failed, sorted ascending.
-    bad_positions: VecDeque<u64>,
+/// Reusable scratch for the bounded-gap matcher.
+///
+/// Stored on [`MatcherMemory`](crate::MatcherMemory) and reused across
+/// matches, analogous to `Tier1DfaCache` / `Tier2DfaCache` etc.
+/// Allocations (Vecs, VecDeques) retain capacity across matches.
+#[derive(Debug)]
+pub(crate) struct BoundedGapCache {
+    runner_scratch: Vec<RunnerScratch>,
+    gap_stages: Vec<GapStageState>,
+    tail_state: Option<TailGapState>,
+    anchor_active: Vec<bool>,
 }
 
-/// Terminal gap state.
-struct TailGapState {
-    /// Accepted end positions from the final anchor, sorted ascending.
-    accepted_final_anchor_ends: VecDeque<u64>,
-    /// Positions where the terminal gap predicate failed, sorted ascending.
-    bad_positions: VecDeque<u64>,
+impl BoundedGapCache {
+    pub(crate) fn new() -> Self {
+        BoundedGapCache {
+            runner_scratch: Vec::new(),
+            gap_stages: Vec::new(),
+            tail_state: None,
+            anchor_active: Vec::new(),
+        }
+    }
+
+    /// Prepare the cache for a new match with the given plan.
+    /// Resizes scratch to match the plan dimensions and clears
+    /// all queues, retaining heap allocations.
+    pub(crate) fn prepare(&mut self, plan: &BoundedGapPlan) {
+        let n = plan.anchors.len();
+
+        // Resize runner scratch.
+        self.runner_scratch.truncate(n);
+        for (i, anchor) in plan.anchors.iter().enumerate() {
+            let num_states = match &anchor.program.engine {
+                AnchorEngine::Tier0(p) => p.states.len(),
+                _ => 16, // placeholder
+            };
+            if i < self.runner_scratch.len() {
+                let scratch = &mut self.runner_scratch[i];
+                scratch.reset();
+                scratch.lastlist.resize(num_states, 0);
+            } else {
+                self.runner_scratch.push(RunnerScratch::new(num_states));
+            }
+        }
+
+        // Seed start closures.
+        for (i, anchor) in plan.anchors.iter().enumerate() {
+            let program = match &anchor.program.engine {
+                AnchorEngine::Tier0(p) => p,
+                _ => continue,
+            };
+            self.runner_scratch[i].seed_start(program);
+        }
+
+        // Resize gap stage queues.
+        self.gap_stages.truncate(plan.interior_gaps.len());
+        for stage in &mut self.gap_stages {
+            stage.accepted_prev_ends.clear();
+            stage.bad_positions.clear();
+        }
+        while self.gap_stages.len() < plan.interior_gaps.len() {
+            self.gap_stages.push(GapStageState {
+                accepted_prev_ends: VecDeque::new(),
+                bad_positions: VecDeque::new(),
+            });
+        }
+
+        // Tail state.
+        if plan.tail_gap.is_some() {
+            if let Some(ref mut ts) = self.tail_state {
+                ts.accepted_final_anchor_ends.clear();
+                ts.bad_positions.clear();
+            } else {
+                self.tail_state = Some(TailGapState {
+                    accepted_final_anchor_ends: VecDeque::new(),
+                    bad_positions: VecDeque::new(),
+                });
+            }
+        } else {
+            self.tail_state = None;
+        }
+
+        // Anchor activation.
+        self.anchor_active.clear();
+        self.anchor_active.resize(n, false);
+        self.anchor_active[0] = true;
+    }
 }
 
 /// Runtime matcher for bounded-gap chains.
@@ -568,17 +626,14 @@ struct TailGapState {
 /// determine whether an `Anchor (Gap Anchor)* Gap?` chain matches
 /// anywhere in the input.  Produces an existence-only result (no
 /// match positions or captures).
+///
+/// Borrows all reusable scratch from a [`BoundedGapCache`] stored on
+/// [`MatcherMemory`](crate::MatcherMemory).
 pub struct BoundedGapMatcher<'a> {
     /// The compiled plan.
     plan: &'a BoundedGapPlan,
-    /// Anchor runners (one per anchor in the chain).
-    runners: Vec<AnchorRunner<'a>>,
-    /// Per-interior-gap stage state.
-    gap_stages: Vec<GapStageState>,
-    /// Terminal gap state (if the chain has a trailing gap).
-    tail_state: Option<TailGapState>,
-    /// Whether each anchor runner is active (lazy activation).
-    anchor_active: Vec<bool>,
+    /// Reusable scratch (borrowed from MatcherMemory).
+    cache: &'a mut BoundedGapCache,
     /// Current absolute byte position.
     position: u64,
     /// Existence result: set once a full chain match is confirmed.
@@ -590,35 +645,12 @@ pub struct BoundedGapMatcher<'a> {
 }
 
 impl<'a> BoundedGapMatcher<'a> {
-    /// Create a new matcher from a compiled plan.
-    pub(crate) fn new(plan: &'a BoundedGapPlan) -> Self {
-        let n = plan.anchors.len();
-        let mut runners: Vec<AnchorRunner<'a>> = Vec::with_capacity(n);
-        for anchor in plan.anchors.iter() {
-            runners.push(AnchorRunner::new(anchor));
-        }
-
-        let gap_stages = (0..plan.interior_gaps.len())
-            .map(|_| GapStageState {
-                accepted_prev_ends: VecDeque::new(),
-                bad_positions: VecDeque::new(),
-            })
-            .collect();
-
-        let tail_state = plan.tail_gap.as_ref().map(|_| TailGapState {
-            accepted_final_anchor_ends: VecDeque::new(),
-            bad_positions: VecDeque::new(),
-        });
-
-        let mut anchor_active = vec![false; n];
-        anchor_active[0] = true; // anchor[0] is always active from start
-
+    /// Create a matcher from a plan and a prepared cache.
+    pub(crate) fn new(plan: &'a BoundedGapPlan, cache: &'a mut BoundedGapCache) -> Self {
+        cache.prepare(plan);
         BoundedGapMatcher {
             plan,
-            runners,
-            gap_stages,
-            tail_state,
-            anchor_active,
+            cache,
             position: 0,
             matched: false,
             matched_here: false,
@@ -658,19 +690,17 @@ impl<'a> BoundedGapMatcher<'a> {
         self.matched_here = false;
 
         // -- Step 1: Feed byte to active anchor runners. -----------------
-        // Collect match results into a fixed-size buffer to avoid
-        // borrowing issues with self.
         let n = self.plan.anchors.len();
         let mut anchor_matched = [false; 16]; // V1 chains are small
         debug_assert!(n <= 16, "chain too long for fixed buffer");
-        for (i, (runner, &active)) in self
-            .runners
-            .iter_mut()
-            .zip(self.anchor_active.iter())
-            .enumerate()
-        {
-            if active {
-                anchor_matched[i] = runner.step(byte);
+        #[allow(clippy::needless_range_loop)] // indexes into 4 parallel arrays
+        for i in 0..n {
+            if self.cache.anchor_active[i] {
+                let program = match &self.plan.anchors[i].program.engine {
+                    AnchorEngine::Tier0(p) => p,
+                    _ => unimplemented!("only Tier 0 anchor runners in V1"),
+                };
+                anchor_matched[i] = self.cache.runner_scratch[i].step(program, byte);
             }
         }
 
@@ -679,11 +709,11 @@ impl<'a> BoundedGapMatcher<'a> {
             if let GapPredicate::ByteClass(bits) = gap.predicate
                 && !bits.contains(byte)
             {
-                self.gap_stages[i].bad_positions.push_back(p);
+                self.cache.gap_stages[i].bad_positions.push_back(p);
             }
         }
         // Terminal gap: current byte IS part of the gap (ordering rule).
-        if let Some(ref mut tail_state) = self.tail_state
+        if let Some(ref mut tail_state) = self.cache.tail_state
             && let Some(tail_gap) = &self.plan.tail_gap
             && let GapPredicate::ByteClass(bits) = tail_gap.predicate
             && !bits.contains(byte)
@@ -723,20 +753,21 @@ impl<'a> BoundedGapMatcher<'a> {
             };
 
             if start_ok {
-                if !self.gap_stages.is_empty() {
+                if !self.cache.gap_stages.is_empty() {
                     // Push to first interior gap stage.
-                    self.gap_stages[0].accepted_prev_ends.push_back(p);
-                } else if self.tail_state.is_some() {
+                    self.cache.gap_stages[0].accepted_prev_ends.push_back(p);
+                } else if self.cache.tail_state.is_some() {
                     // Single anchor + tail gap.
-                    self.tail_state
+                    self.cache
+                        .tail_state
                         .as_mut()
                         .unwrap()
                         .accepted_final_anchor_ends
                         .push_back(p);
                 }
                 // Activate anchor[1] if it exists.
-                if n > 1 && !self.anchor_active[1] {
-                    self.anchor_active[1] = true;
+                if n > 1 && !self.cache.anchor_active[1] {
+                    self.cache.anchor_active[1] = true;
                 }
             }
         }
@@ -752,19 +783,22 @@ impl<'a> BoundedGapMatcher<'a> {
 
             // Validate the preceding gap stage.
             let valid = Self::validate_interior_gap(
-                &mut self.gap_stages[i],
+                &mut self.cache.gap_stages[i],
                 &self.plan.interior_gaps[i],
                 s,
             );
 
             if valid {
                 let next_stage = i + 1;
-                if next_stage < self.gap_stages.len() {
+                if next_stage < self.cache.gap_stages.len() {
                     // Push to next interior gap stage.
-                    self.gap_stages[next_stage].accepted_prev_ends.push_back(p);
-                } else if self.tail_state.is_some() {
+                    self.cache.gap_stages[next_stage]
+                        .accepted_prev_ends
+                        .push_back(p);
+                } else if self.cache.tail_state.is_some() {
                     // Final anchor before tail gap.
-                    self.tail_state
+                    self.cache
+                        .tail_state
                         .as_mut()
                         .unwrap()
                         .accepted_final_anchor_ends
@@ -775,8 +809,8 @@ impl<'a> BoundedGapMatcher<'a> {
                 }
                 // Activate the next anchor if it exists.
                 let next_anchor = anchor_idx + 1;
-                if next_anchor < n && !self.anchor_active[next_anchor] {
-                    self.anchor_active[next_anchor] = true;
+                if next_anchor < n && !self.cache.anchor_active[next_anchor] {
+                    self.cache.anchor_active[next_anchor] = true;
                 }
             }
         }
@@ -830,7 +864,7 @@ impl<'a> BoundedGapMatcher<'a> {
             Some(g) => g,
             None => return,
         };
-        let tail_state = match &mut self.tail_state {
+        let tail_state = match &mut self.cache.tail_state {
             Some(s) => s,
             None => return,
         };
@@ -884,7 +918,7 @@ impl<'a> BoundedGapMatcher<'a> {
             let next_anchor_len = match self.plan.anchors[i + 1].length_info {
                 AnchorLengthInfo::Fixed(len) => len as u64,
             };
-            let stage = &mut self.gap_stages[i];
+            let stage = &mut self.cache.gap_stages[i];
 
             // Expire accepted ends that are too old.
             // An entry `e` is stale when no future anchor start can
@@ -2034,7 +2068,8 @@ mod tests {
         let h = hir(pattern);
         let plan = probe(&h)
             .unwrap_or_else(|| panic!("pattern should be recognized as bounded-gap: {pattern}"));
-        let mut m = BoundedGapMatcher::new(&plan);
+        let mut cache = BoundedGapCache::new();
+        let mut m = BoundedGapMatcher::new(&plan, &mut cache);
         m.chunk(input);
         m.finish()
     }
@@ -2044,7 +2079,8 @@ mod tests {
         let h = hir_merged(pattern);
         let plan = probe(&h)
             .unwrap_or_else(|| panic!("pattern should be recognized as bounded-gap: {pattern}"));
-        let mut m = BoundedGapMatcher::new(&plan);
+        let mut cache = BoundedGapCache::new();
+        let mut m = BoundedGapMatcher::new(&plan, &mut cache);
         m.chunk(input);
         m.finish()
     }
@@ -2146,7 +2182,8 @@ mod tests {
     fn test_matcher_multi_chunk() {
         let h = hir(r"abc.{0,10}xyz");
         let plan = probe(&h).expect("should recognise");
-        let mut m = BoundedGapMatcher::new(&plan);
+        let mut cache = BoundedGapCache::new();
+        let mut m = BoundedGapMatcher::new(&plan, &mut cache);
         m.chunk(b"ab");
         m.chunk(b"c__");
         m.chunk(b"_xy");
@@ -2176,7 +2213,8 @@ mod tests {
         // Once matched, further input doesn't change result.
         let h = hir(r"ab.{0,5}cd");
         let plan = probe(&h).expect("should recognise");
-        let mut m = BoundedGapMatcher::new(&plan);
+        let mut cache = BoundedGapCache::new();
+        let mut m = BoundedGapMatcher::new(&plan, &mut cache);
         m.chunk(b"abcd"); // match immediately
         assert!(m.ismatch());
         m.chunk(b"xxxxxxxxxxxxxxxx"); // should be skipped

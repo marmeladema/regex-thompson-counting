@@ -3439,6 +3439,8 @@ pub struct MatcherMemory {
     tier4_cache: Option<Tier4DfaCache>,
     /// Counter pool for the counting DFA (separate from NFA's pool).
     counting_pool: CounterPool,
+    /// Bounded-gap engine cache (reusable across matches).
+    bounded_gap_cache: Option<bounded_gap::BoundedGapCache>,
 }
 
 impl MatcherMemory {
@@ -3450,7 +3452,10 @@ impl MatcherMemory {
     pub fn matcher<'a>(&'a mut self, regex: &'a Regex) -> AnyMatcher<'a> {
         // Prefer bounded-gap specialisation when available.
         if let Some(plan) = &regex.bounded_gap_plan {
-            return AnyMatcher::BoundedGap(bounded_gap::BoundedGapMatcher::new(plan));
+            let cache = self
+                .bounded_gap_cache
+                .get_or_insert_with(bounded_gap::BoundedGapCache::new);
+            return AnyMatcher::BoundedGap(bounded_gap::BoundedGapMatcher::new(plan, cache));
         }
         if regex.dfa_eligible {
             // Tier 1: pure DFA (no counters, simple assertions).
@@ -3499,8 +3504,11 @@ impl MatcherMemory {
     /// tier-specific caches (the bounded-gap matcher owns its own scratch).
     pub fn bounded_gap_matcher<'a>(&'a mut self, regex: &'a Regex) -> Option<AnyMatcher<'a>> {
         let plan = regex.bounded_gap_plan.as_ref()?;
+        let cache = self
+            .bounded_gap_cache
+            .get_or_insert_with(bounded_gap::BoundedGapCache::new);
         Some(AnyMatcher::BoundedGap(bounded_gap::BoundedGapMatcher::new(
-            plan,
+            plan, cache,
         )))
     }
 
@@ -5103,8 +5111,9 @@ mod tests {
             .bounded_gap_plan
             .as_ref()
             .expect("bounded_gap_plan must be present for bounded-gap test");
+        let mut cache = bounded_gap::BoundedGapCache::new();
         // Full-chunk test.
-        let mut m = bounded_gap::BoundedGapMatcher::new(plan);
+        let mut m = bounded_gap::BoundedGapMatcher::new(plan, &mut cache);
         m.chunk(input.as_bytes());
         let actual = m.finish();
         assert_eq!(
@@ -5112,8 +5121,8 @@ mod tests {
             "BoundedGap chunk mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
             pattern, input, unroll, actual, expected
         );
-        // Byte-at-a-time test.
-        let mut m = bounded_gap::BoundedGapMatcher::new(plan);
+        // Byte-at-a-time test (reuses cache — tests memory reuse).
+        let mut m = bounded_gap::BoundedGapMatcher::new(plan, &mut cache);
         for &b in input.as_bytes() {
             m.chunk(&[b]);
         }
