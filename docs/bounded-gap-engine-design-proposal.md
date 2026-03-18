@@ -181,7 +181,7 @@ and the gap is valid iff:
 For a trailing gap after the final anchor:
 
 - if the final anchor ends at byte position `e`
-- and the whole regex match ends at byte position `p`
+- and the current position being evaluated as a potential whole-match end is `p`
 - then the trailing gap length is:
 
 ```text
@@ -227,8 +227,8 @@ struct BoundedGapPlan {
     anchors: Box<[AnchorPlan]>,
     interior_gaps: Box<[GapPlan]>,
     tail_gap: Option<GapPlan>,
-    anchored_start: bool,
-    anchored_end: bool,
+    start_anchor: StartAnchorKind,
+    end_anchor: EndAnchorKind,
 }
 ```
 
@@ -240,6 +240,27 @@ and:
 
 - `tail_gap.is_some()` means the last anchor is followed by a terminal gap
 - `tail_gap.is_none()` means the chain ends at the final anchor
+
+### Whole-plan anchor kinds
+
+```rust
+enum StartAnchorKind {
+    None,
+    StartOfInput,
+}
+
+enum EndAnchorKind {
+    None,
+    EndOfInput,
+}
+```
+
+Important Version 1 rule:
+
+- hoisted whole-pattern end anchoring in Version 1 corresponds only to
+  `AssertKind::End`
+- whole-pattern line-end anchoring (`AssertKind::EndLF`) is **not** supported in
+  Version 1 and must fall back to the normal engine
 
 ## Gap plan
 
@@ -256,15 +277,22 @@ struct GapPlan {
 ```rust
 enum GapPredicate {
     Any,
-    StaticByteClass(ByteClassBits),
-    CustomByteClass(ClassIdx),
-    NotStaticByteClass(ByteClassBits),
-    NotCustomByteClass(ClassIdx),
+    ByteClass(ByteClassBits),
 }
 ```
 
-This type should be driven by the already-existing byte-class machinery instead
-of inventing a second byte-set representation.
+In Version 1, the gap predicate should be stored inline as a 256-bit byte set,
+with negation already normalized at compile time.
+
+Why this is the recommended simplification:
+
+- `GapPredicate` belongs to the `BoundedGapPlan`, not to some separate NFA graph
+- `ClassIdx` would therefore need an additional ownership story or plan-local
+  side table
+- the number of gaps in a Version 1 plan is small, so storing one inline
+  `ByteClassBits` per non-`Any` gap is acceptable
+- `Any` remains worth keeping separate because it lets the runtime skip gap-byte
+  invalidation tracking entirely for `.{0,K}` / `[\s\S]{0,K}` style gaps
 
 Important note:
 
@@ -275,11 +303,43 @@ Important note:
 
 ```rust
 struct AnchorPlan {
-    regex: Regex,
+    program: AnchorProgram,
     length_info: AnchorLengthInfo,
-    execution_hint: AnchorExecHint,
 }
 ```
+
+### Anchor program
+
+`AnchorProgram` is a dedicated, non-recursive compiled type for anchor
+submatchers.  It is **not** a `Regex`.
+
+```rust
+struct AnchorProgram {
+    engine: AnchorEngine,
+    prefilter: Option<Prefilter>,
+}
+
+enum AnchorEngine {
+    Tier0(AnchorNfaProgram),
+    Tier1(AnchorDfaProgram),
+    Tier2(AnchorTier2Program),
+}
+```
+
+Why a separate type instead of `Box<Regex>`:
+
+- avoids recursive `Regex` ownership
+- anchors do not need full `Regex` semantics (no nested specialization probes,
+  no top-level dispatch policy, no full public diagnostics surface)
+- makes the compilation boundary explicit: anchors are compiled in
+  `CompileMode::Anchor`, which disables bounded-gap detection and other
+  top-level-only specializations
+- easier memory accounting
+
+Each `Anchor*Program` variant stores only the execution data that the
+corresponding tier's anchor scanner needs to emit end-position events.  The
+exact internal layout can be refined during implementation, but it should be
+deliberately smaller than a full `Regex`.
 
 ### Length info
 
@@ -301,25 +361,15 @@ enum AnchorLengthInfo {
 }
 ```
 
-### Execution hint
-
-```rust
-enum AnchorExecHint {
-    Tier0,
-    Tier1,
-    Tier2,
-}
-```
-
 The specialization should deliberately avoid depending on Tier 3 / Tier 4
 anchors in Version 1.
 
-## Why anchors are compiled as regexes
+## Why anchors are compiled as dedicated programs, not as `Regex` objects
 
 This proposal is **not** recommending a separate literal-only engine.
 
-Anchors should be separately compiled internal regex fragments so they can reuse
-existing logic for:
+Anchors should be separately compiled internal programs so they can reuse
+existing compilation logic for:
 
 - character classes
 - case-insensitive literals
@@ -327,6 +377,17 @@ existing logic for:
 - simple alternation
 
 That is how repetitions inside `A` and/or `B` can be supported naturally.
+
+However, anchors are **not** full `Regex` objects.
+
+`AnchorProgram` is a deliberately non-recursive compiled type that stores only
+the execution data needed for event-producing anchor runners.  It does not carry
+a nested `BoundedGapPlan`, a public diagnostics surface, or top-level matcher
+dispatch policy.
+
+This is enforced by compiling anchors in `CompileMode::Anchor`, which disables
+bounded-gap detection and other top-level-only specializations.  That prevents
+recursive specialization trees and keeps the ownership graph flat.
 
 ## Detection From `regex-syntax` HIR
 
@@ -368,6 +429,30 @@ Require:
 - at least one gap
 - no empty anchors
 - anchors and gaps alternate exactly
+
+### Step 4a: normalize away zero-length gaps
+
+If a detected gap has:
+
+```text
+min_gap = 0, max_gap = 0
+```
+
+then it should not become a real gap stage in the bounded-gap plan.
+
+Instead:
+
+- an interior zero-length gap should be normalized away by merging the adjacent
+  anchor fragments into one larger anchor fragment
+- a trailing zero-length gap should be dropped entirely
+
+Why:
+
+- `A.{0,0}B` is just adjacency, not proximity
+- keeping it as a real gap stage adds runtime complexity for no benefit
+
+If normalizing zero-length gaps removes all gaps from the chain, the specialization
+should simply not apply and the pattern should fall back to the normal engine.
 
 ### Step 5: compile each anchor independently
 
@@ -495,13 +580,13 @@ Top-level anchoring is much easier.
 
 The plan already has:
 
-- `anchored_start`
-- `anchored_end`
+- `start_anchor`
+- `end_anchor`
 
 So these are good early candidates:
 
-- leading `^`
-- trailing `$`
+- leading `^` when it lowers to `AssertKind::Start`
+- trailing `$` when it lowers to `AssertKind::End`
 
 They should be hoisted out of the chain when the HIR makes that unambiguous.
 
@@ -512,7 +597,14 @@ Why this is easy:
 
 Version 1 recommendation:
 
-- support top-level `^` and `$` when they can be lifted cleanly into plan flags
+- support top-level start/end anchoring only when it lowers cleanly to
+  `AssertKind::Start` / `AssertKind::End`
+
+Semantic detail:
+
+- top-level `^` support in Version 1 means true start-of-input anchoring only
+- top-level `$` support in Version 1 means true end-of-input anchoring only
+- top-level `StartLF` / `EndLF` are intentionally deferred
 
 ## 3. Assertions inside anchors
 
@@ -559,8 +651,8 @@ However, they widen the Version 1 correctness surface significantly:
 
 Version 1 recommendation:
 
-- exclude internal anchor assertions at first, except for top-level `^` / `$`
-  that are hoisted into plan flags
+- exclude internal anchor assertions at first, except for top-level
+  `AssertKind::Start` / `AssertKind::End` that are hoisted into plan flags
 
 This is a scoping choice, not a claim of impossibility.
 
@@ -614,7 +706,7 @@ Recommendation:
 ### Supported in Version 1
 
 - no assertions inside gaps
-- top-level `^` / `$` hoisted to plan flags when structurally obvious
+- top-level `Start` / `End` hoisted to plan flags when structurally obvious
 - otherwise assertion-free anchors only
 
 ### Not supported in Version 1
@@ -622,6 +714,7 @@ Recommendation:
 - any assertion inside a gap
 - internal anchor assertions like `\bfoo`, `foo\b`, `foo$`
 - CRLF assertions inside anchors
+- whole-pattern `StartLF` / `EndLF`
 
 ### Plausible future support
 
@@ -787,7 +880,15 @@ If `Anchor_{i+1}` matches ending at `p`:
 - query `Gap_i` for whether some accepted end `e` validates the gap
 - if yes, record `p` as an accepted end for stage `i+1`
 
-If the final anchor is accepted, set `matched = true`.
+If the final anchor is accepted:
+
+- when `end_anchor == EndAnchorKind::None`, set `matched = true`
+- when `end_anchor == EndAnchorKind::EndOfInput`, do **not** set the final match
+  result yet; instead record that the chain is satisfied at the current boundary
+  and resolve it only in `finish()`
+
+This is the same high-level idea as the existing engine's distinction between
+ordinary mid-stream success and end-of-input-only success.
 
 ### 4. Expire dead queue entries
 
@@ -812,7 +913,32 @@ Important Version 1 rule:
 - if `tail_gap.min_gap == 0`, then any newly accepted final-anchor end position
   should produce an immediate match at the same input boundary
 
+End-of-input caveat:
+
+- if `end_anchor == EndAnchorKind::EndOfInput`, the trailing-gap success must
+  still be treated as a candidate success at the current boundary and only become
+  a real match in `finish()` if that boundary is the final input boundary
+
 This is the main additional semantic difference introduced by allowing `GapTail`.
+
+### 6. Terminal-gap ordering and bad-byte handling
+
+For terminal gaps, the gap bytes are `(e, p]`, so the current byte position `p`
+is part of the gap being validated.
+
+That means the ordering at position `p` must be:
+
+1. update terminal-gap bad-byte tracking for the current byte
+2. then evaluate terminal-gap validity at `p`
+
+Important consequence:
+
+- if the current byte fails the terminal gap predicate, it invalidates every
+  pending terminal-gap entry with `e < p`, because `p` lies in `(e, p]`
+- a newly accepted final-anchor end at `e = p` is **not** invalidated, because
+  `(p, p]` is empty
+
+This ordering should be treated as a Version 1 correctness requirement.
 
 ## Data-structure invariants required for linearity
 
@@ -836,6 +962,17 @@ The implementation should maintain these invariants:
 
 Without those invariants, the specialization would be too risky for adversarial
 use.
+
+For interior gaps, one intended validation strategy is:
+
+1. pop expired accepted ends from the front
+2. pop accepted ends invalidated by the most recent bad byte before the candidate
+   next-anchor start
+3. test the new front against `min_gap`
+
+The destructive pop in step 2 is correct because once a bad byte lies between an
+accepted end `e` and some candidate next-anchor start `s`, it will also lie
+between `e` and every future `s' >= s`. So that `e` can never become valid again.
 
 ## Pathological / Worst-Case Behavior
 
@@ -1031,10 +1168,11 @@ trait AnchorStep {
 This is a good semantic model, but it should not be the only implementation
 shape considered.
 
-## Preferred implementation shape: chunk scanners
+## Future optimization shape: chunk scanners
 
-For actual performance, the bounded-gap engine should prefer an internal scanner
-API that lets anchors consume chunks and emit sparse end-position events:
+For long-term performance, the bounded-gap engine should eventually support an
+internal scanner API that lets anchors consume chunks and emit sparse
+end-position events:
 
 ```rust
 trait AnchorScanner {
@@ -1070,6 +1208,15 @@ It lets each anchor reuse the optimizations it already has or will have:
 
 Without that, the bounded-gap engine would semantically work but would leave a
 large amount of anchor-side performance on the table.
+
+However, this should be treated as a **follow-up optimization direction**, not as
+the mandatory Version 1 implementation boundary.
+
+Version 1 recommendation:
+
+- start with a simpler byte-by-byte `step_event(byte)` anchor API
+- make correctness, chunk behavior, and end-of-input handling solid first
+- add scanner/event anchor runners later once the specialization is trusted
 
 For Version 1 fixed-length anchors:
 
@@ -1165,6 +1312,73 @@ admit anchors that can supply `matched_now` under:
 and have fixed exact length.
 
 This avoids immediate dependency on Tier 3 / Tier 4 event-reporting semantics.
+
+## Version 1 anchor activation
+
+Version 1 does not need to run every anchor from the start.
+
+Recommended policy:
+
+- `anchor[0]` is active from position 0
+- `anchor[i+1]` becomes active once stage `i` receives its first accepted end
+- once activated, an anchor stays active for the rest of the match
+
+This one-way lazy activation reduces wasted work without introducing complex
+deactivation/reactivation state.
+
+## anchored_start implementation choice
+
+Top-level `^` should be implemented in the bounded-gap layer, not by recompiling
+the first anchor with different semantics.
+
+For a first anchor of fixed length `L`:
+
+- if it reports a match ending at `p`, its start is `p + 1 - L`
+- with `start_anchor == StartAnchorKind::StartOfInput`, accept that event only if
+  the computed start is 0
+
+This keeps anchor semantics and bounded-gap semantics cleanly separated.
+
+## end_anchor implementation choice
+
+With `end_anchor == EndAnchorKind::EndOfInput`, a chain that is otherwise fully
+satisfied at position `p` should be treated only as a **candidate** full match at
+the current boundary.
+
+That candidate becomes a real match only in `finish()`, when the engine knows no
+further input bytes will arrive.
+
+Operational consequence:
+
+- ordinary early exit must be disabled while `end_anchor != None`
+- the matcher should track only whether the chain is fully satisfied at the
+  current boundary, not declare success for earlier boundaries that may later be
+  invalidated by additional input
+
+## Event ordering contract
+
+Version 1's per-byte event model naturally processes positions in increasing
+order, but the contract should still be explicit.
+
+Required contract:
+
+- anchor events are processed in monotonically increasing absolute position order
+- at most one end-event is produced per anchor per end position in Version 1
+
+If scanner/event runners are added later, they must preserve the same ordering.
+
+## Matcher memory reuse
+
+The bounded-gap matcher should participate in `MatcherMemory` from the start.
+
+Version 1 recommendation:
+
+- add a reusable bounded-gap cache analogous to the existing tier caches
+- cache stage queues, tail-gap queues, and anchor-runner memory/state across
+  matches
+
+Fresh allocation per match should not be the intended steady-state design, even
+in Version 1.
 
 ## Prefilters and Re-Engagement
 
@@ -1365,7 +1579,7 @@ Cons:
 ### Mode B: plan-only compile when fully recognized
 
 - if the pattern is fully covered by the bounded-gap model, only keep the plan
-  and anchor regexes
+  and anchor programs
 
 Pros:
 
@@ -1486,9 +1700,17 @@ So the right posture is:
 - exclude most anchor assertions at first,
 - but treat them as a phased extension path, not as a dead end
 
-## 3. Top-level `^` / `$` support can be added, but should not block Version 1
+## 3. Top-level line-anchor support can be added later, but should not block Version 1
 
-The current use cases are mostly unanchored scan patterns.
+Version 1 already supports whole-pattern `Start` / `End` anchors.
+
+What remains deferred is whole-pattern line anchoring:
+
+- `StartLF`
+- `EndLF`
+
+The current use cases are mostly unanchored scan patterns, so deferring those is
+acceptable.
 
 ## 4. Alternation of whole chains should be deferred
 
