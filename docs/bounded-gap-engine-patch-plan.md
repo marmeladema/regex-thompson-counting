@@ -27,8 +27,8 @@ design proposal:
 - fixed-length anchors only
 - anchors individually executable by Tier 0 / Tier 1 / Tier 2 only
 - no assertions inside gaps
-- no internal assertions inside anchors, except top-level `^` / `$` that can be
-  hoisted cleanly into plan flags
+- no internal assertions inside anchors, except whole-pattern `Start` / `End`
+  that can be hoisted cleanly into plan flags
 
 Important Version 1 restriction:
 
@@ -161,6 +161,7 @@ Pros:
 Cons:
 
 - throws away anchor-side prefiltering and re-engagement performance
+- makes it harder to converge on the right long-term internal API
 
 ### Option B: scanner/event adapters (recommended)
 
@@ -176,8 +177,17 @@ Cons:
 
 ### Recommendation
 
-Use **Option B** for implementation, but keep the semantic model documented in
-per-byte terms.
+Use **Option B** as the long-term internal boundary from the start, but allow a
+temporary byte-step implementation behind that boundary during bring-up.
+
+Concretely:
+
+- the bounded-gap matcher should depend on a scanner/event-style internal
+  abstraction
+- the earliest implementations may internally step byte-by-byte to get
+  correctness and chunk behavior right
+- the feature should not be considered complete until the intended anchor
+  classes preserve their prefilter/re-engagement behavior under that boundary
 
 ## 4. Anchor support breadth in Version 1
 
@@ -192,8 +202,8 @@ Cons:
 - much larger correctness surface
 - more chunk / EOI edge cases
 
-### Option B: assertion-free fixed-length anchors only, plus hoisted top-level
-`^` / `$` (recommended)
+### Option B: assertion-free fixed-length anchors only, plus hoisted whole-pattern
+`Start` / `End` (recommended)
 
 Pros:
 
@@ -285,16 +295,26 @@ probe before adding any new runtime.
 ```rust
 enum GapBodyClass {
     Any,
-    StaticByteClass(ByteClassBits),
-    CustomByteClass(ClassIdx),
-    NotStaticByteClass(ByteClassBits),
-    NotCustomByteClass(ClassIdx),
+    ByteClass(ByteClassBits),
 }
 
 struct FixedLengthInfo {
     len: u16,
 }
 ```
+
+Version 1 recommendation:
+
+- keep `GapBodyClass` fully self-contained and inline
+- do not use `ClassIdx` indirection for gap predicates in Version 1
+
+Reason:
+
+- gap predicates belong to the `BoundedGapPlan`, not to some separate NFA graph
+- a plan-local `ClassIdx` indirection would need extra ownership machinery for
+  little benefit in the narrow Version 1 chain shapes
+- `Any` stays separate because it enables a meaningful runtime fast path where
+  bad-byte tracking is skipped entirely
 
 ### Files likely affected
 
@@ -306,6 +326,7 @@ struct FixedLengthInfo {
 - unit tests for fixed-length detection
 - unit tests for gap-body recognition
 - unit tests for top-level concat flattening
+- unit tests that zero-length gaps are normalized away before plan construction
 
 ### Done criteria
 
@@ -320,30 +341,97 @@ Introduce the new internal plan representation without yet enabling execution.
 
 ### Changes
 
-- add `BoundedGapPlan`, `GapPlan`, `AnchorPlan`, `AnchorExecHint`,
-  `AnchorLengthInfo`
+- add `BoundedGapPlan`, `GapPlan`, `AnchorPlan`, `AnchorProgram`,
+  `AnchorEngine`, `AnchorLengthInfo`, `CompileMode`
 - store `Option<BoundedGapPlan>` on `Regex`
 - update `RegexInfo` and diagnostics plumbing to mention bounded-gap availability
   if present
 
 ### Important storage decision
 
-For Version 1 dual compile mode, `AnchorPlan` should store compiled internal
-anchor regexes rather than raw HIR fragments.
+Anchors must **not** be stored as `Box<Regex>` or `Arc<Regex>`.
 
-Because `Regex` will then contain a `BoundedGapPlan`, and `BoundedGapPlan` will
-contain anchors that are themselves compiled regexes, the ownership shape must be
-explicitly indirect.
+That would create a recursive type graph where `Regex` contains a plan that
+contains more `Regex` objects.  It is awkward for ownership, memory accounting,
+and diagnostics, and it risks accidentally letting anchors recurse into
+top-level specializations.
 
-The plan type should reflect Version 1 chain shape explicitly, for example:
+Instead, anchors should be stored as dedicated, non-recursive `AnchorProgram`
+objects.
+
+### Anchor program type
+
+```rust
+struct AnchorProgram {
+    engine: AnchorEngine,
+    prefilter: Option<Prefilter>,
+}
+
+enum AnchorEngine {
+    Tier0(AnchorNfaProgram),
+    Tier1(AnchorDfaProgram),
+    Tier2(AnchorTier2Program),
+}
+```
+
+`AnchorProgram` stores only the execution data needed for event-producing
+anchor runners.  It does not carry a nested `BoundedGapPlan`, a public
+diagnostics surface, or top-level matcher dispatch.
+
+Each `Anchor*Program` variant should be a private struct containing only the
+compiled state that the corresponding tier's anchor scanner needs.  The exact
+fields can be refined during implementation, but they should be deliberately
+smaller than a full `Regex`.
+
+### Compile mode
+
+Anchors should be compiled in a distinct mode:
+
+```rust
+enum CompileMode {
+    TopLevel,
+    Anchor,
+}
+```
+
+In `CompileMode::Anchor`:
+
+- bounded-gap detection is disabled
+- other future top-level-only specializations are disabled
+- the output is an `AnchorProgram`, not a `Regex`
+
+This prevents recursive specialization trees and keeps the ownership graph flat.
+
+### Plan type
+
+The plan type should reflect Version 1 chain shape explicitly:
 
 ```rust
 struct BoundedGapPlan {
     anchors: Box<[AnchorPlan]>,
     interior_gaps: Box<[GapPlan]>,
     tail_gap: Option<GapPlan>,
-    anchored_start: bool,
-    anchored_end: bool,
+    start_anchor: StartAnchorKind,
+    end_anchor: EndAnchorKind,
+}
+
+struct AnchorPlan {
+    program: AnchorProgram,
+    length_info: AnchorLengthInfo,
+}
+```
+
+with:
+
+```rust
+enum StartAnchorKind {
+    None,
+    StartOfInput,
+}
+
+enum EndAnchorKind {
+    None,
+    EndOfInput,
 }
 ```
 
@@ -351,41 +439,14 @@ with the invariant:
 
 - `anchors.len() == interior_gaps.len() + 1`
 
-### Option A: `Box<Regex>` per anchor (recommended for Version 1)
+### Ownership summary
 
-Pros:
+This means `Regex` will own in Version 1 dual compile mode:
 
-- simple ownership model
-- no reference counting
-- easy to debug
+- the ordinary compiled regex (for fallback and differential testing)
+- plus the bounded-gap plan containing `AnchorProgram`s (not `Regex` objects)
 
-Cons:
-
-- duplicated anchor regexes are not shared across plans
-
-### Option B: `Arc<Regex>` per anchor
-
-Pros:
-
-- easier future sharing / dedup if desired
-
-Cons:
-
-- adds reference-counting overhead and policy surface immediately
-
-### Recommendation
-
-Use **`Box<Regex>`** in Version 1.
-
-The main goal is clarity. Anchor sharing can be revisited later if it becomes a
-measured memory issue.
-
-This means `Regex` will temporarily own:
-
-- the ordinary compiled regex
-- plus the bounded-gap plan and its compiled anchors
-
-That is acceptable in bring-up mode.
+No type recursion.  No reference counting.  No dedup.
 
 ### Files likely affected
 
@@ -424,10 +485,21 @@ fn try_build_bounded_gap_plan(&mut self, hir: &Hir) -> Result<Option<BoundedGapP
 2. flatten top-level concat
 3. partition into alternating anchor / gap pieces, allowing one optional trailing
    gap
-4. validate Version 1 restrictions
-5. compile anchors as internal regexes
-6. if all steps succeed, return `Some(plan)`
-7. otherwise return `None` and continue normal compilation
+4. normalize away zero-length gaps (`{0,0}`)
+5. hoist whole-pattern `Start` / `End` when structurally unambiguous
+6. validate Version 1 restrictions
+7. compile each anchor fragment as an `AnchorProgram` using
+   `CompileMode::Anchor`
+8. if all steps succeed, return `Some(plan)`
+9. otherwise return `None` and continue normal compilation
+
+Zero-gap normalization rule:
+
+- an interior `{0,0}` gap is merged away by concatenating the adjacent anchor
+  fragments into one anchor fragment
+- a trailing `{0,0}` gap is dropped entirely
+- if normalization removes all gaps, the bounded-gap specialization no longer
+  applies and the pattern falls back to the normal engine
 
 ### Important ambiguity: whether to compile anchors with the same builder config
 
@@ -461,6 +533,18 @@ Use **Option A**.
   - `CWS.{254}`
   - `token[^/]{0,20}`
 
+- normalization tests for:
+  - `foo.{0,0}bar`
+  - `foo[^/]{0,0}`
+
+- hoisting tests for:
+  - top-level `^` lowering to `Start`
+  - top-level `$` lowering to `End`
+
+- rejection tests for whole-pattern line anchors:
+  - `StartLF`
+  - `EndLF`
+
 ### Done criteria
 
 - recognized patterns store a plan
@@ -474,7 +558,8 @@ Create internal adapters that run anchors and emit end-position events.
 
 ### Recommended interface
 
-Use the scanner/event design from the proposal, not only a byte-step interface.
+Use the scanner/event design from the proposal as the intended internal
+boundary.
 
 Suggested internal trait:
 
@@ -493,46 +578,43 @@ trait AnchorScanner {
 
 ### Implementation plan
 
-- add private adapters for:
-  - Tier 0 anchors
-  - Tier 1 anchors
-  - Tier 2 anchors
+- implement `AnchorScanner` for each `AnchorEngine` variant:
+  - `AnchorNfaProgram` (Tier 0)
+  - `AnchorDfaProgram` (Tier 1)
+  - `AnchorTier2Program` (Tier 2)
 - Version 1 events carry only end positions because anchor length is fixed
 
-### Important ambiguity: where to build the adapters
+It is acceptable for the earliest bring-up code to implement some of these
+scanners via internal byte-step adapters, but the phase is not complete until
+the intended anchor classes preserve their prefilter/re-engagement behavior.
 
-### Option A: wrap existing public matcher types
+### Important note on adapter placement
 
-Pros:
+The anchor scanners should be private structs built directly on top of the
+`AnchorProgram` / `Anchor*Program` internals, **not** wrappers around the public
+`AnyMatcher` type.
 
-- low new code volume
+This is the natural consequence of the `AnchorProgram` decision:
 
-Cons:
-
-- risks coupling scanner semantics to public matcher semantics too tightly
-
-### Option B: build small private runner structs directly on the tier internals
-  (recommended)
-
-Pros:
-
-- easier to expose only the event semantics needed
-- avoids accidental public API pressure
-
-Cons:
-
-- some duplicate glue code
-
-### Recommendation
-
-Use **Option B**.
+- anchors are not `Regex` objects, so there is no public matcher to wrap
+- the scanner implementations consume `Anchor*Program` data directly
+- this avoids accidental coupling between anchor-scanner semantics and public
+  matcher semantics
 
 ### Tests
 
 - unit tests for each anchor runner on fixed-length examples
 - cross-chunk tests
-- tests that prefilter-based anchors still emit the same end-position events as
-  naive stepping
+- tests that event positions are monotonically increasing within a chunk
+- tests that prefilter-based scanners emit the same end-position events as naive
+  stepping
+
+### Event contract
+
+The event contract should be explicit:
+
+- events are observed in monotonically increasing absolute position order
+- at most one end-event is produced per anchor per end position in Version 1
 
 ### Done criteria
 
@@ -564,9 +646,16 @@ struct BoundedGapMatcher<'a> {
     anchors: Box<[AnchorRunner<'a>]>,
     stages: Box<[GapStageState]>,
     tail_stage: Option<TailGapState>,
+    anchor_active: Box<[bool]>,
+    matched_here: bool,
     matched: bool,
 }
 ```
+
+Where `matched_here` means:
+
+- the chain is fully satisfied at the current boundary, but may still require
+  `finish()` resolution when `end_anchor == EndAnchorKind::EndOfInput`
 
 with an additional tail-gap state when `plan.tail_gap.is_some()`:
 
@@ -587,6 +676,18 @@ The implementation must enforce the linearity invariants from the proposal:
 - no scanning of all live predecessors for a single event
 
 The same rules must apply to the terminal-gap queues too.
+
+For interior gaps, the intended destructive-pop validation algorithm is:
+
+1. pop expired accepted ends from the front
+2. pop accepted ends invalidated by the most recent bad byte before the
+   candidate next-anchor start
+3. test the new front against `min_gap`
+
+The destructive pop in step 2 is intentional and correct. Once a bad byte lies
+between an accepted end `e` and some candidate start `s`, that same bad byte
+will also lie between `e` and every future `s' >= s`, so `e` can never become
+valid again.
 
 ### Important ambiguity: event processing order inside a byte/chunk
 
@@ -618,6 +719,50 @@ The runtime must also document the same-boundary success rule for trailing gaps:
 This rule must be tested explicitly because it is easy to miss when the
 implementation is otherwise event-driven.
 
+### Additional terminal-gap bad-byte ordering rule
+
+At position `p`, if `tail_gap` is present:
+
+1. record the current byte as bad for the terminal gap if its predicate fails
+2. then evaluate terminal-gap validity at `p`
+
+This ordering is required because terminal-gap bytes are `(e, p]`, so the
+current byte participates in the gap being validated.
+
+Important consequence:
+
+- a bad byte at `p` invalidates every pending terminal-gap entry with `e < p`
+- a newly accepted final-anchor end at `e = p` is not invalidated, because
+  `(p, p]` is empty
+
+### anchored_start / anchored_end semantics
+
+Version 1 should not model these as booleans.
+
+Required semantics:
+
+- `StartAnchorKind::StartOfInput` is enforced in the bounded-gap layer by
+  filtering first-anchor events whose computed start position is not 0
+- `EndAnchorKind::EndOfInput` means true whole-input end anchoring only
+
+Do not hoist `StartLF` / `EndLF` in Version 1.
+
+Operational consequence:
+
+- when `end_anchor == EndAnchorKind::EndOfInput`, the matcher must not declare
+  a final match during ordinary byte processing
+- instead it tracks only whether the chain is fully satisfied at the **current**
+  boundary and resolves that candidate in `finish()`
+- ordinary early exit is therefore disabled when `end_anchor != None`
+
+### Lazy anchor activation
+
+Include one-way lazy anchor activation in Version 1:
+
+- `anchor[0]` active from the start
+- `anchor[i+1]` becomes active once stage `i` receives its first accepted end
+- once active, an anchor remains active for the rest of the match
+
 ### Tests
 
 - simple `A.{0,K}B` behavior tests
@@ -633,6 +778,13 @@ Specifically add:
 - `A[^/]{0,3}` invalidation tests when `/` occurs after `A`
 - cross-chunk `A.{254}` tests where `A` ends in one chunk and the trailing gap
   completes in another
+- whole-pattern `End` tests such as `foo.{0,3}$` on exact end-of-input matches
+- whole-pattern `End` non-early-exit tests where a candidate match is followed by
+  more bytes and therefore must not succeed
+- rejection tests for multiline top-level `^` / `$` lowering to `StartLF` /
+  `EndLF`
+- anchored-start filtering tests for first-anchor start position 0 only
+- lazy-activation sanity tests showing later anchors stay dormant until enabled
 
 ### Done criteria
 
@@ -693,24 +845,45 @@ Once the specialization is trusted, heuristics can be added later.
 - existing non-recognized patterns remain unchanged
 - `matcher_for_tier()` behavior remains unchanged for `0..4`
 
-## Phase 6: prefilter and re-engagement integration
+## Phase 6: bounded-gap cache in `MatcherMemory`
+
+### Goal
+
+Reuse bounded-gap allocations across matches, consistent with the rest of the
+engine.
+
+### Changes
+
+- add a `bounded_gap_cache` field to `MatcherMemory`
+- cache reusable queue storage and anchor-runner state there
+
+### Recommendation
+
+Do this in Version 1, not as later polish. Fresh allocation per match is the
+wrong default for the intended service setting.
+
+### Tests
+
+- repeated-match tests confirming memory is reused without semantic drift
+
+## Phase 7: prefilter and re-engagement integration
 
 ### Goal
 
 Make sure the specialization does not accidentally discard anchor performance.
 
-### Required Version 1 work
+### Required work
 
 - preserve per-anchor prefilter behavior in anchor scanners
 - preserve per-anchor re-engagement when the anchor runner becomes quiescent
 - support whole-plan first-anchor prefiltering when no windows are active
 
-### Optional Version 1.1 work
+### Optional follow-up work
 
 - gap-predicate span skipping for constrained gaps
 
-This should be explicitly treated as a separate optimization step, not as a
-Version 1 correctness dependency.
+This should be explicitly treated as a second optimization step, not as a core
+correctness dependency.
 
 ### Tests
 
@@ -719,7 +892,7 @@ Version 1 correctness dependency.
 - tests where anchors match every byte to prove invariants still hold when
   prefilters provide no help
 
-## Phase 7: diagnostics and explainability
+## Phase 8: diagnostics and explainability
 
 ### Goal
 
@@ -790,7 +963,7 @@ still new.
 - text output tests
 - JSON info tests
 
-## Phase 8: adversarial validation
+## Phase 9: adversarial validation
 
 ### Goal
 
@@ -846,7 +1019,7 @@ Patterns just below and just above the chosen Version 1 caps.
 - ignored property/fuzz test generating small bounded-gap chains and comparing the
   specialization against the normal engine
 
-## Phase 9: staged extension hooks (documented but not implemented in Version 1)
+## Post-Version-1 extension hooks
 
 Version 1 should leave explicit seams for later work, even if it does not
 implement them yet.
@@ -874,7 +1047,8 @@ Add end-to-end tests for:
 
 - recognized bounded-gap patterns
 - rejected near-miss patterns
-- top-level `^` / `$` hoisting cases
+- whole-pattern `Start` / `End` hoisting cases
+- whole-pattern `StartLF` / `EndLF` rejection cases
 - cross-chunk cases
 - terminal-gap cases
 
@@ -919,9 +1093,10 @@ The Version 1 patch series is done when all of the following hold:
 6. The bounded-gap matcher is correct for both anchor-terminated and terminal-gap
    chain shapes.
 7. The bounded-gap matcher is correct across arbitrary chunk boundaries.
-8. Queue-size and linearity invariants hold on adversarial Version 1 patterns.
-9. Existing patterns not recognized by the probe behave identically to today.
-10. `cargo test`, `cargo clippy -- -D clippy::all`, and `cargo fmt -- --check`
+8. `MatcherMemory` reuses bounded-gap state across matches.
+9. Queue-size and linearity invariants hold on adversarial Version 1 patterns.
+10. Existing patterns not recognized by the probe behave identically to today.
+11. `cargo test`, `cargo clippy -- -D clippy::all`, and `cargo fmt -- --check`
    all pass.
 
 ## Recommended Execution Order
@@ -932,9 +1107,10 @@ The Version 1 patch series is done when all of the following hold:
 4. Phase 3 — internal anchor scanners
 5. Phase 4 — bounded-gap runtime
 6. Phase 5 — default matcher dispatch
-7. Phase 6 — prefilter / re-engagement integration
-8. Phase 7 — diagnostics
-9. Phase 8 — adversarial validation
+7. Phase 6 — bounded-gap cache in `MatcherMemory`
+8. Phase 7 — prefilter / re-engagement integration
+9. Phase 8 — diagnostics
+10. Phase 9 — adversarial validation
 
 ## Final Recommendation
 
@@ -943,8 +1119,11 @@ The safest Version 1 is deliberately narrow and explicit:
 - dual compile mode
 - fixed-length anchors only
 - one-byte finite gaps only, including an optional terminal gap
-- no internal anchor assertions except hoisted top-level `^` / `$`
-- private scanner/event anchor adapters for Tier 0 / Tier 1 / Tier 2
+- no internal anchor assertions except hoisted whole-pattern `Start` / `End`
+- scanner/event as the internal boundary, with byte-step bring-up allowed behind
+  it temporarily
+- one-way lazy anchor activation
+- bounded-gap cache in `MatcherMemory`
 - bounded-gap default dispatch, but no new public forced-tier number
 
 That gives the implementation a clear, coherent first landing point without
