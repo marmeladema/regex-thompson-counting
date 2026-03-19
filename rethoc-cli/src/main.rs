@@ -70,6 +70,8 @@ enum Command {
     Grep {
         pattern: String,
         file: Option<String>,
+        tier: Option<u8>,
+        force_bounded_gap: bool,
         config: RegexConfig,
         quiet: bool,
     },
@@ -294,6 +296,8 @@ fn parse_args() -> Command {
             Command::Grep {
                 pattern: positional[1].clone(),
                 file: positional.get(2).cloned(),
+                tier,
+                force_bounded_gap,
                 config,
                 quiet,
             }
@@ -457,9 +461,21 @@ fn run_match(
     }
 }
 
-fn run_grep(pattern: &str, file: Option<&str>, config: RegexConfig, quiet: bool) {
+fn run_grep(
+    pattern: &str,
+    file: Option<&str>,
+    tier: Option<u8>,
+    force_bounded_gap: bool,
+    config: RegexConfig,
+    quiet: bool,
+) {
     let regex = parse_pattern(pattern, config);
     let mut memory = MatcherMemory::default();
+
+    if tier.is_some() && force_bounded_gap {
+        eprintln!("error: --tier and --bounded-gap are mutually exclusive");
+        process::exit(1);
+    }
 
     let reader: Box<dyn BufRead> = match file {
         Some(path) => {
@@ -481,7 +497,19 @@ fn run_grep(pattern: &str, file: Option<&str>, config: RegexConfig, quiet: bool)
             eprintln!("error: reading input: {e}");
             process::exit(1);
         });
-        let mut matcher = memory.matcher(&regex);
+        let mut matcher = if force_bounded_gap {
+            memory.bounded_gap_matcher(&regex).unwrap_or_else(|| {
+                eprintln!("error: pattern is not eligible for bounded-gap engine");
+                process::exit(1);
+            })
+        } else if let Some(t) = tier {
+            memory.matcher_for_tier(&regex, t).unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                process::exit(1);
+            })
+        } else {
+            memory.matcher(&regex)
+        };
         matcher.chunk(line.as_bytes());
         if matcher.finish() {
             if !quiet {
@@ -527,9 +555,18 @@ fn main() {
         Command::Grep {
             pattern,
             file,
+            tier,
+            force_bounded_gap,
             config,
             quiet,
-        } => run_grep(&pattern, file.as_deref(), config, quiet),
+        } => run_grep(
+            &pattern,
+            file.as_deref(),
+            tier,
+            force_bounded_gap,
+            config,
+            quiet,
+        ),
         Command::Dump {
             pattern,
             config,
