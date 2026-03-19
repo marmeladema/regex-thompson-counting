@@ -144,6 +144,23 @@ fn bench_no_match(c: &mut Criterion) {
             })
         });
 
+        // rethoc default (merged repetitions → single counter, Tier 2)
+        group.bench_with_input(
+            BenchmarkId::new("rethoc/bounded-gap", size),
+            &hay,
+            |b, hay| {
+                let mut mem = MatcherMemory::default();
+                let mut m = mem.bounded_gap_matcher(&rethoc_merged).unwrap();
+                m.chunk(hay);
+                m.finish();
+                b.iter(|| {
+                    let mut m = mem.matcher(&rethoc_merged);
+                    m.chunk(black_box(hay));
+                    black_box(m.finish())
+                })
+            },
+        );
+
         // rethoc tier 2 (merged - differential-counter DFA, 1 counter)
         group.bench_with_input(BenchmarkId::new("rethoc/tier2", size), &hay, |b, hay| {
             let mut mem = MatcherMemory::default();
